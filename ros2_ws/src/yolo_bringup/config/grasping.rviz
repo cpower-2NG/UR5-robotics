@@ -1,0 +1,56 @@
+Panels:
+  - Class: rviz2/Displays
+    Name: Displays
+  - Class: rviz2/Views
+    Name: Views
+
+Visualization Manager:
+  Displays:
+    # TF 框架
+    - Class: rviz2/TF
+      Name: TF
+      Enabled: true
+
+    # RGB 图像
+    - Class: rviz2/Image
+      Name: RGB Camera
+      Enabled: true
+      Topic:
+        Depth: 1
+        Reliability Policy: 2  # Best Effort
+        Value: /camera/color/image_raw
+
+    # YOLO 检测标注
+    - Class: rviz2/Image
+      Name: YOLO Detections
+      Enabled: true
+      Topic:
+        Depth: 1
+        Reliability Policy: 2
+        Value: /detections_image
+
+    # 3D 目标标记
+    - Class: rviz2/Marker
+      Name: Target 3D
+      Enabled: true
+      Topic:
+        Value: /target_3d_marker
+
+    # 机器人模型（需 URDF）
+    - Class: rviz2/RobotModel
+      Name: Robot Model
+      Enabled: false
+      Description Topic:
+        Value: /robot_description
+
+  Global Options:
+    Background Color: 48 48 48
+    Fixed Frame: base_link
+    Frame Rate: 30
+
+  Views:
+    - Class: rviz2/Orbit
+      Name: Current View
+      Target Frame: base_link
+      Distance: 3.0
+      Focal Point: [0.5, 0.0, 0.5]

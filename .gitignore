@@ -1,0 +1,8 @@
+env/
+.env
+__pycache__/
+.pytest_cache/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+*.pyc

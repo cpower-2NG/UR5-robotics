@@ -1,0 +1,7 @@
+torch
+torchvision
+ultralytics
+colcon-common-extensions
+pytest
+transforms3d
+pyquaternion

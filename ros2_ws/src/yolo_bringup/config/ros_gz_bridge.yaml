@@ -1,0 +1,36 @@
+# ros_gz_bridge 参数配置
+# 桥接 Gazebo Harmonic (gz-sim) 话题到 ROS2 话题
+#
+# 用法:
+#   ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=config/ros_gz_bridge.yaml
+
+ros__parameters:
+  # ---- RGB 相机 ----
+  - topic_name: "/camera/color/image_raw"
+    ros_type_name: "sensor_msgs/msg/Image"
+    gz_type_name: "gz.msgs.Image"
+    direction: GZ_TO_ROS
+
+  # ---- 深度相机 ----
+  - topic_name: "/camera/depth/image_raw"
+    ros_type_name: "sensor_msgs/msg/Image"
+    gz_type_name: "gz.msgs.Image"
+    direction: GZ_TO_ROS
+
+  # ---- 相机内参 ----
+  - topic_name: "/camera/color/camera_info"
+    ros_type_name: "sensor_msgs/msg/CameraInfo"
+    gz_type_name: "gz.msgs.CameraInfo"
+    direction: GZ_TO_ROS
+
+  # ---- 关节状态 ----
+  - topic_name: "/joint_states"
+    ros_type_name: "sensor_msgs/msg/JointState"
+    gz_type_name: "gz.msgs.Model"
+    direction: GZ_TO_ROS
+
+  # ---- 时钟 ----
+  - topic_name: "/clock"
+    ros_type_name: "rosgraph_msgs/msg/Clock"
+    gz_type_name: "gz.msgs.Clock"
+    direction: GZ_TO_ROS
