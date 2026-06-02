@@ -44,8 +44,9 @@
 | MoveIt2 | ros-jazzy-moveit | 运动规划与 IK |
 | YOLO | ultralytics (YOLOv8) | Python 推理 |
 | 深度相机 | RealSense D435 (仿真模型) | 通过 ros_gz 桥接 |
-| Python | 3.10 (Conda) | YOLO 与 ROS2 Python 节点 |
+| Python | 3.12 (Conda) | **必须 3.12**（ROS2 Jazzy rclpy 为 Python 3.12 编译） |
 | CUDA | 13.2 | GPU 加速 YOLO 推理 |
+| numpy | < 2.0 | ROS2 cv_bridge 基于 numpy 1.x 编译，不兼容 2.x |
 
 ---
 
@@ -244,21 +245,29 @@ ros2_ws/src/
 ### 6.1 系统依赖安装
 
 ```bash
-# ROS2 Jazzy (Ubuntu 24.04)
-sudo apt update && sudo apt install -y ros-jazzy-desktop
+# 1. 配置 ROS2 源（如使用国内镜像，将 archive.ubuntu.com 换为 mirrors.aliyun.com）
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+  -o /usr/share/keyrings/ros-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/ros2.list
+sudo apt update
 
-# Gazebo Harmonic
-sudo apt install -y gz-harmonic
+# 2. ROS2 Jazzy Desktop（注意：不要装 python3-colcon-common-extensions，与 Conda pip 版本冲突）
+sudo apt install -y ros-jazzy-desktop ros-jazzy-ros-base python3-rosdep
 
-# ROS-Gazebo 桥接
-sudo apt install -y ros-jazzy-ros-gz
+# 3. Gazebo Harmonic（通过 ros-jazzy-ros-gz-sim 自动拉取，无需单独 gz-harmonic）
+sudo apt install -y ros-jazzy-ros-gz ros-jazzy-ros-gz-bridge \
+  ros-jazzy-ros-gz-sim ros-jazzy-ros-gz-image
 
-# MoveIt2
-sudo apt install -y ros-jazzy-moveit
+# 4. MoveIt2 + 感知依赖
+sudo apt install -y ros-jazzy-moveit ros-jazzy-moveit-visual-tools \
+  ros-jazzy-vision-msgs ros-jazzy-cv-bridge ros-jazzy-image-transport \
+  ros-jazzy-image-geometry ros-jazzy-tf2-geometry-msgs ros-jazzy-rviz2 \
+  ros-jazzy-robot-state-publisher ros-jazzy-joint-state-publisher ros-jazzy-xacro
 
-# 其他依赖
-sudo apt install -y ros-jazzy-vision-msgs ros-jazzy-cv-bridge \
-  ros-jazzy-image-transport ros-jazzy-tf2-geometry-msgs
+# 5. rosdep 初始化
+sudo rosdep init && rosdep update
+```
 ```
 
 ### 6.2 Conda 环境
@@ -314,7 +323,84 @@ ros2 service call /trigger_grasp std_srvs/srv/Trigger
 
 ---
 
-## 9. 参考资料
+## 9. 已知问题与排查记录
+
+### 9.1 清华镜像源 403
+
+**现象**：`E: Failed to fetch http://mirrors.tuna.tsinghua.edu.cn/... 403 Forbidden`
+
+**解决**：替换为阿里云镜像（Ubuntu 24.04 使用 deb822 格式）：
+
+```bash
+sudo sed -i 's|mirrors.tuna.tsinghua.edu.cn|mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources
+sudo apt update
+```
+
+### 9.2 CoppeliaSim Qt5 库冲突
+
+**现象**：`version 'Qt_5.15' not found (required by libgz-sim8-gz.so)`
+
+**原因**：`~/.bashrc` 中 `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$COPPELIASIM_ROOT` 导致 CoppeliaSim 自带的旧版 Qt5 库覆盖了系统 Qt5。
+
+**解决**：将 `~/.bashrc` 中的全局环境变量改为按需加载的 alias：
+
+```bash
+# 替换这三行：
+# export COPPELIASIM_ROOT=...
+# export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$COPPELIASIM_ROOT
+# export QT_QPA_PLATFORM_PLUGIN_PATH=$COPPELIASIM_ROOT
+
+# 为这一行：
+alias coppeliasim='$HOME/workspace/CoppeliaSim/CoppeliaSim_Edu_V4_1_0/coppeliaSim.sh'
+```
+
+**临时修复**（不关终端的情况下）：
+
+```bash
+QT_QPA_PLATFORM_PLUGIN_PATH= \
+LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | sed 's|:/home/<user>/workspace/CoppeliaSim/CoppeliaSim_Edu_V4_1_0||g') \
+gz sim -r src/yolo_bringup/worlds/grasping_world.sdf
+```
+
+### 9.3 Python 版本不匹配（3.10 vs 3.12）
+
+**现象**：`ModuleNotFoundError: No module named 'rclpy._rclpy_pybind11'`
+
+**原因**：ROS2 Jazzy 的 rclpy 仅为 Python 3.12 编译。Conda 环境若使用 Python 3.10 则无法导入。
+
+**解决**：Conda 环境必须使用 Python 3.12：
+
+```yaml
+# environment.yml
+dependencies:
+  - python=3.12
+```
+
+### 9.4 numpy 2.x 不兼容 ROS2 cv_bridge
+
+**现象**：`A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x`
+
+**原因**：ROS2 Jazzy 的 `cv_bridge` 和 `image_geometry` 使用 numpy 1.x ABI 编译，不兼容 numpy 2.x。
+
+**解决**：在 Conda 环境中降级 numpy：
+
+```bash
+pip install "numpy<2" deprecated
+```
+
+### 9.5 Gazebo 启动命令
+
+**注意**：Gazebo Harmonic 在 ROS2 Jazzy 下通过 vendor 包提供，不是独立的 `gz-harmonic` deb 包。可执行文件位于：
+
+```
+/opt/ros/jazzy/opt/gz_tools_vendor/bin/gz
+```
+
+需要先 `source /opt/ros/jazzy/setup.bash` 才能正确解析库路径。
+
+---
+
+## 10. 参考资料
 
 - ROS2 Jazzy: https://docs.ros.org/en/jazzy/
 - Gazebo Harmonic: https://gazebosim.org/docs/harmonic

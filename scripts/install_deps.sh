@@ -40,8 +40,7 @@ echo "[2/5] 安装 ROS2 Jazzy Desktop..."
 sudo apt install -y \
     ros-jazzy-desktop \
     ros-jazzy-ros-base \
-    python3-rosdep \
-    python3-colcon-common-extensions
+    python3-rosdep
 
 echo "ROS2 Jazzy 安装完成。"
 

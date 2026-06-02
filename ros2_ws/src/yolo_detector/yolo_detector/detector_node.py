@@ -119,13 +119,11 @@ class YoloDetector(Node):
             detection.header.stamp = msg.header.stamp
             detection.header.frame_id = msg.header.frame_id
 
-            # bbox center (归一化？此处使用像素坐标)
+            # bbox（vision_msgs Pose2D 有 API 兼容问题，手动构造）
             from vision_msgs.msg import BoundingBox2D
             bbox = BoundingBox2D()
-            from geometry_msgs.msg import Pose2D
-            bbox.center = Pose2D()
-            bbox.center.x = cx
-            bbox.center.y = cy
+            bbox.center.position.x = cx
+            bbox.center.position.y = cy
             bbox.size_x = w
             bbox.size_y = h
             detection.bbox = bbox

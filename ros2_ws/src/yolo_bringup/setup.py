@@ -25,4 +25,9 @@ setup(
     maintainer_email='user@example.com',
     description='Top-level bringup for YOLO grasping pipeline',
     license='Apache-2.0',
+    entry_points={
+        'console_scripts': [
+            'test_image_publisher = yolo_bringup.test_image_publisher:main',
+        ],
+    },
 )

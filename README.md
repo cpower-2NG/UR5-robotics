@@ -28,9 +28,10 @@ Gazebo Harmonic 仿真
 | 组件 | 版本 | 说明 |
 |------|------|------|
 | OS | Ubuntu 24.04 | WSL2 + WSLg |
-| ROS2 | Jazzy Jalisco | 系统级 apt 安装 |
-| Gazebo | Harmonic | gz-sim8 |
-| Python | 3.10 (Conda) | yolo_ros 环境 |
+| ROS2 | Jazzy Jalisco | 系统级 apt 安装，**必须 Python 3.12** |
+| Gazebo | Harmonic (gz-sim8) | 通过 ros-jazzy-ros-gz-sim vendor 包提供 |
+| Conda Python | 3.12 | rclpy 仅为 Python 3.12 编译 |
+| numpy | < 2.0 | cv_bridge 基于 numpy 1.x 编译 |
 | CUDA | 13.2 | GPU 加速 YOLO |
 | YOLO | YOLOv8 (ultralytics) | pip 安装 |
 
@@ -111,12 +112,25 @@ yolo_ros/
 - [x] YOLOv8 检测 ROS2 节点
 - [x] 2D→3D 投影 + TF 坐标变换
 - [x] Mock 抓取规划节点 (测试用)
-- [x] Gazebo Harmonic 仿真场景
+- [x] Gazebo Harmonic 仿真场景（静态物体）
+- [x] 3 节点流水线联调通过（`ros2 node list` 验证）
+- [ ] Gazebo 中接入 RGBD 相机传感器 + ros_gz_bridge 桥接
+- [ ] YOLO 实时检测 Gazebo 场景中的物体
 - [ ] MoveIt2 完整 IK 集成
 - [ ] UR5/UR10 机械臂 URDF
-- [ ] 实感相机 Gazebo 插件
 - [ ] 端到端抓取闭环测试
 - [ ] cuRobo IK 替换
+
+## 已知问题
+
+| 问题 | 解决方案 |
+|------|----------|
+| 清华镜像 403 | `sed -i` 替换为阿里云 `mirrors.aliyun.com` |
+| CoppeliaSim Qt5 冲突 | `~/.bashrc` 改为 alias，不设全局 `LD_LIBRARY_PATH` |
+| Python 3.10 → 3.12 | Conda 环境必须用 3.12（ROS2 Jazzy rclpy 要求） |
+| numpy 2.x 不兼容 | `pip install "numpy<2" deprecated` |
+
+详见 [`docs/TECHNICAL_SPEC.md` §9](docs/TECHNICAL_SPEC.md)。
 
 ---
 
