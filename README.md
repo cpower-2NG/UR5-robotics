@@ -87,12 +87,20 @@ yolo_ros/
 ├── README.md
 ├── environment.yml                  # Conda 环境定义
 ├── docs/
-│   └── TECHNICAL_SPEC.md           # 详细技术方案文档
+│   ├── TECHNICAL_SPEC.md           # 详细技术方案文档
+│   ├── GRID_ENV_DESIGN.md          # 方阵环境设计文档
+│   ├── YOLO_TUTORIAL.md            # YOLO 训练+检测完整教程
+│   └── YOLO_VISION_DESIGN.md       # ★ yolo_vision 子项目详细设计
 ├── scripts/
 │   ├── install_deps.sh             # 一键安装系统依赖
 │   ├── create_env.sh               # 创建 Conda 环境
 │   ├── setup_workspace.sh          # 初始化 ROS2 工作区
-│   ├── setup_all.sh                # 全自动配置
+│   ├── generate_grid_world.py      # 方阵世界生成器
+│   ├── collect_training_data.py    # Gazebo 图像采集
+│   ├── auto_label_grid.py          # 自动标注（相机投影）
+│   ├── train_yolo_block.py         # YOLO 训练
+│   ├── demo_pipeline.py            # 端到端演示
+│   ├── capture_and_detect.py       # 单帧截图+检测
 │   └── test_minimal.py             # 最小验证测试
 └── ros2_ws/src/
     ├── yolo_detector/              # YOLOv8 检测节点

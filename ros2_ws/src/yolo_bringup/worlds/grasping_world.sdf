@@ -1,9 +1,9 @@
 <?xml version="1.0" ?>
 <!--
-Gazebo Harmonic 仿真场景：抓取演示
-- 地面平面
-- 简单彩色方块（供 YOLO 检测）
-- 可扩展：UR5 机械臂 + 夹爪 + RGBD 相机
+Gazebo Harmonic 仿真场景：桌面抓取演示
+- 地面 + 桌子（带四条腿）
+- 桌面放置彩色方块 + 圆柱（供 YOLO 检测训练）
+- 可扩展：UR5 机械臂 + 夹爪
 
 用法:
   gz sim -r grasping_world.sdf
@@ -21,29 +21,13 @@ Gazebo Harmonic 仿真场景：抓取演示
     <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
     </plugin>
 
-    <!-- GUI 插件 -->
-    <gui fullscreen="0">
-      <plugin filename="GzScene3D" name="3D View">
-        <gz-gui>
-          <title>3D View</title>
-          <property type="bool" key="showTitleBar">false</property>
-          <property type="string" key="state">docked</property>
-        </gz-gui>
-        <engine>ogre2</engine>
-        <scene>scene</scene>
-        <ambient_light>0.4 0.4 0.4</ambient_light>
-        <background_color>0.8 0.8 0.8</background_color>
-        <camera_pose>2.0 -3.0 2.0 0.0 0.5 2.5</camera_pose>
-      </plugin>
+    <!-- 用户交互（鼠标/键盘控制视角） -->
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands">
+    </plugin>
 
-      <!-- 平移/旋转工具 -->
-      <plugin filename="TransformControl" name="Transform Control">
-        <gz-gui>
-          <property type="bool" key="showTitleBar">false</property>
-          <property type="string" key="state">docked</property>
-        </gz-gui>
-      </plugin>
-    </gui>
+    <!-- 场景信息广播 -->
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
 
     <!-- 光源 -->
     <light type="directional" name="sun">
@@ -59,39 +43,6 @@ Gazebo Harmonic 仿真场景：抓取演示
       </attenuation>
       <direction>-0.5 0.1 -0.9</direction>
     </light>
-
-    <!-- 相机：俯瞰场景 -->
-    <model name="camera_model">
-      <static>true</static>
-      <pose>0.5 0.0 1.5 0.0 1.5708 0.0</pose>
-
-      <link name="camera_link">
-        <visual name="visual">
-          <geometry><box><size>0.05 0.05 0.03</size></box></geometry>
-          <material>
-            <ambient>0.3 0.3 0.3</ambient>
-            <diffuse>0.3 0.3 0.3</diffuse>
-          </material>
-        </visual>
-
-        <sensor name="camera" type="camera">
-          <topic>/camera</topic>
-          <update_rate>15</update_rate>
-          <camera>
-            <horizontal_fov>1.047</horizontal_fov>
-            <image>
-              <width>640</width>
-              <height>480</height>
-              <format>R8G8B8</format>
-            </image>
-            <clip>
-              <near>0.05</near>
-              <far>10.0</far>
-            </clip>
-          </camera>
-        </sensor>
-      </link>
-    </model>
 
     <!-- 地面 -->
     <model name="ground_plane">
@@ -120,15 +71,173 @@ Gazebo Harmonic 仿真场景：抓取演示
       </link>
     </model>
 
-    <!--
-    === 待抓取物体示例 ===
-    彩色方块，YOLOv8 预训练模型可检测 "cube" / "block" 类别
-    实际使用时可替换为 YCB 物体模型
-    -->
+    <!-- ============================================ -->
+    <!-- 桌子：80×60cm 桌面，高 75cm，木色            -->
+    <!-- ============================================ -->
+    <model name="table">
+      <static>true</static>
+      <pose>0.5 0.0 0.0 0 0 0</pose>
+
+      <!-- 桌面 -->
+      <link name="table_top">
+        <pose>0 0 0.75 0 0 0</pose>
+        <collision name="collision">
+          <geometry>
+            <box><size>0.8 0.6 0.03</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.8 0.6 0.03</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.4 0.2 1.0</ambient>
+            <diffuse>0.6 0.4 0.2 1.0</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <!-- 桌腿 1：前左 -->
+      <link name="leg_fl">
+        <pose> 0.35  0.25 0.375 0 0 0</pose>
+        <collision name="collision">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+          <material>
+            <ambient>0.5 0.3 0.15 1.0</ambient>
+            <diffuse>0.5 0.3 0.15 1.0</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <!-- 桌腿 2：前右 -->
+      <link name="leg_fr">
+        <pose> 0.35 -0.25 0.375 0 0 0</pose>
+        <collision name="collision">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+          <material>
+            <ambient>0.5 0.3 0.15 1.0</ambient>
+            <diffuse>0.5 0.3 0.15 1.0</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <!-- 桌腿 3：后左 -->
+      <link name="leg_bl">
+        <pose>-0.35  0.25 0.375 0 0 0</pose>
+        <collision name="collision">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+          <material>
+            <ambient>0.5 0.3 0.15 1.0</ambient>
+            <diffuse>0.5 0.3 0.15 1.0</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <!-- 桌腿 4：后右 -->
+      <link name="leg_br">
+        <pose>-0.35 -0.25 0.375 0 0 0</pose>
+        <collision name="collision">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.75</length></cylinder>
+          </geometry>
+          <material>
+            <ambient>0.5 0.3 0.15 1.0</ambient>
+            <diffuse>0.5 0.3 0.15 1.0</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================ -->
+    <!-- RGBD 相机：固定俯瞰桌面（eye-to-hand 布局）     -->
+    <!-- 双目对齐：RGB + Depth 同一光轴，便于 2D→3D 投影 -->
+    <!-- ============================================ -->
+    <model name="camera_model">
+      <static>true</static>
+      <!-- 相机位于桌面中心正上方 1.5m，光轴朝下（-Z） -->
+      <pose>0.5 0.0 1.5 0.0 1.5708 0.0</pose>
+
+      <link name="camera_link">
+        <visual name="visual">
+          <geometry><box><size>0.05 0.05 0.03</size></box></geometry>
+          <material>
+            <ambient>0.2 0.2 0.2 1.0</ambient>
+            <diffuse>0.2 0.2 0.2 1.0</diffuse>
+          </material>
+        </visual>
+
+        <!-- RGB 相机 -->
+        <sensor name="rgb_camera" type="camera">
+          <topic>/camera/color/image_raw</topic>
+          <update_rate>15</update_rate>
+          <camera>
+            <horizontal_fov>1.047</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>480</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>10.0</far>
+            </clip>
+          </camera>
+        </sensor>
+
+        <!-- 深度相机（与 RGB 同光轴，共享内参） -->
+        <sensor name="depth_camera" type="depth_camera">
+          <topic>/camera/depth/image_raw</topic>
+          <update_rate>15</update_rate>
+          <camera>
+            <horizontal_fov>1.047</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>480</height>
+              <format>R_FLOAT32</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>10.0</far>
+            </clip>
+          </camera>
+        </sensor>
+      </link>
+    </model>
+
+    <!-- ============================================ -->
+    <!-- 桌面物体（YOLO 检测目标，类别名: block）       -->
+    <!-- 桌面表面 Z=0.765，物体高 0.05，中心 Z=0.79    -->
+    <!-- ============================================ -->
 
     <!-- 红色方块 -->
     <model name="red_cube">
-      <pose>0.5 0.0 0.025 0 0 0</pose>
+      <pose>0.5 0.0 0.79 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.1</mass>
@@ -140,20 +249,16 @@ Gazebo Harmonic 仿真场景：抓取演示
         </inertial>
         <collision name="collision">
           <geometry>
-            <box>
-              <size>0.05 0.05 0.05</size>
-            </box>
+            <box><size>0.05 0.05 0.05</size></box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <box>
-              <size>0.05 0.05 0.05</size>
-            </box>
+            <box><size>0.05 0.05 0.05</size></box>
           </geometry>
           <material>
-            <ambient>0.8 0.1 0.1</ambient>
-            <diffuse>0.8 0.1 0.1</diffuse>
+            <ambient>0.8 0.1 0.1 1.0</ambient>
+            <diffuse>0.8 0.1 0.1 1.0</diffuse>
           </material>
         </visual>
       </link>
@@ -161,7 +266,7 @@ Gazebo Harmonic 仿真场景：抓取演示
 
     <!-- 蓝色方块 -->
     <model name="blue_cube">
-      <pose>0.6 0.15 0.025 0 0 0</pose>
+      <pose>0.6 0.15 0.79 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.1</mass>
@@ -173,20 +278,16 @@ Gazebo Harmonic 仿真场景：抓取演示
         </inertial>
         <collision name="collision">
           <geometry>
-            <box>
-              <size>0.05 0.05 0.05</size>
-            </box>
+            <box><size>0.05 0.05 0.05</size></box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <box>
-              <size>0.05 0.05 0.05</size>
-            </box>
+            <box><size>0.05 0.05 0.05</size></box>
           </geometry>
           <material>
-            <ambient>0.1 0.1 0.8</ambient>
-            <diffuse>0.1 0.1 0.8</diffuse>
+            <ambient>0.1 0.1 0.8 1.0</ambient>
+            <diffuse>0.1 0.1 0.8 1.0</diffuse>
           </material>
         </visual>
       </link>
@@ -194,7 +295,7 @@ Gazebo Harmonic 仿真场景：抓取演示
 
     <!-- 绿色圆柱 -->
     <model name="green_cylinder">
-      <pose>0.4 -0.15 0.025 0 0 0</pose>
+      <pose>0.4 -0.15 0.79 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.15</mass>
@@ -206,22 +307,16 @@ Gazebo Harmonic 仿真场景：抓取演示
         </inertial>
         <collision name="collision">
           <geometry>
-            <cylinder>
-              <radius>0.025</radius>
-              <length>0.05</length>
-            </cylinder>
+            <cylinder><radius>0.025</radius><length>0.05</length></cylinder>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <cylinder>
-              <radius>0.025</radius>
-              <length>0.05</length>
-            </cylinder>
+            <cylinder><radius>0.025</radius><length>0.05</length></cylinder>
           </geometry>
           <material>
-            <ambient>0.1 0.8 0.1</ambient>
-            <diffuse>0.1 0.8 0.1</diffuse>
+            <ambient>0.1 0.8 0.1 1.0</ambient>
+            <diffuse>0.1 0.8 0.1 1.0</diffuse>
           </material>
         </visual>
       </link>
