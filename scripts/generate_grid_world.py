@@ -14,17 +14,17 @@
 import os
 
 # ---- 配置 ----
-GRID_ROWS = 5
-GRID_COLS = 5
-BLOCK_SIZE = 0.03          # 方块边长 3cm
+GRID_ROWS = 3
+GRID_COLS = 3
+BLOCK_SIZE = 0.04          # 方块边长 4cm（稍大方便看清）
 TABLE_X = 0.5              # 桌面中心 X
 TABLE_Y = 0.0              # 桌面中心 Y
 TABLE_SURFACE_Z = 0.765    # 桌面表面高度
 BLOCK_Z = TABLE_SURFACE_Z + BLOCK_SIZE / 2.0  # 方块中心 Z
-X_SPACING = 0.14           # 列间距
-Y_SPACING = 0.10           # 行间距
-X_START = 0.18             # 第一列 X
-Y_START = -0.20            # 第一行 Y
+X_SPACING = 0.16           # 列间距（3列跨度0.32m，居中桌面）
+Y_SPACING = 0.12           # 行间距（3行跨度0.24m，居中桌面）
+X_START = 0.50 - (GRID_COLS-1) * X_SPACING / 2.0  # 居中起始
+Y_START = -(GRID_ROWS-1) * Y_SPACING / 2.0        # 居中起始
 
 # 颜色方案：按行区分色系，按列微调深浅
 # 每行一个主色调：(R, G, B) 基准
@@ -32,19 +32,20 @@ ROW_COLORS = [
     (0.85, 0.15, 0.15),   # 红色系
     (0.15, 0.15, 0.85),   # 蓝色系
     (0.15, 0.80, 0.15),   # 绿色系
-    (0.90, 0.70, 0.10),   # 橙色系
-    (0.70, 0.20, 0.80),   # 紫色系
 ]
 
 # 列颜色微调因子（让每列略有深浅变化）
-COL_VARIATION = [0.7, 0.85, 1.0, 1.15, 1.3]
+COL_VARIATION = [0.8, 1.0, 1.2]
 
 # 哪些位置放圆柱（用 (row, col) 指定，0-indexed）
-CYLINDER_POSITIONS = {(1, 1), (2, 3), (3, 2)}  # 几个圆柱增加形状多样性
+CYLINDER_POSITIONS = {(1, 1)}  # 中心圆柱增加形状多样性
 
 # ---- 输出路径 ----
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_PATH = os.path.join(
+    PROJECT_ROOT, "yolo_vision", "worlds", "block_grid_world.sdf"
+)
+OUTPUT_PATH2 = os.path.join(
     PROJECT_ROOT, "ros2_ws", "src", "yolo_bringup", "worlds", "block_grid_world.sdf"
 )
 
@@ -290,17 +291,15 @@ def generate_sdf():
 
 def main():
     content = generate_sdf()
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, 'w') as f:
-        f.write(content)
-    print(f"[OK] 方阵世界文件已生成: {OUTPUT_PATH}")
-    print(f"     方块数量: {GRID_ROWS}×{GRID_COLS} = {GRID_ROWS * GRID_COLS}")
-    print(f"     正方体: {GRID_ROWS * GRID_COLS - len(CYLINDER_POSITIONS)}")
-    print(f"     圆柱体: {len(CYLINDER_POSITIONS)}")
-    print(f"     启动命令:")
-    print(f"       gz sim -r {OUTPUT_PATH}")
-    print(f"       或:")
-    print(f"       ros2 launch yolo_bringup simulation.launch.py world:=block_grid_world.sdf")
+    for out in [OUTPUT_PATH, OUTPUT_PATH2]:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, 'w') as f:
+            f.write(content)
+    print(f"[OK] {OUTPUT_PATH}")
+    print(f"[OK] {OUTPUT_PATH2}")
+    print(f"     方块: {GRID_ROWS}×{GRID_COLS}={GRID_ROWS*GRID_COLS}")
+    print(f"     正方体: {GRID_ROWS*GRID_COLS-len(CYLINDER_POSITIONS)}, 圆柱: {len(CYLINDER_POSITIONS)}")
+    print(f"     ros2 launch yolo_vision sim_detect.launch.py")
 
 
 if __name__ == "__main__":

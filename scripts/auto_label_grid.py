@@ -38,15 +38,15 @@ CAMERA = {
 }
 
 # ---- 方阵方块参数（与 generate_grid_world.py 一致）----
-GRID_ROWS = 5
-GRID_COLS = 5
-BLOCK_SIZE = 0.03          # 边长 3m → 改为 3cm = 0.03m
+GRID_ROWS = 3
+GRID_COLS = 3
+BLOCK_SIZE = 0.04          # 边长 4cm
 TABLE_SURFACE_Z = 0.765
-BLOCK_Z = TABLE_SURFACE_Z + BLOCK_SIZE / 2.0  # 0.78
-X_SPACING = 0.14
-Y_SPACING = 0.10
-X_START = 0.18
-Y_START = -0.20
+BLOCK_Z = TABLE_SURFACE_Z + BLOCK_SIZE / 2.0
+X_SPACING = 0.16
+Y_SPACING = 0.12
+X_START = 0.50 - (GRID_COLS-1) * X_SPACING / 2.0
+Y_START = -(GRID_ROWS-1) * Y_SPACING / 2.0
 
 # 类别 ID（block = 0）
 CLASS_ID = 0

@@ -17,7 +17,7 @@
       <real_time_factor>1.0</real_time_factor>
     </physics>
 
-    <!-- 传感器系统（相机等） -->
+    <!-- 传感器系统 -->
     <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
     </plugin>
 
@@ -142,91 +142,6 @@
     </model>
 
     <!-- ============================================ -->
-    <!-- ★ 旋转托盘 + 4个方块 — 展示实时视频流闪烁效果    -->
-    <!-- ============================================ -->
-    <model name="turntable">
-      <pose>0.5 -0.25 0.78 0 0 0</pose>
-      <!-- 底座（固定） -->
-      <link name="base">
-        <collision name="collision">
-          <geometry><cylinder><radius>0.06</radius><length>0.02</length></cylinder></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><cylinder><radius>0.06</radius><length>0.02</length></cylinder></geometry>
-          <material><ambient>0.4 0.4 0.4 1.0</ambient><diffuse>0.4 0.4 0.4 1.0</diffuse></material>
-        </visual>
-      </link>
-      <!-- 转盘（旋转） -->
-      <link name="disk">
-        <pose>0 0 0.015 0 0 0</pose>
-        <inertial>
-          <mass>0.2</mass>
-          <inertia><ixx>0.001</ixx><ixy>0</ixy><ixz>0</ixz><iyy>0.001</iyy><iyz>0</iyz><izz>0.001</izz></inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><cylinder><radius>0.07</radius><length>0.01</length></cylinder></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><cylinder><radius>0.07</radius><length>0.01</length></cylinder></geometry>
-          <material><ambient>0.7 0.7 0.7 1.0</ambient><diffuse>0.8 0.8 0.8 1.0</diffuse></material>
-        </visual>
-      </link>
-      <joint name="spin" type="revolute">
-        <parent>base</parent>
-        <child>disk</child>
-        <axis>
-          <xyz>0 0 1</xyz>
-          <limit><lower>-inf</lower><upper>inf</upper></limit>
-        </axis>
-      </joint>
-
-      <!-- 旋转驱动：以 1 rad/s 持续旋转 -->
-      <plugin filename="gz-sim-joint-controller-system"
-              name="gz::sim::systems::JointController">
-        <joint_name>spin</joint_name>
-        <use_velocity_commands>true</use_velocity_commands>
-      </plugin>
-    </model>
-
-    <!-- 转盘上的 4 个彩色方块 -->
-    <model name="turntable_red">
-      <pose>0.54 -0.25 0.81 0 0 0</pose>
-      <link name="link">
-        <inertial><mass>0.03</mass><inertia><ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz><iyy>0.00001</iyy><iyz>0</iyz><izz>0.00001</izz></inertia></inertial>
-        <collision name="collision"><geometry><box><size>0.03 0.03 0.03</size></box></geometry></collision>
-        <visual name="visual"><geometry><box><size>0.03 0.03 0.03</size></box></geometry>
-          <material><ambient>0.9 0.15 0.15 1.0</ambient><diffuse>0.9 0.15 0.15 1.0</diffuse></material></visual>
-      </link>
-    </model>
-    <model name="turntable_green">
-      <pose>0.46 -0.25 0.81 0 0 0</pose>
-      <link name="link">
-        <inertial><mass>0.03</mass><inertia><ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz><iyy>0.00001</iyy><iyz>0</iyz><izz>0.00001</izz></inertia></inertial>
-        <collision name="collision"><geometry><box><size>0.03 0.03 0.03</size></box></geometry></collision>
-        <visual name="visual"><geometry><box><size>0.03 0.03 0.03</size></box></geometry>
-          <material><ambient>0.15 0.85 0.15 1.0</ambient><diffuse>0.15 0.85 0.15 1.0</diffuse></material></visual>
-      </link>
-    </model>
-    <model name="turntable_blue">
-      <pose>0.50 -0.21 0.81 0 0 0</pose>
-      <link name="link">
-        <inertial><mass>0.03</mass><inertia><ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz><iyy>0.00001</iyy><iyz>0</iyz><izz>0.00001</izz></inertia></inertial>
-        <collision name="collision"><geometry><box><size>0.03 0.03 0.03</size></box></geometry></collision>
-        <visual name="visual"><geometry><box><size>0.03 0.03 0.03</size></box></geometry>
-          <material><ambient>0.15 0.15 0.9 1.0</ambient><diffuse>0.15 0.15 0.9 1.0</diffuse></material></visual>
-      </link>
-    </model>
-    <model name="turntable_yellow">
-      <pose>0.50 -0.29 0.81 0 0 0</pose>
-      <link name="link">
-        <inertial><mass>0.03</mass><inertia><ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz><iyy>0.00001</iyy><iyz>0</iyz><izz>0.00001</izz></inertia></inertial>
-        <collision name="collision"><geometry><box><size>0.03 0.03 0.03</size></box></geometry></collision>
-        <visual name="visual"><geometry><box><size>0.03 0.03 0.03</size></box></geometry>
-          <material><ambient>0.9 0.8 0.1 1.0</ambient><diffuse>0.9 0.8 0.1 1.0</diffuse></material></visual>
-      </link>
-    </model>
-
-    <!-- ============================================ -->
     <!-- RGBD 相机：固定俯瞰桌面                      -->
     <!-- ============================================ -->
     <model name="camera_model">
@@ -281,12 +196,12 @@
     </model>
 
     <!-- ============================================ -->
-    <!-- 方阵方块：5×5 网格         -->
-    <!-- 桌面表面 Z=0.765，方块中心 Z=0.780          -->
+    <!-- 方阵方块：3×3 网格         -->
+    <!-- 桌面表面 Z=0.765，方块中心 Z=0.785          -->
     <!-- ============================================ -->
 
     <model name="block_r0_c0">
-      <pose>0.1800 -0.2000 0.7800 0 0 0</pose>
+      <pose>0.3400 -0.1200 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -297,20 +212,20 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
-            <ambient>0.595 0.105 0.105 1.0</ambient>
-            <diffuse>0.595 0.105 0.105 1.0</diffuse>
+            <ambient>0.680 0.120 0.120 1.0</ambient>
+            <diffuse>0.680 0.120 0.120 1.0</diffuse>
           </material>
         </visual>
       </link>
     </model>
 
     <model name="block_r0_c1">
-      <pose>0.3200 -0.2000 0.7800 0 0 0</pose>
+      <pose>0.5000 -0.1200 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -321,34 +236,10 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.722 0.128 0.128 1.0</ambient>
-            <diffuse>0.722 0.128 0.128 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r0_c2">
-      <pose>0.4600 -0.2000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
             <ambient>0.850 0.150 0.150 1.0</ambient>
             <diffuse>0.850 0.150 0.150 1.0</diffuse>
@@ -357,8 +248,8 @@
       </link>
     </model>
 
-    <model name="block_r0_c3">
-      <pose>0.6000 -0.2000 0.7800 0 0 0</pose>
+    <model name="block_r0_c2">
+      <pose>0.6600 -0.1200 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -369,44 +260,20 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
-            <ambient>0.977 0.172 0.172 1.0</ambient>
-            <diffuse>0.977 0.172 0.172 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r0_c4">
-      <pose>0.7400 -0.2000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>1.000 0.195 0.195 1.0</ambient>
-            <diffuse>1.000 0.195 0.195 1.0</diffuse>
+            <ambient>1.000 0.180 0.180 1.0</ambient>
+            <diffuse>1.000 0.180 0.180 1.0</diffuse>
           </material>
         </visual>
       </link>
     </model>
 
     <model name="block_r1_c0">
-      <pose>0.1800 -0.1000 0.7800 0 0 0</pose>
+      <pose>0.3400 0.0000 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -417,20 +284,20 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
-            <ambient>0.105 0.105 0.595 1.0</ambient>
-            <diffuse>0.105 0.105 0.595 1.0</diffuse>
+            <ambient>0.120 0.120 0.680 1.0</ambient>
+            <diffuse>0.120 0.120 0.680 1.0</diffuse>
           </material>
         </visual>
       </link>
     </model>
 
     <model name="block_r1_c1">
-      <pose>0.3200 -0.1000 0.7800 0 0 0</pose>
+      <pose>0.5000 0.0000 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -441,34 +308,10 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><cylinder><radius>0.0150</radius><length>0.0300</length></cylinder></geometry>
+          <geometry><cylinder><radius>0.0200</radius><length>0.0400</length></cylinder></geometry>
         </collision>
         <visual name="visual">
-          <geometry><cylinder><radius>0.0150</radius><length>0.0300</length></cylinder></geometry>
-          <material>
-            <ambient>0.128 0.128 0.722 1.0</ambient>
-            <diffuse>0.128 0.128 0.722 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r1_c2">
-      <pose>0.4600 -0.1000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><cylinder><radius>0.0200</radius><length>0.0400</length></cylinder></geometry>
           <material>
             <ambient>0.150 0.150 0.850 1.0</ambient>
             <diffuse>0.150 0.150 0.850 1.0</diffuse>
@@ -477,8 +320,8 @@
       </link>
     </model>
 
-    <model name="block_r1_c3">
-      <pose>0.6000 -0.1000 0.7800 0 0 0</pose>
+    <model name="block_r1_c2">
+      <pose>0.6600 0.0000 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -489,44 +332,20 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
-            <ambient>0.172 0.172 0.977 1.0</ambient>
-            <diffuse>0.172 0.172 0.977 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r1_c4">
-      <pose>0.7400 -0.1000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.195 0.195 1.000 1.0</ambient>
-            <diffuse>0.195 0.195 1.000 1.0</diffuse>
+            <ambient>0.180 0.180 1.000 1.0</ambient>
+            <diffuse>0.180 0.180 1.000 1.0</diffuse>
           </material>
         </visual>
       </link>
     </model>
 
     <model name="block_r2_c0">
-      <pose>0.1800 0.0000 0.7800 0 0 0</pose>
+      <pose>0.3400 0.1200 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -537,20 +356,20 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
-            <ambient>0.105 0.560 0.105 1.0</ambient>
-            <diffuse>0.105 0.560 0.105 1.0</diffuse>
+            <ambient>0.120 0.640 0.120 1.0</ambient>
+            <diffuse>0.120 0.640 0.120 1.0</diffuse>
           </material>
         </visual>
       </link>
     </model>
 
     <model name="block_r2_c1">
-      <pose>0.3200 0.0000 0.7800 0 0 0</pose>
+      <pose>0.5000 0.1200 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -561,34 +380,10 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.128 0.680 0.128 1.0</ambient>
-            <diffuse>0.128 0.680 0.128 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r2_c2">
-      <pose>0.4600 0.0000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
             <ambient>0.150 0.800 0.150 1.0</ambient>
             <diffuse>0.150 0.800 0.150 1.0</diffuse>
@@ -597,8 +392,8 @@
       </link>
     </model>
 
-    <model name="block_r2_c3">
-      <pose>0.6000 0.0000 0.7800 0 0 0</pose>
+    <model name="block_r2_c2">
+      <pose>0.6600 0.1200 0.7850 0 0 0</pose>
       <link name="link">
         <inertial>
           <mass>0.05</mass>
@@ -609,277 +404,13 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <geometry><cylinder><radius>0.0150</radius><length>0.0300</length></cylinder></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><cylinder><radius>0.0150</radius><length>0.0300</length></cylinder></geometry>
+          <geometry><box><size>0.0400 0.0400 0.0400</size></box></geometry>
           <material>
-            <ambient>0.172 0.920 0.172 1.0</ambient>
-            <diffuse>0.172 0.920 0.172 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r2_c4">
-      <pose>0.7400 0.0000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.195 1.000 0.195 1.0</ambient>
-            <diffuse>0.195 1.000 0.195 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r3_c0">
-      <pose>0.1800 0.1000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.630 0.490 0.070 1.0</ambient>
-            <diffuse>0.630 0.490 0.070 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r3_c1">
-      <pose>0.3200 0.1000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.765 0.595 0.085 1.0</ambient>
-            <diffuse>0.765 0.595 0.085 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r3_c2">
-      <pose>0.4600 0.1000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><cylinder><radius>0.0150</radius><length>0.0300</length></cylinder></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><cylinder><radius>0.0150</radius><length>0.0300</length></cylinder></geometry>
-          <material>
-            <ambient>0.900 0.700 0.100 1.0</ambient>
-            <diffuse>0.900 0.700 0.100 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r3_c3">
-      <pose>0.6000 0.1000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>1.000 0.805 0.115 1.0</ambient>
-            <diffuse>1.000 0.805 0.115 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r3_c4">
-      <pose>0.7400 0.1000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>1.000 0.910 0.130 1.0</ambient>
-            <diffuse>1.000 0.910 0.130 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r4_c0">
-      <pose>0.1800 0.2000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.490 0.140 0.560 1.0</ambient>
-            <diffuse>0.490 0.140 0.560 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r4_c1">
-      <pose>0.3200 0.2000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.595 0.170 0.680 1.0</ambient>
-            <diffuse>0.595 0.170 0.680 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r4_c2">
-      <pose>0.4600 0.2000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.700 0.200 0.800 1.0</ambient>
-            <diffuse>0.700 0.200 0.800 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r4_c3">
-      <pose>0.6000 0.2000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.805 0.230 0.920 1.0</ambient>
-            <diffuse>0.805 0.230 0.920 1.0</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
-
-    <model name="block_r4_c4">
-      <pose>0.7400 0.2000 0.7800 0 0 0</pose>
-      <link name="link">
-        <inertial>
-          <mass>0.05</mass>
-          <inertia>
-            <ixx>0.00001</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>0.00001</iyy><iyz>0</iyz>
-            <izz>0.00001</izz>
-          </inertia>
-        </inertial>
-        <collision name="collision">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-        </collision>
-        <visual name="visual">
-          <geometry><box><size>0.0300 0.0300 0.0300</size></box></geometry>
-          <material>
-            <ambient>0.910 0.260 1.000 1.0</ambient>
-            <diffuse>0.910 0.260 1.000 1.0</diffuse>
+            <ambient>0.180 0.960 0.180 1.0</ambient>
+            <diffuse>0.180 0.960 0.180 1.0</diffuse>
           </material>
         </visual>
       </link>
