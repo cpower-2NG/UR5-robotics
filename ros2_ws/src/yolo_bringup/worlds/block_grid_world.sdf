@@ -1,35 +1,28 @@
-<?xml version="1.0" ?>
-<!--
-方阵仿真环境：5×5 方块网格
-用于 YOLO 视觉模型训练数据采集
-
-用法:
-  gz sim -r block_grid_world.sdf
-  或:
-  ros2 launch yolo_bringup simulation.launch.py world:=block_grid_world.sdf
--->
 <sdf version="1.11">
   <world name="block_grid_world">
 
-    <!-- 物理 -->
-    <physics name="1ms" type="dart">
+    
+    <physics name="1ms" type="bullet">
       <max_step_size>0.001</max_step_size>
       <real_time_factor>1.0</real_time_factor>
+      <bullet>
+        <solver><type>sequential_impulse</type></solver>
+      </bullet>
     </physics>
 
-    <!-- 传感器系统 -->
+    
     <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
     </plugin>
 
-    <!-- 用户交互（鼠标/键盘控制视角） -->
+    
     <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands">
     </plugin>
 
-    <!-- 场景信息广播 -->
+    
     <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster">
     </plugin>
 
-    <!-- 光源 -->
+    
     <light type="directional" name="sun">
       <cast_shadows>true</cast_shadows>
       <pose>0 0 10 0 0 0</pose>
@@ -44,7 +37,7 @@
       <direction>-0.5 0.1 -0.9</direction>
     </light>
 
-    <!-- 地面 -->
+    
     <model name="ground_plane">
       <static>true</static>
       <link name="link">
@@ -64,14 +57,14 @@
       </link>
     </model>
 
-    <!-- ============================================ -->
-    <!-- 桌子：80×60cm 桌面，高 75cm                  -->
-    <!-- ============================================ -->
+    
+    
+    
     <model name="table">
       <static>true</static>
       <pose>0.5 0.0 0.0 0 0 0</pose>
 
-      <!-- 桌面 -->
+      
       <link name="table_top">
         <pose>0 0 0.75 0 0 0</pose>
         <collision name="collision">
@@ -86,7 +79,7 @@
         </visual>
       </link>
 
-      <!-- 桌腿 -->
+      
       <link name="leg_fl">
         <pose>0.35 0.25 0.375 0 0 0</pose>
         <collision name="collision">
@@ -141,9 +134,9 @@
       </link>
     </model>
 
-    <!-- ============================================ -->
-    <!-- RGBD 相机：固定俯瞰桌面                      -->
-    <!-- ============================================ -->
+    
+    
+    
     <model name="camera_model">
       <static>true</static>
       <pose>0.5 0.0 1.5 0.0 1.5708 0.0</pose>
@@ -157,7 +150,7 @@
           </material>
         </visual>
 
-        <!-- RGB 相机 -->
+        
         <sensor name="rgb_camera" type="camera">
           <topic>/camera/color/image_raw</topic>
           <update_rate>15</update_rate>
@@ -175,7 +168,7 @@
           </camera>
         </sensor>
 
-        <!-- 深度相机 -->
+        
         <sensor name="depth_camera" type="depth_camera">
           <topic>/camera/depth/image_raw</topic>
           <update_rate>15</update_rate>
@@ -195,10 +188,10 @@
       </link>
     </model>
 
-    <!-- ============================================ -->
-    <!-- 方阵方块：3×3 网格         -->
-    <!-- 桌面表面 Z=0.765，方块中心 Z=0.785          -->
-    <!-- ============================================ -->
+    
+    
+    
+    
 
     <model name="block_r0_c0">
       <pose>0.3400 -0.1200 0.7850 0 0 0</pose>
