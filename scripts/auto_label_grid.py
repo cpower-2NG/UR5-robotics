@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
-方阵方块自动标注脚本
-====================
-利用方块已知 3D 位姿 + 相机参数，自动投影生成 YOLO 标注文件。
-适用于 block_grid_world.sdf 方阵仿真环境。
-
-原理:
-    相机固定在 (0.5, 0, 1.5) 俯瞰桌面（光轴朝下）。
-    已知 25 个方块的 (x, y, z)，通过针孔相机模型投影到 2D 像素坐标，
-    自动生成 YOLO 格式的 .txt 标注文件。
+方块自动标注脚本
+================
+读取 block_grid_world_meta.json（由 generate_grid_world.py 生成），
+利用方块已知 3D 位姿 + 针孔相机模型，自动投影生成 YOLO 标注文件。
 
 用法:
-    # 先采集图像
+    # 先生成场景，再采集图像，最后标注
+    python3 scripts/generate_grid_world.py
     python3 scripts/collect_training_data.py
-    # 再自动标注
     python3 scripts/auto_label_grid.py
 
 输出: block_dataset/train/labels/img_XXXX.txt (YOLO 格式)
@@ -28,79 +23,64 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMG_DIR = PROJECT_ROOT / "block_dataset" / "train" / "images"
 LBL_DIR = PROJECT_ROOT / "block_dataset" / "train" / "labels"
+META_PATHS = [
+    PROJECT_ROOT / "yolo_vision" / "worlds" / "block_grid_world_meta.json",
+    PROJECT_ROOT / "ros2_ws" / "src" / "yolo_bringup" / "worlds" / "block_grid_world_meta.json",
+]
 
-# ---- 相机参数（与 block_grid_world.sdf 一致）----
-CAMERA = {
-    "position": (0.5, 0.0, 1.5),       # 世界坐标
-    "width": 640,
-    "height": 480,
-    "horizontal_fov": 1.047,            # 弧度 ≈ 60°
-}
-
-# ---- 方阵方块参数（与 generate_grid_world.py 一致）----
-GRID_ROWS = 3
-GRID_COLS = 3
-BLOCK_SIZE = 0.04          # 边长 4cm
-TABLE_SURFACE_Z = 0.765
-BLOCK_Z = TABLE_SURFACE_Z + BLOCK_SIZE / 2.0
-X_SPACING = 0.16
-Y_SPACING = 0.12
-X_START = 0.50 - (GRID_COLS-1) * X_SPACING / 2.0
-Y_START = -(GRID_ROWS-1) * Y_SPACING / 2.0
-
-# 类别 ID（block = 0）
-CLASS_ID = 0
+CLASS_ID = 0  # block 类别 ID
 
 
-def compute_camera_params():
+def load_metadata():
+    """从 JSON 元数据加载相机参数和方块列表。"""
+    for p in META_PATHS:
+        if p.exists():
+            with open(p) as f:
+                meta = json.load(f)
+            print(f"[INFO] 读取元数据: {p}")
+            print(f"       seed={meta['seed']}, blocks={meta['num_blocks']}, "
+                  f"fixed_mode={meta.get('fixed_mode', False)}")
+            return meta
+
+    raise FileNotFoundError(
+        f"未找到 block_grid_world_meta.json。\n"
+        f"请先运行 generate_grid_world.py 生成场景和元数据。"
+    )
+
+
+def compute_camera_params(meta):
     """根据水平 FOV 和图像尺寸计算内参。"""
-    w, h = CAMERA["width"], CAMERA["height"]
-    hfov = CAMERA["horizontal_fov"]
-    # 焦距（像素单位）
+    cam = meta["camera"]
+    w, h = cam["width"], cam["height"]
+    hfov = cam["horizontal_fov"]
     fx = (w / 2.0) / math.tan(hfov / 2.0)
-    # 假设正方形像素
-    fy = fx
+    fy = fx          # 正方形像素假设
     cx = w / 2.0
     cy = h / 2.0
     return fx, fy, cx, cy
 
 
-def world_to_pixel(wx, wy, wz, fx, fy, cx, cy):
-    """
-    将世界坐标点投影到像素坐标。
-
-    相机位姿: (0.5, 0, 1.5, 0, π/2, 0)
-    光轴指向世界 -Z（正下方）。
-    相机坐标系:
-        X_cam = world_x - camera_x
-        Y_cam = world_y - camera_y
-        Z_cam = camera_z - world_z  (深度，正值)
-    """
-    cam_x, cam_y, cam_z = CAMERA["position"]
-
-    # 世界 → 相机坐标
+def world_to_pixel(wx, wy, wz, cam_x, cam_y, cam_z, fx, fy, cx, cy):
+    """将世界坐标点投影到像素坐标。"""
     Xc = wx - cam_x
     Yc = wy - cam_y
-    Zc = cam_z - wz
+    Zc = cam_z - wz  # 深度（正值）
 
     if Zc <= 0:
-        return None  # 在相机后方
+        return None
 
-    # 针孔投影
     u = fx * (Xc / Zc) + cx
     v = fy * (Yc / Zc) + cy
-
     return (u, v)
 
 
-def compute_bbox(wx, wy, wz, block_size, fx, fy, cx, cy):
-    """
-    计算一个方块在图像中的 2D 边界框 (YOLO 归一化格式)。
-
-    将方块的 8 个顶点投影到图像，取外接矩形。
-    """
+def compute_bbox(block, block_size, cam, fx, fy, cx, cy):
+    """计算单个方块在图像中的 2D 边界框（YOLO 归一化格式）。"""
+    wx, wy, wz = block["x"], block["y"], block["z"]
+    cam_x, cam_y, cam_z = cam["position"]
     half = block_size / 2.0
-    # 8 个顶点（世界坐标）
+
+    # 8 个顶点
     corners = [
         (wx - half, wy - half, wz - half),
         (wx + half, wy - half, wz - half),
@@ -114,7 +94,7 @@ def compute_bbox(wx, wy, wz, block_size, fx, fy, cx, cy):
 
     pixels = []
     for cx_w, cy_w, cz_w in corners:
-        p = world_to_pixel(cx_w, cy_w, cz_w, fx, fy, cx, cy)
+        p = world_to_pixel(cx_w, cy_w, cz_w, cam_x, cam_y, cam_z, fx, fy, cx, cy)
         if p is not None:
             pixels.append(p)
 
@@ -126,8 +106,7 @@ def compute_bbox(wx, wy, wz, block_size, fx, fy, cx, cy):
     v_min = min(p[1] for p in pixels)
     v_max = max(p[1] for p in pixels)
 
-    # 裁剪到图像范围内
-    w_img, h_img = CAMERA["width"], CAMERA["height"]
+    w_img, h_img = cam["width"], cam["height"]
     u_min = max(0.0, u_min)
     u_max = min(w_img - 1.0, u_max)
     v_min = max(0.0, v_min)
@@ -136,35 +115,40 @@ def compute_bbox(wx, wy, wz, block_size, fx, fy, cx, cy):
     if u_max <= u_min or v_max <= v_min:
         return None
 
-    # YOLO 格式: class x_center y_center width height (归一化)
     x_center = ((u_min + u_max) / 2.0) / w_img
     y_center = ((v_min + v_max) / 2.0) / h_img
     width = (u_max - u_min) / w_img
     height = (v_max - v_min) / h_img
-
     return (x_center, y_center, width, height)
 
 
-def generate_labels_for_image(img_name):
-    """为单张图像生成 YOLO 标注。"""
-    fx, fy, cx, cy = compute_camera_params()
-
+def generate_labels_for_image(meta, fx, fy, cx, cy):
+    """为单张图像生成 YOLO 标注（所有方块）。"""
+    cam = meta["camera"]
     lines = []
-    for row in range(GRID_ROWS):
-        for col in range(GRID_COLS):
-            wx = X_START + col * X_SPACING
-            wy = Y_START + row * Y_SPACING
-            wz = BLOCK_Z
 
-            bbox = compute_bbox(wx, wy, wz, BLOCK_SIZE, fx, fy, cx, cy)
-            if bbox is not None:
-                xc, yc, w, h = bbox
-                lines.append(f"{CLASS_ID} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+    for block in meta["blocks"]:
+        bbox = compute_bbox(block, BLOCK_SIZE, cam, fx, fy, cx, cy)
+        if bbox is not None:
+            xc, yc, w, h = bbox
+            lines.append(f"{CLASS_ID} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
 
     return lines
 
 
 def main():
+    # 加载元数据
+    meta = load_metadata()
+
+    # 方块边长（当前固定 4cm；可由 meta 扩展）
+    global BLOCK_SIZE
+    BLOCK_SIZE = 0.04
+
+    fx, fy, cx, cy = compute_camera_params(meta)
+    cam = meta["camera"]
+    print(f"相机内参: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.1f}, cy={cy:.1f}")
+    print(f"方块数: {meta['num_blocks']}")
+
     os.makedirs(LBL_DIR, exist_ok=True)
 
     images = sorted(
@@ -177,13 +161,9 @@ def main():
 
     print(f"找到 {len(images)} 张图像，开始自动标注...")
 
-    fx, fy, cx, cy = compute_camera_params()
-    print(f"相机内参: fx={fx:.2f}, fy={fy:.2f}, cx={cx:.1f}, cy={cy:.1f}")
-    print(f"方阵: {GRID_ROWS}×{GRID_COLS} = {GRID_ROWS * GRID_COLS} 个方块")
-
     count = 0
     for img_name in images:
-        lines = generate_labels_for_image(img_name)
+        lines = generate_labels_for_image(meta, fx, fy, cx, cy)
         stem = os.path.splitext(img_name)[0]
         label_path = os.path.join(LBL_DIR, f"{stem}.txt")
 
@@ -195,7 +175,7 @@ def main():
             print(f"  [{count}/{len(images)}] {img_name} → {len(lines)} 个框")
 
     print(f"\n[OK] 完成！共标注 {count} 张图像，输出到 {LBL_DIR}")
-    print(f"     每张图像应有 {GRID_ROWS * GRID_COLS} 个边界框")
+    print(f"     每张图像应有 {meta['num_blocks']} 个边界框")
 
 
 if __name__ == "__main__":
