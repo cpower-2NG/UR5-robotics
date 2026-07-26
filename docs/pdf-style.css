@@ -1,39 +1,162 @@
+/* ============================================================
+   书籍出版风格 — 用于 chapter03_yolo_perception.md → PDF
+   通过 pandoc + wkhtmltopdf 渲染
+   ============================================================ */
+
+@page {
+  size: A4;
+  margin: 2.5cm 2cm 2.5cm 2cm;
+  @bottom-center {
+    content: "— " counter(page) " —";
+    font-size: 9pt;
+    color: #888;
+    font-family: 'NotoSansCJK', sans-serif;
+  }
+}
+
 @font-face {
   font-family: 'NotoSansCJK';
   src: url('file:///home/<user>/miniconda3/envs/yolo_ros/fonts/NotoSansCJKtc-VF.ttf') format('truetype');
 }
 
+/* ---- 正文 ---- */
 body {
-  font-family: 'NotoSansCJK', 'DejaVu Sans', sans-serif;
-  line-height: 1.6;
+  font-family: 'NotoSansCJK', 'DejaVu Sans', serif;
+  font-size: 11pt;
+  line-height: 1.8;
+  color: #222;
+  text-align: justify;
+  max-width: 100%;
 }
 
-code, pre {
+/* ---- 标题层级 ---- */
+h1 {
+  font-size: 20pt;
+  font-weight: bold;
+  margin-top: 2em;
+  margin-bottom: 0.8em;
+  padding-bottom: 0.3em;
+  border-bottom: 2px solid #333;
+  page-break-before: always;
+}
+h1:first-of-type { page-break-before: avoid; }
+
+h2 {
+  font-size: 15pt;
+  font-weight: bold;
+  margin-top: 1.8em;
+  margin-bottom: 0.6em;
+  padding-bottom: 0.2em;
+  border-bottom: 1px solid #999;
+}
+
+h3 {
+  font-size: 12.5pt;
+  font-weight: bold;
+  margin-top: 1.4em;
+  margin-bottom: 0.4em;
+}
+
+h4 {
+  font-size: 11.5pt;
+  font-weight: bold;
+  margin-top: 1.2em;
+  margin-bottom: 0.3em;
+}
+
+/* ---- 段落 ---- */
+p {
+  margin: 0.6em 0;
+  text-indent: 2em;
+}
+p:first-of-type { text-indent: 0; }
+li p { text-indent: 0; }
+blockquote p { text-indent: 0; }
+
+/* ---- 代码 ---- */
+code {
   font-family: 'DejaVu Sans Mono', monospace;
-  font-size: 0.9em;
-  background-color: #f5f5f5;
+  font-size: 9pt;
+  background: #f7f7f7;
+  padding: 1px 4px;
+  border-radius: 2px;
 }
 
 pre {
-  padding: 0.8em;
-  border-left: 3px solid #ddd;
+  font-family: 'DejaVu Sans Mono', monospace;
+  font-size: 8.5pt;
+  line-height: 1.5;
+  background: #f7f7f7;
+  padding: 0.8em 1em;
+  border-left: 3px solid #bbb;
   overflow-x: auto;
+  margin: 0.8em 0;
+}
+pre code {
+  background: none;
+  padding: 0;
 }
 
+/* ---- 表格 ---- */
 table {
   border-collapse: collapse;
   margin: 1em 0;
+  font-size: 9.5pt;
+  width: 100%;
 }
-
 th, td {
   border: 1px solid #ccc;
-  padding: 0.4em 0.8em;
+  padding: 0.4em 0.7em;
+  text-align: left;
 }
-
 th {
-  background-color: #f0f0f0;
+  background: #eee;
+  font-weight: bold;
 }
 
+/* ---- 图片 ---- */
 img {
   max-width: 100%;
+  display: block;
+  margin: 1em auto;
+}
+/* 行内公式 SVG：向下偏移对齐正文基线 */
+img[src*="math_"] {
+  display: inline;
+  margin: 0;
+  vertical-align: -0.35em;
+}
+p img + em {
+  display: block;
+  text-align: center;
+  font-size: 9pt;
+  color: #666;
+  margin-top: 0.3em;
+}
+
+/* ---- 引用块 ---- */
+blockquote {
+  margin: 0.8em 0;
+  padding: 0.5em 1em;
+  border-left: 4px solid #999;
+  background: #fafafa;
+  color: #555;
+  font-size: 10pt;
+}
+
+/* ---- 列表 ---- */
+ul, ol {
+  margin: 0.5em 0;
+  padding-left: 2em;
+}
+li {
+  margin: 0.2em 0;
+}
+
+/* ---- 数学公式 ---- */
+.katex { font-size: 1.05em; }
+
+/* ---- 页眉页脚 ---- */
+@media print {
+  body { font-size: 10.5pt; }
 }
