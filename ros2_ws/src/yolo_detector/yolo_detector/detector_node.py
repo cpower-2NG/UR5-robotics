@@ -6,6 +6,28 @@ YOLOv8 目标检测 ROS2 节点 (yolo_detector)
        /detections_image        (sensor_msgs/Image, 标注可视化)
 
 通过 ultralytics YOLOv8 进行推理，输出 2D 检测框。
+
+======================================================================
+坐标约定（**冻结**，改动即破坏下游，见 P2-5 / D7）
+======================================================================
+本节点发布的 ``Detection2D.bbox`` 一律使用 **像素坐标**，原点在图像**左上角**：
+
+  bbox.center.position.x = cx   像素，向右为正
+  bbox.center.position.y = cy   像素，向下为正
+  bbox.size_x             = w    像素宽度（x2 - x1）
+  bbox.size_y             = h    像素高度（y2 - y1）
+
+``center`` 是 ``Pose2D``，其中 **``theta`` 保持未使用**（朝向见 D27：当前物体集
+全部朝向对称，不需要）。**没有归一化坐标**——不要假设值落在 [0,1]。
+
+为何要写死：仓库历史上存在另一份实现（已删除的教学包 ``yolo_vision``）
+发布的是**归一化** bbox，两者接口长得一样、语义不同，混用则 3D 投影全错，
+且**不会报错**（D7）。现在只剩这一份实现，故把约定冻结在此处。
+
+下游依赖此约定的地方：
+  - ``perception_3d/projector_node.py``：把 center 当作像素，配合 camera_info
+    的 fx/fy/cx/cy 做针孔投影。若这里改成归一化，那里会静默算错。
+  - ``/detections_image``：把 bbox 直接画回图像像素坐标系。
 """
 
 import rclpy
@@ -22,6 +44,68 @@ import time
 from pathlib import Path
 
 
+def resolve_device(requested: str, allow_fallback: bool, logger) -> str:
+    """把 `device` 参数解析成**当前环境真正可用**的设备（P2-4）。
+
+    旧实现直接 `self.model.to(device)`：在没有 CUDA 的机器上（或 GPU 被占用、
+    驱动/CUDA 版本不匹配时）会抛异常并让**整个节点崩溃**。真机部署时这类环境
+    差异很常见——「因为显卡不可用所以感知整个不启动」不是想要的失败模式；
+    退到 CPU 慢一点但链路是通的，而且**明确告警**，问题不会被藏起来。
+
+    行为：
+      - ``cpu``                 → 原样返回
+      - ``cuda`` / ``cuda:N``   → 检查 torch.cuda 是否可用、序号是否存在
+      - 不可用 + allow_fallback → 告警并返回 ``cpu``
+      - 不可用 + 不允许 fallback → 抛 RuntimeError（真机上用来暴露环境问题）
+
+    刻意做成模块级函数（而非 Node 方法），这样**不依赖 torch/ultralytics**
+    也能单独测试，见 scripts/test_detector_device.py。
+    """
+    req = (requested or 'cpu').strip()
+
+    if req == 'cpu':
+        return 'cpu'
+
+    if not req.startswith('cuda'):
+        logger.warn(
+            f'无法识别的 device={req!r}（期望 "cpu" 或 "cuda:N"），按 cpu 处理。'
+        )
+        return 'cpu'
+
+    # 解析序号：'cuda' → 0，'cuda:1' → 1
+    index = 0
+    if ':' in req:
+        _, _, idx = req.partition(':')
+        if not idx.isdigit():
+            logger.warn(f'device={req!r} 的序号不是整数，按 cuda:0 处理。')
+        else:
+            index = int(idx)
+
+    try:
+        import torch
+    except ImportError:
+        reason = 'torch 未安装'
+    else:
+        if not torch.cuda.is_available():
+            reason = 'torch.cuda.is_available() 为 False（无 GPU，或驱动/CUDA 版本不匹配）'
+        elif index >= torch.cuda.device_count():
+            reason = f'cuda:{index} 不存在（本机可见 GPU 数为 {torch.cuda.device_count()}）'
+        else:
+            logger.info(f'使用 GPU cuda:{index} — {torch.cuda.get_device_name(index)}')
+            return f'cuda:{index}'
+
+    if not allow_fallback:
+        raise RuntimeError(
+            f'device={req!r} 不可用：{reason}。（device_fallback=false，故不退回 cpu）'
+        )
+
+    logger.warn(
+        f'device={req!r} 不可用：{reason}。**已退回 cpu**——功能正常，但推理会慢很多。'
+        f'Orin 上若出现这条警告，通常说明 JetPack 的 CUDA/torch 不匹配，值得排查。'
+    )
+    return 'cpu'
+
+
 class YoloDetector(Node):
     """YOLOv8 检测节点：订阅 RGB 图像，推理后发布 2D 检测框。"""
 
@@ -32,11 +116,17 @@ class YoloDetector(Node):
         self.declare_parameter('model', 'block_best.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('device', 'cuda:0')  # 'cpu' / 'cuda:0'
+        # 请求的 device 不可用时是否退回 cpu，而不是直接崩溃（P2-4）。
+        # 置 False 可强制「要么用 GPU，要么失败」，便于在真机上暴露环境问题。
+        self.declare_parameter('device_fallback', True)
         self.declare_parameter('publish_annotated', True)
 
         raw_model = self.get_parameter('model').value
         self.conf_thresh = self.get_parameter('confidence_threshold').value
-        device = self.get_parameter('device').value
+        device = self._resolve_device(
+            self.get_parameter('device').value,
+            self.get_parameter('device_fallback').value,
+        )
 
         # ---- 解析模型路径（D6 / D24）----
         # 旧实现把参数原样交给 YOLO()，于是行为随进程 CWD 改变；而且当两处
@@ -135,6 +225,10 @@ class YoloDetector(Node):
             if c.is_file():
                 return c.resolve()
         return None
+
+    def _resolve_device(self, requested: str, allow_fallback: bool) -> str:
+        """见模块级 `resolve_device()`。此处只做日志转发。"""
+        return resolve_device(requested, allow_fallback, self.get_logger())
 
     def image_callback(self, msg: Image):
         """RGB 图像回调：运行 YOLO 推理，发布结果。"""

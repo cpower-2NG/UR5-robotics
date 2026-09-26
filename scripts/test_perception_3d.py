@@ -46,6 +46,19 @@ def check(name, cond, detail=''):
         _failed.append(name)
 
 
+def patch_intrinsics(n):
+    """给未接 camera_info 的节点注入一组内参，使投影可算。
+
+    不这样做的话 PinholeCameraModel 未初始化，cx() 会去索引 None。
+    """
+    n.camera_model.fx = lambda: 554.0
+    n.camera_model.fy = lambda: 554.0
+    n.camera_model.cx = lambda: 320.0
+    n.camera_model.cy = lambda: 240.0
+    n.camera_info_received = True
+    return n
+
+
 def main():
     rclpy.init()
     node = Perception3D()
@@ -125,11 +138,50 @@ def main():
     check("tf_required 默认 False（缺 TF 不崩溃，但会记 ERROR）", node.tf_required is False)
     check("连续失败计数器存在", hasattr(node, 'tf_fail_streak'))
 
+    print("\n--- D7 护栏: 归一化坐标必须可见（P2-5）---")
+    check("护栏标志初始为 False", node._warned_normalized is False)
+
+    # 模拟上游误发归一化 bbox：center/size 全落在 (0,1]
+    # 注意 Humble 的 vision_msgs/Pose2D 是 {position: Point2D, theta}，
+    # 没有扁平的 x/y —— 这正是原代码注释里说的「Pose2D 有 API 兼容问题」。
+    from vision_msgs.msg import (
+        Detection2DArray, Detection2D, BoundingBox2D, Pose2D, Point2D,
+    )
+
+    def make_bbox(cx, cy, w, h):
+        bb = BoundingBox2D()
+        bb.center = Pose2D(position=Point2D(x=cx, y=cy), theta=0.0)
+        bb.size_x, bb.size_y = w, h
+        return bb
+
+    msg = Detection2DArray()
+    msg.header.frame_id = 'camera_color_optical_frame'
+    d = Detection2D()
+    d.bbox = make_bbox(0.5, 0.5, 0.05, 0.05)      # 归一化
+    msg.detections = [d]
+
+    patch_intrinsics(node)
+    node.depth_buffer.clear()
+    node.depth_buffer.append((0.0, np.full((480, 640), 0.5, np.float32)))
+    node.detection_callback(msg)                   # should trip the guard, not raise
+    check("归一化输入不抛异常", True)
+    check("护栏已触发（_warned_normalized=True）", node._warned_normalized is True)
+
+    # 像素坐标不应误报
+    node2 = patch_intrinsics(Perception3D())
+    node2.depth_buffer.clear()
+    node2.depth_buffer.append((0.0, np.full((480, 640), 0.5, np.float32)))
+    msg2 = Detection2DArray()
+    msg2.header.frame_id = 'camera_color_optical_frame'
+    d2 = Detection2D()
+    d2.bbox = make_bbox(320.0, 240.0, 40.0, 40.0)   # 像素
+    msg2.detections = [d2]
+    node2.detection_callback(msg2)
+    check("像素坐标不误报", node2._warned_normalized is False)
+    node2.destroy_node()
+
     print("\n--- 针孔投影数值自洽 ---")
-    node.camera_model.fx = lambda: 554.0
-    node.camera_model.fy = lambda: 554.0
-    node.camera_model.cx = lambda: 320.0
-    node.camera_model.cy = lambda: 240.0
+    patch_intrinsics(node)
     x = (400.0 - node.camera_model.cx()) * 1.0 / node.camera_model.fx()
     y = (300.0 - node.camera_model.cy()) * 1.0 / node.camera_model.fy()
     check("偏离 80px @1m -> x≈0.144m", abs(x - 0.14440) < 1e-3, f"x={x:.5f}")

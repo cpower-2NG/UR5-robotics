@@ -17,11 +17,19 @@
   5. TF: camera_frame → target_frame
   6. 发布 target_frame 下的 3D 坐标
 
+输入约定（**依赖 yolo_detector 冻结的像素约定**，见 P2-5 / D7）:
+  ``/detections`` 的 ``bbox`` 必须是**像素**坐标、原点在图像左上角；
+  本节点把 ``center.position.x/y`` 直接当作像素 (u, v) 使用，并与
+  ``camera_info`` 的 fx/fy/cx/cy 配套。**若上游改成归一化坐标，这里会静默算错**
+  ——这正是 D7 记录过的陷阱。``size_x``/``size_y``（像素）用于框内采样；
+  若上游未填（≤1），本节点退回单点邻域并在需要时告警。
+
 本文件针对真机（RealSense D435i）修了四处会让链路直接失败的问题，
 每条都在下面各自的代码处以「D1/D2/D8/D33」标注了原因，详见
 docs/RESTRUCTURE_PLAN.md。
 """
 
+import math
 from collections import deque
 
 import rclpy
@@ -69,6 +77,16 @@ class Perception3D(Node):
         self.declare_parameter('depth_buffer_len', 10)     # 深度帧环形缓冲长度
         self.declare_parameter('tf_required', False)       # True = 查不到 TF 就退出
 
+        # 话题名做成参数（P2-7）。原因很具体：真机上 realsense2_camera 打开
+        # align_depth.enable:=true 后，**对齐后的深度发布在
+        # /camera/aligned_depth_to_color/image_raw**，而 /camera/depth/image_raw
+        # 保持**未对齐**。若把话题写死成后者，真机会静默用未对齐深度——
+        # 正是 D2 警告的视差偏差。仿真侧由 ros_gz_bridge 直接发到
+        # /camera/depth/image_raw，故默认值保持向后兼容。
+        self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
+        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
+        self.declare_parameter('detections_topic', '/detections')
+
         self.target_frame = self.get_parameter('target_frame').value
         self.median_win = self.get_parameter('depth_median_window').value
         self.depth_grid = max(1, self.get_parameter('depth_grid').value)
@@ -87,6 +105,7 @@ class Perception3D(Node):
         self.depth_buffer = deque(maxlen=self.get_parameter('depth_buffer_len').value)
         self.depth_scale = None          # 首次收到深度图时确定
         self.bridge = CvBridge()
+        self._warned_normalized = False  # D7 护栏：归一化坐标只提示一次
 
         # ---- TF ----
         self.tf_buffer = tf2_ros.Buffer()
@@ -102,17 +121,17 @@ class Perception3D(Node):
         )
 
         self.camera_info_sub = self.create_subscription(
-            CameraInfo, '/camera/color/camera_info',
+            CameraInfo, self.get_parameter('camera_info_topic').value,
             self.camera_info_callback, qos_best_effort
         )
 
         self.depth_sub = self.create_subscription(
-            Image, '/camera/depth/image_raw',
+            Image, self.get_parameter('depth_topic').value,
             self.depth_callback, qos_best_effort
         )
 
         self.detection_sub = self.create_subscription(
-            Detection2DArray, '/detections',
+            Detection2DArray, self.get_parameter('detections_topic').value,
             self.detection_callback, 10
         )
 
@@ -125,13 +144,25 @@ class Perception3D(Node):
 
         self.get_logger().info(
             f'Perception3D node started. target_frame={self.target_frame}, '
-            f'max_sync_dt={self.max_sync_dt}s'
+            f'max_sync_dt={self.max_sync_dt}s\n'
+            f'  订阅: {self.get_parameter("detections_topic").value}, '
+            f'{self.get_parameter("depth_topic").value}, '
+            f'{self.get_parameter("camera_info_topic").value}'
         )
+
         # D2: 深度必须与彩色对齐，否则用彩色内参配深度像素会有视差偏差。
-        self.get_logger().info(
-            '提示：真机请确保 realsense2_camera 启动时带 align_depth:=true，'
-            '并订阅**对齐后**的 /camera/depth/image_raw。'
-        )
+        # 真机上「对齐」不是一句提醒就能保证的——realsense2_camera 开启
+        # align_depth.enable:=true 后，对齐深度发在**另一个话题**上，所以这里
+        # 既提示参数、也把当前实际订阅的话题打出来，便于当场核对。
+        depth_topic = self.get_parameter('depth_topic').value
+        if 'aligned' not in depth_topic:
+            self.get_logger().info(
+                f'提示：当前深度话题为 {depth_topic}。真机上请确认它是**与彩色对齐**的'
+                f'（realsense2_camera 开 align_depth.enable:=true 时，对齐深度在 '
+                f'/camera/aligned_depth_to_color/image_raw；/camera/depth/image_raw '
+                f'是**未对齐**的）。用未对齐深度配彩色内参会有视差偏差。'
+                f'仿真侧 ros_gz_bridge 直接发到 /camera/depth/image_raw，属正常。'
+            )
 
     # ------------------------------------------------------------------
     # 相机内参
@@ -310,10 +341,30 @@ class Perception3D(Node):
             size_x = detection.bbox.size_x
             size_y = detection.bbox.size_y
 
+            # D7 运行时护栏：上游若误发**归一化**坐标，投影会静默算错
+            # （x/y 全落在 0~1，深度取到图像左上角而非目标）。历史上真有过
+            # 一份这样的实现（已删的 yolo_vision），接口一样、语义不同。
+            # 这里只提示一次，避免刷屏。
+            if (not self._warned_normalized
+                    and 0.0 < u < 1.0 and 0.0 < v < 1.0
+                    and 0.0 < size_x <= 1.0 and 0.0 < size_y <= 1.0):
+                self._warned_normalized = True
+                self.get_logger().error(
+                    f'检测框看起来是**归一化**坐标（center=({u:.3f},{v:.3f}), '
+                    f'size=({size_x:.3f},{size_y:.3f})），而本节点按**像素**处理。'
+                    f'上游若确实发了归一化坐标，3D 投影会静默算错（D7）。'
+                    f'请确认 /detections 的发布者遵守像素约定。'
+                )
+
             # ---- Step 2: 取稳健深度（最近簇中位数）----
             depth_val = self._robust_depth(depth_m, u, v, size_x, size_y)
 
-            if depth_val is None or depth_val <= 0.0:
+            # 注意 `not math.isfinite` 这一条：NaN 比较恒为 False，所以单写
+            # `depth_val <= 0.0` 是拦不住 NaN 的，NaN 会一路投影成 NaN 位姿发布
+            # 出去。目前 `_robust_depth()` 的采样已用 np.isfinite 过滤，**不会**
+            # 返回 NaN（已实测），这条属于发布边界的兜底：真机上下游拿到 NaN
+            # 目标位姿，轻则 MoveIt 报错，重则规划出一条 NaN 轨迹。
+            if depth_val is None or not math.isfinite(depth_val) or depth_val <= 0.0:
                 self.get_logger().debug(
                     f'Invalid depth at ({u:.1f}, {v:.1f}), skipping.'
                 )
