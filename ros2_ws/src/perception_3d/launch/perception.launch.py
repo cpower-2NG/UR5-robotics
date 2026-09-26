@@ -3,7 +3,9 @@ Launch 文件: 单独启动 3D 感知节点
 用法:
   ros2 launch perception_3d perception.launch.py target_frame:=base_link
   # 真机（RealSense D435i，深度为 16UC1 毫米，由 encoding 自动判定）：
-  ros2 launch perception_3d perception.launch.py target_frame:=base_link tf_required:=true
+  #   注意真机必须用**与彩色对齐**的深度话题，否则彩色内参配未对齐深度会有视差偏差（D2）
+  ros2 launch perception_3d perception.launch.py target_frame:=base_link tf_required:=true \
+      depth_topic:=/camera/aligned_depth_to_color/image_raw
   # 若深度源编码非标准，可强制指定尺度（米/像素）：
   ros2 launch perception_3d perception.launch.py depth_scale:=0.001
 """
@@ -41,6 +43,21 @@ def generate_launch_description():
             'tf_required', default_value='false',
             description='true = abort if the camera→target TF is unavailable'
         ),
+        # 以下三个话题名在第七轮参数化，以便与 pipeline.launch.py 的
+        # camera_source 开关配合（真机要用**对齐后**的深度话题，见 D2）。
+        DeclareLaunchArgument(
+            'depth_topic', default_value='/camera/depth/image_raw',
+            description='Depth image topic. Must be colour-ALIGNED on the real robot '
+                        '(D435i: /camera/aligned_depth_to_color/image_raw)'
+        ),
+        DeclareLaunchArgument(
+            'camera_info_topic', default_value='/camera/color/camera_info',
+            description='CameraInfo topic supplying fx/fy/cx/cy'
+        ),
+        DeclareLaunchArgument(
+            'detections_topic', default_value='/detections',
+            description='vision_msgs/Detection2DArray input topic'
+        ),
     ]
 
     projector_node = Node(
@@ -55,6 +72,9 @@ def generate_launch_description():
             'depth_grid': LaunchConfiguration('depth_grid'),
             'depth_cluster_tol': LaunchConfiguration('depth_cluster_tol'),
             'tf_required': LaunchConfiguration('tf_required'),
+            'depth_topic': LaunchConfiguration('depth_topic'),
+            'camera_info_topic': LaunchConfiguration('camera_info_topic'),
+            'detections_topic': LaunchConfiguration('detections_topic'),
         }],
     )
 
