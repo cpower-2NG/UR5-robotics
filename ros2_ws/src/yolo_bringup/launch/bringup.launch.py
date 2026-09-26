@@ -11,6 +11,7 @@ from launch.actions import (
     DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
@@ -21,7 +22,7 @@ def generate_launch_description():
         'world', default_value='grasping_world.sdf',
     )
     model_arg = DeclareLaunchArgument(
-        'model', default_value='yolov8n.pt',
+        'model', default_value='block_best.pt',
     )
     mode_arg = DeclareLaunchArgument(
         'mode', default_value='mock',
@@ -36,7 +37,7 @@ def generate_launch_description():
             os.path.join(pkg_dir, 'launch', 'simulation.launch.py')
         ),
         launch_arguments={
-            'world': 'grasping_world.sdf',
+            'world': LaunchConfiguration('world'),
         }.items(),
     )
 
@@ -49,9 +50,9 @@ def generate_launch_description():
                     os.path.join(pkg_dir, 'launch', 'pipeline.launch.py')
                 ),
                 launch_arguments={
-                    'model': 'yolov8n.pt',
-                    'mode': 'mock',
-                    'device': 'cuda:0',
+                    'model': LaunchConfiguration('model'),
+                    'mode': LaunchConfiguration('mode'),
+                    'device': LaunchConfiguration('device'),
                 }.items(),
             ),
         ]

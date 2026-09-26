@@ -30,7 +30,7 @@ TRAIN_IMG = DATASET_DIR / "train" / "images"
 TRAIN_LBL = DATASET_DIR / "train" / "labels"
 VAL_IMG = DATASET_DIR / "val" / "images"
 VAL_LBL = DATASET_DIR / "val" / "labels"
-META_PATH = PROJECT_ROOT / "yolo_vision" / "worlds" / "block_grid_world_meta.json"
+META_PATH = PROJECT_ROOT / "ros2_ws" / "src" / "yolo_bringup" / "worlds" / "block_grid_world_meta.json"
 
 # ---- 图像参数 ----
 IMG_W, IMG_H = 640, 480

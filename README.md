@@ -47,7 +47,7 @@ bash scripts/install_deps.sh
 
 # 创建 Conda 环境 + 依赖
 bash scripts/create_env.sh
-conda activate yolo_ros
+conda activate /home/<user>/robotics/venvs/robot-vision
 
 # 运行最小验证测试 (无需 ROS2/Gazebo)
 python scripts/test_minimal.py
@@ -100,8 +100,10 @@ yolo_ros/
 │   ├── auto_label_grid.py          # 自动标注（相机投影）
 │   ├── train_yolo_block.py         # YOLO 训练
 │   ├── demo_pipeline.py            # 端到端演示
-│   ├── capture_and_detect.py       # 单帧截图+检测
-│   └── test_minimal.py             # 最小验证测试
+│   ├── label_blocks.py             # 交互式标注（matplotlib）
+│   ├── move_block.py               # 移动仿真方块（set_pose 服务）
+│   ├── generate_synthetic_data.py  # 批量合成数据 + 自动标注
+│   └── test_minimal.py             # 最小验证测试（无需 ROS/Gazebo）
 └── ros2_ws/src/
     ├── yolo_detector/              # YOLOv8 检测节点
     ├── perception_3d/              # 2D→3D 投影节点

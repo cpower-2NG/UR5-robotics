@@ -14,6 +14,11 @@
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
 
+  <!-- planner_node.py:80 在 _init_moveit() 内 import moveit_msgs；
+       该导入是防御性的（失败即回落 mock 模式），构建期不需要，
+       故用 exec_depend 而非 depend，避免强制安装 MoveIt2。 -->
+  <exec_depend>moveit_msgs</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

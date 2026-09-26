@@ -24,7 +24,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMG_DIR = PROJECT_ROOT / "block_dataset" / "train" / "images"
 LBL_DIR = PROJECT_ROOT / "block_dataset" / "train" / "labels"
 META_PATHS = [
-    PROJECT_ROOT / "yolo_vision" / "worlds" / "block_grid_world_meta.json",
     PROJECT_ROOT / "ros2_ws" / "src" / "yolo_bringup" / "worlds" / "block_grid_world_meta.json",
 ]
 

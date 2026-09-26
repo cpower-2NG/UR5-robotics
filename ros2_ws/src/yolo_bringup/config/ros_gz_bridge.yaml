@@ -1,36 +1,62 @@
-# ros_gz_bridge 参数配置
+# ros_gz_bridge 参数配置（config_file 形式）
 # 桥接 Gazebo Harmonic (gz-sim) 话题到 ROS2 话题
 #
 # 用法:
-#   ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=config/ros_gz_bridge.yaml
+#   ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=<此文件>
+#
+# ⚠️ 格式要求（曾因不满足而失效，见 docs/RESTRUCTURE_PLAN.md D19）：
+#   顶层必须是**桥接条目列表**（YAML list），不能包一层 `ros__parameters:`。
+#
+# ⚠️ 话题名为什么用 topic_name（同名直通）而不用 ros_topic_name/gz_topic_name：
+#   本项目的 world 已把 Gazebo 侧话题**显式命名成与 ROS 同名**，见
+#   worlds/grasping_world.sdf 与 worlds/block_grid_world.sdf：
+#       <sensor name="rgb_camera"   type="camera">       <topic>/camera/color/image_raw</topic>
+#       <sensor name="depth_camera" type="depth_camera"> <topic>/camera/depth/image_raw</topic>
+#   故此处直通即可。
+#   ❗不要照抄参考项目 docs/reference/ur5-yolo-grasp/grasp_sim/config/gz_bridge.yaml 的
+#     `gz_topic_name: /rgbd_camera/...` —— 那是**它的 world** 的话题名，本项目里并不存在。
+#     可借鉴的只是**顶层列表**这一结构，不是它的话题名。
+#
+# 相机内参话题命名规律（与参考项目一致，两处互相印证）：
+#   图像在 <dir>/image_raw，则 camera_info 在 <dir>/camera_info
+#   参考项目：/rgbd_camera/image      -> /rgbd_camera/camera_info
+#   本项目：  /camera/color/image_raw -> /camera/color/camera_info
 
-ros__parameters:
-  # ---- RGB 相机 ----
-  - topic_name: "/camera/color/image_raw"
-    ros_type_name: "sensor_msgs/msg/Image"
-    gz_type_name: "gz.msgs.Image"
-    direction: GZ_TO_ROS
+# ---- RGB 相机 ----
+- topic_name: "/camera/color/image_raw"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
 
-  # ---- 深度相机 ----
-  - topic_name: "/camera/depth/image_raw"
-    ros_type_name: "sensor_msgs/msg/Image"
-    gz_type_name: "gz.msgs.Image"
-    direction: GZ_TO_ROS
+# ---- 深度相机 ----
+# 注意：仿真侧为 R_FLOAT32（米），而真机 D435i 为 16UC1（毫米）——
+# 下游 perception_3d 必须同时兼容这两种编码，见 D1。
+- topic_name: "/camera/depth/image_raw"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
 
-  # ---- 相机内参 ----
-  - topic_name: "/camera/color/camera_info"
-    ros_type_name: "sensor_msgs/msg/CameraInfo"
-    gz_type_name: "gz.msgs.CameraInfo"
-    direction: GZ_TO_ROS
+# ---- 深度点云（可选：grasp 需要 3D 时才用；gz 侧为 <depth topic>/points）----
+- ros_topic_name: "/camera/depth/points"
+  gz_topic_name: "/camera/depth/image_raw/points"
+  ros_type_name: "sensor_msgs/msg/PointCloud2"
+  gz_type_name: "gz.msgs.PointCloudPacked"
+  direction: GZ_TO_ROS
 
-  # ---- 关节状态 ----
-  - topic_name: "/joint_states"
-    ros_type_name: "sensor_msgs/msg/JointState"
-    gz_type_name: "gz.msgs.Model"
-    direction: GZ_TO_ROS
+# ---- 相机内参 ----
+- topic_name: "/camera/color/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
 
-  # ---- 时钟 ----
-  - topic_name: "/clock"
-    ros_type_name: "rosgraph_msgs/msg/Clock"
-    gz_type_name: "gz.msgs.Clock"
-    direction: GZ_TO_ROS
+# ---- 关节状态 ----
+- topic_name: "/joint_states"
+  ros_type_name: "sensor_msgs/msg/JointState"
+  gz_type_name: "gz.msgs.Model"
+  direction: GZ_TO_ROS
+
+# ---- 时钟 ----
+- topic_name: "/clock"
+  ros_type_name: "rosgraph_msgs/msg/Clock"
+  gz_type_name: "gz.msgs.Clock"
+  direction: GZ_TO_ROS
