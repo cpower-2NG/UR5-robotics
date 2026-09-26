@@ -1,7 +1,7 @@
 """
 Launch 文件: 单独启动 YOLO 检测节点
 用法:
-  ros2 launch yolo_detector detector.launch.py model:=yolov8n.pt
+  ros2 launch yolo_detector detector.launch.py model:=block_best.pt
 """
 
 from launch import LaunchDescription
@@ -13,8 +13,8 @@ from launch.substitutions import LaunchConfiguration
 def generate_launch_description():
     # 声明参数
     model_arg = DeclareLaunchArgument(
-        'model', default_value='yolov8n.pt',
-        description='YOLO model file (yolov8n.pt / yolov8s.pt / ...)'
+        'model', default_value='block_best.pt',
+        description='YOLO model file (block_best.pt, or an absolute path)'
     )
     conf_arg = DeclareLaunchArgument(
         'confidence_threshold', default_value='0.5',

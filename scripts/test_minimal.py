@@ -13,6 +13,7 @@
 
 import sys
 import os
+from pathlib import Path
 
 # 添加项目根目录
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -33,11 +34,18 @@ def test_yolo():
         print("ERROR: ultralytics 未安装。请运行: pip install ultralytics")
         return False
 
-    # 加载模型
-    print("加载 yolov8n.pt...")
-    model = YOLO("yolov8n.pt")
+    # 加载模型 —— 本项目实际部署的方块检测器（1 类 block）。
+    # 旧版此处写的是 YOLO("yolov8n.pt") 却打印「COCO 类别示例」：那个名字
+    # 在仓库根其实是方块模型，真 COCO 在 *_backup.pt 里，且该名字已不再
+    # 存在——继续用会触发 ultralytics 静默联网下载（D6/D24）。
+    model_path = Path(__file__).resolve().parent.parent / "block_best.pt"
+    if not model_path.is_file():
+        print(f"WARNING: 未找到 {model_path}，跳过模型加载测试。")
+        return True
+    print(f"加载 {model_path.name}...")
+    model = YOLO(str(model_path))
     print(f"模型加载成功。类别数: {len(model.names)}")
-    print(f"COCO 类别示例: {list(model.names.values())[:10]}")
+    print(f"类别: {list(model.names.values())[:10]}")
 
     # 生成测试图像（模拟彩色方块）
     img = np.ones((480, 640, 3), dtype=np.uint8) * 200  # 灰色背景

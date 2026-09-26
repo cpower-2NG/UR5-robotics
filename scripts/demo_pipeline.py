@@ -22,7 +22,11 @@ from pathlib import Path
 
 # ---- 路径 ----
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATASET_DIR = PROJECT_ROOT / "block_dataset"
+# 独立数据集目录 —— 本脚本用 BLOCK_SIZE=0.03 / 5×5 网格，与 generate_grid_world.py
+# 的 0.04 / 3×3 不是同一套几何。若与 auto_label_grid.py、generate_synthetic_data.py
+# 共用 block_dataset/，会在同名文件（img_XXXX.jpg / .txt）上互相覆盖，产出
+# 「图像与标注来自不同几何假设」的脏数据集（D30）。故隔离到自己的目录。
+DATASET_DIR = PROJECT_ROOT / "block_dataset_demo"
 TRAIN_IMG = DATASET_DIR / "train" / "images"
 TRAIN_LBL = DATASET_DIR / "train" / "labels"
 VAL_IMG = DATASET_DIR / "val" / "images"
@@ -58,7 +62,10 @@ HFOV = 1.047                      # 弧度 ≈ 60°
 # ---- 训练参数 ----
 NUM_SAMPLES = 100                  # 生成图像数量
 EPOCHS = 50
-MODEL_NAME = "yolov8n.pt"
+# 微调起点：真 COCO yolov8n（原名 yolov8n_backup.pt，已改名以免与方块模型混淆）。
+# 旧值 "yolov8n.pt" 在仓库根其实是方块模型，且该名字已删除——沿用会触发
+# ultralytics 静默联网下载（D6/D24）。
+MODEL_NAME = str(Path(__file__).resolve().parent.parent / "yolov8n_coco.pt")
 
 
 # ============================================================

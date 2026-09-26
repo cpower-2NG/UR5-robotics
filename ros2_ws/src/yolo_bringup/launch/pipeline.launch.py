@@ -15,8 +15,8 @@ from launch_ros.actions import Node
 def generate_launch_description():
     # ---- 参数 ----
     model_arg = DeclareLaunchArgument(
-        'model', default_value='yolov8n.pt',
-        description='YOLO model file'
+        'model', default_value='block_best.pt',
+        description='YOLO model file (block detector; resolved by detector_node)'
     )
     conf_arg = DeclareLaunchArgument(
         'confidence_threshold', default_value='0.5',

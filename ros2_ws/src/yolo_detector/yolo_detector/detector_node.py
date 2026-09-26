@@ -17,7 +17,9 @@ from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithP
 from cv_bridge import CvBridge
 
 import numpy as np
+import os
 import time
+from pathlib import Path
 
 
 class YoloDetector(Node):
@@ -27,24 +29,50 @@ class YoloDetector(Node):
         super().__init__('yolo_detector')
 
         # ---- 参数 ----
-        self.declare_parameter('model', 'yolov8n.pt')
+        self.declare_parameter('model', 'block_best.pt')
         self.declare_parameter('confidence_threshold', 0.5)
         self.declare_parameter('device', 'cuda:0')  # 'cpu' / 'cuda:0'
         self.declare_parameter('publish_annotated', True)
 
-        model_path = self.get_parameter('model').value
+        raw_model = self.get_parameter('model').value
         self.conf_thresh = self.get_parameter('confidence_threshold').value
         device = self.get_parameter('device').value
+
+        # ---- 解析模型路径（D6 / D24）----
+        # 旧实现把参数原样交给 YOLO()，于是行为随进程 CWD 改变；而且当两处
+        # 都找不到时 ultralytics 会**静默联网下载官方 COCO 模型**——真机上
+        # 表现为「什么都检测不到，且不报错」。这里改为显式查找，找不到就
+        # 直接报错退出，绝不允许联网兜底。
+        model_path = self._resolve_model(raw_model)
+        if model_path is None:
+            self.get_logger().error(
+                f'找不到模型文件 {raw_model!r}。已搜索：CWD 及其所有父目录、'
+                f'$YOLO_MODEL_DIR、yolo_detector/models/。'
+                f'请改用绝对路径，例如 -p model:=$HOME/yolo_ros/block_best.pt'
+            )
+            raise FileNotFoundError(f'YOLO model not found: {raw_model}')
 
         # ---- 加载 YOLOv8 模型 ----
         self.get_logger().info(f'Loading YOLO model: {model_path} on {device}')
         try:
             from ultralytics import YOLO
-            self.model = YOLO(model_path)
+            self.model = YOLO(str(model_path))
             self.model.to(device)
         except Exception as e:
             self.get_logger().error(f'Failed to load YOLO model: {e}')
             raise
+
+        # 类别自检：方块检测器应为 1 类 block。用错模型是 D6 的原始症状，
+        # 这里让它至少**可见**。
+        names = list(self.model.names.values())
+        self.get_logger().info(
+            f'Model loaded: {len(names)} class(es) — {names[:8]}'
+        )
+        if names != ['block']:
+            self.get_logger().warn(
+                f'期望 1 类方块模型 [\'block\']，实际 {len(names)} 类。'
+                f'若这不是本意，请检查 model 参数是否指到了 COCO 权重。'
+            )
 
         self.bridge = CvBridge()
 
@@ -68,6 +96,45 @@ class YoloDetector(Node):
         )
 
         self.get_logger().info('YOLO Detector node started.')
+
+    def _resolve_model(self, model: str):
+        """把 `model` 参数解析成真实存在的文件路径，找不到返回 None。
+
+        查找顺序（D6 / D24 修复）：
+          1. 绝对路径 → 直接判定
+          2. ``$YOLO_MODEL_DIR/<name>``  → 真机部署推荐用法
+          3. CWD 及其所有父目录 ``/<name>`` → 兼容「从仓库任意子目录启动」
+          4. ``yolo_detector/models/<name>``（若模型随包安装）
+
+        刻意**不做**的事：不把名字交给 YOLO() 让它联网下载。宁可启动失败，
+        也不要静默地用官方 COCO 模型去检测方块。
+        """
+        p = Path(model).expanduser()
+
+        if p.is_absolute():
+            return p if p.is_file() else None
+
+        candidates = []
+
+        env_dir = os.environ.get('YOLO_MODEL_DIR')
+        if env_dir:
+            candidates.append(Path(env_dir).expanduser() / p)
+
+        cwd = Path.cwd().resolve()
+        for d in (cwd, *cwd.parents):
+            candidates.append(d / p)
+
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            share = Path(get_package_share_directory('yolo_detector'))
+            candidates.append(share / 'models' / p)
+        except Exception:
+            pass
+
+        for c in candidates:
+            if c.is_file():
+                return c.resolve()
+        return None
 
     def image_callback(self, msg: Image):
         """RGB 图像回调：运行 YOLO 推理，发布结果。"""

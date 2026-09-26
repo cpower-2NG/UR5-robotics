@@ -20,10 +20,13 @@ YOLOv8 方块检测训练脚本
            └── labels/   ← 对应标注
 
 训练参数:
-    model:   yolov8n.pt (预训练权重，微调)
+    model:   yolov8n_coco.pt (COCO 预训练权重，微调)
     epochs:  100
     imgsz:   640
     device:  cuda:0 (自动回退 cpu)
+
+输出: runs/block_detect/weights/best.pt → 复制为仓库根 block_best.pt
+      （yolo_detector 的默认 model 参数就指向它）
 """
 
 import os
@@ -35,6 +38,12 @@ from pathlib import Path
 # ---- 路径 ----
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = PROJECT_ROOT / "block_dataset"
+
+# 微调起点：**真 COCO yolov8n**（原名为 yolov8n_backup.pt，已改名以免混淆）。
+# 注意：旧版此处写的是 "yolov8n.pt"，而仓库根那个文件其实是上一次训练产出的
+# 方块模型——于是「微调」实际上是在**上一代方块模型**上继续训，而不是从 COCO
+# 起。行为随 CWD 变化，且文件名与内容不符（详见 docs/RESTRUCTURE_PLAN.md D6）。
+BASE_WEIGHTS = PROJECT_ROOT / "yolov8n_coco.pt"
 TRAIN_IMG = DATASET_DIR / "train" / "images"
 TRAIN_LBL = DATASET_DIR / "train" / "labels"
 VAL_IMG = DATASET_DIR / "val" / "images"
@@ -109,8 +118,14 @@ def train():
     except ImportError:
         device = "cpu"
 
-    print(f"\n加载预训练模型 yolov8n.pt，设备: {device}")
-    model = YOLO("yolov8n.pt")
+    if not BASE_WEIGHTS.is_file():
+        print(f"[ERROR] 找不到微调起点权重: {BASE_WEIGHTS}")
+        print("        这是 COCO 预训练 yolov8n；缺失时 ultralytics 会联网下载，"
+              "结果不可复现。请先补齐该文件。")
+        sys.exit(1)
+
+    print(f"\n加载预训练模型 {BASE_WEIGHTS.name}，设备: {device}")
+    model = YOLO(str(BASE_WEIGHTS))
 
     print(f"开始训练...")
     results = model.train(
@@ -130,7 +145,7 @@ def train():
         verbose=True,
     )
 
-    # 复制最佳模型到项目根目录
+    # 复制最佳模型到项目根目录（yolo_detector 的默认 model 参数就指向它）
     best_src = PROJECT_ROOT / "runs" / "block_detect" / "weights" / "best.pt"
     best_dst = PROJECT_ROOT / "block_best.pt"
     if best_src.exists():
@@ -140,15 +155,10 @@ def train():
     else:
         print(f"\n⚠ 训练完成但未找到 best.pt，请检查日志。")
 
-    # 替换 yolo_detector 使用的模型
-    detector_model = PROJECT_ROOT / "yolov8n.pt"
-    if detector_model.exists():
-        backup = PROJECT_ROOT / "yolov8n_backup.pt"
-        if not backup.exists():
-            shutil.copy(str(detector_model), str(backup))
-            print(f"   已备份原模型: {backup}")
-        shutil.copy(str(best_dst), str(detector_model))
-        print(f"   已替换 yolo_detector 模型: {detector_model}")
+    # 旧版此处会把 best_dst **覆盖到仓库根的 yolov8n.pt**，并把被覆盖的文件
+    # 备份成 yolov8n_backup.pt——D6「同名不同物」正是这样被制造出来的：
+    # 方块模型占用了 yolov8n.pt 这个名字，真 COCO 反而被赶到 *_backup.pt。
+    # 现在检测端默认就是 block_best.pt，这步覆盖已无必要，故删除。
 
 
 if __name__ == "__main__":
