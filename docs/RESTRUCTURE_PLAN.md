@@ -2,8 +2,8 @@
 
 编写日期：2026-09-26
 基线提交：`f250af11b77b1629b4e867eb7820912db66dbc2c`（`main`，8 个提交）
-状态：**审计完成；P1 已开始施工**（在 `migrate/humble-orin` 分支，`main` 未改动，**尚无任何提交**）
-最近更新：2026-09-26 第六轮（**完成 P2 感知链路修复**：`projector_node.py` 重写，修掉 **D33**——`do_transform_pose` 传错类型导致 **`/target_3d` 从未发布过**，这条比 D1/D2/D8 更靠前；同时修 D1 深度尺度、D2 时间戳同步、D8 TF 静默失效，并做掉 P2-6 最近簇；新增 `scripts/test_perception_3d.py` **20 项回归断言全绿**）
+状态：**P1 主体已完成，P2 感知链路已修复并端到端验证**（在 `migrate/humble-orin` 分支；`main` 仍停在基线 `f250af11b`，**未改动、未推送**）
+最近更新：2026-09-26 第七轮（**P2 余项收尾 + 链路首次端到端实证**：P2-4 设备退化、P2-5 冻结像素约定并加护栏、P2-7 `camera_source` 开关（含 `bringup` 透传与「真机不起 Gazebo」）；新增 `scripts/test_pipeline_e2e.py`，**实测 `/target_3d` 数值与解析预期一致**，确认 D33 确已修复且 P2-6 在真实链路上生效。前一轮为 D33/D1/D2/D8/P2-6 的修复）
 
 ---
 
@@ -273,6 +273,26 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 > 新增 `scripts/test_perception_3d.py`（20 项断言，不需仿真器/不需 `colcon build`），
 > 覆盖 D1 尺度、D2 同步、D33 TF 类型、P2-6 最近簇四组行为。
 > 命令：`source /opt/ros/humble/setup.bash && python3 scripts/test_perception_3d.py`（退出码 0 = 全通过）。
+>
+> **第七轮进展（2026-09-26）——「链路端到端跑通」首次被实证**：
+> P2 余项（P2-4/5/7）完成，并新增 `scripts/test_pipeline_e2e.py`：它**真起话题、真走 DDS**，
+> 把合成的 `camera_info` + 深度图 + 检测框喂进**正在运行的** pipeline，再断言 `/target_3d` 的**具体数值**。
+> 实测结果（`camera_source:=external`，TF 为单位阵）：
+>
+> | 场景 | 解析预期 | 实测 `/target_3d` |
+> |---|---|---|
+> | 方块居中、深 0.5 m | `(0, 0, 0.5)` | `(0.0000, 0.0000, 0.5000)` ✅ |
+> | 方块移至 (120, 85) | `x=0.14440, y=0.09025, z=0.5` | `(0.1444, 0.0903, 0.5000)` ✅ |
+>
+> 两条断言各自的含义：① **D33 确已修复**——`/target_3d` 真的被发布出来了（此前**一次都没有**）；
+> ② **P2-6 在真实链路生效**——测试框内 3/4 面积是 1.0 m 桌面、中央 1/4 是 0.5 m 方块，
+> 输出取到 **0.5 而非 1.0**，即「取最近簇」确实剔掉了背景平面；
+> ③ D1 尺度在真实链路上量级正确（`32FC1 → 1.0 m/px`，`z=0.5`）。
+>
+> ⚠️ **这次验证的边界（别读过头）**：喂进去的是**合成**的检测框与深度，
+> 不是真实相机、也不是 Gazebo 世界；相机外参用的是**单位阵**（即假设标定完全准确）。
+> 所以它证明的是「**给定正确的输入，链路算得对且发得出来**」，
+> 而**不**证明「检测框本身正确」或「外参已标定」——后两者分别归 YOLO 模型与手眼标定。
 
 | 编号 | 任务 | 实现要点 | 状态 |
 |---|---|---|---|
@@ -280,10 +300,10 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 | P2-1 | **修 D1 深度尺度** | 按 `msg.encoding` 查表：`16UC1`/`mono16` → `×0.001`（毫米），`32FC1`/`64FC1` → `×1.0`（米）。未知编码**报 ERROR** 并回退 1.0；`depth_scale` 参数（默认 `-1`＝自动）可强制覆盖。**在入口一次性换算成 float32 米**，下游不再关心编码 | ✅ **已完成** |
 | P2-2 | **修 D2 对齐与同步** | 改为**带时间戳的环形缓冲**（`deque(maxlen=depth_buffer_len)`，默认 10 帧），按 stamp **就近配对**；超过 `max_sync_dt`（默认 0.1 s）**丢弃并告警**——宁可不发，也不发一个基于错误时刻深度的坐标。另在启动时提示真机需 `align_depth:=true` | ✅ **已完成**（未采用 `message_filters`，理由见下） |
 | P2-3 | **修 D8 相机外参 TF** | 缺 TF 时由 `warn`+静默 `continue` 升级为 **ERROR + 连续失败计数**，并给出「先做手眼标定/发布静态 TF」的可操作提示；新增 `tf_required` 参数（默认 `False`），置真则直接抛错退出 | ✅ **已完成** |
-| P2-4 | 修 D6 默认模型 | `pipeline.launch.py` 默认改为方块模型 ✅；`device` 可退化（`cuda:0` 不可用时回落 `cpu`）**未做** | ⏳ 部分 |
-| P2-5 | 消除 D7 约定冲突 | 在 `yolo_detector` 消息内固定「像素坐标」并在 docstring + 文档中冻结；或改用 `vision_msgs` 语义（`bbox.center` 为像素是 ROS 惯例）。**二选一并写进文档** | ⏳ 待做 |
-| P2-6 | 深度有效性增强 | 取检测框内 **5×5 多区域**采样（±60% 半宽内，避开混入背景的框边缘），再取**最近簇**中位数（`depth_cluster_tol`，默认 0.03 m）。俯视下物体顶面必比其身后桌面更近，故「最近的一簇」即物体本身 | ✅ **已完成** |
-| P2-7 | 加真机启动配置 | 新增 `bringup` 的 `use_sim` / `use_realsense` 开关，真机走 `realsense2_camera`，仿真走 `ros_gz_bridge`，上层节点不变 | ⏳ 待做 |
+| P2-4 | 修 D6 默认模型 | `pipeline.launch.py` 默认改为方块模型 ✅；`device` 退化：抽出**模块级** `resolve_device(requested, allow_fallback, logger)`，`cpu` / `cuda` / `cuda:N` 逐一校验（`torch` 是否可导入、`cuda.is_available()`、序号是否越界、序号是否合法），不可用则**告警并退回 cpu**——旧实现 `self.model.to(device)` 会直接让**整个节点崩溃**。新增 `device_fallback` 参数（默认 `True`），置 `False` 则抛 `RuntimeError`（真机上用来暴露环境问题）。刻意做成模块级函数以便**不装 torch 也能测**（`scripts/test_detector_device.py`，19 项） | ✅ **已完成**（RTX A2000 实测：`cuda:0` → 用 GPU；`cuda:9` → 告警退回 cpu） |
+| P2-5 | 消除 D7 约定冲突 | 选**方案一（冻结像素约定）**：`detector_node.py` 与 `projector_node.py` 两侧 docstring 均写明「像素坐标、原点左上、**不归一化**」，并列出下游依赖点。**并加运行时护栏**：`projector_node` 若发现 `center` 与 `size` 全部落在 `(0,1]`（归一化的典型特征），立即打一次 ERROR 点名「上游可能发了归一化坐标」——D7 的坑从**静默算错**变成**可见告警**（只报一次，不刷屏） | ✅ **已完成** |
+| P2-6 | 深度有效性增强 | 取检测框内 **5×5 多区域**采样（±60% 半宽内，避开混入背景的框边缘），再取**最近簇**中位数（`depth_cluster_tol`，默认 0.03 m）。俯视下物体顶面必比其身后桌面更近，故「最近的一簇」即物体本身 | ✅ **已完成**（**已在真实链路上验证**：框内 3/4 是 1.0 m 桌面、中央 1/4 是 0.5 m 方块，输出取到 **0.5**） |
+| P2-7 | 加真机启动配置 | **设计变更（见下）**：原计划加 `use_sim` / `use_realsense` **两个布尔量**，实现时改为**单个枚举** `camera_source` ∈ {`sim`, `realsense`, `external`}。`pipeline.launch.py` 按它决定是否拉起 `realsense2_camera`（`align_depth.enable:=true`，D2 的硬要求）并**自动把 `depth_topic` 默认值切到对齐话题**；三个节点的深度/内参/检测话题全部参数化。`bringup.launch.py` 透传该参数，并**据此决定是否启动 Gazebo**；仿真才需要 6 s 延时，真机取 0 | ✅ **已完成** |
 
 > **为何没用 `message_filters`（P2-2 的原方案）**：`ApproximateTimeSynchronizer` 要求
 > **两个话题的消息都到齐**才触发回调，而本项目 `/detections` 的帧率远低于深度（检测是
@@ -293,11 +313,43 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 > 环形缓冲 + 就近配对实现了同样的「按时间戳关联」，但**失配时能明确告警**，
 > 且不改变回调的驱动源。若后续需要精确到毫秒的对齐，再换 `message_filters` 不迟。
 
+> **为何 P2-7 不用两个布尔量（原计划 `use_sim` / `use_realsense`）**：
+> 两个布尔量存在「**都为真**」这种无意义状态，必须额外写校验代码去拒绝它；
+> 枚举 `camera_source` 从类型上就不存在这个状态。三者对上层节点**完全透明**
+> （话题名一致），所以 `yolo_detector` / `perception_3d` / `grasp_planner` 的参数不受影响。
+
+#### P2 附带查明的环境事实（本轮实测，直接影响「能不能跑起来」）
+
+这几条不在原缺陷清单里，但不写下来会反复踩：
+
+| # | 事实 | 后果与对策 |
+|---|---|---|
+| **E1** | **`ultralytics`/`torch` 在 conda 环境 `robot-vision` 里，`rclpy` 在 `/opt/ros/humble` 里，两者互不可见**。| 直接 `ros2 launch` 会看到 `detector_node` 崩于 `No module named 'ultralytics'`。**两个 3.10 解释器可以叠起来用**（实测 `rclpy` + `torch 2.5.1+cu121` + `ultralytics 8.3.99` + `cv2` 同时可用）：<br>`source /opt/ros/humble/setup.bash` 后 `export PYTHONPATH=<venv>/lib/python3.10/site-packages:$PYTHONPATH`。**Orin 上应改为直接把 ultralytics 装进系统 Python，不要依赖这层叠加** |
+| **E2** | **加了 venv 的 `PYTHONPATH` 后 `colcon build` 会失败**：`error: option --uninstall not recognized` | venv 里 `setuptools 84.0.0` 已移除 `setup.py develop --uninstall`，而 colcon 对 ament_python 包会先调它；系统 `setuptools 59.6.0` 还有。**结论：构建用纯净 ROS 环境，运行才叠 venv**（两者分开）。另 `--symlink-install` 同样会触发该错误，**用普通 `colcon build`** |
+| **E3** | **WSL2 上 DDS 组播发现不稳定**：同一份 e2e 脚本「一次全过、一次一条消息都收不到」 | 表现为极难排查的假失败。**对策：`export ROS_LOCALHOST_ONLY=1`**（两个终端都要）。⚠️ **这是工作站开发用的规避手段，不要写进仓库的 launch 文件**——Orin 上机械臂/上位机可能要跨机通信，loopback-only 会切断 |
+| **E4** | **float32 深度图（640×480 = 1.23 MB）把本机 DDS 通道压到约 9 MB/s**（实测：目标 20 Hz，实发 7.6 Hz，订阅端只收到 3.6 Hz） | 直接后果是「检测↔深度」时间戳差达 **431 ms** > `max_sync_dt`（100 ms），检测被**全部丢弃**——看起来像链路 bug，实为传输吞吐。**对策**：e2e 脚本改用 160×120（内参同比缩放，投影公式结果不变）；**真机侧 D435i 是 `16UC1`（600 KB），比 float32 轻一半**，但仍建议留意 `max_sync_dt` 与帧率是否匹配 |
+| **E5** | 本机 GPU 实为 **RTX A2000**，而教材文本写的是「RTX 2060」 | 教材与实际硬件不符（D22 同类）。不影响代码，但写文档/报环境时别照抄教材 |
+
+> 另有两条**未能证实、故不作为缺陷记录**的观察，留待仿真跑通后复核：
+> ① `use_sim_time` 在本仓库**从未被设置过**（launch/参数/节点里都搜不到），而
+> `simulation.launch.py` 又桥接了 `/clock`——若仿真下时间戳不一致，D2 的「就近配对」
+> 会整体失配。**这需要一次真实仿真运行才能确认，本轮不据推测下结论。**
+> ② `projector_node.py` 的 `depth_val <= 0.0` 判断**拦不住 NaN**（NaN 的比较恒为 False）。
+> 已实测 `_robust_depth()` 的采样用 `np.isfinite` 过滤过，**当前不会**返回 NaN，
+> 故这不是一个可触发的 bug；但仍加了一条 `math.isfinite` 兜底——真机上下游若拿到
+> NaN 目标位姿，MoveIt 轻则报错、重则规划出 NaN 轨迹。
+
 **验收**：仿真中已知世界坐标的方块，`/target_3d` 误差 < 2 cm；真机上对尺子量取的目标误差 < 2 cm（D435i 在 0.5–1 m 量程）。
 
-> ⚠️ **验收前提**：需先有能用的 TF `base_link → camera_color_optical_frame`。
-> 仿真下由 URDF/SDF 提供；真机下必须**先做手眼标定**。**这一步没做之前，
-> `scripts/test_perception_3d.py` 全绿只说明「单元逻辑正确」，不等于链路端到端可用。**
+> ⚠️ **验收现状（2026-09-26，第七轮）**：
+> - ✅ **「链路算得对且发得出来」已达成并留证**：`scripts/test_pipeline_e2e.py` 真起话题、
+>   真走 DDS，`/target_3d` 数值与解析预期一致（见上表）。这补上了此前唯一的空白——
+>   在此之前**整条链路从未端到端跑通过**。
+> - ⏳ **「误差 < 2 cm」尚未验收**，因为它的前提还不具备：需要①有真实相机（仿真或 D435i）、
+>   ②有可信的 `base_link → camera_color_optical_frame` 外参。**真机下这一步必须做手眼标定，
+>   代码层面修不了**（D8 只让失败可见，不产生外参）。
+> - ⏳ 因此 `scripts/test_perception_3d.py`（纯逻辑）与 `test_pipeline_e2e.py`（合成输入）
+>   全绿，**都还不等于「真机可用」**。下一个真实里程碑是**仿真里对着已知世界坐标量误差**。
 
 ### P3 — 抓取链路引入（仿真）
 
@@ -397,12 +449,15 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 
 | 文件 | 动作 | 关联缺陷 |
 |---|---|---|
-| `ros2_ws/src/perception_3d/perception_3d/projector_node.py` | ✅ **已改（第六轮，整文件重写）**：TF 改用 `do_transform_pose_stamped`；深度按 encoding 换算成米后入**带时间戳环形缓冲**、按 stamp 就近配对并在超差时丢弃告警；框内 5×5 采样取**最近簇**中位数；TF 失败升级为 ERROR + 连续计数 + `tf_required` 开关；新增 `depth_scale`/`max_sync_dt`/`depth_buffer_len`/`depth_grid`/`depth_cluster_tol`/`tf_required` 六个参数 | D33 D1 D2 D8 P2-6 |
-| `scripts/test_perception_3d.py` | ✅ **新增（第六轮）**：`projector_node` 回归自检，20 项断言，覆盖 D1/D2/D33/P2-6；**不需要仿真器、不需要 `colcon build`**（按源码路径直接导入），退出码 0 = 全绿 | D33 D1 D2 P2-6 |
+| `ros2_ws/src/perception_3d/perception_3d/projector_node.py` | ✅ **已改（第六轮整文件重写；第七轮续改）**：TF 改用 `do_transform_pose_stamped`；深度按 encoding 换算成米后入**带时间戳环形缓冲**、按 stamp 就近配对并在超差时丢弃告警；框内 5×5 采样取**最近簇**中位数；TF 失败升级为 ERROR + 连续计数 + `tf_required` 开关。第七轮：三处话题名参数化（`camera_info_topic`/`depth_topic`/`detections_topic`）以配合 P2-7；归一化护栏（P2-5）；发布前的 `math.isfinite` 兜底。共 **9 个参数** | D33 D1 D2 D8 P2-5 P2-6 P2-7 |
+| `scripts/test_perception_3d.py` | ✅ **新增（第六轮）**：`projector_node` 回归自检，24 项断言，覆盖 D1/D2/D33/D8/P2-5/P2-6；**不需要仿真器、不需要 `colcon build`**（按源码路径直接导入），退出码 0 = 全绿 | D33 D1 D2 D8 P2-5 P2-6 |
+| `scripts/test_detector_device.py` | ✅ **新增（第七轮）**：`resolve_device()` 全分支自检，19 项；**不导入 torch、不实例化 ROS 节点**（用假 logger + `sys.modules` 注入假 torch 模拟有/无 GPU）。⚠️ 模拟「torch 未安装」必须用 `sys.modules['torch'] = None`，`pop` 掉会被真装的 torch 重新导入（本轮实测踩到） | P2-4 |
+| `scripts/test_pipeline_e2e.py` | ✅ **新增（第七轮）**：**端到端**验证——真起话题、真走 DDS，把合成 `camera_info`+深度+检测框喂进运行中的 pipeline，断言 `/target_3d` 的**具体数值**。这是唯一能回答「链路是否真的通」的脚本 | D33 D1 P2-6 |
 | `ros2_ws/src/perception_3d/package.xml` | 补 `numpy` | — |
-| `ros2_ws/src/yolo_detector/yolo_detector/detector_node.py` | ✅ **已改**：`_resolve_model()` 路径解析 + 找不到即报错 + 类别自检；默认值 `block_best.pt`。**仍待**：device 回落、坐标约定写进 docstring | D6 D24 (+D7 待办) |
-| `ros2_ws/src/yolo_bringup/launch/pipeline.launch.py` | ✅ **已改**：默认模型 `block_best.pt` | D6 |
-| `ros2_ws/src/yolo_bringup/launch/bringup.launch.py` | ✅ **已改**：`world`/`model`/`mode`/`device` 四个原先被硬编码忽略的 launch 参数改用 `LaunchConfiguration` | D31 |
+| `ros2_ws/src/yolo_detector/yolo_detector/detector_node.py` | ✅ **已改**：`_resolve_model()` 路径解析 + 找不到即报错 + 类别自检；默认值 `block_best.pt`。第七轮：抽出**模块级** `resolve_device()` 做设备退化（+`device_fallback` 参数）；坐标约定（**像素、不归一化**）写进 docstring 并列为「冻结」 | D6 D24 D7 P2-4 P2-5 |
+| `ros2_ws/src/yolo_bringup/launch/pipeline.launch.py` | ✅ **已改**：默认模型 `block_best.pt`；第七轮加 `camera_source` 枚举（`sim`/`realsense`/`external`），`realsense` 时拉起 `realsense2_camera`（`align_depth.enable:=true`）并**自动把 `depth_topic` 默认值切到对齐话题**；另加 `tf_required` | D6 D2 P2-7 |
+| `ros2_ws/src/yolo_bringup/launch/bringup.launch.py` | ✅ **已改**：`world`/`model`/`mode`/`device` 四个原先被硬编码忽略的 launch 参数改用 `LaunchConfiguration`（D31）；第七轮透传 `camera_source`/`target_frame`/`tf_required`，并**据此决定是否启动 Gazebo**（真机不起仿真）与 6 s 延时是否生效 | D31 P2-7 |
+| `ros2_ws/src/perception_3d/launch/perception.launch.py` | ✅ **已改（第七轮）**：暴露上述新增参数 | P2-7 |
 | `scripts/train_yolo_block.py` | ✅ **已改**：拆除「覆盖根 `yolov8n.pt`／备份为 `yolov8n_backup.pt`」的逻辑（D6 的制造机）；微调起点改为显式 `yolov8n_coco.pt` 并校验存在 | D6 |
 | `scripts/test_minimal.py`、`scripts/demo_pipeline.py` | ✅ **已改**：前者显式加载 `block_best.pt`；后者 `MODEL_NAME`→`yolov8n_coco.pt`、`DATASET_DIR`→独立 `block_dataset_demo/` | D6 D30 |
 | 权重文件（14 删 / 2 改名） | ✅ **已做**：见 §3 P1 完成表与 §1.4 实测总表 | D6 D13 D25 |
@@ -497,18 +552,31 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 - ✅ **新增 `scripts/test_perception_3d.py`**：20 项断言，覆盖 D1/D2/D33/P2-6，**不需仿真器、不需 `colcon build`**，实测**全绿、退出码 0**。
 - 📌 **P2-2 没走原方案的 `message_filters`**，理由已写进 P2 小节（会引入新的「静默丢弃」）。若日后需要毫秒级对齐再换。
 
+**第七轮（2026-09-26）新增完成项：**
+
+- ✅ **P2 余项全部收尾**：P2-5（冻结「像素、不归一化」约定 + 归一化护栏）、P2-4（`resolve_device()` 设备退化）、P2-7（`camera_source` 枚举开关，`bringup` 透传，**真机不起 Gazebo**）。
+- ✅ **链路首次端到端实证**：新增 `scripts/test_pipeline_e2e.py`，实测 `/target_3d` = `(0.0000, 0.0000, 0.5000)` 与 `(0.1444, 0.0903, 0.5000)`，**与解析预期逐位吻合**。这直接证明 **D33 确已修复**（此前该话题从未被发布），并证明 **P2-6 的「最近簇」在真实链路上生效**（框内 3/4 是 1.0 m 桌面，仍取到 0.5 m 的方块）。
+- ✅ **新增 `scripts/test_detector_device.py`**：19 项，全分支覆盖，不装 torch 也能跑。
+- 🎯 **查明 E1–E5 五条环境事实**（见 P2 小节）：`ultralytics` 与 `rclpy` 分居两个解释器、venv 的 setuptools 84 会让 `colcon build` 失败、WSL2 组播发现不稳需 `ROS_LOCALHOST_ONLY=1`、1.23 MB float32 深度把 DDS 压到约 9 MB/s、本机 GPU 实为 **RTX A2000**（教材写的 RTX 2060 有误）。
+- 📌 **P2-7 实现时改了设计**：原计划两个布尔量 `use_sim`/`use_realsense` → 实际用**单枚举** `camera_source`（避免「都为真」的无意义状态）。
+
 **下一步可立即做的（均不阻塞）：**
 
-1. **P2 余项**：P2-5（像素/归一化约定二选一写进文档）、P2-4 的 `device` 退化、P2-7（`use_sim`/`use_realsense` 开关）。仍是**不需要仿真器**的代码层工作。
+1. ~~**P2 余项**~~ ✅ 已完成（P2-4/5/7 全部收尾，链路已端到端验证）。
 2. **P1-5** 文档「设计目标 vs 已实现」标注（`TECHNICAL_SPEC.md` 未动）。
 3. **P5 移植抓取栈**：D27 已降级，朝向**不再是前置阻塞**，可直接以 `docs/reference/ur5-yolo-grasp/` 为基底移植（注意换成模型 A）。
 4. ~~**P1-3** 权重收敛~~ ✅ 已完成（21→7，文件名与内容全部对齐）。
 5. **装 Harmonic**（你已确认）：sudo 部分已给你命令；装完我做 `~/grasp_ws` 工作区 + `gz_ros2_control` 源码编译。
 
-> ⚠️ **端到端的边界要说清楚**：`test_perception_3d.py` 全绿 = **单元逻辑正确**，
-> **不等于**链路可用。要真正验证 `/target_3d` 出数，**前置条件是一个能用的
-> `base_link → camera_color_optical_frame` TF**：仿真下靠 URDF/SDF，真机下靠手眼标定。
-> 在这之前，「感知链路已修好」只能说到「代码层已就绪」。
+> ⚠️ **端到端的边界（第七轮更新后，边界缩小了但仍存在）**：
+> `test_pipeline_e2e.py` 已经证明「**给定正确的检测框与深度，链路算得对、也发得出来**」——
+> 这补上了此前最大的空白。但它喂的是**合成**输入、用的是**单位阵**外参，所以：
+> - 「链路代码是否通」→ ✅ **已证**；
+> - 「检测框本身是否准」→ 归 YOLO 模型，未在真机/仿真上量过；
+> - 「外参是否准」→ **归手眼标定，代码层修不了**（D8 只让失败可见，不产生外参）。
+>
+> 下一个真实里程碑因此是：**在仿真里对已知世界坐标的方块量 `/target_3d` 误差**。
+> 那需要先装好 Harmonic（上面第 5 条）。
 
 > ⚠️ **尚未提交**：第五、六轮所有改动都在 `migrate/humble-orin` 的工作区/暂存区，**没有任何提交**，`main` 仍停在 `f250af11b`。要不要提交、如何分组，等你示下。
 
