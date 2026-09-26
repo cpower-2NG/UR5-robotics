@@ -6,3 +6,9 @@ ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
 *.pyc
+
+# P0: 附件隔离解压区（不入库，见 docs/ATTACHMENT_MANIFEST.md）
+docs/reference/
+
+# demo_pipeline.py 的独立数据集输出（几何与 block_dataset/ 不同，见 D30）
+block_dataset_demo/

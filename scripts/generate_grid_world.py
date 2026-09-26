@@ -15,8 +15,8 @@
     python3 scripts/generate_grid_world.py --fixed               # 固定 3×3 网格（调试用）
 
 输出:
-    yolo_vision/worlds/block_grid_world.sdf
-    yolo_vision/worlds/block_grid_world_meta.json
+    ros2_ws/src/yolo_bringup/worlds/block_grid_world.sdf
+    ros2_ws/src/yolo_bringup/worlds/block_grid_world_meta.json
 """
 
 import os
@@ -62,9 +62,10 @@ COLOR_POOL = [
 ]
 
 # ---- 输出路径 ----
+# 唯一输出位置：yolo_bringup 包内的 worlds/。
+# （原 yolo_vision/worlds/ 已随教学包 yolo_vision/ 一并移除，见 docs/RESTRUCTURE_PLAN.md P1）
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "yolo_vision", "worlds")
-OUTPUT_DIR_ALT = os.path.join(PROJECT_ROOT, "ros2_ws", "src", "yolo_bringup", "worlds")
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, "ros2_ws", "src", "yolo_bringup", "worlds")
 
 
 def clamp(v, lo=0.0, hi=1.0):
@@ -423,12 +424,11 @@ def save_metadata(blocks, seed, is_fixed_mode):
         ],
     }
 
-    for out_dir in [OUTPUT_DIR, OUTPUT_DIR_ALT]:
-        os.makedirs(out_dir, exist_ok=True)
-        meta_path = os.path.join(out_dir, "block_grid_world_meta.json")
-        with open(meta_path, 'w') as f:
-            json.dump(meta, f, indent=2)
-        print(f"[OK] 元数据: {meta_path}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    meta_path = os.path.join(OUTPUT_DIR, "block_grid_world_meta.json")
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f"[OK] 元数据: {meta_path}")
 
 
 # ============================================================
@@ -466,18 +466,17 @@ def main():
 
     # 生成 SDF
     sdf_content = generate_sdf(blocks)
-    for out_dir in [OUTPUT_DIR, OUTPUT_DIR_ALT]:
-        os.makedirs(out_dir, exist_ok=True)
-        sdf_path = os.path.join(out_dir, "block_grid_world.sdf")
-        with open(sdf_path, 'w') as f:
-            f.write(sdf_content)
-        print(f"[OK] SDF: {sdf_path}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    sdf_path = os.path.join(OUTPUT_DIR, "block_grid_world.sdf")
+    with open(sdf_path, 'w') as f:
+        f.write(sdf_content)
+    print(f"[OK] SDF: {sdf_path}")
 
     # 输出元数据
     save_metadata(blocks, seed, is_fixed)
 
-    print(f"\n[完成] 启动: ros2 launch yolo_vision sim_detect.launch.py")
-    print(f"       或: gz sim -r yolo_vision/worlds/block_grid_world.sdf")
+    print(f"\n[完成] 启动: ros2 launch yolo_bringup simulation.launch.py world:=block_grid_world.sdf")
+    print(f"       或: gz sim -r {sdf_path}")
 
 
 if __name__ == "__main__":
