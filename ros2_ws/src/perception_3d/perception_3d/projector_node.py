@@ -7,15 +7,22 @@
   /camera/color/camera_info (sensor_msgs/CameraInfo)
 
 发布:
-  /target_3d  (geometry_msgs/PoseStamped) — base_link 坐标系
+  /target_3d  (geometry_msgs/PoseStamped) — target_frame 坐标系（默认 base_link）
 
 工作流程:
-  1. 从 YOLO 检测框中心取出像素坐标 (u, v)
-  2. 在深度图中取邻域中位数作为 Z
-  3. 针孔投影: P_camera = Z * K⁻¹ * [u, v, 1]ᵀ
-  4. 通过 TF 查询 camera→base_link 变换
-  5. 发布 base_link 下的 3D 坐标
+  1. 深度图按 encoding 换算成**米**后存入带时间戳的环形缓冲
+  2. 收到检测 → 按时间戳就近配对深度帧（超过 max_sync_dt 则丢弃并告警）
+  3. 在检测框内多区域采样，取**最近簇**的中位数作为 Z（抗背景平面干扰）
+  4. 针孔投影: P_camera = Z * K⁻¹ * [u, v, 1]ᵀ
+  5. TF: camera_frame → target_frame
+  6. 发布 target_frame 下的 3D 坐标
+
+本文件针对真机（RealSense D435i）修了四处会让链路直接失败的问题，
+每条都在下面各自的代码处以「D1/D2/D8/D33」标注了原因，详见
+docs/RESTRUCTURE_PLAN.md。
 """
+
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
@@ -33,6 +40,18 @@ import tf2_geometry_msgs
 import numpy as np
 
 
+# 深度编码 → 「像素值 × 系数 = 米」。
+# D1: 原实现把深度值**直接当成米**用，且不判断编码。仿真里深度是 32FC1（米），
+#     所以蒙对了；而真机 D435i 的 16UC1 是**毫米**，直接用会放大 1000 倍。
+#     这里按编码换算，两种后端都正确。
+DEPTH_SCALE_BY_ENCODING = {
+    '16UC1': 0.001,   # RealSense D435i 默认深度：毫米
+    'mono16': 0.001,
+    '32FC1': 1.0,     # Gazebo / ros_gz 仿真深度：米
+    '64FC1': 1.0,
+}
+
+
 class Perception3D(Node):
     """2D 检测 → 3D 投影节点"""
 
@@ -41,27 +60,41 @@ class Perception3D(Node):
 
         # ---- 参数 ----
         self.declare_parameter('target_frame', 'base_link')
-        self.declare_parameter('depth_median_window', 5)  # 邻域窗口大小
+        self.declare_parameter('depth_median_window', 5)   # 每个采样点的邻域窗口
+        self.declare_parameter('depth_grid', 5)            # 框内采样网格边长（5 → 5×5）
+        self.declare_parameter('depth_cluster_tol', 0.03)  # 最近簇容差（米）
+        # -1 = 按 msg.encoding 自动判定；显式给值则强制覆盖（单位：米/像素）
+        self.declare_parameter('depth_scale', -1.0)
+        self.declare_parameter('max_sync_dt', 0.1)         # 检测↔深度 最大时间差（秒）
+        self.declare_parameter('depth_buffer_len', 10)     # 深度帧环形缓冲长度
+        self.declare_parameter('tf_required', False)       # True = 查不到 TF 就退出
 
         self.target_frame = self.get_parameter('target_frame').value
         self.median_win = self.get_parameter('depth_median_window').value
+        self.depth_grid = max(1, self.get_parameter('depth_grid').value)
+        self.cluster_tol = self.get_parameter('depth_cluster_tol').value
+        self.depth_scale_param = self.get_parameter('depth_scale').value
+        self.max_sync_dt = self.get_parameter('max_sync_dt').value
+        self.tf_required = self.get_parameter('tf_required').value
 
         # ---- 相机模型 ----
         self.camera_model = PinholeCameraModel()
         self.camera_info_received = False
 
-        # ---- 深度图缓存 ----
-        self.latest_depth = None
+        # ---- 深度缓冲：[(stamp_sec, depth_in_metres), ...] ----
+        # D2: 原实现只存「最新一帧」深度，与检测之间没有任何时间关联；
+        #     改为带时间戳的环形缓冲，按 stamp 就近配对。
+        self.depth_buffer = deque(maxlen=self.get_parameter('depth_buffer_len').value)
+        self.depth_scale = None          # 首次收到深度图时确定
         self.bridge = CvBridge()
 
         # ---- TF ----
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_fail_streak = 0          # D8: 连续失败计数
 
         # ---- 发布者 ----
-        self.target_pub = self.create_publisher(
-            PoseStamped, '/target_3d', 10
-        )
+        self.target_pub = self.create_publisher(PoseStamped, '/target_3d', 10)
 
         # ---- 订阅者 ----
         qos_best_effort = QoSProfile(
@@ -83,8 +116,26 @@ class Perception3D(Node):
             self.detection_callback, 10
         )
 
-        self.get_logger().info('Perception3D node started.')
+        if self.depth_scale_param > 0.0:
+            self.depth_scale = float(self.depth_scale_param)
+            self.get_logger().info(
+                f'深度尺度被参数强制指定为 {self.depth_scale} m/px'
+                f'（自动判定已禁用）'
+            )
 
+        self.get_logger().info(
+            f'Perception3D node started. target_frame={self.target_frame}, '
+            f'max_sync_dt={self.max_sync_dt}s'
+        )
+        # D2: 深度必须与彩色对齐，否则用彩色内参配深度像素会有视差偏差。
+        self.get_logger().info(
+            '提示：真机请确保 realsense2_camera 启动时带 align_depth:=true，'
+            '并订阅**对齐后**的 /camera/depth/image_raw。'
+        )
+
+    # ------------------------------------------------------------------
+    # 相机内参
+    # ------------------------------------------------------------------
     def camera_info_callback(self, msg: CameraInfo):
         """接收相机内参，初始化 PinholeCameraModel。"""
         if not self.camera_info_received:
@@ -95,27 +146,137 @@ class Perception3D(Node):
                 f'fx={self.camera_model.fx():.1f}, '
                 f'fy={self.camera_model.fy():.1f}, '
                 f'cx={self.camera_model.cx():.1f}, '
-                f'cy={self.camera_model.cy():.1f}'
+                f'cy={self.camera_model.cy():.1f}, '
+                f'frame={msg.header.frame_id}'
             )
+
+    # ------------------------------------------------------------------
+    # 深度
+    # ------------------------------------------------------------------
+    def _resolve_depth_scale(self, encoding: str):
+        """按编码确定「像素值 → 米」的系数（D1）。"""
+        if self.depth_scale is not None:
+            return self.depth_scale
+
+        if encoding in DEPTH_SCALE_BY_ENCODING:
+            self.depth_scale = DEPTH_SCALE_BY_ENCODING[encoding]
+            self.get_logger().info(
+                f'深度编码 {encoding} → 尺度 {self.depth_scale} m/px'
+                f'（{"毫米" if self.depth_scale == 0.001 else "米"}）'
+            )
+        else:
+            self.get_logger().error(
+                f'未知深度编码 {encoding!r}，无法确定尺度。'
+                f'请用 depth_scale 参数显式指定（单位：米/像素）。'
+                f'已支持：{sorted(DEPTH_SCALE_BY_ENCODING)}。'
+                f'本帧按「米」处理，结果可能相差 1000 倍。'
+            )
+            self.depth_scale = 1.0
+        return self.depth_scale
 
     def depth_callback(self, msg: Image):
-        """缓存最新深度图。"""
+        """把深度图换算成米后连同时间戳一起入缓冲。"""
         try:
-            # 深度图编码可能是 16UC1 或 32FC1
-            self.latest_depth = self.bridge.imgmsg_to_cv2(
-                msg, desired_encoding='passthrough'
-            )
+            raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         except Exception as e:
             self.get_logger().error(f'Depth conversion failed: {e}')
+            return
 
+        scale = self._resolve_depth_scale(msg.encoding)
+        # 统一在入口换算成 float32 的米，下游不必再关心编码。
+        depth_m = raw.astype(np.float32) * scale
+
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        self.depth_buffer.append((stamp, depth_m))
+
+    def _nearest_depth(self, stamp_sec: float):
+        """取与给定时间戳最接近的深度帧（D2）。
+
+        返回 (depth_m, dt)；缓冲为空时返回 (None, None)。
+        超过 max_sync_dt 由调用方决定是否丢弃。
+        """
+        if not self.depth_buffer:
+            return None, None
+        best = min(self.depth_buffer, key=lambda item: abs(item[0] - stamp_sec))
+        return best[1], abs(best[0] - stamp_sec)
+
+    def _depth_at(self, depth, u: float, v: float):
+        """取 (u,v) 邻域内的有效深度中位数（米），无有效值返回 None。"""
+        h, w = depth.shape[:2]
+        half = self.median_win // 2
+
+        r_min, r_max = max(0, int(v) - half), min(h, int(v) + half + 1)
+        c_min, c_max = max(0, int(u) - half), min(w, int(u) + half + 1)
+        if r_max <= r_min or c_max <= c_min:
+            return None
+
+        patch = depth[r_min:r_max, c_min:c_max]
+        valid = patch[(patch > 0) & np.isfinite(patch)]
+        if valid.size == 0:
+            return None
+        return float(np.median(valid))
+
+    def _robust_depth(self, depth, u: float, v: float, size_x: float, size_y: float):
+        """在检测框内多区域采样，取**最近簇**的中位数（P2-6）。
+
+        俯视场景里物体顶面一定比它身后的桌面更近，所以「最近的一簇」
+        就是物体本身；这样能剔除背景平面点，比单点邻域稳得多。
+        """
+        samples = []
+
+        if size_x > 1.0 and size_y > 1.0:
+            # 在框内 ±60% 半宽内均匀取样，避开框边缘（边缘常混入背景）
+            half_x, half_y = size_x / 2.0 * 0.6, size_y / 2.0 * 0.6
+            n = self.depth_grid
+            for du in np.linspace(-half_x, half_x, n):
+                for dv in np.linspace(-half_y, half_y, n):
+                    d = self._depth_at(depth, u + du, v + dv)
+                    if d is not None:
+                        samples.append(d)
+        else:
+            # 框尺寸缺失（上游没填 size_x/size_y）→ 退回单点邻域
+            d = self._depth_at(depth, u, v)
+            if d is not None:
+                samples.append(d)
+
+        if not samples:
+            return None
+
+        vals = np.sort(np.asarray(samples))
+        nearest = vals[vals <= vals[0] + self.cluster_tol]
+        return float(np.median(nearest))
+
+    # ------------------------------------------------------------------
+    # TF
+    # ------------------------------------------------------------------
+    def _transform_pose(self, pose_stamped: PoseStamped, transform):
+        """PoseStamped 的 TF 变换（D33）。
+
+        D33: 原实现调用 `tf2_geometry_msgs.do_transform_pose(cam_pose, tf)`，
+        但该函数在 Humble 里的签名是 `do_transform_pose(pose: Pose, ...)`——
+        要的是 **Pose**，传 PoseStamped 会抛
+        `AttributeError: 'PoseStamped' object has no attribute 'position'`。
+        而外层的 except 只捕获 TF 三类异常，**AttributeError 会逃出回调**，
+        于是**每次检测都报错、/target_3d 从未被发布过**。
+        这里改用 `do_transform_pose_stamped`（Humble 已提供，专为 PoseStamped）。
+        """
+        if hasattr(tf2_geometry_msgs, 'do_transform_pose_stamped'):
+            return tf2_geometry_msgs.do_transform_pose_stamped(pose_stamped, transform)
+        # 兜底：老版本没有 *_stamped 时，自己拆出 Pose、再装回 header
+        out = PoseStamped()
+        out.pose = tf2_geometry_msgs.do_transform_pose(pose_stamped.pose, transform)
+        out.header = pose_stamped.header
+        return out
+
+    # ------------------------------------------------------------------
+    # 主回调
+    # ------------------------------------------------------------------
     def detection_callback(self, msg: Detection2DArray):
         """收到检测结果 → 投影到 3D → TF 变换 → 发布。"""
         if not self.camera_info_received:
-            self.get_logger().warn('Camera info not yet received, skipping.')
-            return
-
-        if self.latest_depth is None:
-            self.get_logger().warn('No depth image received yet, skipping.')
+            self.get_logger().warn(
+                'Camera info not yet received, skipping.', throttle_duration_sec=5.0
+            )
             return
 
         if len(msg.detections) == 0:
@@ -123,14 +284,34 @@ class Perception3D(Node):
 
         camera_frame = msg.header.frame_id  # e.g. camera_color_optical_frame
         stamp = msg.header.stamp
+        stamp_sec = stamp.sec + stamp.nanosec * 1e-9
+
+        # ---- 配对深度帧（D2）----
+        depth_m, dt = self._nearest_depth(stamp_sec)
+        if depth_m is None:
+            self.get_logger().warn(
+                'No depth image received yet, skipping.', throttle_duration_sec=5.0
+            )
+            return
+
+        if stamp_sec > 0.0 and dt > self.max_sync_dt:
+            # 深度与检测差得太远：宁可不发，也不要发出一个基于错误时刻深度的坐标
+            self.get_logger().warn(
+                f'深度与检测时间差 {dt*1000:.0f} ms 超过 max_sync_dt'
+                f'（{self.max_sync_dt*1000:.0f} ms），丢弃本批检测。',
+                throttle_duration_sec=5.0
+            )
+            return
 
         for detection in msg.detections:
-            # ---- Step 1: 提取检测框中心像素坐标 ----
-            u = detection.bbox.center.x
-            v = detection.bbox.center.y
+            # ---- Step 1: 提取检测框 ----
+            u = detection.bbox.center.position.x
+            v = detection.bbox.center.position.y
+            size_x = detection.bbox.size_x
+            size_y = detection.bbox.size_y
 
-            # ---- Step 2: 取深度邻域中位数 ----
-            depth_val = self._get_median_depth(int(u), int(v))
+            # ---- Step 2: 取稳健深度（最近簇中位数）----
+            depth_val = self._robust_depth(depth_m, u, v, size_x, size_y)
 
             if depth_val is None or depth_val <= 0.0:
                 self.get_logger().debug(
@@ -147,14 +328,12 @@ class Perception3D(Node):
 
             # ---- Step 4: TF 变换 camera_frame → target_frame ----
             try:
-                # 构建相机坐标系下的 Pose
                 cam_pose = PoseStamped()
                 cam_pose.header.stamp = stamp
                 cam_pose.header.frame_id = camera_frame
                 cam_pose.pose.position = Point(x=x, y=y, z=z)
                 cam_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
 
-                # 查询 TF 变换
                 transform = self.tf_buffer.lookup_transform(
                     self.target_frame,
                     camera_frame,
@@ -162,12 +341,12 @@ class Perception3D(Node):
                     timeout=rclpy.duration.Duration(seconds=1.0)
                 )
 
-                # 变换
-                base_pose = tf2_geometry_msgs.do_transform_pose(cam_pose, transform)
+                base_pose = self._transform_pose(cam_pose, transform)
                 base_pose.header.stamp = self.get_clock().now().to_msg()
                 base_pose.header.frame_id = self.target_frame
 
                 self.target_pub.publish(base_pose)
+                self.tf_fail_streak = 0
 
                 class_name = ''
                 if len(detection.results) > 0:
@@ -184,27 +363,22 @@ class Perception3D(Node):
             except (tf2_ros.LookupException,
                     tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException) as e:
-                self.get_logger().warn(f'TF lookup failed: {e}')
+                # D8: 原实现只 warn 一句就 continue——真机上 TF 缺失时**静默失效**，
+                #     表现为「什么都检测不到」，极难定位。改为 ERROR + 可操作提示，
+                #     并用连续失败计数把问题顶到明面上。
+                self.tf_fail_streak += 1
+                self.get_logger().error(
+                    f'TF 查询失败（连续 {self.tf_fail_streak} 次）：{e} | '
+                    f'需要 {self.target_frame} → {camera_frame} 的变换。'
+                    f'真机请先完成手眼标定并发布静态 TF；仿真下由 URDF/SDF 提供。',
+                    throttle_duration_sec=5.0
+                )
+                if self.tf_required:
+                    raise RuntimeError(
+                        f'TF {self.target_frame} → {camera_frame} 不可用，'
+                        f'tf_required=True 故直接失败'
+                    ) from e
                 continue
-
-    def _get_median_depth(self, u: int, v: int) -> float:
-        """取深度图中 (u,v) 邻域的中位数，抗噪声。"""
-        h, w = self.latest_depth.shape[:2]
-        half = self.median_win // 2
-
-        r_min = max(0, v - half)
-        r_max = min(h, v + half + 1)
-        c_min = max(0, u - half)
-        c_max = min(w, u + half + 1)
-
-        patch = self.latest_depth[r_min:r_max, c_min:c_max]
-        # 过滤掉 0 和 NaN
-        valid = patch[(patch > 0) & (~np.isnan(patch))]
-
-        if len(valid) == 0:
-            return None
-
-        return float(np.median(valid))
 
 
 def main(args=None):
