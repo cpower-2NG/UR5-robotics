@@ -200,7 +200,8 @@ yolo_ros/
 
 ## 自检与验收
 
-三个脚本，**层层递进**，都不需要 Gazebo：
+五个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py` 与 `test_real_launch.py`
+连真夹爪、真串口都不需要 —— 前者用一个手写的 Modbus 从站接在 pty 上验）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -208,6 +209,8 @@ source /opt/ros/humble/setup.bash
 python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学
 python3 scripts/test_perception_3d.py    # 感知单元：24 项断言
 python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
+python3 scripts/test_real_launch.py      # launch 参数面：39 项断言
+python3 scripts/test_ag95_probe.py       # AG-95 只读探针：38 项断言（无 pymodbus 时 9 项 SKIP）
 ```
 
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
@@ -239,6 +242,22 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 - 板端只编子集即可，`bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错。
 - 夹爪 = **大寰 AG-95**（Modbus RTU / RS485），是**独立设备**，不在 JTC 关节里。
 - 前置：手眼标定（外参）、AG-95 寄存器映射现场核实、抓取位姿/TCP 偏置按 AG-95 重新推导。
+
+**AG-95 的第一步是只读探测**（在写路径可用之前，先用它把接线/从站号/波特率确认下来）。
+`scripts/ag95_probe.py` **一个字节都不写**，且这条由自检**扫源码**钉住：
+
+```bash
+python3 scripts/ag95_probe.py --frames                    # 不接硬件：看要读哪些寄存器
+python3 scripts/ag95_probe.py --list-ports                # 适配器被认出来了吗
+python3 scripts/ag95_probe.py --port /dev/ttyTHS1 --scan-slaves 1 16   # 从站号是几
+python3 scripts/ag95_probe.py --port /dev/ttyTHS1 --slave 1 --dump    # 读全部候选寄存器
+python3 scripts/ag95_probe.py --port /dev/ttyTHS1 --slave 1 --watch   # 用手掰手指，定千分位方向
+```
+
+`--watch` 是现场**判方向**的那一条：把手指**用手**掰到全开，看 `0x0202` 读到 1000 还是 0
+—— 这就是 `gripper.py` 里 `open_is_high` 那个必填参数的来源，全程一个字节都没写。
+⚠️ 2026-09-27 在板子上实测过 `--frames` / `--list-ports`（能跑，且如实报「没有发现任何串口」，
+与 `lsusb` 无 USB-串口芯片一致）；**`--scan-slaves` / `--dump` / `--watch` 还没有真设备可验**。
 
 详见 [`docs/MIGRATION_HANDOFF.md`](docs/MIGRATION_HANDOFF.md) 与
 [`docs/RESTRUCTURE_PLAN.md`](docs/RESTRUCTURE_PLAN.md)（P4/P5 组）。
