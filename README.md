@@ -228,7 +228,9 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 
 - 部署分层：真机由 `ur_robot_driver` 走 **RTDE（以太网）**，**不装 Gazebo /
   `gz_ros2_control` / `arm_grasp_sim`**（那些是工作站专用）。
-- 板上需补 `ros-humble-moveit`；`torch`/`ultralytics`/RealSense/UR 驱动都已就绪。
+- **MoveIt 板上已经装好**（`ros-humble-moveit-*` 2.5.10，2026-09-27 只读实测）—— **不用再装**。
+  `torch`/`ultralytics`/RealSense/UR 驱动同样就绪。缺的只有 AG-95 侧的 `pymodbus`
+  （⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的 `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
 - 板端只编子集即可，`bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错。
 - 夹爪 = **大寰 AG-95**（Modbus RTU / RS485），是**独立设备**，不在 JTC 关节里。
 - 前置：手眼标定（外参）、AG-95 寄存器映射现场核实、抓取位姿/TCP 偏置按 AG-95 重新推导。
