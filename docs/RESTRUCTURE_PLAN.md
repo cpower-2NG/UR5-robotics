@@ -92,7 +92,7 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 | **D2** ✅**已修** | 同上 `:54, 101-119` | 深度图独立缓存，与 detection 时间戳**无同步**；用彩色 `camera_info` 配**未对齐**的深度像素 | 运动/快速场景下取错深度；color/depth 视差导致偏差。✅ **已修（第六轮）**：改为**带时间戳环形缓冲**（`deque(maxlen=10)`）+ 按 stamp **就近配对**；超 `max_sync_dt`（默认 0.1 s）**丢弃并告警**；启动时提示真机需 `align_depth:=true` 且订阅**对齐后**的深度话题。⚠️ **未采用 `message_filters`**——理由见 §3 P2 小节（会引入新的「静默丢弃」） |
 
 | D3 | `grasp_planner/planner_node.py:76-89, 183-195` | `moveit` 模式恒返回 `False`，`_init_moveit()` 直接置 `moveit_available=False` | 该包**没有任何抓取能力**，只是日志打印 |
-| D4 | `yolo_bringup/worlds/grasping_world.sdf` | 场景内只有 `ground_plane / table / camera_model / red_cube / blue_cube / green_cylinder`，**没有机械臂** | README 宣称的「Gazebo 中复现完整闭环」不成立 |
+| D4 ✅**已修** | `yolo_bringup/worlds/grasping_world.sdf` | 场景内只有 `ground_plane / table / camera_model / red_cube / blue_cube / green_cylinder`，**没有机械臂** | README 宣称的「Gazebo 中复现完整闭环」不成立。<br>✅ **已修（第十三轮，用户授权「改名」）**：`git mv` → **`color_objects_world.sdf`**，文件内 `<world name>` 与 6 个文件共 12 处引用同步改，重建 `yolo_bringup` 并清掉 install 里的旧拷贝，**实测起得来**（40 个服务、6 个模型、无 `[Err]`）。详见第十三轮第二节 |
 | D5 | `ros2_ws/src/` 全局 | 全仓库无 URDF / moveit_config / ros2_control / 夹爪包 | 抓取链路缺全部机器人侧资产 |
 | **D6** ✅**已修** | `pipeline.launch.py:17`、`bringup.launch.py:24,52`、`yolo_detector/launch/detector.launch.py:16`、`detector_node.py:30` | `model` 默认 `'yolov8n.pt'`，而 `detector_node.py` 把这个值**直接传给 `YOLO()`，不做任何路径解析**，于是行为**取决于进程 CWD**：① 仓库根 → 命中 `./yolov8n.pt`（其实是方块模型 A）；② `ros2_ws/` → 命中真 COCO；③ 都没有 → **ultralytics 静默联网下载 COCO**。<br>**🎯 根因（第五轮查明）**：这一切是 `scripts/train_yolo_block.py:143-151` **自己造出来的**——它训练完把新模型 `shutil.copy` **覆盖到仓库根的 `yolov8n.pt`**，并把被覆盖的文件备份为 `yolov8n_backup.pt`。所以方块模型占用了 `yolov8n.pt` 这个名字，真 COCO 反被赶进 `*_backup.pt`。「同名不同物」不是历史意外，是这段代码的**必然产物** | ✅ **已修（P1-3）**：① 检测端默认改为 `block_best.pt`（4 个文件 5 处）；② 删除仓库根 `yolov8n.pt`（内容与 `block_best.pt` **同一 blob** `e917eeaf1`，属纯重复）与 `ros2_ws/yolov8n.pt`（COCO 副本，其**路径本身**就是 CWD 陷阱）；③ COCO 基线改名 `yolov8n_backup.pt` → **`yolov8n_coco.pt`**；④ `train_yolo_block.py` 删掉那段覆盖逻辑，微调起点改为显式 `yolov8n_coco.pt`；⑤ `detector_node.py` 新增 `_resolve_model()`：绝对路径 → `$YOLO_MODEL_DIR` → CWD 及各级父目录 → 包 `models/`，**找不到就报错退出，绝不联网兜底**，并打印类别数、非 1 类时告警 |
 | D7 | `yolo_vision/detector_node.py:98-100` vs `yolo_detector/detector_node.py:125-128` | 前者发布**归一化** bbox，后者发布**像素** bbox，而 `projector_node.py:129-130` 按像素使用 | 两个包**不可混用**，混用则投影全错。当前是潜在陷阱（未触发） |
@@ -738,7 +738,7 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 | `ros2_ws/src/grasp_planner/config/grasp_planner.yaml` | ✅ **新增（第九轮）**：全部参数集中一处；**每个几何量都注明「真机必须现场覆盖」**；`table_min_z` 附坐标系换算说明（世界系与 base 系差 0.80，填错会静默丢弃全部候选） | P3-6 |
 | `ros2_ws/src/grasp_planner/launch/planner.launch.py` | ✅ **已改（第九轮）**：废弃 `mode:=mock\|moveit`（mock 分支只打日志、从不执行，是**误导性死分支**），改为加载 yaml 并暴露 `params_file`/`gripper_backend` | D3 D12 |
 | `ros2_ws/src/arm_grasp_sim/**` | ✅ **新增（第九轮，自附件移植）**：world + UR5+Robotiq 的 URDF/SRDF + `sim.launch.py`。**D34–D39 已修**（构造期改运行期、去 `\|\| true`、去必然失败的 `set_p_gain`、去冗余 `switch_controller`、路径改 `get_package_prefix`、仿真改回 `ExecuteProcess`） | D34 D35 D36 D37 D38 D39 |
-| `ros2_ws/src/yolo_bringup/worlds/grasping_world.sdf` | **改**：要么补机械臂，要么改名去掉 "grasping" | D4 |
+| `ros2_ws/src/yolo_bringup/worlds/color_objects_world.sdf` | ✅ **已改（第十三轮）**：选「改名」而非补机械臂（补臂等于再造一个 `grasp_world.sdf`，而 `arm_grasp_sim` 里已经有一套成套的）。文件 + `<world name>` + 12 处引用全部更新 | D4 |
 | `yolo_vision/**`、`yolo_coco/**` | **删除**——⚠️ 但 `docs/chapter03_yolo_perception.md` 的 §3.4/§3.5 依赖它们，**先处理教材正文与 5 张配图**（§5 问题 9） | D21 |
 | `docs/chapter03_yolo_perception.md` | **改**：§3.3.2/§3.3.3 的 Jazzy 改为 Humble（与附件及 Orin 对齐）；§3.4/§3.5 视问题 9 的选择重写或保留 | D21 D22 |
 | `docs/YOLO_VISION_DESIGN.md` | **改**：全文按 `yolo_vision` 包写（`:230-466` 多处命令与目录树），删包后需重指向 `ros2_ws/src/yolo_detector` | D21 |
@@ -946,7 +946,13 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 | `scripts/demo_pipeline.py` | 收尾打印的 `simulation.launch.py` → `grid_world.launch.py`（**本轮追加**：该文件已删，照抄必报 file not found） |
 | `scripts/generate_grid_world.py` | 同上，收尾打印的死命令一并改掉（**本轮追加**） |
 
-> 未采纳：`move_block.py` 的 world/model/z 修正（Q3 中未勾选）。该问题仍在，见 §5。
+> ~~未采纳：`move_block.py` 的 world/model/z 修正（Q3 中未勾选）。该问题仍在，见 §5。~~
+> ✅ **已在第十三轮补做，且发现它远不止「三个常量」** —— 原来的机制（`set_pose`）在这个
+> gz build 里**完全是空转的**，脚本一次都没真正挪动过方块。已按 `remove`+`create` 重写并
+> 用读回判据验证，见第十三轮第一节（新增 D62/D63）。
+>
+> 另：本表第 1 行 `demo_pipeline.py` 的绝对 `path:` **不是缺陷，是正确设计**（`DATASET_DIR`
+> 运行时算出、注释也解释对了），**先前把它记作「待修」是我的误判，第十三轮已更正**。
 
 **4. README 整体重写（Q4 决定）**
 
@@ -964,7 +970,8 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
   叠加方式，并说明为何删。同节前一处**多余的 ``` 围栏**一并修掉（原先会把
   「### 6.2」整段吞进代码块）。
 
-**本轮遗留（未做，见 §5）**：`move_block.py` 的 world/model/z。
+**本轮遗留（未做，见 §5）**：~~`move_block.py` 的 world/model/z。~~
+→ ✅ **已完成（第十三轮）**，且原判据低估了它（不是常量问题，是机制空转）。
 （原列于此的 Q7 历史改写、Q8 模型 A 确认均已于本轮完成；Q9 板端脚本入 `docs/` 用户已决定纳入，
 但**被"没有板子 IP"阻塞**——待用户提供地址后只读拉取。）
 
@@ -986,10 +993,10 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 > - 「外参是否准」→ **归手眼标定，代码层修不了**（D8 只让失败可见，不产生外参）。仿真里相机外参是我们自己写死的，**真机必须实测**；
 > - 「真机夹爪能否用」→ AG-95 后端**目前是会报错的桩**，现场核实寄存器映射前**不可用**（这是刻意设计，见 `gripper.py`）。
 
-> 📌 **提交状态（2026-09-27，第十一轮末核实）**：
-> `migrate/humble-orin` 已领先 `main` **19 个提交**。第八/九/十/十一轮的全部改动**均已按分组提交**
-> （共 5 组：训练世界启动器 / 删除环境脚手架与死启动器 / 工具类小修 / README 重写 / 文档去陈旧）。
-> **未推送任何东西**（且 `origin` 在历史改写时已被 `git filter-repo` 移除，见下）。
+> 📌 **提交状态（2026-09-27，第十二轮末核实）**：
+> `migrate/humble-orin` 已领先 `main` **22 个提交**（`main` 停在 `0ab13ec`，未被动过）。
+> 第十二轮的改动（W1/W1b/D50–D57/W4 与 3 个新脚本）**尚未提交**，仍在工作区；
+> 按你此前选定的「分组提交」策略，等你确认后再落。**未推送任何东西**，`origin` 仍不存在（见下）。
 >
 > ⚠️ **历史改写后，所有提交哈希已变**。旧哈希仅在备份与 `docs/` 的历史叙述中有意义。
 > 映射：旧 `535b0666e`（第九轮末）→ 新 `a94c79c` 之前的提交；`main` 旧 `f250af11b` → 新哈希见下。
@@ -1038,7 +1045,7 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 > 第八轮（本文档 P3-0/E5 的修订）尚未提交——工作区仅 `docs/RESTRUCTURE_PLAN.md` 一处改动。
 > **按你此前选定的「分组提交」策略，本轮改动等你确认后再落。** 不擅自提交或推送。
 
-**等你的两件事：**
+**等你的事（第十二轮更新）：**
 
 | # | 事项 | 影响 |
 |---|---|---|
@@ -1046,9 +1053,470 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 | 9 | ~~板上六个 `arm-*.sh` 与那份「体检清单」是否纳入 `docs/`~~ ✅ **已完成（第十一轮）** | 用户提供 SSH 后**只读取回**，存入 `docs/board/`：6 个脚本 + **母文档**`机械臂板卡-体检与改造清单.md`（305 行，脚本头部引用的「体检清单 D4」就是它）+ `UR5接入方案.md`。另加 `docs/board/README.md`（来源、sudo 风险、与仓库的关系）与 `docs/JETSON_SSH.md`（连接方式）。全部取回文件已按凭据模式扫描，无密码/私钥/令牌 |
 | **12** | ~~`gz_ros2_control` 放哪~~ ✅ **已定（第十轮）：留外部叠加工作区**（`~/grasp_ws`）。不 vendored、不入库 | **只影响工作站，不影响 Orin**（P4「部署分层」已确认：真机由 `ur_robot_driver` 走 RTDE，**不用 `gz_ros2_control`**）。选外部的理由：避免仓库携带一份第三方源码、避免与 apt 版本混淆；代价是**多一步前置**（README 已写明 `GZ_VERSION=harmonic` 的源码编译步骤）。`launch` 已用 `get_package_prefix` 解耦 |
 | **13** | ~~「方阵世界」要不要恢复启动器~~ ✅ **已定（第十一轮）：恢复轻量启动器** | 新增 `yolo_bringup/launch/grid_world.launch.py`（`gz sim -r` + ros_gz_bridge + 静态 TF，**不含机械臂**），训练链恢复可用。已实测：话题齐全、`camera_info.frame_id` 与常量逐字相同、TF 链正确。顺带复活了孤儿文件 `config/ros_gz_bridge.yaml` |
+| **14** | ✅ **已定（第十二轮）：D61 = 不动它（保持现状）** —— 用户原话「**不动它（保持现状）**」。`scripts/generate_synthetic_data.py` 的 `world_to_pixel` 仍是转置的，但它渲染与标注共用同一函数 ⇒ 图与标签自洽，数据集有效、`block_best.pt` 不必重训 | 按决定执行：**不改投影、不重生成、不重训**。已在两处留下警告：脚本模块 docstring + `world_to_pixel()` docstring（均标明「转置、勿作真机起点、真机走 `auto_label_grid.py`」）与 `README.md` 的「训练数据」一节（两个标注脚本的对照表）。详见下方第十二轮记录第六节 |
 
 **Orin 侧的 P4 剩余项**（P4-1 已证明板子基础很好）：缺 `ros-humble-moveit` 与 `ros-humble-robotiq-description`；`torch`/`ultralytics`/RealSense/UR 驱动**都已就绪**。P4-4（Jetson 版 PyTorch）实际已完成，勿用通用 pip 覆盖。
 
 > ⚠️ **Orin 上不需要、也不要装 `gz_ros2_control` 与任何仿真器**（P4「部署分层」的 c/d 两条已核实）。
 > 第九轮新增的 `arm_grasp_sim` 同理——它是**工作站专用**的仿真资产，板端不参与。
 > 板端唯一要补的是 `ros-humble-moveit`（P5-3 规划验证用）。
+
+---
+
+#### 第十二轮：真机阻塞缺陷修复（W1 / W1b / D50–D57 / W4）—— 仿真已验收（2026-09-27）
+
+**本轮范围**（用户决策 9）：**只做纯代码 + 仿真可验证的部分**。真机 launch（W2）、AG-95 写路径（W3）、
+现场步骤（W5）、板上装包与压内存 —— **均不做**，前置条件见计划书「本轮实际执行清单」。
+完整计划在 `~/.claude/plans/fluttering-gliding-shore.md`。
+
+**改动规模**（`git diff --stat`，不含 3 个新增未跟踪脚本）：
+
+| | |
+|---|---|
+| 已跟踪文件 | 11 个，**+1841 / −275** 行 |
+| `planner_node.py` | 672 → **1503** 行（函数 26 → 47 个）；`.py`/`.yaml` 均已与 `install/` **逐字节一致**（copy install，已 `diff` 核过 7 个文件） |
+| 新增未跟踪脚本 | `scripts/elbow_guard_probe.py`（353 行）、`scripts/test_label_projection.py`（463 行）、`scripts/test_ag95_units.py`（171 行） |
+| `scripts/auto_label_grid.py` | 整体重写，510 行 |
+
+##### 一、逐项改动与证据
+
+| # | 改法 | 证据 |
+|---|---|---|
+| **W1** | 放置从「左摆 90° 松爪」改为**笛卡尔放置区**：新增 `pick_zone`（6 值 3D 区）、`place_slots`（**扁平** `[x,y,...]`，因为 ROS 2 参数**没有嵌套数组**）、`place_z`、`place_release_lift`。终止 = 抓取区空 + 槽位用尽 | 见下「二、三次整跑」 |
+| **W1** | 新增 `carry_objects`（默认 `true`）：`false` = **只做动作演示**，不闭合夹爪、不判空，臂照样走完全程 —— 这就是**决策 7 的「不抓取 demo」开关** | `grasp_planner.yaml:147` |
+| **W1** | 新增 `max_attempts_without_place`（10）与 `idle_finish_timeout`（20 s）两道**无进展兜底**；`_holding` 状态 + 失败恢复路径（D53） | 见下「三」的护栏 run：10/10 → `收工` |
+| **W1** | ⚠️ **故意偏离计划一处**：计划写「`left_drop_joints` 保留为参数默认值」。实际**删掉了**（全仓库只剩 `planner_node.py:66` 的一句历史注释），并同步改掉了启动期长度检查（原检查要求 `home_joints`/`left_drop_joints`/`ik_seed` 都是 6 值，删掉后**必须同步改，否则节点拒绝启动**）。理由：留着就是一个「改了没反应」的第二套路径，正是 D50 的同一类坑 | `grep -rn left_drop_joints ros2_ws/src scripts` |
+| **W1b** | 新增**肘高护栏**：`elbow_guard_enabled`、`fk_service: /compute_fk`、`guard_links: [forearm_link, wrist_1_link]`、`table_plane_z`、`guard_margin: 0.02`。不满足时**换另一分支重解一次**，仍不满足就**放弃该目标、不发轨迹** —— 刻意**不用**「去种子重解」（那正是 D54 的错法） | 见下「三」 |
+| **W1b** | 桌面作为碰撞体发入规划场景：`table_scene_enabled`、`table_box_size/pose`、`table_retry_period`。**默认 `false`** —— 一个默认值不可能同时对上仿真和真机的桌子，而**错的碰撞体比没有更坏**（会把正确解全拒掉，看起来像 IK 坏了）。`false` 时**明确告警**「avoid_collisions 现在只防自碰撞」 | `sim_run3.log`:245「把桌面作为碰撞体发入规划场景：size=[0.8,0.6,0.03] pose=[0.6,0,-0.405,…]」+「桌面碰撞体已进入规划场景 —— avoid_collisions 现在名副其实」 |
+| **W1b/D54** | `arm_grasp_sim/config/kinematics.yaml`：`attempts` 3 → **1**，加 `consistency_limits: [100.0]*6`（关掉 KDL 随机重启），新增 `max_joint_jump: 1.0` 做**对上一路点的关节空间一致性检查**（L∞），取代「`shoulder_pan > 1.40`」那条仿真直觉 | 该 yaml 是 `sim.launch.py:208` 实际使用的那份（计划已核实） |
+| **D50** | `pipeline.launch.py` 真的加载 `grasp_planner.yaml` 了，并新增 `planner_params_file` 参数供现场指向自备 yaml | 见下「四」 |
+| **D51** | `_open_and_reset()` 改成**先回 HOME、再张爪**；带 `_recovering` 自锁防两个回调互相触发；回 HOME 也失败时**不松爪**并停机 | `planner_node.py:1437`；`sim_run2.log`:11210 实测走到这条路径 |
+| **D52** | 轨迹回调改成透传 **`(status, result)`**，要求 `status == STATUS_SUCCEEDED` **且** `result.error_code == 0` | `planner_node.py:121,786`；`test_ag95_units.py` 钉住签名 |
+| **D55** | `goal_time_tolerance` 0 → **2.0 s**（0 是**最严**，不是「关闭检查」；原注释理解是反的） | `sim_run3.log` 起跑打印的放置位 z 随 `approach_clearance` 而变 ⇒ 参数真的在驱动几何 |
+| **D56** | AG-95 的 **mm ↔ 千分**换算：参数面保持 mm，换算只发生在 `_write_position`/`_read_position` 内部，契约写进 docstring | `scripts/test_ag95_units.py` **全部通过**（含「把寄存器原值当毫米会判不出空夹」的 D56 回归，量级差 ≥10×） |
+| **D57** | `block_dataset/data.yaml` 去掉 `path:`；`generate_synthetic_data.py` 的写入端同步改 | 见下「六」，这条同时带出 **D61** |
+| **W4** | `auto_label_grid.py` 重写成 `projector_node.py` 的**严格逆运算**（tf + camera_info），新增单应后端（含可选 `H_top` 两平面精确模式）、`--sim-meta` 适配器、`--draw` 覆盖图 | 见下「五」 |
+
+##### 二、仿真验收：三次整跑（`arm_grasp_sim/full.launch.py`，headless）
+
+启动行（**必须**先 source `~/grasp_ws/install`，`gz_ros2_control` 在外部叠加工作区）：
+
+```bash
+setsid bash -c 'source /opt/ros/humble/setup.bash; source ~/grasp_ws/install/setup.bash;
+  source ros2_ws/install/setup.bash;
+  exec ros2 launch arm_grasp_sim full.launch.py headless:=true'
+```
+
+| run | `table_plane_z` | 结果 | 日志 |
+|---|---|---|---|
+| 3 | −0.390 | **已放置 6/6**，随后正常收工 | `/tmp/sim_run3.log` |
+| 4 | −0.390 | **已放置 6/6**，同样收工（复现） | `/tmp/sim_run4.log` |
+| 护栏 | **−0.100** | **0 次放置、0 条轨迹**，10/10 兜底停机 | `/tmp/sim_guard.log` |
+
+run 3 的终止路径原文（这是 W1 的核心验收点 —— **终止不再依赖「掉到某高度以下」**）：
+
+```
+候选 9 个 | 已放置 0/6 | 已抓 0 个 | 连续未放置 0/10
+候选 8 个 | 已放置 1/6 ...        ← 候选数单调递减，放下去的方块自动不再是候选
+...
+候选 3 个 | 已放置 6/6 | 已抓 6 个 | 连续未放置 0/10
+============================================================
+收工：放置槽位已用尽（6 个）—— 没有地方可放了
+  已成功放置 6 个 / 槽位共 6 个；已抓取记账 7 个
+  ⚠️ 夹爪里可能还夹着一个物体，且已无处可放。请在 HOME 位置人工取走（或补 place_slots 后重启）。
+```
+
+**「落点真的在桌面上」的独立证据**（不靠规划器自述）：run4 收尾时 `projector_node` 仍在发布，
+它把相机看到的场景投影回 `base_link`，最后一批 9 个候选是：
+
+```
+(0.444,0.118) (0.599,0.120) (0.754,0.119)      ← 3 个没被搬走的，恰好在原方阵 y=0.12 那一行
+(0.443,-0.229) (0.599,-0.226→-0.230) (0.754,-0.228/-0.232)   ← 6 个放在 -y 槽位
+(0.444,0.224) (0.599,0.226) (0.754,0.228)                    ← 6 个放在 +y 槽位
+z 全部 = -0.350 = 台面(-0.390) + 方块半高(0.020)
+```
+
+即：**6 个方块确实躺在 `place_slots` 那一排（y=±0.24）的桌面上，z 正好是「桌面 + 半高」**，
+而不是旧设计里的「桌外地上、z 从 0.02 起叠」。未搬走的 3 个与 Gazebo 真值
+`block_r2_*`（`base_link` y=**0.120**）对比，检出值 0.118/0.119/0.120 —— **吻合到 2 mm**，
+顺带给了投影链一个独立的正向验证。
+
+##### 三、肘高护栏的**双向**验证（W1b 的核心，计划里就写明了这个做法）
+
+计划原话：「把 `table_plane_z` 临时设成 **−0.10** … 此时肘朝下的分支应当被护栏拒绝并告警；
+恢复 −0.39 后应正常抓取。**这是不用真机就能证明护栏真的在拦的办法。**」
+
+| 方向 | 观测 | 结论 |
+|---|---|---|
+| `table_plane_z=-0.390`（真值） | run3/run4 各 **0 次**护栏拦下，6/6 放置 | 护栏**不误伤**正确解 ✅ |
+| `table_plane_z=-0.100`（把桌子抬到肘部活动区） | **20 次**`肘高护栏拦下`（10 个目标 × 2 个分支）、**10 次**`两个分支都不满足 → 放弃该目标，不发轨迹`；`下降完成`/`已夹住` **计数 0** ⇒ **一条轨迹都没发出去** | 护栏**真的在拦**，且拦下后**不发运动** ✅ |
+| 同上 | 拦到第 10 次触发兜底：`收工：连续 10 次尝试都没有产生新的成功放置（上限 10）—— 判定为卡住` | 护栏「全拦」的失效模式是**工位停住等人**，不是撞桌或死循环 ✅ |
+
+原文（`/tmp/sim_guard.log`:5026-5048）：
+
+```
+肘高护栏拦下：wrist_1_link 的 z=-0.088 < 台面+余量 -0.080（table_plane_z=-0.100）
+肘高护栏不过，改用「另一分支」种子重解一次 ...
+肘高护栏拦下：forearm_link 的 z=-0.299 < 台面+余量 -0.080（table_plane_z=-0.100）
+两个分支都不满足肘高护栏 —— 放弃该目标，不发轨迹
+```
+
+> 这与计划里 D49 的手算吻合：真机几何下「肘朝下」那一支会落到桌面**以下**。
+> 仿真里把台面抬到 −0.10 就是在**复现真机的那个几何关系**，护栏随即开火 ——
+> 也就是说 D49 在仿真里被**构造出来并当场拦下**了。
+
+**现场工具**：`scripts/elbow_guard_probe.py`（本轮从 `/tmp` 提升入库）。
+它读**运行中规划器自己的参数**（量的是规划器真会发的位姿），只调 `/compute_ik` + `/compute_fk`，
+**不发任何轨迹**；退出码 0 = 可以动、1 = 不要动。两次实跑结论一致：
+正常参数下 `wrist_1_link` 最低 **−0.138**（离仿真台面还有 **+0.232 m** 余量）→ exit 0；
+把 `table_plane_z` 抬到 −0.10 后 → exit 1。这就是 W5 第 4b 步「肘高预检」的工具。
+
+##### 四、D50 的一行验证（**本轮重做**，两方向都干净）
+
+计划要求的验证是「改 yaml 里任一值 → 必须跟着变」。为免歧义，用了一个**只在该 yaml 里出现**的探针值
+`approach_clearance = 0.077`（src 与 install 两份同步改），然后：
+
+| 启动方式 | 读到的 `接近余量` | 判定 |
+|---|---|---|
+| `ros2 run grasp_planner planner_node`（裸跑，不加载 yaml） | **0.05**（`_declare_params` 的硬编码默认值） | yaml **没被读** —— 修之前的行为 |
+| `ros2 launch yolo_bringup pipeline.launch.py camera_source:=sim skip_detector:=true` | **0.077** | yaml **被读了** ✅ |
+
+进程自己的 argv 就是铁证（从 `pgrep -af planner_node` 抄的）：
+
+```
+planner_node --ros-args -r __node:=grasp_planner
+  --params-file .../install/grasp_planner/share/grasp_planner/config/grasp_planner.yaml
+  --params-file /tmp/launch_params_...
+```
+
+派生值也跟着变了（`放置下降位 tool0 z` 不变，但 `接近位 z` 由 −0.155 变到 **−0.133**），
+说明这股参数已经接进几何计算，不是只打印出来好看。
+
+> ⚠️ 重做原因：本轮早先存下的 `/tmp/d50_launch.log` **不足以证明它走的是 `pipeline.launch.py`**
+> （该 log 里只起了 `planner_node` 一个进程，而 `pipeline.launch.py` 还会起 `projector_node`；
+> `planner.launch.py` 在修之前**本来就**加载 yaml，所以那个 log 证不了 D50）。
+> 上面这一次是干净可复现的。
+
+##### 五、W4：标注器重写与自检
+
+`scripts/auto_label_grid.py` 现在是 `projector_node.py` 投影链的**严格逆运算**（先前那版
+`world_to_pixel()` **连旋转参数都没有**，见计划 W4 一节的说明）。三个要点：
+
+1. **拟合**：`project_pinhole` 丢弃 `Z_c ≤ 0` 的点；`TfProjector.to_camera` 用 `R.T @ (p − t)`；
+   相机光心位置就是外参的 `t` 本身（**不是** `R.T @ (−t)` —— 那是最难发现的一类错，见自检第 5 节）。
+2. **单应后端有两档**：只给 `H`（零厚度近似，docstring 里量化了误差 ≈ 块高/相机高 × 离光心距离，
+   ~11 px @ r=250、~18 px 在画面角）；给 `H_top` 则**取底面∪顶面的凸包**，
+   对一个凸立方体这是**精确**轮廓，与 tf 后端一致到 **2.6e-11 px**。
+3. `--sim-meta` 把仿真也走同一套 tf 代码（相机位姿当已知外参写进去），
+   于是仿真成为共用数学的一次执行，而不是一条旁路。
+
+`scripts/test_label_projection.py`（新，5 节 27 项检查）**全部通过，退出码 0**：
+
+| 节 | 关键结果 |
+|---|---|
+| 1 往返恒等 | 2000 组随机内参/像素/深度，最大误差 **1.137e-13 px**；含 `fx≠fy` |
+| 2 旧写法的转置被钉住 | `u_true = cx+cy−v_old`、`v_true = cx+cy−u_old`，500 点最大偏差 **2.842e-13 px**；`det(R)=+1`；旧写法**位置**偏差最大 **1233 px**（不是几像素），但**尺寸**几乎相同（58.3 vs 58.3 px）—— 这正是「框看着挺对」掩盖位置全错的原因；真投影下 0.8×0.6 桌面 `v ∈ [−62,542]` **出画**，旧渲染 `v ∈ [14,466]` 装得下 |
+| 3 退化 | 相机背后的点丢弃、方块在相机背后返回 `None`（不是横跨画面的巨框）、越界框裁剪、空集不除零 |
+| 4 单应 vs tf | 500 点一致 **2.109e-11 px**；给 `H_top` 后整立方体一致 **2.589e-11 px**；只给 `H` 时偏差最大 **14.9 px**（与 docstring 声明的边缘误差相符，**故意**断言它偏，而不是假装精确） |
+| 5 仿真回归 | 9 个框全在画面内；正中方块宽 **31.91 px = 0.04·fx/顶面距离**（解析吻合）；尺寸随离轴有 **13.6~19.1%** 的自然变化；框中心经正向链解回 `base_link` 误差 **3.331e-16 m** |
+
+端到端（真机形态的 fixture：`/camera/color/camera_info` 内参 + 手眼外参 + ArUco 单应 + 已知方块）：
+
+| 路径 | 输出 |
+|---|---|
+| 手眼 tf | `0 0.500000 0.006230 0.040280 0.012460` / `0 0.253395 0.105552 0.050574 0.070416` |
+| ArUco 单应（只给 `H`） | `0 0.500000 0.006230 0.038490 0.012460` / `0 0.259438 0.115100 0.038490 0.051320` |
+
+**正轴那个方块两条独立路径逐位相同**；离轴方块上的差异（4.4% 宽；高度差更多）
+是**已声明的零厚度近似**——单应看不见侧面，tf 看得见。要精确就上 `H_top`（第 4 节已证明一致到 2.6e-11 px）。
+仿真回归的 3 帧（`--sim-meta` + `--draw`）落在 `/tmp/lbl_test/`、覆盖图在 `/tmp/lbl_check/`。
+
+##### 六、🐛 D61（新发现，**需要你定**）：合成数据生成器用的是**同一个有 bug 的投影**
+
+**这条不在计划里**，是收尾核 W4 时发现的，而且它比 W4 本身更要紧：
+
+`scripts/generate_synthetic_data.py`（`block_dataset/` 的**真正生成者**，40 个种子 × 5 张 = 200 张、
+实际入库 128 张）里有一份**自己的、同样没有旋转的** `world_to_pixel`（`:61-69`），
+而且它**同时用于渲染和标注**：
+
+| 用途 | 行 | 调用 |
+|---|---|---|
+| 渲染桌面多边形 | `:115` | `world_to_pixel(table_corners)` → `cv2.fillPoly` |
+| 渲染方块顶面 | `:135` | `world_to_pixel(top_corners)` → `cv2.fillPoly` |
+| **生成标签** | `:80`（`compute_bbox`） | `world_to_pixel(8 个角)` → YOLO bbox |
+
+**后果要分两半说清**：
+
+- ✅ **数据集本身是有效的、`block_best.pt` 也不该重训。** 因为图与标签用的是**同一个**函数，
+  两者**互相自洽**；而「棕色桌面上一个彩色方块」是位置无关的，
+  仿真三次整跑的检测（9/9、分数 0.68~0.94）已经证明它工作。**几何被转置了，但一致性没坏。**
+- ⚠️ **但几何是错的**，一旦有人想「用这套 meta 复现/扩充数据集」或者把这份 `world_to_pixel`
+  当成真机的起点，就会撞上 W4 那一整节。**修它 = 重新生成全部图像 = 现有 128 张数据集与
+  已训练权重全部作废。** 所以我没动它，只把 `data.yaml` 的 `path:`（D57）改了。
+
+**要不要修，取决于你的取向**：① 只留作历史、不动（当前状态）；② 修渲染器并重生成 + 重训
+（数据集更正确，但要重训、且要重新验证 9/9）；③ 把渲染器改成调用 `auto_label_grid.py` 的共享数学，
+让「图」和「标签」永远不可能再走两套数学（改动最大，但根治）。
+
+> ✅ **你的决定：①「不动它（保持现状）」。** 已按此执行 —— **投影一行没改、数据集没重生成、
+> 权重没重训**。作为补偿，把「它是转置的」这件事**显式写进了三个地方**，免得下一个人
+> 把它当通用投影用：脚本模块 docstring、`world_to_pixel()` 自己的 docstring、
+> 以及 `README.md` 的训练数据一节（两个标注脚本的对照表，指明真机走
+> `scripts/auto_label_grid.py` + `scripts/collect_training_data.py`）。
+
+##### 七、仍**未**验证 / 本轮不做（别当成已完成）
+
+- ⚠️ **W4 的「真机数据集」一步都没在真机上做过**。上面全是**仿真 + 构造的 fixture**。
+  真机要的东西（手眼外参、`camera_info`、台面网格实测）本轮都不具备，W4 只交付了**工具与数学**。
+- ⚠️ **第一个真机 demo 还没有**。本轮做出的是它的**全部前置代码与仿真验收**；
+  W2（真机 launch：UR 驱动 + MoveIt + 相机 TF，含 D59 `launch_rviz/launch_servo:=false`、
+  `ik_group:=ur_manipulator`、`trajectory_action:=/scaled_joint_trajectory_controller/...`、
+  `max_sync_dt` 放宽、示教器 TCP/负载）与 W3、W5 一行未动。
+- ⚠️ **AG-95 写路径没实现**，`ag95_dry_run` 骨架只做了只读探测 + 单位契约。
+  **闸门仍是**：只读通链路 → 夹爪**拆下臂**放工作台、急停在手边 → 才允许 `ag95_dry_run=false`。
+- **`_grasped_positions` 保留**（计划 W1 第 7 点的结论：别删，它防的是「同一位置又冒出检测框」）。
+- 板端装包与压内存（`ros-humble-moveit`、停 ollama、`pymodbus`、`dialout` 组、
+  `arm-cleanup-sudo.sh` 的 ufw 陷阱）**一项没执行**（需 sudo / 逐项授权）。
+- 先前登记的小项：**第十三轮清掉三项** —— ✅ `move_block.py`（机制重写，D62/D63）、
+  ✅ `yolo_bringup/worlds/grasping_world.sdf`（D4 改名 `color_objects_world.sdf`）、
+  ✅ `demo_pipeline.py` 的绝对 `path:`（**结论是「不是缺陷」，撤销登记**，理由见第十三轮第四节）。
+  **仍在**：AG-95 的 URDF 连杆、
+  `arm_grasp_sim/config/kinematics.yaml` 里那句关于 `full.launch.py` 覆盖 `gripper_backend` 的旧注释、
+  W2/W3 的两个 `test_*`。
+- **未提交、未推送**：`migrate/humble-orin` 仍是本地分支带未提交改动，`main` 未被动过。
+
+##### 八、状态复位（免得下次踩自己的雷）
+
+- `table_plane_z` 已由 −0.10 **复位到 −0.390**（护栏 run 结束后），并核过 `src` 与 `install` 两份。
+- `approach_clearance` 的 D50 探针值 0.077 已 **复位到 0.05**，两份文件 `diff` 为空。
+- 仿真进程**全部清干净**（`ps` 计数 0）。⚠️ **但清场本身有个坑，下次别信 `pkill -f <launch>`**：
+  本轮收尾时发现 **4 个孤儿 `projector_node` + 3 个孤儿 `detector_node`**，全是前几次整跑的残留。
+  `kill` 掉 launch 父进程后，子进程被 **WSL 的 `/init`（pid 3832）** 收为孤儿并**继续跑**——
+  `detector_node` 尤其要紧：它**在 CPU 上一直跑 YOLO 推理**（日志里 `device='cuda:0' 不可用`），
+  白烧算力还会让下一次拉起的检测看起来「莫名其妙地慢」。
+  **清场判据要看进程名，不是看 launch 还在不在**：
+  ```bash
+  ps -eo pid,args --no-headers | grep -E "projector_node|planner_node|detector_node|gz sim|move_group"
+  ```
+  （本轮最终 `ps` 计数 0。另注：仿真侧 `detector_node` 报 `cuda:0 不可用：torch 未安装`
+  是因为**纯 ROS 环境**的 PYTHONPATH 里没有 venv —— 这是**预期**的，仿真跑在 CPU 上足够。）
+
+##### 九、⚠️ 收尾时的一次自伤事故：`--help` 清空数据集 —— **发生了两次，第二次是我自己加的防护坏了**
+
+这一节的目的是让下一个人**不必再踩**，不是自责。两次都是我自己造成的，两次都已完全恢复，
+但第二次的教训比第一次值钱得多。
+
+**第一次：`--help` 会干活。** 为核对刚改完 docstring 的脚本还能否正常解析，我给
+`scripts/generate_synthetic_data.py` 传了 `--help`。**当时该脚本没有 argparse**，
+`main()` 第一件事就是**无条件** `shutil.rmtree` 四个输出目录，于是这个「只想看看用法」的调用
+**立刻清空数据集并开始重生成**；管道里的 `| head -5` 在约 5 个种子后把它 SIGPIPE 掉，所以残在一半。
+损失：**284 个文件被删、19 个被改、24 个新未跟踪**，且 `block_grid_world.sdf` 与
+`block_grid_world_meta.json` 被随机种子覆写（`fixed_mode` 由 True 变 False、形状由 box 变 cylinder）。
+
+恢复路径（**值得记住的是那一步被拒绝**）：auto 模式分类器**拒绝**了我第一条整体清理命令
+（`git clean -f block_dataset/` + `git checkout -- block_dataset/`），理由是「不可逆的本地删除，
+需用户点名 `block_dataset` 或只回退**已核实的本会话路径**」——**这个拒绝是对的**，整体清理会连
+我有意做的 D57 改动一起抹掉。于是改为逐路径：从 `git status` 构造精确的 D/M 清单
+（**显式排除我有意改的 `block_dataset/data.yaml`**），逐条确认存在于 HEAD，再
+`xargs -a <清单> git checkout --`；随后按精确路径删掉 24 个残留；两份世界文件单独回退。
+校验：`git status` 只剩 `M block_dataset/data.yaml`；train 128/128、val 32/32 图与标签**成对**；
+权重（`runs/block_detect/weights/best.pt`、`yolo_detector/models/block_best.pt`）未被动过。
+根因修复：给它加 argparse + `--force` 门槛。
+
+**第二次（更要紧）：那道防护自己是坏的，于是数据集又被清了一次。**
+判据我写成了 `out.glob("*/*/images/*.jpg")` —— 这个模式比真实布局
+`out/train/images/*.jpg` **多要求一层同名目录**，于是**恒等于 0**。
+**防护一次都没拦过**：其后一次不加参数的普通运行照样清空重建，这次 **339 条改动
+（64 D / 131 M / 144 ??）**，同样逐路径救回，数据集回到 128/128 + 32/32、世界文件回到
+`seed 824517619 / fixed_mode True / 9 blocks`。
+
+**为什么没早发现 —— 这是本节的核心：我只用 `--help` 验证了「修好了」。**
+而 `--help` 在 argparse 内部就 `sys.exit(0)`，**根本走不到那道判据**。
+换句话说，我测的是「命令能不能跑」，不是「它该不该拦」。
+修完判据后又在实测中抓出第二个毛病：`if __name__ == "__main__": main()` **把返回值丢了**，
+于是「拒绝执行」也以 **0** 退出，调用方分不出「干活了」与「我拒绝干活」——已改为 `sys.exit(main())`。
+
+**现在的防护，以及它**实测过的**四种场景**：
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| 数据集非空、不加 `--force` | 拒绝 + **退出码 2** | ✋ 打印「已有 160 张图 / 160 个标签」+ 退出码 2 ✅ |
+| `--help` | 用法 + 退出码 0 | ✅ |
+| `--dry-run` | 只说明、不删不写 + 退出码 0 | ✅ |
+| `--force --out /tmp/gt` | **只动沙盒** | 沙盒被清空重建，真实 `block_dataset` **160 张逐字节未变** ✅ |
+
+顺带修掉同类的三项（都是「参数解析了却没接进代码」，与 **D50** 同一个病）：
+四个输出目录改为**从 `--out` 派生**（原先硬用模块常量 `TRAIN_IMG/...`：`--out /tmp/foo`
+会被忽略，**报告的是 A、删的却是 B**）；`--seeds` / `--per-seed` 真正接进循环（原先解析了没人用，
+`--seeds 5` 照样生成 40 个场景）；删掉 `TRAIN_IMG` 等已成死代码的重复常量。
+判据本身改为 `rglob("*.jpg")` + `rglob("*.txt")`：**与深度无关**，且**图或标签任一边残留即算非空**。
+
+> 📌 **写给下一轮的一句话**：**防护必须测「它该拦的那个场景」，不是测「命令能不能跑」。**
+> 并且这一轮「参数解析了但没接进代码」共出现三次（D50 的 yaml、`--seeds`、`--out`），
+> 看到 `add_argument` 就要顺手确认它**真的被用到了**。
+
+**相关坑：`generate_grid_world.py` 的输出目录 —— ✅ 已修（用户授权「现在就修」）。**
+它原先的 `OUTPUT_DIR` 是**硬编码常量**（`:68`，无 `--out`），**无条件**写
+`block_grid_world.sdf` 与 `block_grid_world_meta.json`。所以**即使只想往别处生成数据**
+（`--out /tmp/...`），草稿也会打到仓库里这两个被跟踪的世界文件上 —— 实测确认过
+（`--force --out /tmp/gt` 之后这两个文件仍变成 `M`，已回退）。**这正是前两次事故里
+「顺手覆写了跟踪文件」那一半的来源。**
+
+修法：`generate_grid_world.py` 新增 `--out-dir`（默认值**不变**，向后兼容；
+`save_metadata()` 同步加 `out_dir=` 形参）；`generate_synthetic_data.py` 把它 40 次生成
+全部指向 `tempfile.mkdtemp()` 的临时目录（`atexit` 自动清理，不给生成循环加缩进），
+并且**开始检查子进程退出码** —— 原先不看返回值，生成器一旦失败就会去读上一次的残留
+meta，于是「用 A 场景的方块位姿标注 B 场景的图」而毫无报错。
+
+实测证据（`scripts/generate_synthetic_data.py --force --out /tmp/gt2 --seeds 2 --per-seed 2`）：
+
+| 判据 | 修之前 | 修之后 |
+|---|---|---|
+| `git status --porcelain .../worlds/` | 两个文件变 `M` | **空**（一行不动）✅ |
+| 临时草稿目录 | 无（直接写仓库） | `/tmp/synth_world_3eybo8vw`，结束**自动删除**，无残留 ✅ |
+| 真实 `block_dataset/` | 不受影响 | 不受影响（160 张） ✅ |
+
+另外验过**产出没被这次改动弄坏**（`--seeds 5 --per-seed 2`，8 个标签文件）：
+每文件框数 **min=9 max=9 mean=9.0**、空文件 **0**、格式非法行 **0** ——
+与 HEAD 里那 128 个参照文件的分布**完全一致**。
+前提也验过：生成器失败时**确实**非零退出（未知参数 → 退出码 2），
+所以那道 `returncode` 检查不是摆设。
+
+---
+
+#### 第十三轮：登记在案的遗留项清理（`move_block.py` 机制重写 / D4 改名 / 注释修正）（2026-09-27）
+
+##### 一、`move_block.py`：不是「改三个常量」，是**原来一次都没挪动过方块**
+
+登记时这一项写的是「`move_block.py` 的 world/模型/z 修正」，读起来像是补几个常量。动手后
+才发现**整个机制是假的**，而且假了**两层**：
+
+| # | 缺陷 | 实测证据 |
+|---|---|---|
+| **D62** | `/world/<w>/set_pose` 在此 build（gz sim 8.15.0 / Harmonic）**空转**：接受合法 `gz.msgs.Pose`、**无条件回 `data: true`**、然后什么都不做 | 8 行矩阵：`set_pose`（name / id / 两者 / vector / 对 `table` / 显式 `pause:false` 后 / 对**不存在**的模型）全部回 `data: true` 且**位姿一律不变**；同 build 的 `create` / `remove` 对照组则真的生效。`gz service -i -s` 确认请求类型确实是 `gz.msgs.Pose`，非法 `--req` 会被 protobuf 拒、不存在的服务会超时 —— **不是调用写错了** |
+| **D63** | gz CLI 的**应答层与读取层都不可信**，三条独立的：<br>(a) `create` **失败也回 `data: true`**；<br>(b) `create` 要求 SDF 包在 `<sdf>` 根元素里，裸 `<model>…</model>` 被 sdformat 拒；<br>(c) `gz model -m X -p` **约 10% 的调用假失败** | 见下方两张表 |
+
+**D63(a)(b) 四形态实测**（判据是 `gz model -m <名> -p` 能否读回，**不是**服务应答）：
+
+| 送的 SDF | 应答 | 模型真的建出来？ |
+|---|---|---|
+| 裸 `<model name="t">…</model>` | `true` | **否** |
+| **`<sdf version="…"><model …></model></sdf>`** | `true` | **是** ✅ |
+| 裸 `<model>` 最简（只有一个 `<link/>`） | `true` | 否 |
+| 裸 `<model>` 带真实换行 | `false` | 否（proto text 解析就挂了） |
+
+服务端日志才是真相（`UserCommands.cc:927`）：
+`Error Code 40: XML does not seem to be an SDFormat or an URDF string` /
+`Error Code 30: Unable to read SDF string: <model name="block_0">…`。
+版本号不写死，从世界文件头读（现为 `1.11`）。
+
+**D63(c) 实测**（连续 30 次读同一个方块）：
+
+```
+第 15/18/25 次失败：rc=0 用时 5.23s
+Service call to [/gazebo/worlds] timed out
+Command failed when trying to get the world name of the running simulation.
+失败 3/30；耗时 min=0.67s max=5.24s 均值=1.19s
+```
+
+`gz model` 每次都要先做一次世界发现，那一步会偶发超时，**而退出码仍是 0**。
+后果不是「报错」，是**报错报错了对象**：`--random` 有一轮把两块写成「✗ 世界里没有这个模型」，
+而它俩好端端地待在世界里没动过。服务端同时刷屏
+`NodeShared::RecvSrvRequest() error sending response: Host unreachable` ——
+每次调 `gz` 都是一个**短命进程**，它一退出服务端回包就没人收。这解释了假失败的来源。
+
+**这三条我自己各踩了一次，都不是推演出来的：**
+
+1. **我给它加的预检，染上了它本该防住的病。** `remove`+`create` 中间有真空期（create 一失败
+   方块就没了），所以我在**高处先建一个探针**、建得出来才动真的。可那版探针是拿
+   `data: true` 判的 —— **探针假通过**，正式那块照旧被删掉没建回来，`block_0` 从世界里消失。
+   判据现已全部换成 `read_pose()` 读回，`create_model()` / `remove_model()` 都自带重试。
+2. **我的量具报了一次假警报。** `create` 出来的模型把**世界位姿记在 link 级**、模型级是缺省的
+   `0 0 0`；而原生方块记在模型级。两种写法**世界位姿相同**，我只读模型级就误判「位姿变成 0」。
+   量具已改成**位姿走 `gz model -p`、材质/几何才走 SDF 读回**。
+3. **我用了一个脆弱的判空方式，让脚本平静地报错。** `list_models()` 第一版写的是
+   「输出里没有 `timed out` 就当真空」，于是碰到没见过的失败就**回报一张空表**，
+   脚本继而打印「这个世界里没有 `block_*` 模型」并退出 —— 实测撞上过一次，
+   当时**世界活着、9 块齐全**。现在只有读到 `No model named <X> was found`（实测原文）
+   才算「确定没有」，**其余一律算不确定、交给重试**。教训：**「没有」必须是正面识别出来的，
+   不能靠「没看见某个错误字样」推断。**
+
+**另有一个我自己引入、又自己发现的缺陷（已修）**：`--seed` 原先**只复现「抽签序列」，
+复现不了「谁拿到哪一签」** —— `blocks` 取自 `list_models()` 给出的世界内部顺序，而方块每被
+`remove`+`create` 一次就跑到列表末尾。实测两遍 `--random --seed 1` 抽出的 9 组坐标一模一样、
+对应到方块名却全变了。现已按名字排序（`block_0..8` 升序）后再抽签。
+
+**改完后的实测矩阵**（全部通过）：
+
+| 测试 | 结果 |
+|---|---|
+| `--list` | 12 个模型、真名、真位姿（不再硬编码 `block_r0_c0`） |
+| 不存在的模型 `block_99` | `✗ 世界里没有这个模型`、退出码 **1**、3.8 s |
+| `--restore block_0`（新增的恢复路径） | 建回 `(0.34, −0.12, 0.785)`，与基准**逐项一致** |
+| 单块移动 `block_0 → (0.30, 0.20)` | 位姿由 `gz model -p` **独立读回** = `(0.300, 0.200, 0.785)`；ambient 与移动前**逐字节相同**；几何 `box:0.04³` 不变；**无 `__preflight_*` 残留** |
+| `--random --seed 1` 连跑两遍 | **9/9** 两遍、逐字节一致（含「哪个方块去哪」） |
+| 材质保全（含 **block_4 是圆柱**） | 9 块 ambient + 几何全部与基准一致；`block_4` 仍是 `cylinder:0.04`、`0.15 0.15 0.85` |
+| 落点 | 9 块全在桌面内（`x∈[0.16,0.84]`、`y∈[−0.24,0.24]`、`z=0.785`） |
+
+材质这一列是**真读回来的**，不是推断：通道是
+`/world/<w>/generate_world_sdf`（`gz.msgs.SdfGeneratorConfig` → `gz.msgs.StringMsg`），
+实测它返回**当前已加载**世界的 SDF，`create` 出来的模型也在里面。
+（对照：`/world/<w>/state` 只回 `SerializedStepMap`（位姿，无材质）；`gz model -l` 也不打材质。）
+
+> ⚠️ **D62/D63 是仿真工具链的缺陷，不影响 Orin 真机那条路**（真机不跑 `move_block.py`）。
+> 它们的价值在于：**「服务回了 true」在这个环境里从来不是证据。**
+
+##### 二、D4：`grasping_world.sdf` 改名（用户授权「改名（推荐）」）
+
+事实：该文件 `grep -c '<joint'` = **0**，无机械臂，内容只是 `ground_plane / table /
+camera_model / red_cube / blue_cube / green_cylinder`；真正的抓取仿真世界是
+`arm_grasp_sim/worlds/grasp_world.sdf`（UR5 + 控制器，成套）。它**没有被任何 launch 当默认值**。
+
+已做：`git mv` → **`color_objects_world.sdf`**（保历史），**文件内的 `<world name>` 同步改**
+（世界名同时是 gz 的话题/服务前缀，只改文件名会留下半截不一致）；6 个文件共 12 处引用全部更新
+（`grid_world.launch.py` / `README.md` / `GRID_ENV_DESIGN.md` / `YOLO_VISION_DESIGN.md` /
+`TECHNICAL_SPEC.md` / `ros_gz_bridge.yaml`）。
+
+两处**容易漏掉、差点漏掉**的：
+
+- **install 是拷贝安装**，而 `grid_world.launch.py:68` 是从**包的 share 目录**解析 world 的 ——
+  光改 `src/` 的话，`world:=color_objects_world.sdf` 在重建前**根本不存在**。
+  已 `colcon build --packages-select yolo_bringup`（纯 ROS 环境、无 `--symlink-install`，
+  1.27 s 通过），并**手工删掉 install 里 colcon 不会自动清理的旧 `grasping_world.sdf`**；
+  之后 `diff -rq src install` 只剩 `block_grid_world_meta.json`（它**本来就没被安装**，与本次无关）。
+- 验证不是「文件在」，是**真起了一次**：headless 启动后 `world/color_objects_world` 前缀下
+  **40 个服务**、模型 `ground_plane table camera_model red_cube blue_cube green_cylinder`
+  齐 6 个、启动日志无 `[Err]`。
+
+**顺带修掉一处会烂的引用**：`grid_world.launch.py` 原用行号引用
+（`grasping_world.sdf:181-184`），而我往文件头加了几行注释就让它失效了（实为 185-188）。
+已改为**可 grep 的锚点**并写明「故意不写行号」。
+
+> 📌 **读本台账时注意**：上面历史轮次里出现的 `grasping_world.sdf`（D1/D19/D31 的证据引用、
+> 第七/十轮的验证记录）**指的都是同一个文件**，即现在的 `color_objects_world.sdf`；
+> 那些引用**故意不回改** —— 它们是当时的事实记录。全仓库现在已无 `grasping_world` 的实际引用，
+> 只剩本台账的历史条目和 SDF 头部那句「原先叫什么」。
+
+##### 三、两处注释修正
+
+- **`block_dataset/data.yaml` 第 2 行原本指向它自己**（「理由见 `block_dataset/data.yaml`
+  顶部注释」—— 可它就在那个文件顶部，等于没说）。改为指向真正的出处
+  （`generate_synthetic_data.py` 里 `# 写 data.yaml` 那段），且**生成器里的字面量与签入文件同步改**，
+  随后用脚本比对确认二者**逐字节一致**（否则下次生成又漂开）。
+- 上面 D4 提到的行号引用。
+
+##### 四、澄清：`demo_pipeline.py` 的绝对 `path:` **不是** bug（更正我此前的登记）
+
+先前把它记作「D57 同族」，**这是我的误判**：`DATASET_DIR` 是运行时按 `__file__` 算出来的
+（`scripts/demo_pipeline.py:259-278`），仓库搬到哪都对；且该处注释**正确地说清**了
+「相对 `path:` 会被 ultralytics 按 `DATASETS_DIR` 解析、而不是按 yaml 所在目录」这一层，
+所以写绝对路径是有理由的选择。**不改。** 登记里这一项就此撤销。
+
+##### 五、状态复位（免得下次踩自己的雷）
+
+- 所有 gz 进程已收：`block_grid_world` 与 `color_objects_world` 各 0 个服务，
+  `pgrep` 无残留，`ps` 无 reparent 到 1 的孤儿。
+- ⚠️ **`gz sim` 在本环境不吃 SIGTERM**，实测要 `kill -9`；
+  且 `pgrep -f "<模式串>"` 会**匹配到调用它的那条 shell 自己** —— 我又踩了一次，
+  循环把自己杀了（退出码 **144**）。查进程用字符类（`[g]z sim`）或直接按 PID。
+- 仍然**没有推送**：`migrate/humble-orin` 在本地，`main` 未动。
