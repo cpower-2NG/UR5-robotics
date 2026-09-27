@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""`scripts/ag95_probe.py` 的自检（离线，不需要真夹爪、不需要 Gazebo、不需要 colcon build）。
+
+为什么这个自检里最重的一段是「扫源码」而不是「跑功能」
+========================================================
+这个探针是**现场第一个接触真夹爪的东西**，而它能造成的最大伤害不是「读不到」，
+而是「偷偷写了一个寄存器」—— 夹爪会当场动起来，而现场的人以为它只是只读的。
+
+所以本文件用三段不同性质的手段钉住「只读」这一条，**从强到弱**：
+
+1. **扫源码找写调用**（结构性、最强）：源码里出现 `write_register` / `write_coils`
+   等任何写 API 就是 FAIL。这条不依赖我的记性 —— 以后谁加了写路径都会被拦下。
+2. **pty 回环**：用一个**手写的**最小 Modbus RTU 从站（`_RtuSlave`，只用
+   `os.read`/`os.write` + 自己算的 CRC，**不依赖 pymodbus**）接上真实串口设备节点，
+   让探针的 `--scan-slaves` / `--dump` 真的跑一遍。被测的是探针，从站是量具。
+   顺带覆盖了三个真机上最容易翻车的分支：**地址不是我的就静默**（表现为超时）、
+   **非法地址回异常码**、**FC3 与 FC4 都要试**。
+3. **换算不重复实现**：断言探针里的 `permille_to_mm` **就是**
+   `grasp_planner.gripper` 里那一个对象（`is` 比较）。两份换算迟早会分叉。
+
+⚠️ 第 2 段需要 `pymodbus`；没装时报 **SKIP 并打印原因**（不算 PASS）。板上装了
+就能全跑。第 3 段需要 ROS 环境（`gripper.py` 会 import `sensor_msgs`），同理处理。
+
+用法：`python3 scripts/test_ag95_probe.py`（建议先 `source /opt/ros/humble/setup.bash`）
+"""
+
+import fcntl
+import importlib.util
+import io
+import os
+import pty
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from contextlib import redirect_stdout
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+PROBE_PATH = REPO / "scripts" / "ag95_probe.py"
+YAML_PATH = (REPO / "ros2_ws" / "src" / "grasp_planner" / "config"
+             / "grasp_planner.yaml")
+
+PASS = SKIP = FAIL = 0
+FAILURES = []
+PROBE = None                      # 由 main() 装载（见 load_probe）
+
+
+def check(name, cond, detail="", *, skip=False):
+    global PASS, SKIP, FAIL
+    if skip:
+        SKIP += 1
+        print(f"  SKIP  {name}" + (f"  —— {detail}" if detail else ""))
+        return
+    if cond:
+        PASS += 1
+        print(f"  PASS  {name}")
+    else:
+        FAIL += 1
+        FAILURES.append(name)
+        print(f"  FAIL  {name}" + (f"  —— {detail}" if detail else ""))
+
+
+def load_probe():
+    """按路径加载探针模块（`scripts/` 不是包，只能这么导）。"""
+    spec = importlib.util.spec_from_file_location("ag95_probe", PROBE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["ag95_probe"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ------------------------------------------------------------------ 手写从站
+def _crc16(data: bytes) -> int:
+    """Modbus RTU 的 CRC-16（poly 0xA001，初值 0xFFFF）。自己算，不借库。"""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def _reply(slave: int, fc: int, payload: bytes) -> bytes:
+    body = bytes([slave, fc]) + payload
+    crc = _crc16(body)
+    return body + bytes([crc & 0xFF, crc >> 8])      # Modbus 是**低字节在前**
+
+
+class _RtuSlave:
+    """手写的最小 Modbus RTU 从站，跑在 pty 的 **master** 端。
+
+    只实现探针会用到的那一种请求：**读 1 个寄存器**（FC3/FC4，共 8 字节），
+    所以请求长度固定，不需要通用解析。寄存器值由 `regs` 给定；不在表里的地址
+    回**异常码 2（非法地址）**，`slave_id` 之外的一律**静默**（真夹爪也是这样：
+    地址不对就没人应答，表现为超时）。
+    """
+
+    def __init__(self, master_fd: int, regs: dict, slave_id: int = 1):
+        self.fd = master_fd
+        self.regs = dict(regs)
+        self.slave_id = slave_id
+        self.seen = []                                # 收到的有效请求，供断言
+        self._stop = threading.Event()
+        flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
+        fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self._t = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._t.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                chunk = os.read(self.fd, 256)
+            except (BlockingIOError, OSError):
+                time.sleep(0.005)
+                continue
+            if not chunk:
+                time.sleep(0.005)
+                continue
+            buf += chunk
+            while len(buf) >= 8:
+                req, buf = buf[:8], buf[8:]
+                self._handle(req)
+
+    def _handle(self, req: bytes):
+        sid, fc = req[0], req[1]
+        addr = (req[2] << 8) | req[3]
+        if _crc16(req[:6]) != (req[7] << 8) | req[6]:
+            return                                    # CRC 不过就当一个字节都没收到
+        if sid != self.slave_id:
+            return                                    # 不是我的地址：静默
+        self.seen.append((fc, addr))
+        val = self.regs.get(addr)
+        if val is None:
+            os.write(self.fd, _reply(sid, fc | 0x80, bytes([0x02])))
+        else:
+            os.write(self.fd, _reply(sid, fc, bytes([2, val >> 8, val & 0xFF])))
+
+
+class _PtyPair:
+    """一对 pty 组成的「虚拟串口线」：从站占 master 端，探针用 `/dev/pts/N`。"""
+
+    def __init__(self):
+        self.master_fd, self.slave_fd = pty.openpty()
+        self.port = os.ttyname(self.slave_fd)
+
+    def close(self):
+        for fd in (self.master_fd, self.slave_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _run_probe(argv):
+    """跑探针的 `main()`，捕获 stdout 与返回码（不起子进程，省一层环境问题）。"""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = PROBE.main(argv)
+    return rc, buf.getvalue()
+
+
+def _run_probe_cli(argv):
+    """同 `_run_probe`，但真的起子进程 —— 用来验「命令行入口」本身是通的。"""
+    p = subprocess.run([sys.executable, str(PROBE_PATH)] + argv,
+                       capture_output=True, text=True, timeout=120)
+    return p.returncode, p.stdout + p.stderr
+
+
+# 手写的从站寄存器表：637‰ 让两种方向的解释**不相等**（60.5 / 34.5），
+# 用 500 的话两个方向都算出 47.5 mm，断言就分不出方向错了没。
+FAKE_REGS = {0x0202: 637, 0x0100: 1, 0x0103: 500, 0x0101: 50}
+
+
+def main() -> int:
+    print("AG-95 只读探针自检")
+    print("=" * 72)
+    src = PROBE_PATH.read_text(encoding="utf-8")
+    global PROBE
+    PROBE = load_probe()
+
+    # ---- 1. 只读契约（扫源码）-------------------------------------------
+    print("\n[1] 只读契约：源码里不得出现任何写 API")
+    for api in ("write_register", "write_registers", "write_coil",
+                "write_coils", "write_discrete", "mask_write"):
+        hits = [i + 1 for i, ln in enumerate(src.splitlines()) if api in ln]
+        check(f"没有 {api}", not hits, f"出现在第 {hits} 行")
+
+    # 「不写」还有一层：不碰那个**有写能力**的类。探针只用纯换算函数，
+    # 所以文档里**提到**它没问题（要解释为什么不用写路径），**导入或实例化**才是问题。
+    check("没有实例化 Ag95Gripper（写路径在那边）",
+          "Ag95Gripper(" not in src and not hasattr(PROBE, "Ag95Gripper"))
+    check("探针模块里没有写路径的类",
+          not any(n for n in dir(PROBE) if "Gripper" in n),
+          f"多了 {[n for n in dir(PROBE) if 'Gripper' in n]}")
+    # 只读功能码是 3/4；6（写单个）与 16（写多个）一旦出现就是写路径的痕迹。
+    check("源码里没有功能码 6 / 16 的常量",
+          not re.search(r"\b0x0?06\b|\b0x10\b", src))
+
+    # ---- 2. 换算：不重复实现 --------------------------------------------
+    print("\n[2] 换算复用（不重复实现）")
+    gripper_mod = None
+    try:
+        sys.path.insert(0, str(REPO / "ros2_ws" / "src" / "grasp_planner"))
+        from grasp_planner import gripper as gripper_mod
+    except ImportError as exc:
+        why = f"没有 ROS 环境（{exc}）—— 先 source /opt/ros/humble/setup.bash"
+    if gripper_mod is None:
+        check("permille_to_mm 就是 gripper.py 里那一个", False, why, skip=True)
+        check("千分位方向在两种解释下不同", False, why, skip=True)
+    else:
+        # 前提：探针确实导入成功（没成功的话下面这个断言会以「None is not ...」失败，
+        # 那正是我们要的 —— 「没导入」本身就是缺陷，不能被静默算过）
+        check("permille_to_mm 就是 gripper.py 里那一个",
+              PROBE.permille_to_mm is gripper_mod.permille_to_mm,
+              f"探针里是 {PROBE.permille_to_mm!r}")
+        hi = gripper_mod.permille_to_mm(1000, 95.0, open_is_high=True)
+        lo = gripper_mod.permille_to_mm(1000, 95.0, open_is_high=False)
+        check("1000‰ 两种方向 = 95.0 / 0.0 mm", (hi, lo) == (95.0, 0.0), f"{hi} / {lo}")
+
+    # ---- 3. interpret()：两种方向都印出来 --------------------------------
+    print("\n[3] interpret()：两种方向都印（现场靠它判方向）")
+    text = PROBE.interpret(FAKE_REGS[0x0202], 95.0)
+    if gripper_mod is None:
+        check("印出两种方向", False, why, skip=True)
+    else:
+        check("印出两种方向", "若 1000=全开" in text and "若 1000=全闭" in text, text)
+        check("637‰ ⇒ 60.5 / 34.5 mm（两值不等，方向看得见）",
+              "60.5" in text and "34.5" in text, text)
+
+    # ---- 4. 默认值只有一个来源（yaml）-----------------------------------
+    print("\n[4] 串口默认值取自 grasp_planner.yaml（不另写一份）")
+    if not YAML_PATH.exists():
+        check("yaml 存在", False, str(YAML_PATH), skip=True)
+    else:
+        import yaml
+        cfg = yaml.safe_load(YAML_PATH.read_text(encoding="utf-8"))
+        cfg = cfg["grasp_planner"]["ros__parameters"]
+        d = PROBE._yaml_defaults()
+        check("port 与 yaml 一致", d["port"] == cfg["ag95_port"],
+              f"{d['port']} vs {cfg['ag95_port']}")
+        check("baudrate 与 yaml 一致", d["baudrate"] == cfg["ag95_baudrate"],
+              f"{d['baudrate']} vs {cfg['ag95_baudrate']}")
+        check("slave_id 与 yaml 一致", d["slave_id"] == cfg["ag95_slave_id"],
+              f"{d['slave_id']} vs {cfg['ag95_slave_id']}")
+        check("行程与 yaml 一致", d["stroke_mm"] == cfg["ag95_stroke_mm"],
+              f"{d['stroke_mm']} vs {cfg['ag95_stroke_mm']}")
+        check("命令行默认值 = yaml 值",
+              PROBE.build_parser().parse_args([]).port == cfg["ag95_port"])
+
+    # 没有 PyYAML / 没有 yaml 文件时**必须退到默认值而不是抛异常** —— 这个函数在
+    # 建解析器时就被调用，一抛异常连 `--frames` 都打不开，而 `--frames` 正是
+    # 「环境不全时还能看一眼」的那条路。用 `sys.modules['yaml'] = None` 模拟缺模块
+    # （CPython 里这会让 `import yaml` 抛 ImportError）。
+    saved = sys.modules.get("yaml", "缺失")
+    try:
+        sys.modules["yaml"] = None
+        try:
+            d2 = PROBE._yaml_defaults()
+            check("没有 PyYAML 时退到默认值（不抛异常）",
+                  d2["baudrate"] == 115200 and "PyYAML" in d2["source"], str(d2))
+        except Exception as exc:                       # noqa: BLE001
+            check("没有 PyYAML 时退到默认值（不抛异常）", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        if saved == "缺失":
+            sys.modules.pop("yaml", None)
+        else:
+            sys.modules["yaml"] = saved
+
+    # ---- 5. 命令行界面：模式互斥 + 默认模式不碰串口 ----------------------
+    print("\n[5] 命令行：模式互斥，默认模式最安全")
+    rc, _ = _run_probe(["--dump", "--watch"])
+    check("两个模式同时给 → 退出码 2", rc == 2, f"rc={rc}")
+    rc, out = _run_probe_cli(["--frames"])
+    check("子进程跑 --frames → 退出码 0", rc == 0, f"rc={rc}")
+    check("--frames 印出寄存器表", "0x0202" in out and "FC3" in out)
+    check("--frames 说明「全程不写」", "不写" in out)
+    # 关键：默认（不给模式）走的是最安全的那条，且**不打开串口**。
+    # 用一个必然打不开的端口当默认值也照样成功，就证明它没碰端口。
+    rc, out = _run_probe(["--port", "/dev/definitely-not-a-port"])
+    check("默认模式不碰串口（给个不存在的口也能跑）", rc == 0, f"rc={rc}")
+    check("默认模式就是 --frames", "只读探测" in out)
+
+    # ---- 6. pty 回环：真的读一遍 ----------------------------------------
+    print("\n[6] pty 回环：接一个手写从站，真的把这几个模式跑一遍")
+    try:
+        import pymodbus                                     # noqa: F401
+        has_pymodbus = True
+        pymodbus_why = ""
+    except ImportError:
+        has_pymodbus = False
+        pymodbus_why = ('没有 pymodbus —— pip3 install "pymodbus>=3.6"'
+                        '（板上装了就能全跑）')
+
+    if not has_pymodbus:
+        for name in ("扫从站找到 1", "扫从站跳过非本机地址", "dump 读到 637‰",
+                     "dump 对非法地址报错", "FC4 也试", "全失败时给排查顺序"):
+            check(name, False, pymodbus_why, skip=True)
+    else:
+        pair = _PtyPair()
+        slave = _RtuSlave(pair.master_fd, FAKE_REGS, slave_id=1).start()
+        try:
+            rc, out = _run_probe(["--port", pair.port, "--scan-slaves", "1", "4"])
+            check("扫从站：找到 1 号并读到 637‰", "从站 1" in out and "637" in out, out)
+            check("扫从站：2..4 号静默（地址不对就没人应答）",
+                  out.count("无响应") == 3, out)
+            check("扫从站：退出码 0（有设备就该成功）", rc == 0, f"rc={rc}")
+
+            rc, out = _run_probe(["--port", pair.port, "--slave", "1", "--dump"])
+            check("dump：FC3 读到 0x0202 = 637‰（含两种方向解释）",
+                  "[OK ] 0x0202" in out and "60.5" in out, out)
+            check("dump：非法地址 0x0300 报错（不是崩溃）",
+                  "[--] 0x0300" in out, out)
+            check("dump：FC3 与 FC4 都试过",
+                  {fc for fc, _ in slave.seen} == {3, 4},
+                  f"实际只收到 FC{sorted({fc for fc, _ in slave.seen})}")
+            check("dump：退出码 0", rc == 0, f"rc={rc}")
+
+            # 一个真·负例：从站地址对不上时必须**明确失败**，不能假装成功。
+            rc, out = _run_probe(["--port", pair.port, "--slave", "7", "--dump"])
+            check("从站号给错 → 全部无应答且退出码 3（不静默成功）",
+                  rc == 3 and "有应答的读取项：0" in out, f"rc={rc}\n{out}")
+            check("全失败时给出排查顺序（接线/波特率/地址/上电）",
+                  "按这个顺序查" in out and "A/B" in out and "24V" in out, out)
+
+            # --watch 是现场**判方向**用的那条（人工掰手指，看原始值落在 0 还是 1000），
+            # 所以它必须满足两件事：只读地持续读、且**值的每一次变化都看得见**。
+            # 这里在子进程跑 --watch 的同时**改从站的寄存器**，模拟「手指被掰动」。
+            proc = subprocess.Popen(
+                [sys.executable, str(PROBE_PATH), "--port", pair.port,
+                 "--slave", "1", "--watch", "--interval", "0.05"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                time.sleep(0.6)                     # 先读到 637
+                slave.regs[0x0202] = 1000           # 「掰到全开」
+                time.sleep(0.6)
+                proc.send_signal(signal.SIGINT)
+                wout, _ = proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:        # pragma: no cover
+                proc.kill()
+                wout, _ = proc.communicate()
+                wout += "\n（超时被杀：--watch 没有响应 Ctrl-C）"
+            check("watch：变化前后的原始值都打印出来",
+                  "637" in wout and "1000" in wout, wout)
+            check("watch：被中断时干净退出（退出码 0）", proc.returncode == 0,
+                  f"rc={proc.returncode}\n{wout}")
+            check("watch：结束时提示怎么判方向",
+                  "open_is_high" in wout, wout)
+            check("watch：全程只有读请求（从站没收到过别的功能码）",
+                  {fc for fc, _ in slave.seen} <= {3, 4},
+                  f"收到过 FC{sorted({fc for fc, _ in slave.seen})}")
+        finally:
+            slave.stop()
+            pair.close()
+
+    print("\n" + "=" * 72)
+    print(f"PASS {PASS}   SKIP {SKIP}   FAIL {FAIL}")
+    if FAILURES:
+        print("失败项：")
+        for f in FAILURES:
+            print(f"  - {f}")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
