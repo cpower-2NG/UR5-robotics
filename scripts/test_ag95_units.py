@@ -49,24 +49,55 @@ def _raises(fn, exc=ValueError):
     return False
 
 
-def load_gripper():
-    """按文件路径加载 gripper.py，并注入假的 sensor_msgs。
+def _stub(name, **attrs):
+    """造一个假的 ROS 包模块树，缺哪个补哪个。
 
-    gripper.py 只用 `sensor_msgs.msg.JointState` 做订阅类型，把它换成哑元即可
-    让本脚本在**没有 ROS 环境**的机器上跑（与 test_detector_device.py 注入假
-    torch 是同一个套路）。真正的 ROS 环境里也能跑——先试真包，失败再注入。
+    只补 `find_spec` 查不到的包，所以**在真 ROS 环境里跑时用的仍是真包**。
+    """
+    pkg = types.ModuleType(name)
+    sys.modules[name] = pkg
+    for sub, members in attrs.items():
+        full = f'{name}.{sub}'
+        mod = types.ModuleType(full)
+        for key, val in members.items():
+            setattr(mod, key, val)
+        setattr(pkg, sub, mod)
+        sys.modules[full] = mod
+
+
+def load_gripper():
+    """按文件路径加载 gripper.py，并注入假的 ROS 消息类型。
+
+    gripper.py 的三个 ROS 依赖都只是**类型**，换成哑元即可让本脚本在**没有
+    ROS 环境**的机器上跑（与 test_detector_device.py 注入假 torch 是同一个
+    套路）。真正的 ROS 环境里也能跑——先试真包，失败再注入。
+
+    ⚠️ `action_msgs` / `control_msgs` 是随 `NullGripper`（gripper_backend:=none）
+    一起进来的。**别删这两个桩**：删了本脚本在没有 ROS 的机器上会直接
+    `ModuleNotFoundError` 崩掉——而它测的是纯换算函数，本就不该需要 ROS。
     """
     if importlib.util.find_spec('sensor_msgs') is None:
-        pkg = types.ModuleType('sensor_msgs')
-        msg = types.ModuleType('sensor_msgs.msg')
-
         class JointState:  # 只为通过注解/类型检查，本脚本不实例化它
             pass
 
-        msg.JointState = JointState
-        pkg.msg = msg
-        sys.modules['sensor_msgs'] = pkg
-        sys.modules['sensor_msgs.msg'] = msg
+        _stub('sensor_msgs', msg={'JointState': JointState})
+
+    if importlib.util.find_spec('action_msgs') is None:
+        class GoalStatus:
+            STATUS_SUCCEEDED = 4
+
+        _stub('action_msgs', msg={'GoalStatus': GoalStatus})
+
+    if importlib.util.find_spec('control_msgs') is None:
+        class Result:
+            """哑元：只要求有 `error_code`，且默认 0（与真消息一致）。"""
+            error_code = 0
+
+        class FollowJointTrajectory:
+            pass
+
+        FollowJointTrajectory.Result = Result
+        _stub('control_msgs', action={'FollowJointTrajectory': FollowJointTrajectory})
 
     spec = importlib.util.spec_from_file_location('ag95_gripper_probe', GRIPPER_PY)
     mod = importlib.util.module_from_spec(spec)

@@ -66,11 +66,25 @@ AG-95 **不在机械臂的轨迹控制器里**，所以「把夹爪当第 7 个�
 所以这里刻意让它在被调用时**立刻抛出可操作的错误**，而不是写一段看起来能跑、
 实际没人验证过的 Modbus 代码。现场确认后在此实现 `_write_position()` 与
 `_read_position()` 即可，规划器侧无需改动。
+
+⚠️ 后端一览（`gripper_backend` 参数）
+=====================================
+==============  ==========================================================
+``sim``         仿真：Robotiq 2F-85，作为 JTC 的第 7 个关节
+``ag95``        真机：大寰 AG-95，Modbus —— **尚未实现，构造即报错**
+``none``        不驱动夹爪：只用于 ``carry_objects:=false`` 的**只走位**演示
+==============  ==========================================================
+
+`none` 是给「第一个真机 demo」用的：那时 AG-95 的 RS485 适配器还不在板上，
+而 `ag95` 后端构造即报错 —— 若真机入口按 `camera_source` 默认成 `ag95`，
+规划器**根本起不来**，连「臂走到目标上方」都做不到。详见 `NullGripper`。
 """
 
 import threading
 from typing import Callable, List, Optional
 
+from action_msgs.msg import GoalStatus
+from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
 
 #: AG-95 位置寄存器（0x0103 目标 / 0x0202 实时）的满量程，单位**千分位**。
@@ -387,12 +401,106 @@ class Ag95Gripper(GripperBackend):
                 f"force={self._force}N)")
 
 
+class NullGripper(GripperBackend):
+    """**不驱动任何夹爪**：给 ``carry_objects:=false``（只走位）的演示用。
+
+    为什么需要它
+    ============
+    ``make_gripper()`` 是在 ``planner_node.__init__`` 里**无条件**调用的，而
+    ``Ag95Gripper`` 构造即报错。真机入口按 ``camera_source`` 默认出 ``ag95``，
+    于是**规划器根本起不来** —— 连「臂走到目标上方」都做不到。而第一个真机
+    demo 本来就不含抓取（板上没有 USB-串口芯片，AG-95 物理上没接），它需要的
+    恰恰是一个「能起来、能走位、不碰夹爪」的后端。
+
+    为什么要 ``carry_objects:=false`` 配套
+    ======================================
+    这个后端**只实现 ``open()``**，因为状态机在只走位模式下只会调它：
+
+    ==========================  ==========================  ============
+    调用点                       只走位模式下会不会到         本后端行为
+    ==========================  ==========================  ============
+    ``open()`` :691 初始化       **会**                      静默 no-op + 回调
+    ``open()`` :1473 失败恢复     **会**                      同上
+    ``open()`` :1393 放置松开     **不会**（:1390 已提前返回）  —
+    ``close()`` :1252            **不会**（:1244 已提前返回）  抛 RuntimeError
+    ``is_empty()`` :1262         **不会**                     抛 RuntimeError
+    ``current_position()`` :1260 **不会**                     抛 RuntimeError
+    ==========================  ==========================  ============
+
+    那张表的右两列是**同一个决定的两面**：只走位模式下这三个方法不可达，所以
+    它们应当**抛错而不是静默返回**。若 ``carry_objects`` 被误设成 true，抛出
+    的信息会直接指出这个配置矛盾；若改成静默 no-op，规划器会以为夹住了空气、
+    一路搬到放置区 —— 一个只在真机上才暴露的静默错误。
+
+    ⚠️ 真机上**不要**用它来「先跑通再说」：它不驱动夹爪，但**也不阻止**规划器
+    走完整的抓取流程。它只与 ``carry_objects:=false`` 成对使用。
+    """
+
+    def __init__(self, node, reason: str = ""):
+        self._node = node
+        self._reason = reason or "未配置夹爪硬件"
+        self.arm_joint_names = []   # 不参与 JTC
+
+    def _no_grasp(self, what: str) -> RuntimeError:
+        return RuntimeError(
+            f"gripper_backend=none 不驱动夹爪，无法执行 {what}()。"
+            f"该后端只与 carry_objects:=false（只走位、不夹持）配套使用；"
+            f"若确实要夹取，请换成 sim（仿真）或 ag95（真机）。"
+        )
+
+    @staticmethod
+    def _succeeded() -> tuple:
+        """回一个与 ``_send_trajectory`` 契约一致的 ``(status, result)``。
+
+        必须是**真类型**而不是 ``(0, None)``：规划器的 ``traj_succeeded()``
+        要求 ``result is not None`` 且 ``result.error_code == 0``（D52 的教训）。
+        ``FollowJointTrajectory.Result()`` 的 ``error_code`` 默认就是 0。
+        """
+        return (GoalStatus.STATUS_SUCCEEDED, FollowJointTrajectory.Result())
+
+    def _async_done(self, done_cb: Optional[Callable]) -> None:
+        """异步回调一次。
+
+        **不能用同步调用**：调用点（``_start_initial_home``）本身就在一个
+        「即将发轨迹」的位置上，同步回调会让 ``_send_arm_trajectory`` 嵌在
+        它自己的调用栈里跑。真实后端（``SimGripper``/``Ag95Gripper``）的回调
+        来自 action 的 future，都在**另一个线程**；这里用定时器复现同样的
+        异步语义，也让两条路径的状态机时序一致。
+
+        复用 ``SimGripper._once`` 的「只调一次」包装：那是为动作回调的重复
+        触发写的保险，这里同样适用。
+        """
+        once = SimGripper._once(done_cb)
+        if once is None:
+            return
+        threading.Timer(0.05, once, args=self._succeeded()).start()
+
+    def open(self, done_cb: Optional[Callable] = None) -> None:
+        self._node.get_logger().info(
+            f"夹爪后端 none（{self._reason}）：跳过「张开」——不发任何夹爪指令"
+        )
+        self._async_done(done_cb)
+
+    def close(self, done_cb: Optional[Callable] = None) -> None:
+        raise self._no_grasp("close")
+
+    def is_empty(self) -> bool:
+        raise self._no_grasp("is_empty")
+
+    def current_position(self) -> Optional[float]:
+        raise self._no_grasp("current_position")
+
+    def describe(self) -> str:
+        return f"NullGripper(reason={self._reason!r}, 不驱动夹爪)"
+
+
 def make_gripper(node, backend: str, params: dict, send_joint_trajectory: Callable):
     """按 `gripper_backend` 参数构造夹爪后端。
 
     backend:
       ``sim``       —— 仿真：Robotiq 2F-85，作为 JTC 的一个关节
       ``ag95``      —— 真机：大寰 AG-95，Modbus（尚未实现，构造即报错）
+      ``none``      —— 不驱动夹爪：只配 ``carry_objects:=false`` 的只走位演示
     """
     if backend == "sim":
         return SimGripper(
@@ -416,6 +524,9 @@ def make_gripper(node, backend: str, params: dict, send_joint_trajectory: Callab
             open_mm=params["ag95_open_mm"],
             close_mm=params["ag95_close_mm"],
         )
+    if backend == "none":
+        # 不传 reason 也行，但真机排查时「为什么没夹爪」值得写进日志
+        return NullGripper(node, reason=params.get("gripper_none_reason", ""))
     raise ValueError(
-        f"未知的 gripper_backend: {backend!r}（可选：sim | ag95）"
+        f"未知的 gripper_backend: {backend!r}（可选：sim | ag95 | none）"
     )

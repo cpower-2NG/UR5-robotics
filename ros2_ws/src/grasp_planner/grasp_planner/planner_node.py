@@ -291,6 +291,17 @@ class GraspPlanner(Node):
         )
 
         # ---- 夹爪 ----
+        # ⚠️ 这组搭配在**启动时**就要查，不能等到第一次 close()（半分钟后、
+        #    臂已经悬在目标上方）才炸。`none` 后端只实现 open()，配合
+        #    carry_objects=true 会在 `_evaluate_grasp` 抛错，而那时臂正在动。
+        if p["gripper_backend"] == "none" and self.carry_objects:
+            raise ValueError(
+                "配置矛盾：gripper_backend:=none 不驱动夹爪，无法夹取，"
+                "但它被要求 carry_objects:=true（真抓取）。"
+                "两者必须成对：只走位演示用 "
+                "`carry_objects:=false gripper_backend:=none`；"
+                "要真夹取请用 sim 或 ag95。"
+            )
         self._gripper = make_gripper(
             self, p["gripper_backend"], p, self._send_trajectory
         )
@@ -456,7 +467,10 @@ class GraspPlanner(Node):
         d("retry_delay", 0.5)           # 没有可抓目标时，多久后重新接受检测（s）
 
         # ---- 夹爪 ----
-        d("gripper_backend", "sim")     # sim | ag95
+        d("gripper_backend", "sim")     # sim | ag95 | none
+        # 仅 backend=none 时有意义：写进启动日志的「为什么没有夹爪」。
+        # 真机第一个 demo（只走位、不夹持）由 real.launch.py 填实际情况。
+        d("gripper_none_reason", "")
         d("sim_gripper_joint", "robotiq_85_left_knuckle_joint")
         d("sim_gripper_open", 0.0)
         d("sim_gripper_close", 0.8)

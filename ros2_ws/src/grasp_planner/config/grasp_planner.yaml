@@ -184,7 +184,11 @@ grasp_planner:
     # ---- 夹爪 ----
     # sim  = 仿真 Robotiq 2F-85，JTC 的第 7 个关节
     # ag95 = 真机大寰 AG-95，Modbus RTU 独立设备（尚未实现，构造即报错）
+    # none = 不驱动夹爪，只配 carry_objects:=false（只走位、不夹持）使用
     gripper_backend: sim
+    # 仅 gripper_backend:=none 时有意义：写进启动日志的「为什么没有夹爪」。
+    # 真机第一个 demo 由 real.launch.py 覆写成实际情况（AG-95 未接）。
+    gripper_none_reason: ""
     sim_gripper_joint: robotiq_85_left_knuckle_joint
     sim_gripper_open: 0.0
     sim_gripper_close: 0.8
