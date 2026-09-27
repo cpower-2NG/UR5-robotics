@@ -123,6 +123,10 @@ class Perception3D(Node):
         self.depth_scale = None          # 首次收到深度图时确定
         self.bridge = CvBridge()
         self._warned_normalized = False  # D7 护栏：归一化坐标只提示一次
+        # 因 max_sync_dt 被丢弃的批数。日志本身按 5 s 限流（否则每帧一条刷屏），
+        # 但限流会让「偶尔丢一批」和「一直都在丢」看起来一样 —— 现场需要后者这
+        # 个数才能判断该不该放宽 max_sync_dt，所以累计值进日志正文。
+        self._sync_drops = 0
 
         # ---- TF ----
         self.tf_buffer = tf2_ros.Buffer()
@@ -347,9 +351,12 @@ class Perception3D(Node):
 
         if stamp_sec > 0.0 and dt > self.max_sync_dt:
             # 深度与检测差得太远：宁可不发，也不要发出一个基于错误时刻深度的坐标
+            self._sync_drops += 1
             self.get_logger().warn(
                 f'深度与检测时间差 {dt*1000:.0f} ms 超过 max_sync_dt'
-                f'（{self.max_sync_dt*1000:.0f} ms），丢弃本批检测。',
+                f'（{self.max_sync_dt*1000:.0f} ms），丢弃本批检测'
+                f'（累计 {self._sync_drops} 批）。'
+                f'本节点在没有目标时会**静默**，若累计数持续增长请调大 max_sync_dt。',
                 throttle_duration_sec=5.0
             )
             return
