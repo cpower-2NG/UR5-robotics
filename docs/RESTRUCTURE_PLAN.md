@@ -102,7 +102,7 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 | D11 | `scripts/` vs `yolo_vision/scripts/` | 6 个同名脚本（`auto_label_grid` / `collect_training_data` / `demo_pipeline` / `generate_grid_world` / `label_blocks` / `train_yolo_block`）**内容全部不同** | 无法判断哪份权威，改错版本会静默失效 |
 | D12 | `grasp_planner/package.xml` | 代码 `:80` `from moveit_msgs.msg import MoveItErrorCodes`（在 `_init_moveit()` 的防御性 `try` 内），但 `package.xml` **未声明 `moveit_msgs`**；反向地，`tf2_ros` / `tf2_geometry_msgs` **已声明却在代码中完全未使用** | 清单与代码**双向不符**。另：`MoveItErrorCodes` 导入后从未被引用，属残留 |
 | **D13** ✅**已修** | 模型权重曾散落 **21 个 `.pt`**（全量哈希+加载实测） | 除 **A/B 两份方块模型**外，还有**真 COCO yolov8n**、**yolo26n（80 类）**、**1 份损坏文件**、10 个训练中间盘 | ✅ **已收敛（P1-3）**：删 14 个（根 `yolov8n.pt`、`ros2_ws/yolov8n.pt`、损坏件、10 个 `epoch*.pt`）、改名 2 个 → 现存 **7 个 `.pt`**，且**每个文件名都与其内容相符**：`block_best.pt`(A)、`runs/block_detect/weights/{best,last}.pt`、`runs/detect/block_grid_demo/weights/{best,last}.pt`(B)、`yolov8n_coco.pt`(COCO)、`yolo26n.pt`(COCO-26) |
-| D18 | 模型 A / B 并存 | **A**（域随机化，较新）`a926d959…` 在 `block_best.pt`、`runs/block_detect/weights/best.pt`；**B**（方阵演示，较旧）`b9baf6f1…` 在 `runs/detect/block_grid_demo/weights/best.pt` 与**附件**的 `yolo_vision/models/best.pt`。~~`yolo_vision/models/best.pt`~~ 已随该包删除 | 附件抓取栈自带的是**旧模型 B**；P3 接入时应改用模型 A，勿为「与附件一致」而回退 |
+| D18 | 模型 A / B 并存 | **A**（域随机化，较新）`a926d959…`(sha256) 在 `block_best.pt`、`runs/block_detect/weights/best.pt`；**B**（方阵演示，较旧）`b9baf6f1…`(sha256) 在 `runs/detect/block_grid_demo/weights/best.pt` 与**附件**的 `yolo_vision/models/best.pt`。~~`yolo_vision/models/best.pt`~~ 已随该包删除 | 附件抓取栈自带的是**旧模型 B**；P3 接入时应改用模型 A，勿为「与附件一致」而回退。<br>⚠️ **本行哈希是 sha256，D6 的 `e917eeaf1…` 是 git blob(sha1)，同一个文件两种算法，都对**（第十一轮实测确认）。A 的文件内部：`nc=1`、`names={0:'block'}`、训练于 2026-07-16、ultralytics 8.4.51 |
 | D14 | `yolo_bringup/launch/simulation.launch.py:45` | `bridge_config` 计算后**从未使用**（桥接全靠硬编码参数） | 配置文件形同虚设，改 YAML 无效果 |
 | D15 | 同上 `:28-31, :37-41` | `gui_arg` 声明后 `gz_sim` 未引用；`condition=None` 恒真 | `gui:=false` 无效 |
 | D16 | 同上 `:108-130` | `rviz_node` 定义但**未加入** `LaunchDescription` 返回值。**补充（本轮新查）**：`setup.py:17` 只装 `glob('config/*.yaml')`，`grasping.rviz` **根本没被安装到 `share/`** | RViz 永不启动；**即使接上也找不到配置文件**——修 D16 必须同时补 `setup.py` 的安装规则 |
@@ -771,8 +771,18 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 4. ✅ **CoppeliaSim 阶段（本轮已查清，无需再答）**：对**全部 8 个提交**做了路径级检索（`git log --all --name-only`），**没有任何 `coppelia`/`cph` 踪迹**，且 `.cph-ng/` 经解码证实**不是 CoppeliaSim**——它是 VS Code **Competitive Programming Helper** 扩展的元数据（268 B gzip JSON，`{"version":"0.7.8",...,"src":{"path":".../yolo_vision/README.md"}}`），与仿真无关，**删对了**。结论：**CoppeliaSim 阶段不在本仓库历史中**，本仓库里的仿真自始至终是 **Gazebo**。若那段资产存在，只可能在外部目录或其他仓库——见问题 10。
 5. ✅ **【已解决】真机是 UR5**。板上 `~/arm-isolation-sudo.sh:3` 直接写明 **`# Slice for robot arm control (UR5 / ROS2)`**，且第 12 行写「**等真正开始跑 UR5 控制节点时再执行更合适**」——这是比 `arm-check.sh` 的串口探测更明确的意图声明。原先的「矛盾」解释为：**CH340/串口探测属 Yahboom 车体外设，与机械臂无关**（板上 `yahboom_ws/src = camera, interfaces, largemodel, text_chat`，另有 `qr_code_recognition`/`mediapipe`/`CH341SER`/`yolo26_data`，是 Yahboom 套件，不是臂）。**故 P5 按 UR5 + Robotiq 2F-85 + 以太网 RTDE 编制。**
    **仍需现场确认的只剩两点**（不影响现在动工）：(a) UR 控制柜当前 IP 属于哪个网段——板上只见 `eno1 = <板载 IP>/23`，**未见** UR 默认的 `192.168.1.x`，说明**臂还没接上或尚未配置**；(b) 现场接线时以哪块网卡对接。
-7. **仓库体积**：工作区已从 9.3 GB 降到 **405 MB**（见 §3 P1）。但**历史仍有 8.4 GB 的 `.git`**——要让仓库真正变小必须在**历史**上动刀（`git filter-repo` / LFS 迁移），那会改写 `main`，`MIGRATION_HANDOFF.md` 明确要求需你确认。**是否处理、如何处理，请你定。**
-8. **模型 A 的来源确认**：`runs/block_detect/args.yaml` 是否就是模型 A 的训练配置？（P1-3 会据此补全记录）
+7. ✅ **【已解决】仓库体积**：工作区已从 9.3 GB 降到 405 MB（见 §3 P1）；**历史 8.4 GB 已于第十一轮清除**（用户授权），`.git` 现为 **146 MB**。见上方「历史改写记录」。
+8. ✅ **【已解决，第十一轮】模型 A 的来源确认 → 是。** `runs/block_detect/args.yaml` **就是模型 A 的训练配置**。证据链（四条独立印证）：
+   - **同目录**：它的 `save_dir` 即 `…/runs/block_detect`，与该 run 产出的 `best.pt` 同处一目录；
+   - **同一文件**：该 `best.pt` 与 `block_best.pt` 是**同一个 git blob**（`e917eeaf1…`）、同一个 sha256（`a926d959…`）——即 D18 认定的模型 A；
+   - **自述一致**：用 torch 读该 `.pt` 的 `train_args`，其 `model/data/epochs/batch/imgsz` 与 `args.yaml` **逐项相同**（`yolov8n.pt` / `block_dataset/data.yaml` / 100 / 16 / 640），说明该 yaml 就是那次训练的忠实转储；
+   - **可与 B 区分**：模型 B 的 `args.yaml` 是 `epochs: 50` / `name: block_grid_demo`，两者不会混。
+
+   **顺带查明的两条事实**（对 Orin 上重训有用）：
+   - 该 `.pt` 内部：`nc=1`、`names={0:'block'}`、检测头 `cv3` 输出通道 = 1，训练日期 **2026-07-16**，ultralytics **8.4.51**。即它是 **COCO 预训练微调成单类**，不是从零训练。
+   - ⚠️ `args.yaml` 里的训练数据路径 `/home/<user>/workspace/yolo_ros/block_dataset/data.yaml` 与 `project` 同理是**旧机器上的路径，现已不存在**（仓库现位于 `/home/<user>/robotics/repos/yolo_ros_original`）。重训前须改指当前 `block_dataset/`。**该 yaml 是历史记录，不要去"修"它**——它如实反映当时的运行环境。
+
+   > 注：`RESTRUCTURE_PLAN` 中模型 A 有两个哈希写法，**都对，只是算法不同**——D6 的 `e917eeaf1…` 是 **git blob（sha1）**，D18 的 `a926d959…` 是**文件 sha256**。已实测确认，勿据其一改其二。
 9. ⚠️ **板上那六个 `arm-*.sh` 要不要纳入本仓库？** 它们是本项目在 Orin 上的部署准备（性能调优 / 资源隔离 / 无头检查 / 清理 / 扩容），**只存在于板子上**，且 `arm-isolation-sudo.sh` 引用了一份我在板上和仓库里都没找到的「**体检清单**」（其 D4 项）。建议连同那份清单一起放进 `docs/`——否则这部分知识只活在板子家目录里，重装即失。
 10. ✅ **【已解决】`Moveit2YoloObb` 已找回。** URL 在仓库内两处文档中就有（`docs/GRID_ENV_DESIGN.md:327`、`docs/YOLO_VISION_DESIGN.md:4`）：
     **`https://github.com/laoxue888/Moveit2YoloObb`**。实测该 gitlink 记录的 commit **`ce16f5a5…` 在上游仍然存在**，已按原版本精确检出到 `docs/reference/Moveit2YoloObb/`（43 MB，附 `PROVENANCE.md`，已删其 `.git`）。
@@ -954,8 +964,9 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
   叠加方式，并说明为何删。同节前一处**多余的 ``` 围栏**一并修掉（原先会把
   「### 6.2」整段吞进代码块）。
 
-**本轮遗留（未做，见 §5）**：`move_block.py` 的 world/model/z；Q7 历史改写；Q9 板端脚本入
-`docs/`；Q8 `runs/block_detect/args.yaml` 的模型 A 确认。
+**本轮遗留（未做，见 §5）**：`move_block.py` 的 world/model/z。
+（原列于此的 Q7 历史改写、Q8 模型 A 确认均已于本轮完成；Q9 板端脚本入 `docs/` 用户已决定纳入，
+但**被"没有板子 IP"阻塞**——待用户提供地址后只读拉取。）
 
 **下一步可立即做的（均不阻塞）：**
 
@@ -975,11 +986,52 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 > - 「外参是否准」→ **归手眼标定，代码层修不了**（D8 只让失败可见，不产生外参）。仿真里相机外参是我们自己写死的，**真机必须实测**；
 > - 「真机夹爪能否用」→ AG-95 后端**目前是会报错的桩**，现场核实寄存器映射前**不可用**（这是刻意设计，见 `gripper.py`）。
 
-> 📌 **提交状态（2026-09-27 核实）**：
-> `migrate/humble-orin` 已领先 `main` **8 个提交**（`main` 停在 `f250af11b`，未被动过）。
-> **第九轮的全部改动尚未提交**——工作区含 `grasp_planner/**`（重写+新增）、`arm_grasp_sim/**`（新增）、
-> `perception_3d`、`yolo_detector`、`.gitignore` 与本文件，以及 `scripts/` 下的测试脚本。
-> **按你此前选定的「分组提交」策略，本轮改动等你确认后再落。** 不擅自提交或推送。
+> 📌 **提交状态（2026-09-27，第十一轮末核实）**：
+> `migrate/humble-orin` 已领先 `main` **19 个提交**。第八/九/十/十一轮的全部改动**均已按分组提交**
+> （共 5 组：训练世界启动器 / 删除环境脚手架与死启动器 / 工具类小修 / README 重写 / 文档去陈旧）。
+> **未推送任何东西**（且 `origin` 在历史改写时已被 `git filter-repo` 移除，见下）。
+>
+> ⚠️ **历史改写后，所有提交哈希已变**。旧哈希仅在备份与 `docs/` 的历史叙述中有意义。
+> 映射：旧 `535b0666e`（第九轮末）→ 新 `a94c79c` 之前的提交；`main` 旧 `f250af11b` → 新哈希见下。
+
+#### 历史改写记录（Q7，2026-09-27，用户明确授权）
+
+用户授权"可以改"。执行前**先做完整备份**，并用**树哈希**（内容指纹）而非提交哈希来验证结果。
+
+**清除的三个路径**（执行前逐一核实**不在 `migrate/humble-orin` 的 HEAD 中**，故对当前工作零影响）：
+
+| 路径 | 历史体积 | 在 HEAD 中 |
+|---|---|---|
+| `yolo_coco/` | ~8.86 GB（其中 `train2017.zip` 单个 6.76 GB；共 250,367 个文件） | ❌ 无 |
+| `docs/chapter03_yolo_perception.html` | 47.6 MB | ❌ 无 |
+| `runs/block_detect/weights/epoch*.pt` | 243 MB（10 个） | ❌ 无（HEAD 只剩 `best.pt`/`last.pt`） |
+
+**结果核验**：
+
+| 项 | 改写前 | 改写后 | 判定 |
+|---|---|---|---|
+| `.git` 体积 | 8.4 GB | **146 MB** | ✅ −98.3% |
+| `HEAD^{tree}` | `201ca7d91e4c…` | `201ca7d91e4c…` | ✅ **未变** |
+| `git ls-tree -r HEAD \| sha256` | `603356bd9d4d…` | `603356bd9d4d…` | ✅ **逐字节未变** |
+| `main^{tree}` | `1b08535ae13a…` | `d9414da6d5cf…` | ⚠️ **变了**，见下 |
+| 提交数 | 27 | 27 | ✅ |
+| `main` 是 HEAD 祖先 | 是 | 是 | ✅ 关系保持 |
+| 工作区 | 干净 | 干净 | ✅ |
+
+⚠️ **`main` 的树变了，这是预期内的**：`main`（基线 `f250af11b`）**仍含** `yolo_coco/`（250,367 个文件）
+与那 10 个 `epoch*.pt`——**8.4 GB 正来自这里**。清除后，检出 `main` 将不再有这两样。
+`docs/chapter03_yolo_perception.html` 两个分支都不含，无影响。
+即：**活跃分支逐字节不变，只读基线瘦身**。若你需要一个"原样"的基线，它在备份里。
+
+**副作用与备份**：
+
+- `git filter-repo` **移除了 `origin`**（原本指向 `/mnt/c/Users/<winuser>/Downloads/yolo_ros.bundle`）。
+  这是它的标准行为（防止误推回旧历史）。**不建议恢复**——从那个 bundle 取回会把旧历史重新灌进来，
+  使 146 MB 前功尽弃。若只想当只读参照，用 `git bundle verify` 直接查即可。
+- 改写前的完整 `.git` 备份：`/home/<user>/robotics/backups/yolo_ros_git_20260927_130248.git`（8.4 GB，已验证可读，
+  含原 27 个提交与 `main`/`migrate/humble-orin` 两分支）。
+- 另有更早的原始快照 `/mnt/c/Users/<winuser>/Downloads/yolo_ros.bundle`（8.9 GB，9/26 16:32，早于本轮全部改动）。
+- 工具：`git-filter-repo` 2.47.0（本轮 `pip3 install --user` 装的，在 `~/.local/bin`）。
 
 > 📌 **提交状态（2026-09-26 核实，修正此前本文档中「没有任何提交」的错误陈述）**：
 > `migrate/humble-orin` 已领先 `main` **8 个提交**（`main` 停在 `f250af11b`，未被动过），
@@ -990,8 +1042,8 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 
 | # | 事项 | 影响 |
 |---|---|---|
-| 7 | 仓库**历史** 8.4 GB 是否改写（会动 `main`，需明确授权） | 仓库体积；不改也能正常工作。**注意：本轮删掉的 245 MB `epoch*.pt` 仍留在历史里**，只有改写历史才能真瘦身 |
-| 9 | 板上六个 `arm-*.sh` 与那份「体检清单」是否纳入 `docs/` | 避免板子重装即失传 |
+| 7 | ~~仓库历史 8.4 GB 是否改写~~ ✅ **已授权并完成（第十一轮）**，见下方「历史改写记录」 | `.git` **8.4 GB → 146 MB**（−98.3%）。`migrate/humble-orin` 内容**逐字节未变**；`main` 的树变了（它仍含 `yolo_coco/` 与 10 个 `epoch*.pt`），这是**预期内**的——那正是 8.4 GB 所在。备份在 `/home/<user>/robotics/backups/yolo_ros_git_20260927_130248.git` |
+| 9 | 板上六个 `arm-*.sh` 与那份「体检清单」是否纳入 `docs/` | 用户已决定**纳入**。⚠️ **当前被"没有板子 IP"阻塞**：本机 `~/.ssh/config` 无 Host 条目、`known_hosts` 是哈希过的、文档里写的是 `jetson@<板载 IP>`（占位符）、全盘搜索 `/home/<user>` 与 `/mnt/c/Users/<winuser>` 均无 `arm-*.sh`。需要用户提供地址后才能只读拉取 |
 | **12** | ~~`gz_ros2_control` 放哪~~ ✅ **已定（第十轮）：留外部叠加工作区**（`~/grasp_ws`）。不 vendored、不入库 | **只影响工作站，不影响 Orin**（P4「部署分层」已确认：真机由 `ur_robot_driver` 走 RTDE，**不用 `gz_ros2_control`**）。选外部的理由：避免仓库携带一份第三方源码、避免与 apt 版本混淆；代价是**多一步前置**（README 已写明 `GZ_VERSION=harmonic` 的源码编译步骤）。`launch` 已用 `get_package_prefix` 解耦 |
 | **13** | ~~「方阵世界」要不要恢复启动器~~ ✅ **已定（第十一轮）：恢复轻量启动器** | 新增 `yolo_bringup/launch/grid_world.launch.py`（`gz sim -r` + ros_gz_bridge + 静态 TF，**不含机械臂**），训练链恢复可用。已实测：话题齐全、`camera_info.frame_id` 与常量逐字相同、TF 链正确。顺带复活了孤儿文件 `config/ros_gz_bridge.yaml` |
 
