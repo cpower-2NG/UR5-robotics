@@ -993,10 +993,11 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 > - 「外参是否准」→ **归手眼标定，代码层修不了**（D8 只让失败可见，不产生外参）。仿真里相机外参是我们自己写死的，**真机必须实测**；
 > - 「真机夹爪能否用」→ AG-95 后端**目前是会报错的桩**，现场核实寄存器映射前**不可用**（这是刻意设计，见 `gripper.py`）。
 
-> 📌 **提交状态（2026-09-27，第十二轮末核实）**：
-> `migrate/humble-orin` 已领先 `main` **22 个提交**（`main` 停在 `0ab13ec`，未被动过）。
-> 第十二轮的改动（W1/W1b/D50–D57/W4 与 3 个新脚本）**尚未提交**，仍在工作区；
-> 按你此前选定的「分组提交」策略，等你确认后再落。**未推送任何东西**，`origin` 仍不存在（见下）。
+> 📌 **提交状态（2026-09-27，第十四轮末核实）**：
+> `migrate/humble-orin` 已领先 `main` **40 个提交**（`main` 停在 `0ab13ec`，未被动过）。
+> 第十二 / 十三 / 十四轮的改动**全部已提交**：第十二轮 = `b82eee0`…`818248e`
+> （W1/W1b/D50–D57/W4 与 3 个新脚本），第十三轮 = `9a1db21`…`d3892a6`，
+> 第十四轮的 5 个提交见第十四轮第一节。**未推送任何东西**，`origin` 仍不存在（见下）。
 >
 > ⚠️ **历史改写后，所有提交哈希已变**。旧哈希仅在备份与 `docs/` 的历史叙述中有意义。
 > 映射：旧 `535b0666e`（第九轮末）→ 新 `a94c79c` 之前的提交；`main` 旧 `f250af11b` → 新哈希见下。
@@ -1054,12 +1055,17 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 | **12** | ~~`gz_ros2_control` 放哪~~ ✅ **已定（第十轮）：留外部叠加工作区**（`~/grasp_ws`）。不 vendored、不入库 | **只影响工作站，不影响 Orin**（P4「部署分层」已确认：真机由 `ur_robot_driver` 走 RTDE，**不用 `gz_ros2_control`**）。选外部的理由：避免仓库携带一份第三方源码、避免与 apt 版本混淆；代价是**多一步前置**（README 已写明 `GZ_VERSION=harmonic` 的源码编译步骤）。`launch` 已用 `get_package_prefix` 解耦 |
 | **13** | ~~「方阵世界」要不要恢复启动器~~ ✅ **已定（第十一轮）：恢复轻量启动器** | 新增 `yolo_bringup/launch/grid_world.launch.py`（`gz sim -r` + ros_gz_bridge + 静态 TF，**不含机械臂**），训练链恢复可用。已实测：话题齐全、`camera_info.frame_id` 与常量逐字相同、TF 链正确。顺带复活了孤儿文件 `config/ros_gz_bridge.yaml` |
 | **14** | ✅ **已定（第十二轮）：D61 = 不动它（保持现状）** —— 用户原话「**不动它（保持现状）**」。`scripts/generate_synthetic_data.py` 的 `world_to_pixel` 仍是转置的，但它渲染与标注共用同一函数 ⇒ 图与标签自洽，数据集有效、`block_best.pt` 不必重训 | 按决定执行：**不改投影、不重生成、不重训**。已在两处留下警告：脚本模块 docstring + `world_to_pixel()` docstring（均标明「转置、勿作真机起点、真机走 `auto_label_grid.py`」）与 `README.md` 的「训练数据」一节（两个标注脚本的对照表）。详见下方第十二轮记录第六节 |
+| **15** | 🟡 **等你跑（第十四轮新增）：板端 sudo 清单** —— 停 ollama、关桌面、`usermod -aG dialout jetson` | 命令清单见**第十四轮第九节**。**不含**装 MoveIt（板上已有）。⚠️ 两个坑：`docs/board/arm-cleanup-sudo.sh` 的 **A8 段会开 ufw**（默认拒绝入站 ⇒ WSL 侧发现不到板子），且它第 6 行明说「ollama 保留不动」⇒ **别整个脚本照跑**；`pymodbus` **不用 sudo**（pip 已在 `~/.local`），且**别装 apt 的 2.1.0** |
 
-**Orin 侧的 P4 剩余项**（P4-1 已证明板子基础很好）：缺 `ros-humble-moveit` 与 `ros-humble-robotiq-description`；`torch`/`ultralytics`/RealSense/UR 驱动**都已就绪**。P4-4（Jetson 版 PyTorch）实际已完成，勿用通用 pip 覆盖。
+**Orin 侧的 P4 剩余项**（P4-1 已证明板子基础很好）：`torch`/`ultralytics`/RealSense/UR 驱动**都已就绪**。P4-4（Jetson 版 PyTorch）实际已完成，勿用通用 pip 覆盖。
+
+> ✅ **MoveIt 板端已装（第十四轮只读实测，D48 推翻）**：`ros-humble-moveit-*` 2.5.10 齐
+> （core / kinematics / ros-move-group / planners-ompl / msgs / ros-planning …）。
+> **不要再装 `ros-humble-moveit`。** 板上现在缺的只有 AG-95 侧的 `pymodbus`
+> （`pip3 install "pymodbus>=3.6"`；apt 的 `python3-pymodbus` 是 2.1.0，不兼容）。
 
 > ⚠️ **Orin 上不需要、也不要装 `gz_ros2_control` 与任何仿真器**（P4「部署分层」的 c/d 两条已核实）。
 > 第九轮新增的 `arm_grasp_sim` 同理——它是**工作站专用**的仿真资产，板端不参与。
-> 板端唯一要补的是 `ros-humble-moveit`（P5-3 规划验证用）。
 
 ---
 
@@ -1520,3 +1526,270 @@ camera_model / red_cube / blue_cube / green_cylinder`；真正的抓取仿真世
   且 `pgrep -f "<模式串>"` 会**匹配到调用它的那条 shell 自己** —— 我又踩了一次，
   循环把自己杀了（退出码 **144**）。查进程用字符类（`[g]z sim`）或直接按 PID。
 - 仍然**没有推送**：`migrate/humble-orin` 在本地，`main` 未动。
+
+---
+
+#### 第十四轮：W2 真机 launch（+ `none` 夹爪后端与相机话题收回单层）—— 代码完成，真机未验（2026-09-27）
+
+**范围**：第十二轮把 W2 推迟了（决策 9「本轮只做纯代码 + 仿真可验证的部分」）。本轮按你的
+「**2.可以做**」重新纳入。W2 全是纯代码，不需要真机就能写完，也能在**加载 / 参数 / 守卫**
+三层验证；真机上的行为仍要等现场（见第八节）。
+
+##### 一、交付：5 个提交
+
+| 提交 | 内容 | 要点 |
+|---|---|---|
+| `011a1f2` | 夹爪 `none` 后端（`NullGripper`） | **真机 demo 的前提**：`make_gripper()` 在 `planner_node.__init__` 里**无条件**调用，而 `Ag95Gripper` 构造即报错 ⇒ 不加这个后端，**真机上规划器根本起不来**，连「臂走到目标上方」都做不到。只实现 `open()`（异步回 `(STATUS_SUCCEEDED, Result())`，契约见 D52），其余三个方法**抛错而不是静默 no-op** —— 只走位模式下它们不可达（由调用点可达性逐点核对） |
+| `45dd3a3` | 相机话题收回单层 + `ik_group`/`trajectory_action`/`carry_objects` 随源切换 | 板端实测：RealSense 发 `/camera/camera/...`；`ik_group` 是 SRDF 派生值（仿真 `ur5_manipulator` / 真机 `ur_manipulator`）；官方默认控制器是 `scaled_joint_trajectory_controller` |
+| `b8738bd` | **新增 `real.launch.py`**（真机四件事：驱动 / `move_group` / 相机静态 TF / pipeline） | 见第三节 |
+| `b442b17` | `bringup.launch.py` 的真机分支改为 include `real.launch.py` | 见第二节 D64 |
+| `9f48ee5` | `scripts/test_real_launch.py`（24 项断言）+ README 更正 MoveIt | 见第五节 |
+
+##### 二、D64（新）：`launch_configurations` 是**整棵树共享的一个 dict** —— 我因此把仿真路径静默改坏过一次
+
+原先我在 `bringup.launch.py`（唯一入口）里把真机专属参数也声明了一遍，理由是我以为
+「未声明的参数覆盖会被 launch 拒绝」。**实测把这个前提推翻了**：
+
+```
+$ ros2 launch yolo_bringup bringup.launch.py camera_source:=external zzz_bogus:=1
+   （无任何报错，zzz_bogus 被静默接受，值照常进 launch_configurations）
+```
+
+而 `launch_configurations` **是整棵树共享的**：父文件声明过的参数会顺着 include 链一路传进
+`full.launch.py` → `pipeline.launch.py`，下游的 `DeclareLaunchArgument` 见到「已设置」就
+**不再应用自己的默认值**。于是「在唯一入口为真机写了 `gripper_backend` 默认 `none`」这一个动作，
+把**仿真路径**也变成了 `none`：
+
+```
+（当时的仿真日志，无任何错误）
+  GraspPlanner 就绪 | 夹爪后端=none … 动作模式=只走位（不夹持）
+```
+
+**这是我引入的缺陷，被 `skip_detector` 冒烟当场抓到**（仿真本该是
+`夹爪后端=sim (SimGripper(Robotiq 2F-85, …)) / 动作模式=抓取`）。它**没有进过 git** ——
+`bringup.launch.py` 在本提交之前的版本从未包含那段声明，所以 git 历史里没有这个回退可查，
+理由记在这里：**为什么本文件故意不声明真机参数**。
+
+修法与取舍：真机专属参数（`robot_ip` / `ur_type` / `safety_limits` / `start_*` /
+`publish_camera_tf` / `camera_x..camera_qw`）**只在 `real.launch.py` 声明**，入口靠命令行直通。
+
+| 写法 | 万一将来 launch 不再直通未声明参数 | 失效方式 |
+|---|---|---|
+| 不声明（现状） | `robot_ip` 没传进去 → `real.launch.py` 抛「robot_ip 是必填项」 | **响亮** |
+| 声明 | 默认值悄悄改掉仿真路径 | **静默**，且只有跑仿真才会发现 |
+
+取响亮的那个。代价：`--show-args` 不再列出真机细分项（故真机用法写在文件头）。
+
+> ⚠️ **这条机制对现场也有用**：它意味着「在入口 launch 里加一个同名参数」可以**跨文件**改变
+> 下游默认值。任何往 `bringup.launch.py` 加参数的动作，都要问一句「这个名字在 include 链下游
+> 有没有同名参数」。
+
+##### 三、`real.launch.py` 的三处刻意选择
+
+1. **相机静态 TF 的子帧是 `camera_link`，不是 `camera_color_optical_frame`。**
+   第十二轮计划里写着「必须终止在 `camera_color_optical_frame`」—— **那句是错的**，本轮实测更正：
+   D435i 驱动自己发 `camera_link → camera_color_frame → camera_color_optical_frame`
+   （板端实测，`camera_link` 是根）。给 `camera_link` 补一个父帧整棵树就通了；直接给 optical
+   frame 发父帧会让它**有两个父节点**，TF 树直接坏掉。因此**手眼标定的结果必须表达在
+   `camera_link` 上**；若标定工具给的是 optical frame 的外参，要先左乘驱动那条固定的
+   `camera_link→optical`。
+2. **`safety_limits` 在驱动与 `move_group` 两处传同一个值。** 它进的是这台机器人的
+   `robot_description`（UR 的 xacro 里安全限制会加东西）。两份 description 不一致时，
+   `move_group` 的 FK/IK 与驱动实际发布的 TF 是**两套几何**，解出来的关节角到真机上是偏的，
+   **而两边都不报错**。
+3. **`initial_joint_controller` 显式传 `scaled_joint_trajectory_controller`** —— 它本来就是
+   驱动的默认值（板端实测），但显式传是为了不依赖上游默认值（上游改一次，本文件的意图就悄悄变了）。
+   它相对 `joint_trajectory_controller` 的差别是**尊重示教器速度滑条**，对第一次真机动作是明显
+   更安全的默认。配套的 `goal_time_tolerance` 已在本轮之前改成 2.0 s（D55）。
+
+D59（`launch_servo` / `launch_rviz` 上游默认 `true`）在本文件里被显式关掉：
+`launch_servo` 起的是 `moveit_servo` —— **一个能直接指挥机器人的节点**，真机联调阶段没有任何
+东西需要它，一旦被误用就是「绕过规划器直接动臂」。
+
+##### 四、D48 推翻：板上**已经装好** MoveIt，不要再装 `ros-humble-moveit`
+
+第十二轮登记 D48「板上 `moveit` 包缺失」，**本轮实测推翻**（只读）：
+
+```
+$ dpkg -l | grep -i moveit
+ros-humble-moveit-core                       2.5.10-1jammy.20260910
+ros-humble-moveit-kinematics                 2.5.10-1jammy.20260910
+ros-humble-moveit-ros-move-group             2.5.10-1jammy.20260910
+ros-humble-moveit-planners-ompl              2.5.10-1jammy.20260910
+…（另有 common / msgs / ros-planning / occupancy-map-monitor 等）
+```
+
+**W5 第 0 步的「装 `ros-humble-moveit`」删掉。** 当年那次探测大概是被 `ros2 pkg list`
+的其它故障误导（见第七节：本机 `ros2` CLI 的发现故障，症状正是「查什么都是空」）。
+
+##### 五、验收证据（本机执行，**只到「起得来、参数对、守卫真会拦」这一层**）
+
+| 项 | 怎么验的 | 结果 |
+|---|---|---|
+| 三个守卫**真会拦** | 直接跑 launch 树 | ① `robot_ip` 空 → 抛「robot_ip 是必填项」并给出两个入口的用法；② `publish_camera_tf:=true` + 全零四元数 → 抛「这不是一个合法的旋转（模长为 0）」；③ 缺 `ur_robot_driver` → 报 `sudo apt install ros-humble-ur-robot-driver` 而不是堆栈 |
+| 守卫在 `--show-args` 时**不**误触发 | `--show-args` | 包路径是**执行期**求值，`--show-args` 照样打出全部参数（写错成构造期就会整体失败） |
+| 仿真路径**没被改坏** | `camera_source:=sim` 冒烟 | `夹爪后端=sim (SimGripper(Robotiq 2F-85, …))` / `动作模式=抓取` / `IK组=ur5_manipulator` / `桌面进场景=True` |
+| `external` 分支**不碰机械臂** | `camera_source:=external skip_planner:=true` | 只起 detector + perception_3d，没有 UR 驱动 / `move_group` |
+| 参数**真到得了**规划器 | 读规划器启动横幅（本机 `ros2 param get` 不可用，见第七节） | `IK组=ur5_manipulator`（仿真的正确值） |
+| 上面这些**以后不会悄悄退回去** | 新增 `scripts/test_real_launch.py`（24 项，9 组） | 全 PASS。它只用 `/opt/ros/humble`，**不需要仿真器、不需要 `colcon build`**（包路径解析被替换成假的，所以查的是源码而不是 install 里的拷贝）。含 **D64 回归**：唯一入口不得声明任何真机专属参数 |
+
+⚠️ **这些验证的边界必须说清**：它们证明的是**「进程起得来、参数解析对、守卫会拦」**，
+**不是**「跨节点的数据流是通的」。第七节说明为什么。
+
+##### 六、另外两处登记更新
+
+- `grasp_planner.yaml` 的 D50 修复（把 yaml 接进真实入口）+ `ik_group` / `trajectory_action` /
+  `carry_objects` 的按源切换已在 `45dd3a3` 落地；`real.launch.py` 从 `pipeline.launch.py`
+  继承这套参数（**参数只在 `pipeline.launch.py` 一处定义**，两边各写一份必然出现
+  「仿真能跑、真机不跑」）。
+- `AG95_EMPTY_TOLERANCE_MM` 等换算契约（D56）与 `test_ag95_units.py` 的哑元注入（新增
+  `action_msgs` / `control_msgs` 桩）已随 `011a1f2` 修好，22 项全 PASS。
+
+##### 七、本轮顺手发现的两件事（都**不是**本仓库的缺陷，但会影响你怎么用这台工作站）
+
+**(1) 本机跨进程 DDS 发现当前是坏的 —— 这就是「`ros2` CLI 查什么都是空」的真正原因。**
+
+实测（三个进程，同一 shell、同一 `ROS_DOMAIN_ID`、同一 RMW）：
+
+```
+$ python3 listen.py &   # 订阅 /probe_topic
+$ python3 talk.py       # 发 8 秒
+listener: 收到 0 条         ← 而且 get_node_names() 里只有它自己
+```
+
+`ros2 param get` / `ros2 topic list` / `ros2 node list` 全是独立进程，走的是同一条发现路径，
+所以它们返回空**不是 CLI 坏**，是发现不到。**变通办法（实测有效）**：
+
+```
+$ FASTDDS_BUILTIN_TRANSPORTS=SHM python3 listen.py &   # 同一条命令
+listener: 收到 16 条
+```
+
+分项矩阵（同样的 talker/listener）：
+
+| 传输 | 结果 |
+|---|---|
+| 默认（SHM + UDPv4） | **0 条** |
+| `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` | 0 条 |
+| `ROS_LOCALHOST_ONLY=1`（+ UDPv4） | 0 条 |
+| **`FASTDDS_BUILTIN_TRANSPORTS=SHM`** | **16 条** ✅ |
+| 清空 `/dev/shm/fastrtps_*` 后默认 | 0 条（**不是**残留段的问题） |
+
+⇒ 坏的是 UDPv4/多播那条路（WSL2 的 `eth0` 是 <ip>/23，另有 `loopback0`），
+SHM 那条是好的。
+
+⚠️ **两个限制**：
+  · **`FASTDDS_BUILTIN_TRANSPORTS=SHM` 只适合本机自测**。SHM 不出主机，**与 Orin 板子通信
+    必须走 UDP**，所以不要把它写进 `.bashrc` 或任何 launch 文件；
+  · 桌面上「`gz sim` 里一切正常」与「`ros2 topic echo` 看不到任何东西」可以**同时成立**，
+    别再把后者当成链路坏了。
+
+> 时间线补一句：19:35 那次仿真跑里 `robot_state_publisher` 报了
+> `Moved backwards in time, re-publishing joint transforms!` —— 那条警告**要求 RSP 真的
+> 收到了 `controller_manager` 发的 `/joint_states`**，即**当时发现是通的**。发现失效发生在
+> 之后（我唯一做过的动作是收进程与探测 gz 时钟）。所以这更像是 WSL 侧网络状态变化
+> （本机此前记录过同样的 CLI 怪象），**不是本仓库的代码问题**，我也**没有**把它当成
+> 「一直如此」。
+
+**(2) 仿真里 move_group 的 `jump back in time` 刷屏 —— 成因**没有**确认，但复现条件收窄了。**
+
+现象（19:43 那份完整仿真日志）：`[tf2_buffer]: Detected jump back in time. Clearing TF buffer.`
+**16486 次**（move_group），`Moved backwards in time` **287 次**（RSP）。
+
+**已排除的：`/clock` 本身。** 直接量了两侧：
+
+```
+gz 侧 /clock（gz.msgs.Clock 有三个字段）:  system 1790509559 / real 17.78 / sim 15.72
+ROS 侧 /clock（rclpy 订阅 6.5 s）      :  16.694 → 23.194  回退 0 次（≈1000 Hz）
+```
+
+⇒ ros_gz_bridge 取的是 `gz.msgs.Clock` 的 **`sim`** 字段（**不是** `system`），且转发后
+**单调递增**。所以跳变不是「`/clock` 倒退」。
+
+**而且它没能在干净环境里复现。** 同一条命令（`camera_source:=sim skip_detector:=true
+headless:=true`，80 s）在**随后两次干净启动**里各跑一遍，两种传输都跑：
+
+| 运行 | `Moved backwards` | `jump back in time` |
+|---|---|---|
+| plain（默认传输） | **0** | **0** |
+| `FASTDDS_BUILTIN_TRANSPORTS=SHM` | **0** | **0** |
+| 19:43 那次（对着 16486/287） | 287 | 16486 |
+
+关键差别是 19:43 那次跑之前，机器上**有前几次整跑留下的孤儿进程**（第十三轮已经实测过
+这一类：4 个孤儿 `projector_node` + 3 个孤儿 `detector_node`，被 WSL 的 `/init` 收留后
+**继续跑**）。若其中有一个旧的 `parameter_bridge` 还活着，它会把**已经死掉的那个 gz 世界**
+的 `/clock` 继续发出来 —— 两个 `/clock` 发布者、两个时基，正是「跳回过去」的形状。
+
+⚠️ **这是假设，不是结论**：我没有复现出「有孤儿 → 必刷屏」这一步。本轮**未改任何时钟相关
+代码**（`sim.launch.py` 不在改动范围内），`arm_grasp_sim` 整套又是本迁移分支上**新增**的
+（没有「改造前」可比），所以我**不**声称它「一直存在」或「本轮引入」。风险是实在的：
+`Clearing TF buffer` 会清空 move_group 的 TF 缓存，若正好落在投影/IK 期间，症状是
+**偶发的解算失败**。留给下一轮，判据两条：① 跑完整闭环（带检测器）时是否还出现；
+② 出现时 `ps` 里有几个 `parameter_bridge` —— **清场要看进程名，不是看 launch 还活着**。
+
+##### 八、未验证 / 未做（别当成已完成）
+
+- ⚠️ **真机上一次都没跑过。** `real.launch.py` 只在本机验到「守卫会拦、参数解析对」。真机上
+  十有八九还会撞上本机看不见的东西（驱动握手、控制器激活、相机话题名、手眼外参）。
+- ⚠️ **跨节点数据流在本机没验**（第七节 (1)）。带检测器的完整闭环要在
+  `FASTDDS_BUILTIN_TRANSPORTS=SHM` 下重跑才算验过。
+- **W3（AG-95 写路径）仍是骨架**，闸门不变：只读通链路 → 夹爪**拆下臂**放工作台、急停在手边
+  → 才允许 `ag95_dry_run=false`。
+- **W5 一行没动**（现场步骤），板端 sudo 清单见第九节。
+- 板上**未装任何东西、未改任何配置**（本轮所有板端动作都是只读）。
+
+##### 九、状态与**板端 sudo 清单**（等你跑）
+
+- `migrate/humble-orin`：本轮 5 个提交，**未推送**，`main` 未动。
+
+**板端只读探测（2026-09-27，本轮）**：Python 3.10.12；`pymodbus` 缺，
+**apt 里的 `python3-pymodbus` 是 2.1.0（2.x API，与我们要用的 3.x 不兼容）⇒ 用 pip**；
+`pip3` 26.0.1 已在 `~/.local`（**装 pymodbus 不需要 sudo**）；`jetson` **不在** `dialout` 组；
+`/dev/ttyTHS1` / `ttyTHS2` 存在且是 `root:dialout 660`；ollama `active`+`enabled`；
+默认 target 是 `graphical.target`、`gdm.service` 在跑；内存 7.4 GiB 总 / 590 MiB free /
+4.2 GiB available；RSS 前几名是 **ChatGPT(×3，合计约 1 GB) / gnome-shell(360 MB) /
+gnome-software(317 MB)**，ollama 常驻只占 24 MB（大内存是它**加载模型**时才吃）。
+
+**要你跑的（都是系统状态变更，我不动板子）**：
+
+```bash
+# ① 先看清现状（三条只读）
+free -h
+systemctl is-active ollama gdm
+sudo ufw status                      # ← 只读，但要 sudo；见下面 ③ 的警告
+
+# ② 停 ollama（常驻服务，禁用后重启不回来）
+sudo systemctl stop ollama
+sudo systemctl disable ollama        # 想恢复：sudo systemctl enable --now ollama
+
+# ③ 关桌面 —— 8 GB 板上跑 驱动+MoveIt+YOLO 时最有效的一步（可回退）
+sudo systemctl stop gdm              # 立即释放；注意当前图形会话会掉
+sudo systemctl set-default multi-user.target
+#   回退：sudo systemctl set-default graphical.target && sudo systemctl start gdm
+#   只想温和一点：pkill -f ChatGPT; pkill -f gnome-software; pkill -f update-manager
+
+# ④ 串口权限（AG-95 走 /dev/ttyTHS1 时必须；加完组**要重新登录**才生效）
+sudo usermod -aG dialout jetson
+#   重连 SSH 后确认：groups jetson | grep dialout
+```
+
+**不需要 sudo 的**：
+
+```bash
+pip3 install "pymodbus>=3.6"         # 别用 apt（那是 2.1.0）
+python3 -c "import pymodbus; print(pymodbus.__version__)"
+ros2 pkg prefix moveit_ros_move_group   # 应回 /opt/ros/humble —— MoveIt 已在（D48 推翻）
+```
+
+⚠️ **两件别做的事**：
+  · **别整个跑 `docs/board/arm-cleanup-sudo.sh`**。它的 **A8 段会 `ufw --force enable`**
+    （默认拒绝入站、只放行 22/3389/5900），而 ROS 2 DDS 用的是动态 UDP 端口 ⇒
+    **WSL 侧发现不到板子**；它第 6 行还明写「保留不动：ollama 服务、docker」⇒
+    内存那件事它**不会**帮你做。要跑就只跑它的 A1–A7 段，或跑完补 `sudo ufw disable`。
+  · **别装 `ros-humble-moveit`**（已在），**别用 apt 装 `pymodbus`**（版本太老）。
+
+> 🩹 **本轮清场又踩了一次自己的雷**（第十三轮记过同一条）：`pkill -f "[r]os2 launch"`
+> 把**我自己的 shell** 也杀了 —— 因为那条命令的命令行文本里就含 `ros2 launch`。
+> **查/杀进程一概用 `ps` + `awk` 带字符类**：
+> `ps -eo pid,args --no-headers | awk '/[g]z sim|[m]ove_group|[p]lanner_node|[r]os2 launch/'`，
+> 别用 `pkill -f`（它会匹配到调用它的那条 shell）。
