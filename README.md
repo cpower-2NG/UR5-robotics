@@ -176,6 +176,8 @@ yolo_ros/
     ├── TECHNICAL_SPEC.md     # 设计稿（含环境对照表，注意其前提已过时）
     ├── GRID_ENV_DESIGN.md    # 方阵世界与训练流水线
     ├── MIGRATION_HANDOFF.md  # Orin 迁移交接
+    ├── ORIN_ACCESS.md        # 板子 SSH 连接方式（不含密码）
+    ├── board/                # 板端资产留档：6 个 arm-*.sh + 体检清单 + UR5 接入方案
     ├── YOLO_TUTORIAL.md, YOLO_VISION_DESIGN.md
     └── reference/            # 外部参考项目（不入库）
 ```

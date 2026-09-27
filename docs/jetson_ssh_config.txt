@@ -1,0 +1,16 @@
+# ~/.ssh/config 模板 —— SSH 到 Orin 板子（见 docs/ORIN_ACCESS.md）
+#
+# 用法：
+#   mkdir -p ~/.ssh && chmod 700 ~/.ssh
+#   cp docs/jetson_ssh_config.txt ~/.ssh/config
+#   chmod 600 ~/.ssh/config
+#
+# 前提：私钥 ~/.ssh/board_ed25519 已在 WSL 内且权限为 600。
+#       ⚠️ 不要指向 /mnt/c 下的私钥——/mnt/c 权限是 777，SSH 会以
+#       "permissions too open" 拒绝加载。
+
+Host jetson
+    HostName <host-ip>
+    User jetson
+    IdentityFile ~/.ssh/board_ed25519
+    StrictHostKeyChecking accept-new
