@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>arm_grasp_sim</name>
+  <version>0.1.0</version>
+  <description>
+    UR5 + Robotiq 2F-85 抓取仿真（Gazebo Harmonic）。
+    从参考项目 grasp_sim 迁入主线，作为仿真侧的唯一事实源；
+    真机侧同一套 launch 靠 camera_source 开关切换。
+
+    注意：仿真夹爪是 Robotiq 2F-85，**真机是 大寰 AG-95**（Modbus RTU/RS485），
+    两者控制接口不同，规划器通过夹爪抽象层适配，详见 grasp_planner 包。
+  </description>
+  <maintainer email="user@example.com">cyh</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>ros_gz_image</exec_depend>
+  <exec_depend>ur_description</exec_depend>
+  <exec_depend>ur_moveit_config</exec_depend>
+  <exec_depend>moveit</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>gz_ros2_control</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>moveit_ros_move_group</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>vision_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <!-- 相机 TF：仿真侧由 sim.launch.py 依据世界文件真值发静态 TF；
+       真机侧改由手眼标定结果提供，接口一致（static_transform_publisher）。 -->
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
