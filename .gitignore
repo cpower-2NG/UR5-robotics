@@ -12,3 +12,10 @@ docs/reference/
 
 # demo_pipeline.py 的独立数据集输出（几何与 block_dataset/ 不同，见 D30）
 block_dataset_demo/
+
+# YOLO 权重：属**构建产物**而非源码，默认不入库（历史里已有一批被删但仍在
+# history 中的 .pt blob，见 RESTRUCTURE_PLAN 的 Q7，不再往上加）。
+# 需要随仓库分发时用 `git add -f` 显式覆盖。
+# detector_node 会按 $YOLO_MODEL_DIR → CWD 逐级向上 → 包内 models/ 的顺序查找，
+# 找不到就明确报错，**不会**联网下载 COCO 权重冒充（见 D6/D24）。
+ros2_ws/src/yolo_detector/models/*.pt

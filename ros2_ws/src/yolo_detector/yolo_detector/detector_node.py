@@ -266,7 +266,23 @@ class YoloDetector(Node):
             if conf < self.conf_thresh:
                 continue
 
-            x1, y1, x2, y2 = box
+            # ⚠️ 必须显式转成 Python float。`boxes` 来自 `.cpu().numpy()`，是
+            # float32，`x1..y2` 就是 **np.float32** 标量；而 vision_msgs 的纯
+            # Python 消息类在 setter 里做了严格断言
+            #   assert isinstance(value, float), "The 'size_x' field must be of type 'float'"
+            # `isinstance(np.float32(1.0), float)` 是 **False**（np.float64 才是
+            # float 的子类），于是消息一构造就 AssertionError，节点在**第一帧
+            # 图像**上直接崩掉。
+            #
+            # 这里曾经只在下面把 score 包了 float()，bbox 的四个量没包，所以
+            # cx/cy 侥幸能过（np.float32 与 Python float 运算在 NumPy 1.x 的
+            # 值域规则下被提升成 np.float64），而 w/h 是 np.float32 相减、仍是
+            # np.float32，必崩——报错只指向 size_x，很容易让人以为只错了一个字段。
+            #
+            # 更要命的是这依赖 NumPy 版本：NumPy 2 起（NEP 50）np.float32 与
+            # float 运算**不再**提升，cx/cy 也会一起崩。Orin 上装的若是 NumPy 2，
+            # 症状会与这里不同。所以四个量全部显式 float()。
+            x1, y1, x2, y2 = (float(v) for v in box)
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
             w = x2 - x1
