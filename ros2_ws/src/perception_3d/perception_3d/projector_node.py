@@ -7,7 +7,8 @@
   /camera/color/camera_info (sensor_msgs/CameraInfo)
 
 发布:
-  /target_3d  (geometry_msgs/PoseStamped) — target_frame 坐标系（默认 base_link）
+  /targets_3d (vision_msgs/Detection3DArray) — target_frame 下**全部**目标的 3D 位姿
+  /target_3d  (geometry_msgs/PoseStamped)    — 其中**最高分**那一个（向后兼容）
 
 工作流程:
   1. 深度图按 encoding 换算成**米**后存入带时间戳的环形缓冲
@@ -16,6 +17,16 @@
   4. 针孔投影: P_camera = Z * K⁻¹ * [u, v, 1]ᵀ
   5. TF: camera_frame → target_frame
   6. 发布 target_frame 下的 3D 坐标
+
+为什么有**两个**发布话题（P3-6 的决定）:
+  抓取规划器要做三件事——按 Y 排序（从左到右抓，避免机械臂横扫其他物体）、
+  跳过已抓过的（按世界坐标去重）、取最高分。**这三件事都需要"全部候选"**，
+  而一个 ``PoseStamped`` 只能装一个目标，且不含 id/类别/分数，
+  订阅者无法分辨哪条是哪个物体。所以新增 ``/targets_3d`` 携带完整候选集
+  （每条含 ``id`` / ``hypothesis.class_id`` / ``hypothesis.score`` / 3D 位姿），
+  规划器只消费它、**不再自己做任何投影**。
+  ``/target_3d`` 保留为「最高分那个」，以免破坏既有测试与文档契约
+  （``scripts/test_pipeline_e2e.py``、``docs/TECHNICAL_SPEC.md``）。
 
 输入约定（**依赖 yolo_detector 冻结的像素约定**，见 P2-5 / D7）:
   ``/detections`` 的 ``bbox`` 必须是**像素**坐标、原点在图像左上角；
@@ -37,7 +48,13 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
-from vision_msgs.msg import Detection2DArray
+from vision_msgs.msg import (
+    Detection2DArray,
+    Detection3DArray,
+    Detection3D,
+    ObjectHypothesisWithPose,
+    BoundingBox3D,
+)
 from geometry_msgs.msg import PoseStamped, Point, Quaternion
 
 from cv_bridge import CvBridge
@@ -113,6 +130,9 @@ class Perception3D(Node):
         self.tf_fail_streak = 0          # D8: 连续失败计数
 
         # ---- 发布者 ----
+        # /targets_3d：全部候选（规划器消费这个，P3-6）
+        self.targets_pub = self.create_publisher(Detection3DArray, '/targets_3d', 10)
+        # /target_3d：最高分那个，向后兼容既有测试与文档契约
         self.target_pub = self.create_publisher(PoseStamped, '/target_3d', 10)
 
         # ---- 订阅者 ----
@@ -334,6 +354,15 @@ class Perception3D(Node):
             )
             return
 
+        # P3-6：本批结果先收集成 Detection3DArray，循环结束后**一次性**发布。
+        # 逐条发到同一话题会让订阅者无法分辨物体（没有 id、分数被覆盖）。
+        targets_msg = Detection3DArray()
+        targets_msg.header.stamp = stamp
+        targets_msg.header.frame_id = self.target_frame
+        best_score = -1.0
+        best_pose = None
+        best_class = ''
+
         for detection in msg.detections:
             # ---- Step 1: 提取检测框 ----
             u = detection.bbox.center.position.x
@@ -396,12 +425,31 @@ class Perception3D(Node):
                 base_pose.header.stamp = self.get_clock().now().to_msg()
                 base_pose.header.frame_id = self.target_frame
 
-                self.target_pub.publish(base_pose)
                 self.tf_fail_streak = 0
 
                 class_name = ''
+                score = 0.0
                 if len(detection.results) > 0:
                     class_name = detection.results[0].hypothesis.class_id
+                    score = detection.results[0].hypothesis.score
+
+                # ---- Step 5: 收进本批候选集（P3-6）----
+                # id 透传上游；上游没填时用序号兜底，保证每条都可区分。
+                d3 = Detection3D()
+                d3.header = base_pose.header
+                d3.id = detection.id if detection.id else f'det{len(targets_msg.detections)}'
+                hyp = ObjectHypothesisWithPose()
+                hyp.hypothesis.class_id = class_name
+                hyp.hypothesis.score = score
+                hyp.pose.pose = base_pose.pose
+                d3.results.append(hyp)
+                bbox3d = BoundingBox3D()
+                bbox3d.center = base_pose.pose   # 3D 位置在此；尺寸无意义故留零
+                d3.bbox = bbox3d
+                targets_msg.detections.append(d3)
+
+                if score > best_score:
+                    best_score, best_pose, best_class = score, base_pose, class_name
 
                 self.get_logger().info(
                     f'Target [{class_name}] projected: '
@@ -430,6 +478,21 @@ class Perception3D(Node):
                         f'tf_required=True 故直接失败'
                     ) from e
                 continue
+
+        # ---- Step 6: 发布本批全部候选（P3-6）----
+        # 一个都没投影成功时不发空数组：发了会让下游误以为「拍到了但没目标」，
+        # 与「深度/TF 出问题导致全部丢弃」无法区分。
+        if not targets_msg.detections:
+            return
+
+        self.targets_pub.publish(targets_msg)
+        if best_pose is not None:
+            self.target_pub.publish(best_pose)   # 最高分那个，向后兼容
+
+        self.get_logger().info(
+            f'发布 {len(targets_msg.detections)} 个候选到 /targets_3d；'
+            f'/target_3d = [{best_class}] score={best_score:.2f}'
+        )
 
 
 def main(args=None):
