@@ -12,6 +12,13 @@
   <depend>perception_3d</depend>
   <depend>grasp_planner</depend>
 
+  <!-- camera_source:=sim 时 bringup 会 include arm_grasp_sim/full.launch.py，
+       故是**运行期**依赖。用 exec_depend 而非 depend：真机部署上根本不会走到
+       那一条分支，构建期没有必要为此拉入 Gazebo 相关的东西。
+       bringup 对该包做了缺包容错（OpaqueFunction + 可操作报错），
+       所以在板上只编子集、不装仿真资产的场景仍可正常用真机分支。 -->
+  <exec_depend>arm_grasp_sim</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
 

@@ -1,7 +1,9 @@
 """
 Launch 文件: 启动感知+抓取流水线 (不含 Gazebo)
 用法:
-  # 仿真：相机话题由 simulation.launch.py 的 ros_gz_bridge 提供
+  # 仿真：相机话题由 arm_grasp_sim 的 ros_gz_bridge 提供。
+  # 一般**不直接调本文件**跑仿真——用 bringup.launch.py camera_source:=sim，
+  # 它会先起世界与机械臂，再 include 本文件。直接调只适合「世界已在跑」的场合。
   ros2 launch yolo_bringup pipeline.launch.py camera_source:=sim
 
   # 真机：自己拉起 realsense2_camera（需要 ros-humble-realsense2-camera）
@@ -17,8 +19,8 @@ grasp_planner 的参数不变。
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
+from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
@@ -42,10 +44,6 @@ def generate_launch_description():
         'device', default_value='cuda:0',
         description='Inference device: cpu | cuda:N (falls back to cpu unless '
                     'device_fallback:=false)'
-    )
-    mode_arg = DeclareLaunchArgument(
-        'mode', default_value='mock',
-        description='Grasp mode: mock | moveit'
     )
     target_frame_arg = DeclareLaunchArgument(
         'target_frame', default_value='base_link',
@@ -72,6 +70,44 @@ def generate_launch_description():
     tf_required_arg = DeclareLaunchArgument(
         'tf_required', default_value='false',
         description='true = perception_3d aborts if the camera→target TF is missing'
+    )
+    # 夹爪后端的默认值**随 camera_source 变**，理由同 depth_topic：
+    #   sim        → 夹爪就是 JTC 的第 7 个关节（Robotiq 2F-85），发轨迹即可
+    #   realsense/ → 夹爪是**独立的 Modbus 设备**（大寰 AG-95），不在 JTC 里。
+    #   external
+    # 真机上若仍默认 sim，规划器会去命令一个**真机不存在的关节**
+    # robotiq_85_left_knuckle_joint——JTC 收下这条轨迹却不动任何东西，
+    # 于是「夹爪没反应」而不报错。故真机默认 ag95（其当前实现是**会大声报错的桩**，
+    # 现场核实 Modbus 寄存器映射前不可用，这是刻意设计，见 grasp_planner/gripper.py）。
+    gripper_backend_default = PythonExpression([
+        "'sim' if '", LaunchConfiguration('camera_source'),
+        "' == 'sim' else 'ag95'",
+    ])
+    gripper_backend_arg = DeclareLaunchArgument(
+        'gripper_backend', default_value=gripper_backend_default,
+        description='sim | ag95 — 夹爪后端。sim = JTC 第 7 关节；'
+                    'ag95 = 独立 Modbus 设备（真机）。默认随 camera_source。'
+    )
+    # 感知单测 / 真机分阶段验收需要**只起感知、不起抓取**。
+    # 这与 gripper_backend 的默认值是两个正交的问题：前者是「本轮验不验抓取」，
+    # 后者是「抓取该用哪个夹爪」。若不提供这个开关，跑感知单测时就只能
+    # 连带把 ag95 桩拉起来（它会按设计**立刻报错退出**），把日志搞脏。
+    skip_detector_arg = DeclareLaunchArgument(
+        'skip_detector', default_value='false',
+        description='true = 不起 YOLO（喂外部 /detections，如自检脚本）'
+    )
+    skip_planner_arg = DeclareLaunchArgument(
+        'skip_planner', default_value='false',
+        description='true = 不起抓取规划器（只验感知）'
+    )
+    # 统一延时：仿真里这些节点要等 Gazebo 把 /clock、相机话题发出来，
+    # 还要等 MoveIt 的 /compute_ik 与 JTC 的 action 就绪；真机上是 0。
+    # 之所以是**一个**延时而不是 detector/planner 两档：本文件是节点的
+    # **唯一定义处**，而「几秒起步」是仿真专属的调度细节，不该在这里长成
+    # 两个可调旋钮。仿真侧传一个够用的值即可（见 arm_grasp_sim/full.launch.py）。
+    start_delay_arg = DeclareLaunchArgument(
+        'start_delay', default_value='0.0',
+        description='所有节点统一延迟启动（秒）。仿真传 18；真机保持 0'
     )
 
     # 注意：不能写 LaunchConfiguration('camera_source') == 'realsense' ——
@@ -101,6 +137,7 @@ def generate_launch_description():
         executable='detector_node',
         name='yolo_detector',
         output='screen',
+        condition=UnlessCondition(LaunchConfiguration('skip_detector')),
         parameters=[{
             'model': LaunchConfiguration('model'),
             'confidence_threshold': LaunchConfiguration('confidence_threshold'),
@@ -122,13 +159,17 @@ def generate_launch_description():
     )
 
     # ---- 抓取规划节点 ----
+    # 其余参数（几何、时序、IK 种子等）由 grasp_planner 自己的
+    # config/grasp_planner.yaml 提供，planner_node 已内置同名默认值，
+    # 故此处只需覆盖后端选择。
     planner = Node(
         package='grasp_planner',
         executable='planner_node',
         name='grasp_planner',
         output='screen',
+        condition=UnlessCondition(LaunchConfiguration('skip_planner')),
         parameters=[{
-            'mode': LaunchConfiguration('mode'),
+            'gripper_backend': LaunchConfiguration('gripper_backend'),
         }],
     )
 
@@ -136,13 +177,16 @@ def generate_launch_description():
         model_arg,
         conf_arg,
         device_arg,
-        mode_arg,
         target_frame_arg,
         camera_source_arg,
         depth_topic_arg,
         tf_required_arg,
-        realsense,
-        detector,
-        perception,
-        planner,
+        gripper_backend_arg,
+        skip_detector_arg,
+        skip_planner_arg,
+        start_delay_arg,
+        TimerAction(
+            period=LaunchConfiguration('start_delay'),
+            actions=[realsense, detector, perception, planner],
+        ),
     ])
