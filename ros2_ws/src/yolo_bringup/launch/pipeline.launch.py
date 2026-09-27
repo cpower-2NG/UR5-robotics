@@ -156,6 +156,62 @@ def generate_launch_description():
         'tf_required', default_value='false',
         description='true = perception_3d aborts if the camera→target TF is missing'
     )
+    # max_sync_dt：检测↔深度帧的最大时间差，超过就**丢弃整批检测**（不报错退出）。
+    # ⚠️ 这一项原先**到不了**：`projector_node` 认得它（默认 0.1），但只有
+    # `perception_3d/launch/perception.launch.py` 暴露它，而那个文件**全仓库没有
+    # 一处 include**（setup.py 只把它装进 share/）—— 于是现场无论怎么传都无效，
+    # 正是 D50 那一类「参数定义在一个没人走的入口上」。这里补上唯一入口的定义。
+    #
+    # 为什么真机默认放宽到 0.3：窗口太紧的症状是**看不见目标**（日志里每 5 s 才
+    # 一条「丢弃本批检测」，很像检测器坏了），而真机的相机/桥接比仿真更容易抖动。
+    # 放宽到 0.3 不会换来错误坐标：相机静止、方块静止时，晚 0.3 s 的深度帧与当前
+    # 帧**逐像素相同**（深度是场景几何的函数，不随采样时刻变），所以「配对到旧帧」
+    # 对静止物体是无害的；它仍然拦得住真正的失步（流停了、时间戳对不上）。
+    # 仿真保持 0.1 不动 —— 这是拿到 9/9 那套结果时用的值，不为了让日志干净去改它。
+    max_sync_dt_default = PythonExpression([
+        "'0.1' if '", LaunchConfiguration('camera_source'), "' == 'sim' else '0.3'",
+    ])
+    max_sync_dt_arg = DeclareLaunchArgument(
+        'max_sync_dt', default_value=max_sync_dt_default,
+        description='检测↔深度 最大时间差（秒），超过则丢弃整批检测。'
+                    '默认：仿真 0.1 / 真机 0.3。设小了症状是「看不到目标」'
+    )
+    # ── 3D 感知的采样/配准旋钮：也在唯一入口上给全 ─────────────────────
+    # 规则（本文件对**它自己起的三个节点**都适用）：**传给节点的每个参数，
+    # 都要在本文件里声明**。不声明的话现场传了 `depth_grid:=7` 会**静默无效** ——
+    # 未声明的参数会被 launch **接受**并塞进共享的 `launch_configurations`（实测），
+    # 只是没有任何人读它，于是「我明明传了」与「一点反应都没有」同时成立。
+    # 默认值一律**照抄节点 `declare_parameter` 的值**（改了就是静默改行为）；
+    # 下面 7 个只有真机才需要动，仿真的值全部与节点默认值相同。
+    depth_scale_arg = DeclareLaunchArgument(
+        'depth_scale', default_value='-1.0',
+        description='深度 像素→米 的尺度。-1 = 按 msg.encoding 自动判定'
+                    '（16UC1→0.001 / 32FC1→1.0）。非标准编码的深度源才需要强制'
+    )
+    depth_grid_arg = DeclareLaunchArgument(
+        'depth_grid', default_value='5',
+        description='检测框内的采样网格边长（5 → 5×5）。真机深度更脏时可调'
+    )
+    depth_cluster_tol_arg = DeclareLaunchArgument(
+        'depth_cluster_tol', default_value='0.03',
+        description='取「最近深度簇」的容差（米），抗框内背景干扰'
+    )
+    depth_median_window_arg = DeclareLaunchArgument(
+        'depth_median_window', default_value='5',
+        description='每个采样点的邻域中值窗口边长（去深度噪点）'
+    )
+    depth_buffer_len_arg = DeclareLaunchArgument(
+        'depth_buffer_len', default_value='10',
+        description='深度帧环形缓冲长度（按时间戳就近配对用）'
+    )
+    camera_info_topic_arg = DeclareLaunchArgument(
+        'camera_info_topic', default_value='/camera/color/camera_info',
+        description='提供 fx/fy/cx/cy 的 CameraInfo 话题（真机与仿真同名）'
+    )
+    detections_topic_arg = DeclareLaunchArgument(
+        'detections_topic', default_value='/detections',
+        description='vision_msgs/Detection2DArray 输入话题'
+    )
     # 夹爪后端的默认值**随 camera_source 变**，理由同 depth_topic：
     #   sim        → 夹爪就是 JTC 的第 7 个关节（Robotiq 2F-85），发轨迹即可
     #   realsense/ → 夹爪是**独立的 Modbus 设备**（大寰 AG-95），不在 JTC 里。
@@ -295,6 +351,16 @@ def generate_launch_description():
             'target_frame': LaunchConfiguration('target_frame'),
             'depth_topic': LaunchConfiguration('depth_topic'),
             'tf_required': LaunchConfiguration('tf_required'),
+            # 默认值随 camera_source 变（仿真 0.1 / 真机 0.3），见上面 max_sync_dt_arg
+            'max_sync_dt': LaunchConfiguration('max_sync_dt'),
+            # 采样/配准旋钮：全部在参数面上出现，理由见上面那一组 DeclareLaunchArgument
+            'depth_scale': LaunchConfiguration('depth_scale'),
+            'depth_grid': LaunchConfiguration('depth_grid'),
+            'depth_cluster_tol': LaunchConfiguration('depth_cluster_tol'),
+            'depth_median_window': LaunchConfiguration('depth_median_window'),
+            'depth_buffer_len': LaunchConfiguration('depth_buffer_len'),
+            'camera_info_topic': LaunchConfiguration('camera_info_topic'),
+            'detections_topic': LaunchConfiguration('detections_topic'),
         }],
     )
 
@@ -342,6 +408,14 @@ def generate_launch_description():
         camera_source_arg,
         depth_topic_arg,
         tf_required_arg,
+        max_sync_dt_arg,
+        depth_scale_arg,
+        depth_grid_arg,
+        depth_cluster_tol_arg,
+        depth_median_window_arg,
+        depth_buffer_len_arg,
+        camera_info_topic_arg,
+        detections_topic_arg,
         gripper_backend_arg,
         ik_group_arg,
         trajectory_action_arg,

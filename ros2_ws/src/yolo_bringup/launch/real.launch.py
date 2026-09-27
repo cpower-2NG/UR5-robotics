@@ -320,6 +320,11 @@ def generate_launch_description():
     # ---- 感知/抓取 ----
     # 与仿真共用同一份参数定义，只在 pipeline.launch.py 一处（它的文件头写了
     # 为什么）—— 两边各写一份的话，改一处忘一处就是「仿真能跑、真机不跑」。
+    # ⚠️ 这里**故意不写** max_sync_dt：它的真机默认值（0.3）已经由 pipeline.launch.py
+    # 按 camera_source 给出（sim 0.1 / 其余 0.3），本文件再声明一次就是第二处定义 ——
+    # 谁生效取决于 include 顺序，而那种错**不会报错**（D50/D64 都是这一类）。
+    # 现场要调就命令行直通：`... bringup.launch.py camera_source:=realsense max_sync_dt:=0.5`
+    # （未声明的参数会直接进 launch_configurations，实测如此）。
     pipeline = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_dir, "launch", "pipeline.launch.py")
