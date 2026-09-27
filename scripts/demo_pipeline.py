@@ -258,8 +258,13 @@ def step2_split_val(val_ratio=0.2):
 
 def step3_create_yaml():
     """确保 data.yaml 存在"""
-    yaml_content = """# YOLOv8 方块检测数据集配置
-path: block_dataset
+    # ⚠️ `path` 必须是**本演示自己的**绝对路径。
+    # 原先写死相对路径 `path: block_dataset`，而 ultralytics 对相对 path 是按
+    # `DATASETS_DIR`（默认 ~/datasets）解析、**不是**按 yaml 所在目录——于是
+    # 训练会去找 ~/datasets/block_dataset，把本文件顶部反复强调的「与
+    # block_dataset/ 隔离」（D30）彻底绕过，且取错数据时**不报错**。
+    yaml_content = f"""# YOLOv8 方块检测数据集配置
+path: {DATASET_DIR}
 train: train/images
 val: val/images
 
@@ -374,7 +379,9 @@ def main():
     print(f"  预测结果: runs/block_detect/demo_predict/")
     print()
     print("  在真实 Gazebo 环境中使用时：")
-    print(f"    1. ros2 launch yolo_bringup simulation.launch.py world:=block_grid_world.sdf")
+    # ⚠️ 这里曾打印 simulation.launch.py——该文件第九轮已删除，照抄会直接报
+    #    「file not found」。训练世界现由 grid_world.launch.py 启动（第十轮恢复）。
+    print(f"    1. ros2 launch yolo_bringup grid_world.launch.py")
     print(f"    2. python3 scripts/collect_training_data.py")
     print(f"    3. python3 scripts/auto_label_grid.py")
     print(f"    4. python3 scripts/train_yolo_block.py")

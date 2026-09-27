@@ -475,7 +475,9 @@ def main():
     # 输出元数据
     save_metadata(blocks, seed, is_fixed)
 
-    print(f"\n[完成] 启动: ros2 launch yolo_bringup simulation.launch.py world:=block_grid_world.sdf")
+    # ⚠️ 原打印的是 simulation.launch.py——该文件第九轮已删除（第十轮由
+    #    grid_world.launch.py 接管训练世界职责），照抄会报 file not found。
+    print(f"\n[完成] 启动: ros2 launch yolo_bringup grid_world.launch.py")
     print(f"       或: gz sim -r {sdf_path}")
 
 

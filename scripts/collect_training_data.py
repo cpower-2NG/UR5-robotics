@@ -219,11 +219,7 @@ def main():
 
     print(f"\n采集完成。共 {count} 张图像保存在:")
     print(f"  {OUTPUT_DIR}")
-    print(f"\n下一步: labelImg 标注 → train_yolo_block.py 训练")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"\n下一步: python3 scripts/label_blocks.py 标注 → train_yolo_block.py 训练")
 
 
 if __name__ == "__main__":
