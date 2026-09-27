@@ -18,6 +18,13 @@ Launch 文件: 启动感知+抓取流水线 (不含 Gazebo)
 grasp_planner 的参数不变。
 """
 
+import os
+import sys
+
+from ament_index_python.packages import (
+    PackageNotFoundError,
+    get_package_share_directory,
+)
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.conditions import IfCondition, UnlessCondition
@@ -28,6 +35,29 @@ from launch_ros.actions import Node
 # 那个是**未对齐**的）。D2 要求用对齐深度配彩色内参，故真机走这个。
 REALSENSE_ALIGNED_DEPTH = '/camera/aligned_depth_to_color/image_raw'
 SIM_DEPTH = '/camera/depth/image_raw'
+
+
+def _default_planner_params_file():
+    """抓取规划器的默认参数文件；包没编出来时返回空串。
+
+    板端「只编子集 + skip_planner:=true 只验感知」是 README 文档化的用法，
+    那时 grasp_planner 可能不在。不要因此让整个 launch 起不来（与
+    bringup.launch.py 对 arm_grasp_sim 的容错保持同一种态度），
+    但**必须出声**——静默退回节点内置默认值正是本函数要防的那个 bug。
+    """
+    try:
+        return os.path.join(
+            get_package_share_directory('grasp_planner'),
+            'config', 'grasp_planner.yaml',
+        )
+    except PackageNotFoundError:
+        print(
+            '[pipeline.launch.py] 警告: 找不到 grasp_planner 包，规划器将退回'
+            '节点内置默认参数。若你正要跑抓取（不是 skip_planner:=true），'
+            '这不是你想要的。',
+            file=sys.stderr,
+        )
+        return ''
 
 
 def generate_launch_description():
@@ -100,6 +130,27 @@ def generate_launch_description():
         'skip_planner', default_value='false',
         description='true = 不起抓取规划器（只验感知）'
     )
+    # 抓取规划器的几何/时序/IK 参数**全部**在 grasp_planner/config/grasp_planner.yaml。
+    # 真机上线必须能按现场实测覆盖它（`planner.launch.py:11`、
+    # `docs/RESTRUCTURE_PLAN.md` 都这么要求），所以这里给出这条入口。
+    planner_params_default = _default_planner_params_file()
+    planner_params_arg = DeclareLaunchArgument(
+        'planner_params_file', default_value=planner_params_default,
+        description='抓取规划器参数文件。真机现场覆盖几何时指向自备的 yaml'
+    )
+    # 桌子的碰撞体**由谁打开**：grasp_planner 的 `table_scene_enabled`，
+    # yaml 里默认 false（一个默认值不可能同时对上仿真和真机的桌子，而**错的
+    # 碰撞体比没有更坏**——它可能把正确解全拒掉，看起来像 IK 坏了）。
+    # 这里单开一个同名 launch 参数，让**后端自己声明**要不要那块桌子：
+    #   仿真 → arm_grasp_sim/full.launch.py 传 true（它知道 grasp_world.sdf 的桌面尺寸）
+    #   真机 → 暂不打开，等现场实测出台面尺寸再传 true（W2）
+    # 之所以不直接写进 planner_params_file 指的那份 yaml：那份 yaml 是**共用**的，
+    # 而这一个开关是**后端属性**，属于 launch 该管的事。
+    table_scene_arg = DeclareLaunchArgument(
+        'table_scene_enabled', default_value='false',
+        description='true = 把工作台作为碰撞体发进 MoveIt 规划场景'
+                    '（几何取 planner yaml 的 table_box_*）。仿真侧传 true'
+    )
     # 统一延时：仿真里这些节点要等 Gazebo 把 /clock、相机话题发出来，
     # 还要等 MoveIt 的 /compute_ik 与 JTC 的 action 就绪；真机上是 0。
     # 之所以是**一个**延时而不是 detector/planner 两档：本文件是节点的
@@ -159,18 +210,32 @@ def generate_launch_description():
     )
 
     # ---- 抓取规划节点 ----
-    # 其余参数（几何、时序、IK 种子等）由 grasp_planner 自己的
-    # config/grasp_planner.yaml 提供，planner_node 已内置同名默认值，
-    # 故此处只需覆盖后端选择。
+    # ⚠️ 这里的 params 文件**必须显式加载**（D50）。
+    # 曾经这里只传了 gripper_backend，而注释写着「其余参数由 grasp_planner.yaml
+    # 提供」——**那句是假的**：planner_node 的 _declare_params 全是硬编码
+    # d(name, default)，它自己不读 yaml；yaml 只被 grasp_planner 自己的
+    # planner.launch.py 加载，而全仓库没有一处 include 它。
+    # 之所以一直没暴露：那 34 条默认值与 yaml 的 35 条**逐条相同**，跑起来
+    # 「碰巧是对的」。一旦按文档去改 yaml 覆盖真机几何，就会静默无效。
+    # 若包不在（板端只编子集 + skip_planner），用空 dict 占位，不引用该参数。
+    # ⚠️ 这里的 'true'/'false' 字符串会被 launch_ros 按 **yaml 规则**求值成
+    # Python bool（launch_ros/utilities/evaluate_parameters.py:79 的
+    # yaml.safe_load），正好对上节点里 `declare_parameter(..., False)` 声明出的
+    # bool 类型。若哪天要传**字符串**参数，两边都得加引号。
+    planner_params = [
+        LaunchConfiguration('planner_params_file') if planner_params_default else {},
+        {
+            'gripper_backend': LaunchConfiguration('gripper_backend'),
+            'table_scene_enabled': LaunchConfiguration('table_scene_enabled'),
+        },
+    ]
     planner = Node(
         package='grasp_planner',
         executable='planner_node',
         name='grasp_planner',
         output='screen',
         condition=UnlessCondition(LaunchConfiguration('skip_planner')),
-        parameters=[{
-            'gripper_backend': LaunchConfiguration('gripper_backend'),
-        }],
+        parameters=planner_params,
     )
 
     return LaunchDescription([
@@ -184,6 +249,8 @@ def generate_launch_description():
         gripper_backend_arg,
         skip_detector_arg,
         skip_planner_arg,
+        planner_params_arg,
+        table_scene_arg,
         start_delay_arg,
         TimerAction(
             period=LaunchConfiguration('start_delay'),
