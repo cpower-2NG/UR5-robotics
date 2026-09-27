@@ -112,8 +112,17 @@ colcon build --packages-up-to gz_ros2_control
 
 ```bash
 ros2 launch yolo_bringup grid_world.launch.py                    # 3×3 方阵
-ros2 launch yolo_bringup grid_world.launch.py world:=grasping_world.sdf
+ros2 launch yolo_bringup grid_world.launch.py world:=color_objects_world.sdf
 ```
+
+⚠️ **两个「标注」脚本不要混用，它们不是一回事**：
+
+| 脚本 | 适用 | 状态 |
+|---|---|---|
+| `scripts/generate_synthetic_data.py` | **只看仿真**：自己用 OpenCV 渲染图 + 自动出标签，生成 `block_dataset/` | ⚠️ **它的投影是转置的（D61）** —— 但它**渲染和标注共用同一个函数**，图与标签自洽，所以数据集本身有效、`block_best.pt` 不必重训。**不要拿它当真机的起点**（它的相机模型**没有旋转**，表达不了手眼外参） |
+| `scripts/auto_label_grid.py` | **真机（和仿真）**：`perception_3d/projector_node.py` 投影链的**严格逆运算**，走 tf + `/camera/color/camera_info`，含单应后端 | ✅ 自检 `scripts/test_label_projection.py` 全过。采集端用现成的 `scripts/collect_training_data.py`（订阅 ROS 话题，真机可直接用） |
+
+详见 `docs/RESTRUCTURE_PLAN.md` 第十二轮的 W4 一节与 D61 一条。
 
 ### 真机首验（相机来源三选一）
 
