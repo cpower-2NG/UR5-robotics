@@ -62,8 +62,12 @@ COLOR_POOL = [
 ]
 
 # ---- 输出路径 ----
-# 唯一输出位置：yolo_bringup 包内的 worlds/。
+# 默认输出位置：yolo_bringup 包内的 worlds/。
 # （原 yolo_vision/worlds/ 已随教学包 yolo_vision/ 一并移除，见 docs/RESTRUCTURE_PLAN.md P1）
+#
+# ⚠️ **这个目录里的 `block_grid_world.sdf` 与 `block_grid_world_meta.json` 都被 git 跟踪**，
+# 所以「默认输出」= 「改仓库」。只想生成草稿的调用方请用 `--out-dir`（或传 `out_dir=`），
+# 别让一次「顺手生成」变成两个被跟踪文件的 diff。踩过的实例见 RESTRUCTURE_PLAN.md 第九节。
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "ros2_ws", "src", "yolo_bringup", "worlds")
 
@@ -399,8 +403,15 @@ def generate_sdf(blocks):
 # ============================================================
 # 元数据输出（JSON，供自动标注读取）
 # ============================================================
-def save_metadata(blocks, seed, is_fixed_mode):
-    """输出方块位姿元数据。"""
+def save_metadata(blocks, seed, is_fixed_mode, out_dir=None):
+    """输出方块位姿元数据。
+
+    `out_dir` 缺省仍是 `OUTPUT_DIR`（`yolo_bringup/worlds/`）—— 但那个目录
+    **被 git 跟踪**，往里写等于改仓库。只想生成一份草稿、不想碰仓库的调用方
+    **必须显式传 `out_dir` 或 `--out-dir`**；`generate_synthetic_data.py`
+    就是把 40 次生成全部指到临时目录的（它原先没这么做，于是每跑一次
+    都静默覆写 `block_grid_world.{sdf,meta.json}`）。
+    """
     meta = {
         "seed": seed,
         "fixed_mode": is_fixed_mode,
@@ -424,8 +435,9 @@ def save_metadata(blocks, seed, is_fixed_mode):
         ],
     }
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    meta_path = os.path.join(OUTPUT_DIR, "block_grid_world_meta.json")
+    out_dir = out_dir or OUTPUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    meta_path = os.path.join(out_dir, "block_grid_world_meta.json")
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
     print(f"[OK] 元数据: {meta_path}")
@@ -446,6 +458,9 @@ def main():
                         help="方块数量（默认 %(default)s）")
     parser.add_argument("--pos_jitter", type=float, default=POS_JITTER,
                         help="位置扰动幅度/米（默认 %(default)s）")
+    parser.add_argument("--out-dir", default=None,
+                        help=f"输出目录（默认 {OUTPUT_DIR}，**该目录被 git 跟踪**）。"
+                             f"只想生成草稿就指到别处，别默认写进仓库。")
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.randint(0, 10**9)
@@ -465,15 +480,16 @@ def main():
     print(f"[INFO] 生成 {len(blocks)} 个方块 ({n_box} 正方体 + {n_cyl} 圆柱)")
 
     # 生成 SDF
+    out_dir = args.out_dir or OUTPUT_DIR
     sdf_content = generate_sdf(blocks)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    sdf_path = os.path.join(OUTPUT_DIR, "block_grid_world.sdf")
+    os.makedirs(out_dir, exist_ok=True)
+    sdf_path = os.path.join(out_dir, "block_grid_world.sdf")
     with open(sdf_path, 'w') as f:
         f.write(sdf_content)
     print(f"[OK] SDF: {sdf_path}")
 
     # 输出元数据
-    save_metadata(blocks, seed, is_fixed)
+    save_metadata(blocks, seed, is_fixed, out_dir)
 
     # ⚠️ 原打印的是 simulation.launch.py——该文件第九轮已删除（第十轮由
     #    grid_world.launch.py 接管训练世界职责），照抄会报 file not found。
