@@ -1,5 +1,10 @@
 """Launch 文件: 单独启动抓取规划节点。
 
+⚠️ 本文件**不在主链路上**：全仓库没有一处 include 它（`setup.py` 只是把它装进
+`share/`）。仿真与真机的唯一入口是 `yolo_bringup`（`bringup.launch.py` →
+`pipeline.launch.py`），yaml 也由那里加载（`planner_params_file`，D50 的修法）。
+本文件的存在意义只是「把规划节点单独拉起来调」；**改这里的默认值对主链路无效**。
+
 用法:
   ros2 launch grasp_planner planner.launch.py
   ros2 launch grasp_planner planner.launch.py gripper_backend:=ag95

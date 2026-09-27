@@ -1,5 +1,14 @@
 """
 Launch 文件: 单独启动 3D 感知节点
+
+⚠️ 本文件**不在主链路上**：全仓库没有一处 include 它（`setup.py` 只是把它装进
+`share/`）。仿真与真机的唯一入口是 `yolo_bringup`（`bringup.launch.py` →
+`pipeline.launch.py`），**`max_sync_dt` 等参数只在 `pipeline.launch.py` 一处定义**
+（那里给了真机放宽值 0.3，见该文件 max_sync_dt_arg 的注释）。
+本文件的存在意义只是「把投影节点单独拉起来调」；**改这里的默认值对主链路无效** ——
+现场要调参数请走唯一入口，或命令行直通。参数面已经与主入口对齐（主入口声明了
+全部 11 个参数），所以两边不会再出现「一个有、一个没有」。
+
 用法:
   ros2 launch perception_3d perception.launch.py target_frame:=base_link
   # 真机（RealSense D435i，深度为 16UC1 毫米，由 encoding 自动判定）：
@@ -40,6 +49,14 @@ def generate_launch_description():
             description='Tolerance (m) for the nearest-depth cluster'
         ),
         DeclareLaunchArgument(
+            'depth_median_window', default_value='5',
+            description='Neighbourhood median window inside a sample point (denoise)'
+        ),
+        DeclareLaunchArgument(
+            'depth_buffer_len', default_value='10',
+            description='Depth ring buffer length (timestamp pairing)'
+        ),
+        DeclareLaunchArgument(
             'tf_required', default_value='false',
             description='true = abort if the camera→target TF is unavailable'
         ),
@@ -71,6 +88,8 @@ def generate_launch_description():
             'max_sync_dt': LaunchConfiguration('max_sync_dt'),
             'depth_grid': LaunchConfiguration('depth_grid'),
             'depth_cluster_tol': LaunchConfiguration('depth_cluster_tol'),
+            'depth_median_window': LaunchConfiguration('depth_median_window'),
+            'depth_buffer_len': LaunchConfiguration('depth_buffer_len'),
             'tf_required': LaunchConfiguration('tf_required'),
             'depth_topic': LaunchConfiguration('depth_topic'),
             'camera_info_topic': LaunchConfiguration('camera_info_topic'),

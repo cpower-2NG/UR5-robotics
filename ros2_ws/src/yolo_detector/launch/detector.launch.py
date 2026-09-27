@@ -1,5 +1,11 @@
 """
 Launch 文件: 单独启动 YOLO 检测节点
+
+⚠️ 本文件**不在主链路上**：全仓库没有一处 include 它（`setup.py` 只是把它装进
+`share/`）。仿真与真机的唯一入口是 `yolo_bringup`（`bringup.launch.py` →
+`pipeline.launch.py`），`model` / `confidence_threshold` / `device` 在那里也有定义。
+本文件的存在意义只是「把检测节点单独拉起来调」；**改这里的默认值对主链路无效**。
+
 用法:
   ros2 launch yolo_detector detector.launch.py model:=block_best.pt
 """
