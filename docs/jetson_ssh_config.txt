@@ -1,4 +1,4 @@
-# ~/.ssh/config 模板 —— SSH 到 Orin 板子（见 docs/ORIN_ACCESS.md）
+# ~/.ssh/config 模板 —— SSH 到 Orin 板子（见 docs/JETSON_SSH.md）
 #
 # 用法：
 #   mkdir -p ~/.ssh && chmod 700 ~/.ssh

@@ -1043,7 +1043,7 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 | # | 事项 | 影响 |
 |---|---|---|
 | 7 | ~~仓库历史 8.4 GB 是否改写~~ ✅ **已授权并完成（第十一轮）**，见下方「历史改写记录」 | `.git` **8.4 GB → 146 MB**（−98.3%）。`migrate/humble-orin` 内容**逐字节未变**；`main` 的树变了（它仍含 `yolo_coco/` 与 10 个 `epoch*.pt`），这是**预期内**的——那正是 8.4 GB 所在。备份在 `/home/<user>/robotics/backups/yolo_ros_git_20260927_130248.git` |
-| 9 | ~~板上六个 `arm-*.sh` 与那份「体检清单」是否纳入 `docs/`~~ ✅ **已完成（第十一轮）** | 用户提供 SSH 后**只读取回**，存入 `docs/board/`：6 个脚本 + **母文档**`机械臂板卡-体检与改造清单.md`（305 行，脚本头部引用的「体检清单 D4」就是它）+ `UR5接入方案.md`。另加 `docs/board/README.md`（来源、sudo 风险、与仓库的关系）与 `docs/ORIN_ACCESS.md`（连接方式；**不含密码**）。全部文件已扫描确认无凭据 |
+| 9 | ~~板上六个 `arm-*.sh` 与那份「体检清单」是否纳入 `docs/`~~ ✅ **已完成（第十一轮）** | 用户提供 SSH 后**只读取回**，存入 `docs/board/`：6 个脚本 + **母文档**`机械臂板卡-体检与改造清单.md`（305 行，脚本头部引用的「体检清单 D4」就是它）+ `UR5接入方案.md`。另加 `docs/board/README.md`（来源、sudo 风险、与仓库的关系）与 `docs/JETSON_SSH.md`（连接方式）。全部取回文件已按凭据模式扫描，无密码/私钥/令牌 |
 | **12** | ~~`gz_ros2_control` 放哪~~ ✅ **已定（第十轮）：留外部叠加工作区**（`~/grasp_ws`）。不 vendored、不入库 | **只影响工作站，不影响 Orin**（P4「部署分层」已确认：真机由 `ur_robot_driver` 走 RTDE，**不用 `gz_ros2_control`**）。选外部的理由：避免仓库携带一份第三方源码、避免与 apt 版本混淆；代价是**多一步前置**（README 已写明 `GZ_VERSION=harmonic` 的源码编译步骤）。`launch` 已用 `get_package_prefix` 解耦 |
 | **13** | ~~「方阵世界」要不要恢复启动器~~ ✅ **已定（第十一轮）：恢复轻量启动器** | 新增 `yolo_bringup/launch/grid_world.launch.py`（`gz sim -r` + ros_gz_bridge + 静态 TF，**不含机械臂**），训练链恢复可用。已实测：话题齐全、`camera_info.frame_id` 与常量逐字相同、TF 链正确。顺带复活了孤儿文件 `config/ros_gz_bridge.yaml` |
 
