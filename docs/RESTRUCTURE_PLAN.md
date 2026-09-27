@@ -1731,8 +1731,11 @@ headless:=true`，80 s）在**随后两次干净启动**里各跑一遍，两种
 
 - ⚠️ **真机上一次都没跑过。** `real.launch.py` 只在本机验到「守卫会拦、参数解析对」。真机上
   十有八九还会撞上本机看不见的东西（驱动握手、控制器激活、相机话题名、手眼外参）。
-- ⚠️ **跨节点数据流在本机没验**（第七节 (1)）。带检测器的完整闭环要在
-  `FASTDDS_BUILTIN_TRANSPORTS=SHM` 下重跑才算验过。
+- ⚠️ ~~**跨节点数据流在本机没验**（第七节 (1)）。带检测器的完整闭环要在
+  `FASTDDS_BUILTIN_TRANSPORTS=SHM` 下重跑才算验过。~~
+  → **第十五轮已验**：`test_pipeline_e2e.py` 15 项全 PASS（`SHM` 下）。
+  另：本轮的 W2 清单里 **`max_sync_dt` 这一条当时漏做了**（它到不了唯一入口），
+  也由第十五轮补上。
 - **W3（AG-95 写路径）仍是骨架**，闸门不变：只读通链路 → 夹爪**拆下臂**放工作台、急停在手边
   → 才允许 `ag95_dry_run=false`。
 - **W5 一行没动**（现场步骤），板端 sudo 清单见第九节。
@@ -1793,3 +1796,111 @@ ros2 pkg prefix moveit_ros_move_group   # 应回 /opt/ros/humble —— MoveIt �
 > **查/杀进程一概用 `ps` + `awk` 带字符类**：
 > `ps -eo pid,args --no-headers | awk '/[g]z sim|[m]ove_group|[p]lanner_node|[r]os2 launch/'`，
 > 别用 `pkill -f`（它会匹配到调用它的那条 shell）。
+
+---
+
+#### 第十五轮：W2 收官 —— `max_sync_dt` 到不了真机，与「参数定义了但没人读」这一类（2026-09-27）
+
+第十四轮把 W2 的代码写完时，**漏了计划里明写的一条**：`max_sync_dt` 要放宽。本轮把它补上，
+并顺着它查出**同一类缺陷的另外 7 个参数**和**三个重复定义面**。
+
+##### 一、交付：4 个提交（+ 文档）
+
+| 提交 | 内容 | 要点 |
+|---|---|---|
+| `5cdd6ac` | 丢弃检测时带上**累计**批数 | 限流日志分辨不出「偶尔丢一批」与「一直在丢」，而后者才是「该不该放宽窗口」的依据 |
+| `165b210` | `max_sync_dt` 接到唯一入口（默认随源 0.1 / 0.3）+ 投影节点参数面补全 7 项 | 见第二、三节 |
+| `407351e` | 三个「单独启动」launch 文件标注**不在主链路**上 | 见第四节 |
+| `94d6a7a` | `test_real_launch.py` 24 → **39 项** | 见第五节 |
+| （本轮末） | README「看不到目标先看这一条」 | 把现场排查线索写进用户文档 |
+
+##### 二、D65（新）：投影节点的参数面**只在没人 include 的文件上**定义
+
+`perception_3d/projector_node.py` 有 11 个参数，而 `pipeline.launch.py`（唯一入口）
+**只传了 3 个**（`target_frame` / `depth_topic` / `tf_required`）。剩下的 8 个里：
+
+- `max_sync_dt` / `depth_scale` / `depth_grid` / `depth_cluster_tol` /
+  `camera_info_topic` / `detections_topic` 只在 `perception_3d/launch/perception.launch.py` 上，
+- `depth_median_window` / `depth_buffer_len` **哪儿都没有**。
+
+而那个文件**全仓库没有一处 include 它**（`setup.py` 只是把它装进 `share/`）。于是：
+
+```
+$ ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense max_sync_dt:=0.5
+   （不报错、不生效。未声明的参数会被 launch **接受**并塞进共享的
+     launch_configurations —— 实测 —— 然后没有任何进程读它。）
+```
+
+**症状是「看不见目标」**：`projector_node` 超窗时整批丢弃检测（`projector_node.py:352-362`），
+**不报错退出**，只在日志里每 5 s 留一条。现场很容易读成「检测器坏了 / 模型不行」。
+真机比仿真更容易抖动，所以这一条正是 W2 计划里点名要放宽的。
+
+> 这是 **D50 的同类**：参数定义在一个没人走的入口上。D50 是「yaml 没人加载」，
+> D65 是「launch 文件没人 include」。**两者的共同形状**是「定义了、看着像生效、
+> 实际没有任何进程读它，且不报错」。所以本轮把它一般化成一条规则写进
+> `pipeline.launch.py`：**传给节点的每个参数，都要在本文件声明**，并用自检钉住。
+
+**默认值随源**（沿用 `depth_topic` / `gripper_backend` 的成例）：
+仿真 **0.1**（不动 —— 9/9 那套结果就是它跑出来的），`realsense` / `external` **0.3**。
+
+放宽**不会**换来错误坐标：相机与方块静止时，晚 0.3 s 的深度帧与当前帧**逐像素相同**
+（深度是场景几何的函数，不随采样时刻变），但窗口仍然拦得住真正的失步（流停了、
+时间戳对不上）。而窗口过紧的代价是**没有任何目标**。两害相权，放宽是对的。
+
+##### 三、同一类缺陷的另外 7 个参数（一并补全）
+
+`depth_scale` / `depth_grid` / `depth_cluster_tol` / `depth_median_window` /
+`depth_buffer_len` / `camera_info_topic` / `detections_topic` 全部接到唯一入口。
+默认值**照抄节点的 `declare_parameter`**（写别的数就是**静默改行为**，
+当年 `grasp_planner.yaml` 与节点默认值「碰巧逐条相同」才没暴露），并由自检逐条比对。
+
+`real.launch.py` 里**故意不声明** `max_sync_dt`：真机默认值已由 `pipeline.launch.py`
+按源给出，再声明一次就是**第二处定义**（谁生效取决于 include 顺序，且不报错）。
+现场要调就命令行直通 —— 这是 D64 那次事故的同一条理由。
+
+##### 四、三个「单独启动」文件：不删，但要把「不在主链路上」写在脸上
+
+`perception_3d` / `yolo_detector` / `grasp_planner` 各有一个单节点 launch，
+**全仓库没有一处 include 它们**，但都把所在节点的参数又声明了一遍，文件头还写着
+「真机几何必须按现场实测覆盖」这类话 —— 照做是**白忙**，主链路读的是 `yolo_bringup`。
+
+处理方式：**不删**（单独拉一个节点起来调，现场真的会用到），改为在三个文件头写同一条
+警示：不在主链路、改这里的默认值无效、要调走唯一入口。`perception.launch.py` 另补了
+两个它缺的参数，使它的参数面与主入口**对齐**（自检里有子集断言钉住「不得存在只在那
+边有的旋钮」）。
+
+##### 五、验收证据（本机执行）
+
+| 项 | 怎么验的 | 结果 |
+|---|---|---|
+| **仿真路径的窗口值不变** | `camera_source:=sim` 整跑，读节点启动横幅 | `Perception3D node started. target_frame=base_link, max_sync_dt=0.1s` |
+| **非仿真路径拿到放宽值** | `camera_source:=external` 整跑，读同一行 | `… max_sync_dt=0.3s` |
+| **累计计数真的会动** | 同一次仿真跑 | `深度与检测时间差 1716 ms 超过 max_sync_dt（100 ms），丢弃本批检测（累计 1 批）…` |
+| **跨节点数据流是通的**（第十四轮列的第一条未验项） | `pipeline.launch.py camera_source:=external skip_detector:=true` + `test_pipeline_e2e.py`，**`FASTDDS_BUILTIN_TRANSPORTS=SHM`** | **15 项全 PASS**：喂合成 `camera_info`+深度+检测框，`/target_3d` 的**数值**被逐项核对（`x=0.14440`、`y=0.09025`、`z=0.5`）。这是本仓库第一次在**本机**跑通跨进程数据流 |
+| 感知单元没被改坏 | `scripts/test_perception_3d.py` | 全 PASS |
+| 冒烟 | `scripts/test_minimal.py` | 全 PASS（⚠️ **必须先叠加 YOLO 环境**：不叠 `PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages` 时 YOLO 段必 FAIL —— 那是**环境**，不是回归） |
+| 上面这些**以后不会悄悄退回去** | `scripts/test_real_launch.py` 24 → 39 项 | 全 PASS。新增：**每个**节点收到的参数 ⊂ 入口声明（3 个节点）、无死旋钮（24 个声明全有引用）、三个单独启动文件不藏私有旋钮、投影节点默认值 = 节点 `declare_parameter`（只放过两处刻意分叉） |
+
+##### 六、顺带量到的一个数（解释第十四轮那条「仿真里每轮触发 24 次」）
+
+仿真跑 100 s：**累计丢弃 24 批**，日志里出现的 dt 是 **1716 ms** 与 **132 ms**。
+
+⇒ 这**不是**启动瞬态，而是**持续的低频失配**（仿真里深度与检测的发布节奏差得多）。
+方块静止，所以「投影用的是旧深度帧」不影响结果 —— 9/9 仍然成立。
+**因此仿真默认值 0.1 不动**：它是拿到那套结果时的配置，且丢的是**少数**批次。
+（真机上的 dt 由驱动帧率决定，D435i 彩色/对齐深度同源、量级是几十毫秒，
+0.3 s 是宽裕的；这一点**真机上没有实测过**。）
+
+##### 七、未验证 / 未做
+
+- ⚠️ **真机仍是一次都没跑过**（与第十四轮同）。`max_sync_dt=0.3` 只是**推理上安全**，
+  真机实测的 dt 分布还不知道；现场若见累计数持续增长，按 README 那条调大即可。
+- 三个「单独启动」文件**仍然重复声明参数**（只是现在写清了「改这里无效」）。
+  要根治得让它们 include 主入口 —— 会引入「叶子包 include `yolo_bringup`」的反向依赖，
+  收益不抵风险，故登记不做。
+- W3（AG-95 写路径）、W5（现场步骤）不变；板端 sudo 清单见第十四轮第九节。
+
+##### 八、状态
+
+- `migrate/humble-orin`：本轮 4 个提交 + 1 个文档提交，**未推送**，`main` 未动（共领先 **44** 个提交）。
+- 板端本轮**零动作**（全是本机代码 + 本机仿真/自检）。
