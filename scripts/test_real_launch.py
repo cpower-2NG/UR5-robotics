@@ -19,7 +19,12 @@
    `camera_link` —— 发到 `camera_color_optical_frame` 会给它第二个父节点，TF 树直接
    坏掉；`safety_limits` 必须**同时**传给驱动与 `move_group`（两侧各有一份
    robot_description，不一致时 FK/IK 与真实 TF 是两套几何，且两边都不报错）。
-4. **D64 回归**：唯一入口 `bringup.launch.py` **不得声明**真机专属参数。
+4. **参数真的到得了节点**（`max_sync_dt`，D50 家族）。参数在本仓库有两种
+   「定义了但没用」的坏法：定义在一个**没人 include 的 launch 文件**上
+   （`perception_3d/launch/perception.launch.py` 就是），或者定义了两处、
+   其中一处静默失效。所以既断言 pipeline.launch.py **声明并传下去**，
+   也断言 real/bringup **没有**第二处定义。
+5. **D64 回归**：唯一入口 `bringup.launch.py` **不得声明**真机专属参数。
    `launch_configurations` 是整棵树共享的一个 dict，而下游的
    `DeclareLaunchArgument` 见到「已设置」就不再应用自己的默认值 —— 在入口声明
    真机参数的默认值，会把**仿真路径**的默认值一起改掉，且不报错。
@@ -91,6 +96,36 @@ def load_launch(name):
     return mod
 
 
+def load_launch_at(path):
+    """同 `load_launch`，但按完整路径加载（用于**别包**的 launch 文件）。"""
+    if not Path(path).exists():
+        return None
+    spec = importlib.util.spec_from_file_location(f"probe_{Path(path).stem}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.get_package_share_directory = lambda pkg: f"/nonexistent/{pkg}"
+    return mod
+
+
+def _node_defaults(node_path):
+    """从节点源码里解析 `declare_parameter('name', <default>)` 的默认值。
+
+    这一项没有运行时接口可查（`ros2 param get` 在本机不可用，见 README 与
+    第十三轮记录），但**源码就是权威** —— 而且这里要比的正是「launch 的默认值
+    与节点默认值是否一致」，两边都从源码读最直接。
+    """
+    import re
+
+    src = Path(node_path).read_text(encoding="utf-8")
+    out = {}
+    for m in re.finditer(r"declare_parameter\(\s*'([^']+)'\s*,\s*([^)]+?)\s*\)", src):
+        name, raw = m.group(1), m.group(2).strip()
+        if raw.startswith("'") and raw.endswith("'"):
+            raw = raw[1:-1]
+        out[name] = raw
+    return out
+
+
 def ctx(**overrides):
     """假的 launch context：这些函数只读 launch_configurations。"""
     base = {"start_ur_driver": "true", "publish_camera_tf": "false"}
@@ -139,6 +174,83 @@ def declared_names(mod):
 
 def _src(name):
     return (LAUNCH_DIR / name).read_text(encoding="utf-8")
+
+
+def _lc_name(v):
+    """取参数值指向的 launch 参数名。
+
+    ⚠️ `LaunchConfiguration.variable_name` 在 Humble 里**不是字符串**，是替换
+    对象列表（实测 `[<TextSubstitution ...>]`）—— 与 `default_value` 那个坑
+    同一类。所以还要再求值一次，否则比出来永远是个 repr 串。
+    """
+    if isinstance(v, str):
+        return v
+    name = getattr(v, "variable_name", None)
+    if name is None:
+        return None
+    return name if isinstance(name, str) else _resolve_default_in(name)
+
+
+def _raw_default(mod, name):
+    """取某个 DeclareLaunchArgument 的 `default_value` **替换对象本身**。
+
+    `declared_names()` 已经把默认值求值成字符串了，但 `PythonExpression`
+    在空 context 里求不出来，只能拿到 repr —— 所以「默认值随 camera_source
+    变」这种要另拿原对象、在填好 camera_source 的 context 里再求一次。
+    """
+    for e in _walk(mod.generate_launch_description().entities):
+        if getattr(e, "name", None) == name:
+            return getattr(e, "default_value", None)
+    return None
+
+
+def _resolve_default_in(subs, **confs):
+    """在**给定** launch_configurations 的环境里求值默认值。
+
+    `_resolve_default` 用的是空 context，所以像 `PythonExpression`（引用
+    `camera_source`）这类默认值只能拿到 repr。这里把待用的键填进去，
+    让「默认值随 camera_source 变」这件事**真的被求值出来**再断言。
+    """
+    from launch import LaunchContext
+    from launch.utilities import perform_substitutions
+
+    c = LaunchContext()
+    c.launch_configurations.update(confs)
+    try:
+        return perform_substitutions(c, subs)
+    except Exception:
+        return repr(subs)
+
+
+def _walk(entities):
+    """展平 LaunchDescription 的实体树（Node 在 pipeline 里被 TimerAction 包着）。"""
+    for e in entities:
+        yield e
+        inner = getattr(e, "actions", None)
+        if inner:
+            yield from _walk(inner)
+
+
+def node_params(mod, node_name):
+    """取某个 Node 的 parameters 列表；找不到返回 None。
+
+    ⚠️ 两个坑，都会让断言变成「永远 PASS」或直接崩：
+      · `Node` 在 pipeline.launch.py 里**不是顶层实体** —— 四个节点都裹在一个
+        `TimerAction(period=LaunchConfiguration('start_delay'), actions=[...])` 里
+        （统一延时启动）。只遍历 `desc.entities` 一个节点都找不到 ⇒ 必须展平。
+      · `node.node_name` 是**公开属性但会抛**（`cannot access 'node_name'
+        before executing action`）—— 我们在 `generate_launch_description()`
+        之后、执行之前读它，正好落在这个禁区里。所以读它存进去的私有字段
+        （`Node.__init__` 里的 `self.__node_name`）。这是测试代码读 launch 的
+        内部结构，用私有名是**有意的**：公开接口在这个时机不可用。
+    """
+    for e in _walk(mod.generate_launch_description().entities):
+        raw = getattr(e, "_Node__node_name", None)
+        if isinstance(raw, str) and raw == node_name:
+            # 名字同样是私有字段（`self.__parameters`）：公开的 `.parameters`
+            # 在 launch_ros 里**不存在**（Humble 实测 AttributeError）。
+            return getattr(e, "_Node__parameters", None)
+    return None
 
 
 def main():
@@ -245,6 +357,132 @@ def main():
         names = [n for n, _ in declared_names(mod)]
         dupes = sorted({n for n in names if names.count(n) > 1})
         check(f"{label}.launch.py 无重复声明", not dupes, f"重复: {dupes}" if dupes else "")
+
+    # ------------------------------------------- 参数真的到得了投影节点（D50 家族）
+    print("\n--- W2-10 max_sync_dt 在唯一入口上真的有定义、真的传下去了 ---")
+    pipeline = load_launch("pipeline.launch.py")
+    if pipeline is None:
+        skip("max_sync_dt 的可达性", "pipeline.launch.py 不存在")
+    else:
+        p_names = [n for n, _ in declared_names(pipeline)]
+        p_defaults = dict(declared_names(pipeline))
+        check("pipeline.launch.py 声明了 max_sync_dt",
+              "max_sync_dt" in p_names)
+        subs = _raw_default(pipeline, "max_sync_dt")
+        check("仿真默认 0.1（= 拿到 9/9 那套结果时的值，不为了让日志干净去改它）",
+              _resolve_default_in(subs, camera_source="sim") == "0.1",
+              f"got {_resolve_default_in(subs, camera_source='sim')!r}")
+        check("真机默认放宽到 0.3（窗口太紧的症状是**看不见目标**）",
+              _resolve_default_in(subs, camera_source="realsense") == "0.3",
+              f"got {_resolve_default_in(subs, camera_source='realsense')!r}")
+        check("external 也走放宽值（话题来自 rosbag/自建 launch，同样会抖）",
+              _resolve_default_in(subs, camera_source="external") == "0.3")
+
+        params = node_params(pipeline, "perception_3d")
+        check("找得到 perception_3d 这个 Node（否则下面的断言全是空的）",
+              params is not None, "" if params is not None else "Node 不在实体树里")
+        if params:
+            # ⚠️ `Node.__init__` 会 `normalize_parameters`：**键与值都变成替换对象
+            # 元组**（`(<TextSubstitution>,)` / `(<LaunchConfiguration>,)`），
+            # 既不是 str 也不是可下标比较的对象 —— 直接 `d.get("max_sync_dt")`
+            # 恒 None，`sorted(d)` 还会抛 TypeError。所以两边都各求值一次。
+            d = params[0] if isinstance(params[0], dict) else {}
+            pairs = {_resolve_default_in(k): _lc_name(v[0]) for k, v in d.items()}
+            check("投影节点的参数里 max_sync_dt 指向同名 launch 参数",
+                  pairs.get("max_sync_dt") == "max_sync_dt",
+                  f"got {pairs.get('max_sync_dt')!r}; keys={sorted(pairs)}")
+            check("原有三项没被顶掉（target_frame / depth_topic / tf_required）",
+                  {"target_frame", "depth_topic", "tf_required"} <= set(pairs),
+                  f"keys={sorted(pairs)}")
+        else:
+            _failed.append("perception_3d 的参数不可读")
+
+        # 节点自身还留着一个兜底默认值（launch 什么都不传时用它）——也钉住，
+        # 免得它和 launch 侧的默认值悄悄分叉。
+        node_src = (PROJECT_ROOT / "ros2_ws" / "src" / "perception_3d"
+                    / "perception_3d" / "projector_node.py").read_text(encoding="utf-8")
+        check("节点侧兜底默认值仍是 0.1（与仿真路径一致）",
+              "declare_parameter('max_sync_dt', 0.1)" in node_src)
+        check("丢弃检测时给出**累计**批数（限流日志里要能分辨「偶尔」与「一直」）",
+              "_sync_drops += 1" in node_src and "累计 {self._sync_drops} 批" in node_src)
+
+        # ------------------------------------------------ 参数面完整性（整条规则）
+        print("\n--- W2-12 唯一入口的参数面完整性：传给节点的每一个参数都有声明 ---")
+        # 这条规则是 D50 家族的一般化：**未声明的参数会被 launch 接受**并塞进
+        # 共享的 launch_configurations（实测），然后**没有任何人读它** ——
+        # 于是「我明明传了」和「一点反应都没有」同时成立。所以对**每个**节点
+        # 都断言「它收到的参数 ⊂ 本文件声明的参数」。
+        for node in ("yolo_detector", "perception_3d", "grasp_planner"):
+            prm = node_params(pipeline, node)
+            keys = set()
+            if prm:
+                for item in prm:
+                    if isinstance(item, dict):
+                        keys |= {_resolve_default_in(k) for k in item}
+            undeclared = sorted(k for k in keys if k not in p_names)
+            check(f"{node} 收到的参数都在入口声明了（{len(keys)} 个）",
+                  bool(keys) and not undeclared,
+                  f"未声明: {undeclared}" if undeclared else
+                  ("" if keys else "一个参数都没读到 —— 断言是空的"))
+
+        # 反向：声明了却从没被引用 = 死旋钮（传了永远没反应，同样静默）
+        p_src = _src("pipeline.launch.py")
+        unused = [n for n in p_names
+                  if f"LaunchConfiguration('{n}')" not in p_src
+                  and f'LaunchConfiguration("{n}")' not in p_src]
+        check("没有「声明了但文件里从不引用」的死旋钮", not unused,
+              f"死旋钮: {unused}" if unused else f"{len(p_names)} 个声明都有引用")
+
+        print("\n--- W2-13 三个「单独启动」文件里不得藏着主入口没有的旋钮 ---")
+        # 它们是**不在主链路上**的文件（全仓库没有一处 include）。若某个参数
+        # 只在那边定义，现场照文档去那边调就是白忙 —— 主链路读的是 pipeline。
+        # `params_file` 是别名：同一个东西，主入口叫 `planner_params_file`。
+        ALIASES = {"params_file": "planner_params_file"}
+        for rel in ("perception_3d/launch/perception.launch.py",
+                    "yolo_detector/launch/detector.launch.py",
+                    "grasp_planner/launch/planner.launch.py"):
+            path = PROJECT_ROOT / "ros2_ws" / "src" / rel
+            mod = load_launch_at(path)
+            if mod is None:
+                skip(f"{path.name} 的参数面", "文件不存在")
+                continue
+            own = [n for n, _ in declared_names(mod)]
+            only_there = [n for n in own
+                          if n not in p_names and ALIASES.get(n) not in p_names]
+            check(f"{path.name} 的参数都在主入口有对应（{len(own)} 个）",
+                  not only_there,
+                  f"只在它这里有: {only_there}" if only_there else "")
+
+        print("\n--- W2-14 投影节点的默认值 = 节点自己的 declare_parameter（除两处刻意的）---")
+        # launch 侧写了一个与节点默认值不同的数，就是**静默改行为**（当年
+        # grasp_planner 的 yaml 与节点默认值「碰巧逐条相同」才没暴露）。这里
+        # 用节点源码里的 declare_parameter 值当基准，逐条比。
+        # 两处**刻意**分叉：depth_topic（真机用对齐深度，D2）、max_sync_dt（真机放宽）。
+        INTENTIONAL = {"depth_topic", "max_sync_dt"}
+        node_defaults = _node_defaults(PROJECT_ROOT / "ros2_ws" / "src"
+                                       / "perception_3d" / "perception_3d"
+                                       / "projector_node.py")
+        check("从节点源码里解析出参数默认值（解析失败下面全是空的）",
+              len(node_defaults) >= 8, f"解析到 {len(node_defaults)} 条")
+        mismatched = []
+        for name, node_val in node_defaults.items():
+            if name in INTENTIONAL or name not in p_names:
+                continue
+            launch_val = _resolve_default_in(_raw_default(pipeline, name),
+                                             camera_source="sim")
+            if str(launch_val).lower() != str(node_val).lower():
+                mismatched.append(f"{name}: launch={launch_val!r} node={node_val!r}")
+        check("除 depth_topic / max_sync_dt 外，两边默认值逐条相同", not mismatched,
+              "; ".join(mismatched) if mismatched else
+              f"比了 {len(node_defaults) - len(INTENTIONAL & set(node_defaults))} 条")
+
+    print("\n--- W2-11 max_sync_dt 只能有一处定义（D50/D64 的同一类错）---")
+    for mod, label in ((real, "real"), (bringup, "bringup")):
+        if mod is None:
+            continue
+        names = [n for n, _ in declared_names(mod)]
+        check(f"{label}.launch.py **不**声明 max_sync_dt（第二处定义会静默抢走）",
+              "max_sync_dt" not in names)
 
     # ------------------------------------------------------------------ 收尾
     print("\n" + "=" * 56)
