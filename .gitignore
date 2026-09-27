@@ -2,9 +2,16 @@ env/
 .env
 __pycache__/
 .pytest_cache/
-ros2_ws/build/
-ros2_ws/install/
-ros2_ws/log/
+# ⚠️ **不带路径前缀**，故意如此。原先写的是 `ros2_ws/build/` 这种锚定写法，
+# 于是「在仓库根目录误跑一次 colcon」就会凭空造出一套平行的 build/install/log，
+# 而且**不被忽略**、直接以 `??` 出现在 git status 里（实测踩过一次：
+# 从根目录 `colcon build --packages-select ...` 会递归找到 ros2_ws/src 下的包，
+# 编到根 install/ 里；而现场 source 的是 ros2_ws/install/setup.bash，
+# 于是「刚编译完」和「跑起来还是老代码」同时成立 —— 最难查的一类假象）。
+# colcon 的工作目录本身就是约定：构建产物一律不入库，不管它出现在哪一层。
+build/
+install/
+log/
 *.pyc
 
 # P0: 附件隔离解压区（不入库，见 docs/ATTACHMENT_MANIFEST.md）
