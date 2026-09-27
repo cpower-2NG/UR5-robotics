@@ -209,7 +209,20 @@ def generate_launch_description():
     joint_limits_yaml = load_yaml("ur_moveit_config", "config/joint_limits.yaml")
     ompl_yaml = load_yaml("ur_moveit_config", "config/ompl_planning.yaml")
     controllers_yaml = load_yaml("ur_moveit_config", "config/controllers.yaml")
+    # 仿真跑的是 joint_trajectory_controller，真机官方默认跑 scaled_joint_trajectory_controller。
+    # ⚠️ 只 pop 掉它的详情块**不够**：官方那份 yaml 顶层还有一条
+    #    `controller_names: [scaled_..., joint_...]` 的清单，详情块没了但名字
+    #    还留在清单里，moveit_simple_controller_manager 会照着清单挨个查
+    #    `moveit_simple_controller_manager.<name>.action_ns` —— 查不到就报
+    #    「No action namespace specified for controller `scaled_joint_trajectory_controller`」。
+    #    所以名字也必须从 controller_names 里摘掉。
+    #    今天不发作是因为 planner_node 直接发 JTC 的 action，从不走 /move_action；
+    #    但任何人试着用 move_group 规划就会踩到。
     controllers_yaml.pop("scaled_joint_trajectory_controller", None)
+    controllers_yaml["controller_names"] = [
+        n for n in controllers_yaml.get("controller_names", [])
+        if n != "scaled_joint_trajectory_controller"
+    ]
     controllers_yaml["joint_trajectory_controller"]["default"] = True
 
     ompl_config = {

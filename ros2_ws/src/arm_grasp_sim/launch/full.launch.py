@@ -65,6 +65,23 @@ def generate_launch_description():
         "start_delay", default_value="18.0",
         description="上层节点（YOLO/感知/规划）的统一延迟启动秒数",
     )
+    # 仿真里**默认打开**：grasp_world.sdf 的桌子是已知量，把它作为碰撞体发进
+    # MoveIt 规划场景后，`avoid_collisions=True` 才名副其实（会拿真实连杆几何
+    # 去撞）。默认关在 grasp_planner.yaml 里，因为真机的桌子尺寸还不知道，
+    # 而**错的碰撞体比没有更坏**（可能把正确解全拒掉，看起来像 IK 坏了）。
+    #
+    # ⚠️ 打开它就等于把下面这些**耦合**摆上台面：`grasp_world.sdf` 的桌子几何
+    # 一变，grasp_planner.yaml 里的几何就都得跟着改，否则碰撞体与看到的桌子
+    # 不是同一张：
+    #     table_box_size / table_box_pose  ← 碰撞体本身
+    #     table_plane_z / table_min_z      ← 肘高护栏与「还算在桌上」的判据
+    #     pick_zone / place_slots / place_z ← 抓取区与放置槽位
+    # 改世界的人不一定会想到去看规划器的 yaml，所以把这行写在这里。
+    table_scene_arg = DeclareLaunchArgument(
+        "table_scene_enabled", default_value="true",
+        description="true = 把仿真世界的桌子发进 MoveIt 规划场景（需与 "
+                    "grasp_planner.yaml 的 table_box_* 一致）",
+    )
 
     # ---- 仿真专属：世界 + 机械臂 + 控制器 + MoveIt ----
     sim = IncludeLaunchDescription(
@@ -88,6 +105,7 @@ def generate_launch_description():
             "skip_detector": LaunchConfiguration("skip_detector"),
             "skip_planner": LaunchConfiguration("skip_planner"),
             "start_delay": LaunchConfiguration("start_delay"),
+            "table_scene_enabled": LaunchConfiguration("table_scene_enabled"),
         }.items(),
     )
 
@@ -97,6 +115,7 @@ def generate_launch_description():
         skip_detector_arg,
         skip_planner_arg,
         start_delay_arg,
+        table_scene_arg,
         DeclareLaunchArgument("headless", default_value="false"),
         sim,
         pipeline,

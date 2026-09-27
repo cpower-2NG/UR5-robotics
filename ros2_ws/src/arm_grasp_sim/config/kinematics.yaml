@@ -5,4 +5,12 @@
         kinematics_solver: kdl_kinematics_plugin/KDLKinematicsPlugin
         kinematics_solver_search_resolution: 0.005
         kinematics_solver_timeout: 0.005
-        kinematics_solver_attempts: 3
+        # attempts: 1 —— 只解一次，不随机重启。
+        # KDL 的随机重启是**不可复现**的来源：同一个种子，有时解出自然分支，
+        # 有时解出翻转分支（多弧度大摆动）。规划器发的是单点关节空间轨迹，
+        # 它跟踪不了那种摆动。参考项目在真机 stage D 上踩过这个坑
+        # （见 arm-grasping/src/arm_moveit_config/config/kinematics.yaml:16）。
+        kinematics_solver_attempts: 1
+        # 一致性上限（弧度/关节）：KDL 认为「解与种子不一致」就会去随机重启。
+        # 100 rad 远大于任何关节行程 ⇒ **实际上关闭这个重启**，让解由种子决定。
+        kinematics_solver_consistency_limits: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]
