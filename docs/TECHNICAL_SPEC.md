@@ -4,6 +4,57 @@
 
 ---
 
+> # ⚠️ 本文是**设计稿**，不是当前实现的描述（P1-5）
+>
+> 本文写在动手实现**之前**。当时的选型与实际落地的环境**不一致**，若照着本文
+> 的命令操作会失败（装 Jazzy、找不存在的文件）。实测对照（2026-09-27 本机）：
+>
+> | 本文写的 | 实际是 | 怎么核实的 |
+> |---|---|---|
+> | Ubuntu 24.04 (Noble) | **Ubuntu 22.04.5 LTS (jammy)** | `cat /etc/os-release` |
+> | ROS 2 Jazzy | **ROS 2 Humble** | `ls /opt/ros/` → `humble` |
+> | Python 3.12 (Conda) | **Python 3.10.21，conda 环境**（miniforge3 派生的 `robot-vision`） | `~/robotics/venvs/robot-vision/bin/python --version`；该目录有 `conda-meta/`，故是 conda env 而非 venv。**`which conda` 查不到**（conda 不在 PATH 上），别据此以为没用 conda |
+> | Gazebo Harmonic (gz-sim8) | ✅ 一致 | `gz sim --versions` → 8.15.0 |
+> | `ros-jazzy-ros-gz` | **`ros-humble-ros-gzharmonic-sim`** | 注意是 gzharmonic 变体，非默认 `ros-gz` |
+> | `ros-jazzy-moveit` | **`ros-humble-moveit`** | |
+>
+> **为什么从 Jazzy 回落到 Humble**：选 Jazzy 的理由是「24.04 官方 LTS」，但本项目的
+> **部署目标是 Orin（JetPack 6.2 / aarch64）**，其上官方支持的 ROS 2 发行版是
+> **Humble**。以真机为准，故全线回落。详见 `MIGRATION_HANDOFF.md`、
+> `RESTRUCTURE_PLAN.md` 的 P2/P4 组。
+>
+> ## 本文中提到、但**并不存在**的东西（勿照做）
+>
+> | 文中位置 | 写的是 | 实际 |
+> |---|---|---|
+> | §6.4、README | `/trigger_grasp` 服务 | **不存在**。全仓库 `grep create_service` 无命中。规划器是**自主**的：订阅 `/targets_3d`，每来一帧就选一个目标去抓，无需外部触发 |
+> | §4 包结构 | `yolo_bringup/config/moveit_config.yaml` | **不存在**；实际是 `config/ros_gz_bridge.yaml` |
+> | §4、§6 | `yolo_bringup/launch/simulation.launch.py` | **已删除**（第九轮）。它是个**没有机械臂**的世界，抓取链路接上后已无意义 |
+> | §4 包结构树 | 整个 `ros2_ws/src/` 树 | 与实际有出入（缺 `arm_grasp_sim`、`perception_3d`、`grasp_planner` 的细节）——以 `ls ros2_ws/src/` 为准 |
+> | §3.5 | MoveIt2 → **cuRobo** | cuRobo **未使用**；规划器直接调 MoveIt 的 `/compute_ik` |
+> | §5 | `pipeline.launch.py mode:=mock` | `mode` 参数**已删除**（D41）。ROS 2 对未声明的参数覆盖**静默忽略**，故旧命令不报错也不生效 |
+>
+> ## 当前正确的用法（唯一入口）
+>
+> ```bash
+> # 仿真：Gazebo 世界 + UR5 + MoveIt + 感知 + 抓取，一并起来
+> ros2 launch yolo_bringup bringup.launch.py camera_source:=sim
+>
+> # 真机：不起仿真，由 realsense2_camera 提供 /camera/*
+> ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense
+> ```
+>
+> 仿真前提：`gz_ros2_control` 需 Harmonic 源码编译版（apt 的 humble 版依赖
+> Fortress，与本机 gz-sim8 **不兼容**），放在外部叠加工作区 `~/grasp_ws`。
+>
+> **仍然有效、值得一读的章节**：§3.3（2D→3D 投影数学）、§9（环境坑：
+> 清华源 403、CoppeliaSim Qt5、numpy 2.x 与 cv_bridge）。
+> 其余章节请对照上表**打折阅读**。
+>
+> 权威现状见 `RESTRUCTURE_PLAN.md`（缺陷台账 + 改造计划 + 验收证据）。
+
+---
+
 ## 1. 系统架构概述
 
 ```
@@ -213,15 +264,21 @@ ros2_ws/src/
 │
 └── yolo_bringup/           # 顶层启动文件 + Gazebo 场景
     ├── launch/
-    │   ├── simulation.launch.py
-    │   └── pipeline.launch.py
+    │   ├── bringup.launch.py    # ← 唯一入口（camera_source 决定后端）
+    │   └── pipeline.launch.py   # ← 感知+抓取节点的唯一定义处
     ├── config/
     │   ├── ros_gz_bridge.yaml
-    │   └── moveit_config.yaml
+    │   └── grasping.rviz
     ├── worlds/
-    │   └── grasping_world.sdf
+    │   ├── grasping_world.sdf
+    │   └── block_grid_world.sdf
     └── package.xml
 ```
+
+> ⚠️ 上面这棵树是**设计稿的设想**，与实际不一致：缺了 `arm_grasp_sim`
+> （世界 + UR5 + 控制器 + MoveIt，仿真入口真正的持有者）、缺了
+> `perception_3d`。`simulation.launch.py` 与 `moveit_config.yaml` **不存在**。
+> 以 `ls ros2_ws/src/` 为准。
 
 ---
 
@@ -268,14 +325,22 @@ sudo apt install -y ros-jazzy-moveit ros-jazzy-moveit-visual-tools \
 # 5. rosdep 初始化
 sudo rosdep init && rosdep update
 ```
-```
 
-### 6.2 Conda 环境
+### 6.2 Python 依赖环境
 
-```bash
-conda env create -f environment.yml
-conda activate yolo_ros
-```
+> ⚠️ 本节原写的 `conda env create -f environment.yml` **已不可用**：`environment.yml`
+> 已删除（第十轮）。原因有二——它硬编码 Python 3.12 / noble，与 Orin 的 3.10 / jammy
+> 不符（D9）；且本项目真正使用的是**既有的** `robot-vision` 环境，不是本仓库创建的环境。
+>
+> 实际环境：conda 环境 `~/robotics/venvs/robot-vision`（Python 3.10.21，
+> numpy 1.26.4 / torch 2.5.1+cu121 / ultralytics 8.3.99）。运行时叠加：
+>
+> ```bash
+> source /opt/ros/humble/setup.bash
+> export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
+> ```
+>
+> ⚠️ 只在**运行期**叠加。构建期必须保持纯净 ROS 环境，否则触发 E2。
 
 ### 6.3 构建工作区
 
@@ -288,15 +353,15 @@ source install/setup.bash
 ### 6.4 运行完整 Pipeline
 
 ```bash
-# 终端 1: 启动 Gazebo 仿真
-ros2 launch yolo_bringup simulation.launch.py
-
-# 终端 2: 启动感知+抓取流水线
-ros2 launch yolo_bringup pipeline.launch.py
-
-# 终端 3: 手动触发抓取
-ros2 service call /trigger_grasp std_srvs/srv/Trigger
+# 单条命令即可，仿真与真机只差一个参数
+ros2 launch yolo_bringup bringup.launch.py camera_source:=sim        # 仿真
+ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense  # 真机
 ```
+
+> ⚠️ 本节原写的三条命令**都不可用**：`simulation.launch.py` 已删除；
+> `/trigger_grasp` 服务不存在（规划器是自主的，无需触发）；`pipeline.launch.py`
+> 也不该在仿真里单独调用——世界与机械臂由 `arm_grasp_sim` 提供，单独起它
+> 只会有节点没有臂。分步调试请用 `skip_planner:=true` / `skip_detector:=true`。
 
 ---
 

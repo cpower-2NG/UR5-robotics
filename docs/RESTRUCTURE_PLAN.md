@@ -326,9 +326,9 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 |---|---|---|
 | **E1** | **`ultralytics`/`torch` 在 conda 环境 `robot-vision` 里，`rclpy` 在 `/opt/ros/humble` 里，两者互不可见**。| 直接 `ros2 launch` 会看到 `detector_node` 崩于 `No module named 'ultralytics'`。**两个 3.10 解释器可以叠起来用**（实测 `rclpy` + `torch 2.5.1+cu121` + `ultralytics 8.3.99` + `cv2` 同时可用）：<br>`source /opt/ros/humble/setup.bash` 后 `export PYTHONPATH=<venv>/lib/python3.10/site-packages:$PYTHONPATH`。**Orin 上应改为直接把 ultralytics 装进系统 Python，不要依赖这层叠加** |
 | **E2** | **加了 venv 的 `PYTHONPATH` 后 `colcon build` 会失败**：`error: option --uninstall not recognized` | venv 里 `setuptools 84.0.0` 已移除 `setup.py develop --uninstall`，而 colcon 对 ament_python 包会先调它；系统 `setuptools 59.6.0` 还有。**结论：构建用纯净 ROS 环境，运行才叠 venv**（两者分开）。另 `--symlink-install` 同样会触发该错误，**用普通 `colcon build`** |
-| **E3** | **WSL2 上 DDS 组播发现不稳定**：同一份 e2e 脚本「一次全过、一次一条消息都收不到」 | 表现为极难排查的假失败。**对策：`export ROS_LOCALHOST_ONLY=1`**（两个终端都要）。⚠️ **这是工作站开发用的规避手段，不要写进仓库的 launch 文件**——Orin 上机械臂/上位机可能要跨机通信，loopback-only 会切断 |
+| **E3** | ~~**WSL2 上 DDS 组播发现不稳定**：同一份 e2e 脚本「一次全过、一次一条消息都收不到」~~ ⚠️ **本条的对策已被第九轮实测证伪，见下** | 当年判为「组播不稳」，对策写成 `export ROS_LOCALHOST_ONLY=1`。**第九轮实测：这个值会让发现彻底失效**——`ros2 node list` 返回空、e2e 脚本一条消息都收不到，**症状与当年一模一样，但原因不是组播**。`source /opt/ros/humble/setup.bash` 自己会把该变量置为 **0**，用 0 两节点正常发现。<br>⇒ **正确做法：不要动这个变量**，让它保持 humble 设定的 0。<br>⇒ 真正的干扰源是**上一次仿真没退干净的残留节点**（第九轮实测抓到 **4 个** `static_transform_publisher` 一直在发 `world→overhead_camera` 的 TF）。发现异常时先 `ps` 查残留，而不是去调 DDS 变量 |
 | **E4** | **float32 深度图（640×480 = 1.23 MB）把本机 DDS 通道压到约 9 MB/s**（实测：目标 20 Hz，实发 7.6 Hz，订阅端只收到 3.6 Hz） | 直接后果是「检测↔深度」时间戳差达 **431 ms** > `max_sync_dt`（100 ms），检测被**全部丢弃**——看起来像链路 bug，实为传输吞吐。**对策**：e2e 脚本改用 160×120（内参同比缩放，投影公式结果不变）；**真机侧 D435i 是 `16UC1`（600 KB），比 float32 轻一半**，但仍建议留意 `max_sync_dt` 与帧率是否匹配 |
-| **E5** | 本机 GPU 实为 **RTX A2000**，而教材文本写的是「RTX 2060」 | 教材与实际硬件不符（D22 同类）。不影响代码，但写文档/报环境时别照抄教材 |
+| **E5** | 本机 GPU 实为 **RTX A2000**；教材文本写的是「RTX 2060」 | **这不是教材写错，而是本机根本不是当初编教材那台开发机**（用户 2026-09-26 确认）。因此本机与教材在硬件（尤其显卡）、可能还有驱动的对应关系上**没有可比性**，不要拿教材的硬件描述来核对本机。**对代码无影响**：`detector_node` 的设备选择已由 P2-4 做成运行时探测（实测日志 `使用 GPU cuda:0 — NVIDIA RTX A2000`），不硬编码任何型号。**最终以 Orin 为准**——Orin 的 CUDA/torch 匹配是独立问题（见 E1 与 P4） |
 
 > 另有两条**未能证实、故不作为缺陷记录**的观察，留待仿真跑通后复核：
 > ① `use_sim_time` 在本仓库**从未被设置过**（launch/参数/节点里都搜不到），而
@@ -355,18 +355,214 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 
 | 编号 | 任务 | 说明 |
 |---|---|---|
-| P3-1 | 解压 `grasp_sim` + 其 `yolo_vision` 到工作区 | 注意：**用附件内的 `yolo_vision` 保持其内部坐标约定自洽**，或适配为 P2-5 决定的统一约定——二选一，不要混 |
-| P3-2 | 源码编译 `gz_ros2_control`（`humble` 分支） | apt 版仅支持 Fortress，Harmonic 必须源码编译 |
+| **P3-0** | **装 Gazebo Harmonic（含卸载 Classic）** | ✅ **已完成 2026-09-27**（用户执行）。实测 `gz-harmonic 1.0.0-1~jammy`、`ros-humble-ros-gzharmonic 0.244.12-3jammy`、`libgz-sim8-dev 8.15.0-1~jammy` 在位；Classic 已彻底移除（`/usr/bin/gz-11*`、`/usr/bin/gazebo` 均不存在），`/usr/bin/gz` 归 `gz-tools2`，`gz sim --versions` = **8.15.0**，`gz help` 已有 `sim` 子命令 |
+| P3-1 | 解压 `grasp_sim` + 其 `yolo_vision` 到工作区 | ✅ **已完成 2026-09-27**。按 LAB.md 的做法**建符号链接而非复制**，避免与 `docs/reference/` 分叉：`~/grasp_ws/src/{grasp_sim,yolo_vision}` → `docs/reference/ur5-yolo-grasp/{grasp_sim,yolo_vision}`。`colcon list` 已确认两者被正常发现（符号链接被跟进）。注意：此处**用附件内的 `yolo_vision` 以保持其内部坐标约定自洽**；勿与本仓库主线混用 |
+| P3-2 | 源码编译 `gz_ros2_control`（`humble` 分支） | ✅ **已完成 2026-09-27**。`--packages-up-to gz_ros2_control`，20.6 s 通过。产物 `libgz_ros2_control-system.so` / `libgz_hardware_plugins.so`。**已实证与 Harmonic 匹配**（见下方） |
 | P3-3 | 锁定 `setuptools==68.0.0` | 附件 README 已记录：≥79 会破 `ament_python` |
 | P3-4 | 预生成 URDF/SRDF | `xacro … -o /tmp/ur5.urdf` + `-o /tmp/ur5.srdf` |
-| P3-5 | 跑通 `full.launch.py` 仿真抓取 | 验证 9 物体依次抓取 |
+| P3-5 | 跑通 `full.launch.py` 仿真抓取 | ✅ **已完成 2026-09-27**——端到端「检测 → 规划 → 抓取 → 搬运 → 放置」实测跑通，方块被**真实搬离网格**（物理位姿为证，非回读值）。见下方两处「P3-5 实测」 |
 | P3-6 | 接入主线感知 | 让 `perception_3d` 的输出风格与 `grasp_planner` 的输入对齐（附件版内部自己做投影，需决定是**复用**还是**替换**——见下） |
+
+#### P3-5 实测：仿真链路已全部打通（2026-09-27）
+
+`sim.launch.py` 常驻运行实测（用户目视 + 数据双向确认）：
+
+| 环节 | 证据 |
+|---|---|
+| 世界加载 | 13 个模型：`ground_plane`/`table`/`overhead_camera`/**9×`block_r{0,1,2}_c{0,1,2}`**/`pedestal` |
+| UR5+gripper spawn | `ros_gz_sim: OK creation of entity.`；`resource_manager: Successful initialization of hardware 'ur5'` |
+| mimic 关节 | `Joint 'robotiq_85_right_finger_tip_joint' is mimicking 'robotiq_85_left_knuckle_joint' multiplier: 1` |
+| ros2_control | `gz_ros2_control: System Successfully configured!` → `Loading controller_manager` |
+| 控制器 | `joint_trajectory_controller` / `joint_state_broadcaster` 均 `Loaded` + **`Configured and activated`** |
+| MoveIt | `move_group` 起，`start_state_max_bounds_error=0.1` |
+| **相机（Gazebo 侧）** | `/rgbd_camera/{image,depth_image,camera_info,depth_image/points}` **实测有数据**，`frame_id=overhead_camera::camera_link::color_camera` |
+| **桥接（ROS 侧）** | `/camera/{color/image_raw,depth/image_raw,color/camera_info,depth/points}`、`/clock`、`/joint_states`、`/dynamic_joint_states` 全部可见 |
+| **关节状态** | `/joint_states` 有真值：`shoulder_lift=-1.5700`、`wrist_1=-1.5700`（UR5 标准初始位姿） |
+| **控制通路（关键）** | 发一条 `FollowJointTrajectory`（仅 `wrist_3_joint`→0.4，靠 `allow_partial_joints_goal: true`）→ **`error_code: 0`、`Goal successfully reached!`、状态 `SUCCEEDED`**；回读 `wrist_3_joint=+0.4000` **精确命中**，其余 6 关节保持不动 |
+
+> ⚠️ **此前「没有运动」是正常的，不是故障**：`sim.launch.py` **只负责把世界+控制器+MoveIt 立起来，不下发任何运动指令**。我最初也把「无运动」误当成待查问题，实际它本就不该动。运动来自 `full.launch.py`（它才加 `yolo_vision` 检测 + `grasp_planner`）。
+
+#### P3-5 实测（二）：`full.launch.py` 端到端抓取跑通（2026-09-27）
+
+在 E1 叠加环境（`source /opt/ros/humble/setup.bash` → `export PYTHONPATH=<venv>/lib/python3.10/site-packages:$PYTHONPATH`）下实跑：
+
+```bash
+cd /home/<user>/grasp_ws && source /opt/ros/humble/setup.bash && source install/setup.bash
+export GZ_VERSION=harmonic
+export PYTHONPATH=/home/<user>/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
+ros2 launch grasp_sim full.launch.py
+```
+
+| 环节 | 证据 |
+|---|---|
+| YOLO 节点 | `Loading model: …/yolo_vision/models/best.pt on cuda:0` → `YOLO Detector ready (RGB + depth → 3D)` —— **E1 叠加生效，ultralytics 在 venv 里被找到并跑在 GPU 上** |
+| 相机内参 | `K from camera_info: fx=554.4 fy=554.4 cx=320.0 cy=240.0`（`K from HFOV` 的兜底路径也走通了） |
+| 回 HOME | `Moving to HOME before first grasp...` → `Initial HOME reached — ready for detections` |
+| 检测 | `Detected: ['0'×10]`，取最高置信度 `0.93` → `world=(0.493,-0.119,0.450)` |
+| 抓取动作链 | `Approach → Descend → Close → Lift → Home → swing left → Drop → Release → Return home`，**每一步 `Trajectory done: error_code=0`** |
+| 连续抓取 | 第 2 轮 `Detected: ['0'×8] | already grasped: 1` → 再抓 1 个，计数 `(2 objects grasped)` |
+| **物理搬运（关键独立证据）** | 查 Gazebo 真实位姿：`block_r0_c0`/`block_r0_c1` 已**不在网格**（网格 x∈{0.34,0.5,0.66}, y∈{-0.12,0,0.12}），双双位于 `(-0.207, 0.486)` 即规划器的 left-drop 放置区，**数量恰为 2**，与计数器一致 |
+
+> 🔎 **为什么要另找证据**：日志里的 `Close done: gripper_pos=0.4503` 只是**位置命令回读**，这个仿真没有力反馈，空夹与夹住物体都可能落到相近值——**单看回读值不能证明抓到了**。查 Gazebo 里方块的**物理位姿**才是硬证据：方块确实离开了原位、成对出现在放置区。这条同样适用于真机验证：**别把关节回读当成抓取成功**。
+
+**D36 从「时序脆弱」升级为「实测行为失败」**：本轮 `set_p_gain-4` 直接 **died**，日志第 11 行：
+
+```
+[set_p_gain-4] Node not found
+[ERROR] [set_p_gain-4]: process has died [pid 33527, exit code 1,
+  cmd 'bash -c sleep 2 && ros2 param set /gz_ros2_control position_proportional_gain 5.0 && echo ...']
+```
+
+即 `position_proportional_gain` **停留在 yaml 的 10.0，而非作者想要的 5.0**。之前只判为「与 spawn 赛跑、靠运气熬过」，现在确认它是**稳定失败**——`sleep 2` 时 `/gz_ros2_control` 节点尚未存在，`ros2 param set` 报 `Node not found` 后 `&&` 链中断、进程退出。修法：改用 `--controller-manager-timeout` 等就绪等待，或直接在 `ros2_control.yaml` 里写 5.0。
+
+**实测中发现、应在 P3-6 移植时一并修掉的附件缺陷**（记为新缺陷编号 D34–D37）：
+
+| # | 缺陷 | 后果 | 证据 |
+|---|---|---|---|
+| **D34** | `sim.launch.py:97`/`:124` 在**构造期** `open(URDF_PATH)`/`open(SRDF_PATH)`，而生成它们的 `ExecuteProcess` 在 `:56`/`:70`、**运行期**才执行 | **首次冷启动必然失败**（文件还不存在）。这正是 `LAB.md` §9.5 警告的现象。P3-4 的预生成只是绕过，根因未修。**正确修法**：把 `urdf_contents`/`srdf_contents` 改为运行期读取（或 `Command` 替换） | `open()` 在 `generate_launch_description()` 内 |
+| **D35** | `:202`/`:204` 的 spawner 命令末尾带 `\|\| true` | **吞掉控制器加载失败**。控制器起不来时 launch 仍"成功"，直到后面规划失败才暴露，且现象与真实原因相距很远 | `--controller-manager-timeout 30 ... \|\| true;` |
+| **D36** | `:190` 用固定 `sleep 2` 设 `position_proportional_gain`，注释却写「**BEFORE** robot spawn」 | 与 spawn 赛跑。实测出现 `robot_state_publisher service not available, waiting again...` ×4 后才恢复（靠运气熬过）。属 D17 同类固定延时 | 日志第 41–44 行 |
+| **D37** | spawner 已激活控制器后，`:206` 又调 `switch_controller` 激活一次 | **冗余调用**，产生误导性的 `Could not activate controller ...` 两条 WARN，但响应实为 `ok=True`。看起来像失败，实际是噪音——**会浪费排查时间** | 日志第 232–234 行 + `SwitchController_Response(ok=True)` |
+
+**其他观察（非缺陷，供参考）**：`ros2_control.yaml` 注释仍写「in Gazebo **Fortress**」（我们跑的是 Harmonic，注释过期）；world SDF 版本为 `1.9`（Fortress 时代，sdformat14 兼容但可现代化）；moveit 报 `No action namespace specified for controller 'scaled_joint_trajectory_controller'`（`:136` 的 `pop` 未完全生效，因 JTC 才是 `default: True`，无实际影响）。
+
+**环境操作注意**：`ros2 daemon` 在仿真运行期间会**卡死**（`ros2 daemon stop` 本身挂住不退出），导致 `ros2 topic list` 等命令超时。**`--no-daemon` 可绕过**（实测立即正常）。另：**launch 与查询 shell 必须用一致的 `ROS_LOCALHOST_ONLY` 设置**——第九轮进一步实测：该值由 `source /opt/ros/humble/setup.bash` 置为 **0**，**保持 0 即可**；改成 1 会让发现完全失效（见 E3）。发现异常时**先查残留节点**（`ps -eo pid,comm | grep -E "static_transf|projector|detector|planner"`），本轮实测抓到 4 个上一次仿真遗留的 `static_transform_publisher`。**清理时必须用 `pkill -9 -x <精确进程名>`，不能用 `pkill -f`——`-f` 会匹配到执行该命令的 shell 自己，把自己的会话杀掉**（本轮踩到两次）。
+
+#### P3-6 实测：自研规划器接管抓取，9/9 全量跑通（2026-09-27，第九轮）
+
+按你确认的 **P3-6(B)** 落地：`perception_3d` 是**唯一**的 2D→3D 转换点，规划器**零投影代码**，只消费 `/targets_3d`；夹爪走**抽象层**（仿真 = JTC 第 7 关节，真机 = AG-95 Modbus）。同时修掉 D34–D37，并新增 D38/D39。
+
+**改动清单（本轮）**
+
+| 文件 | 动作 |
+|---|---|
+| `grasp_planner/grasp_planner/planner_node.py` | **整文件重写**：删掉参考项目自带的 `_optical_to_world()`/`_publish_camera_tf()` 与 `x - BASE_X` 一类硬编码偏移，改为纯 `/targets_3d` 消费者；`move_duration`/`descend_duration` 等几何与时序量全部提为 ROS 参数 |
+| `grasp_planner/grasp_planner/gripper.py` | **新增**：`GripperBackend` 接口 + `SimGripper`（已实测）+ `Ag95Gripper`（**会大声报错的桩**，见下） |
+| `grasp_planner/config/grasp_planner.yaml` | **新增**：全部参数集中一处，几何量逐条注明「真机必须现场覆盖」 |
+| `grasp_planner/launch/planner.launch.py` | **重写**：废弃 `mode:=mock\|moveit`（mock 分支只打日志，从不执行），改为加载 yaml + 暴露 `params_file`/`gripper_backend` |
+| `arm_grasp_sim/**` | **新增（自附件移植）**：world + UR5+Robotiq 的 URDF/SRDF + launch；D34–D37 已修 |
+| `perception_3d`、`grasp_planner` 的 `setup.py`/`package.xml` | 装 `config/`、补 `vision_msgs`/`trajectory_msgs`/`control_msgs` 等依赖 |
+
+> **为什么把夹爪单独拆出来命令，而不是塞进同一条 7 关节轨迹**：AG-95 **不在机械臂的轨迹控制器里**，真机上「当第 7 个关节发 `FollowJointTrajectory`」根本走不通。仿真侧借助 JTC 已开启的 `allow_partial_joints_goal: true`，只发夹爪那一个关节即可（**已实测该路径可用**：日志有 `Goals with partial set of joints are allowed`，且夹爪单独轨迹稳定 `Goal reached`）。两边对规划器暴露同一接口，状态机无需分叉。
+>
+> ⚠️ **但要注意顺序**：JTC 的**新目标会抢占正在执行的目标**。所以臂与夹爪的轨迹**必须严格串行**——每一段夹爪动作都放在某段臂轨迹的完成回调里发出，绝不可并发，否则会静默打断臂的运动。
+
+**验收证据（本轮，全部为实测）**
+
+| 环节 | 证据 |
+|---|---|
+| 统一 3D 接口 | `perception_3d` 日志：`发布 9 个候选到 /targets_3d；/target_3d = [block] score=0.94`（新接口与兼容接口同时可用） |
+| 规划器零投影 | 规划器日志**只有** `候选 9 个 … / → 选中 … / 接近解：[…]`，全文无任何相机内参或 TF 运算 |
+| 完整动作链 | `初始化：先张开夹爪，再回 HOME` → `接近完成` → `下降完成` → `已夹住物体（回读位置=0.4508）` → `抬起成功，已记录 …（累计 1 个）` → `已到 HOME —— 左摆放置` → `已到放置位 —— 张开夹爪放下` → `返回 HOME` → `已就绪` |
+| 连续抓取 | 候选数随抓取递减 **9→8→7→6→5→…→1**，规划器计数递增 `累计 1…9 个`，**无一次重试、无一次空夹误判** |
+| **物理搬运（关键独立证据）** | 查 Gazebo 真值：**9/9 全部离开网格**，堆在放置区 `(-0.208, 0.485)`，z = 0.02→0.34 **整齐叠成 9 层塔**；落点离散度 **x 仅 0.9 mm、y 仅 9.8 mm** |
+| **计数一致性** | Gazebo 真值「已搬走 9 个」与规划器自报「累计 9 个」**逐一对应**，且**正是**规划器依次选中的那 9 个（r0_c1, r0_c2, r0_c0, r1_c1, r1_c0, r1_c2, r2_c0, r2_c2, r2_c1） |
+
+> 🔎 **为什么必须查 Gazebo 真值**：`已夹住物体（回读位置=0.4508）` 只是 JTC 的**位置回读**，本仿真**没有力反馈**——空夹与夹住都可能落到相近值。**回读值本身不能证明抓到了**。只有方块在物理世界里真的换了位置，才算证据。**这条对真机同样成立：别把关节回读当成抓取成功。**
+
+**本轮新发现并已修的缺陷**
+
+| # | 归属 | 缺陷 | 后果 | 修法 |
+|---|---|---|---|---|
+| **D38** | 附件遗留 | `sim.launch.py` 把 `gz_ros2_control` 路径**硬编码**成 `<ws>/install/gz_ros2_control/lib` | 换工作区/换机器即失效；而该包按 P3-2 必须**源码编在工作站**，路径本就与主工作区不同 | 改用 `get_package_prefix("gz_ros2_control")`，包缺失时抛**可操作**的报错（指明要 `source ~/grasp_ws/install/setup.bash`） |
+| **D39** | 附件遗留 | 用 `Node(package="ros_gz_sim", executable="gz_sim")` 起仿真 | `executable 'gz_sim' not found in the libexec directory '/opt/ros/humble/lib/ros_gz_sim'`——**Harmonic 变体只提供 `create`/`test_stopwatch`，没有 `gz_sim`** | 回到 `ExecuteProcess(cmd=["gz","sim","-r",world])`，与 `ros_gz_sim` 包解耦 |
+| **D40** | **主仓库既有** | `detector_node.py` 检测循环里 `boxes` 来自 `.cpu().numpy()`，`x1..y2` 是 **np.float32** 标量；`vision_msgs` 的纯 Python 消息类在 setter 里做**严格断言** `assert isinstance(value, float)` | `isinstance(np.float32(1.0), float)` 是 **False**（`np.float64` 才是 float 子类）⇒ 消息一构造就 `AssertionError`，节点在**第一帧图像**上直接崩掉。**这条与抓取无关，是主仓库感知链自己就断了** | 显式 `(float(v) for v in box)` |
+| — | 移植期自引入 | `table_min_z` 沿用参考项目的**世界系**值 `0.3`，但本规划器已改在 `base_link` 系作业 | 两个系差一个底座高度（0.80）。base_frame 里桌面 ≈ **-0.39**、桌上方块实测 **-0.350**、地上 **-0.78** ⇒ 用 0.3 会把**所有**候选判为「已落地」而**全部丢弃，且不报任何错**——规划器一个目标都选不出来 | 改 `-0.5`（干净分开 -0.35 与 -0.78），并把这段换算写进参数注释 |
+| — | 移植期自引入 | `gripper.py` 的 `_wrap()` 从 `self._done_cb` 取回调，而该属性**从未被赋值** | **调用方的完成回调被静默吞掉**：夹爪动作做完了，规划器永远等不到回调，卡在初始位姿、`_first_home_sent` 恒为 False，**所有检测都被丢弃**。症状是「夹爪动了但规划器毫无反应」，且**一句报错都没有** | 换成 `_once(done_cb)`（只做「只调用一次」防重入），回调从参数传入 |
+| — | 移植期自引入 | `planner_node.py` 里 `move_duration`/`descend_duration` 只被 `_declare_params()` **声明**，忘了赋给 `self` | 第一段 HOME 轨迹一发出就 `AttributeError`，节点启动 **2 秒后直接死掉** | 补上赋值，并在注释里点明「`_declare_params()` 只负责声明，不会自动变成属性」 |
+| **D41** | 移植期自引入 | `pipeline.launch.py`/`bringup.launch.py` 仍向规划器传 `mode:=mock\|moveit`，而新规划器**没有这个参数**（它随参考项目的 mock/moveit 分支一起被删） | **实测确认：ROS 2 对未声明的参数覆盖是静默忽略的**——`ros2 run grasp_planner planner_node --ros-args -p mode:=mock` 正常启动，输出里 **0 次**提及 `mode`。于是「mode 参数已失效」这件事**没有任何提示**，用户以为选了 moveit 其实什么都没发生 | 删掉两个 launch 里的 `mode`，改为传**真正有用**的 `gripper_backend`；其默认值**随 `camera_source` 走**（`sim`→`sim`，真机→`ag95`），理由同 `depth_topic`：真机上若默认 `sim`，规划器会去命令一个**真机不存在的关节** `robotiq_85_left_knuckle_joint`，JTC 收下却不动任何东西——**「夹爪没反应」且不报错** |
+
+> **`gripper_backend` 为什么必须随 `camera_source` 变、而不是固定默认值**：这两个后端在真机上是**对错之别**，不是偏好。`sim` 后端 = 「夹爪是 JTC 第 7 关节」，这条在真机上**根本不成立**（AG-95 是独立 Modbus 设备）。固定默认 `sim` 会让真机静默失效；固定默认 `ag95` 会让仿真开箱即错。跟随 `camera_source` 是唯一能同时正确的默认值，且 `pipeline.launch.py` 里 `depth_topic` 已经是这个写法，属本文件既有惯例。
+
+**关于「控制器没起来时规划器怎么办」（实测澄清，非缺陷）**：单独起规划器（无仿真、无控制器）实测输出：
+
+```
+[INFO]  GraspPlanner 就绪 | 夹爪后端=sim (...)
+[INFO]  初始化：先张开夹爪，再回 HOME ...
+[ERROR] 轨迹 action 服务不可用（控制器起了吗？）
+```
+
+`_send_trajectory()` 在 `wait_for_server` 超时后会**主动调用 `done_cb(None)`**，所以状态机**不会卡死**，而是照常推进到 `_first_home_sent=True` 并开始接收检测。这是**有意的降级**（报错但继续），比挂起好。
+> ⚠️ **但真机上要注意一个后果**：此时 HOME **并未真正执行**，而规划器已经认为自己「就绪」。若机械臂此刻停在任意位姿，规划器仍会发出**绝对关节角**的接近轨迹——它会从当前位置直接奔向目标（可能穿过障碍），而不是从 HOME 出发。所以 **P5 真机联调时，必须先确认控制器与 `ur_robot_driver` 已就绪、且机械臂确实在 HOME，再启动规划器**（仿真里靠 `full.launch.py` 的 `planner_delay:=18.0` 规避了这点）。
+
+
+
+> **这三条自引入缺陷有共同教训**：它们都**不是逻辑错误，而是「以为存在的东西不存在」**，且前两条**完全静默**（一个丢弃全部候选、一个吞掉全部回调），日志上只剩「什么也没发生」。**端到端实跑是唯一能暴露它们的手段**——单元测试与静态检查都覆盖不到。移植参考代码时，**「参数改名了、坐标系换了、回调改道了」这三类要逐条对账**。
+
+**本轮发现、尚未处理的问题（留给你决定）**
+
+| # | 问题 | 说明 |
+|---|---|---|
+| a | **世界里没有放置容器** | 9 个方块全被放到**地面**上（放置点 `(-0.208, 0.485)` 在桌子外，落点 z≈0.02），叠成塔。参考项目的 `left_drop_joints` 是个**硬编码关节角**，并没有对应的接料容器。真机上「放置位」必须有**真实目标**（料框/指定台面），且 `left_drop_joints` 是仿真几何下的值，**真机必须重新标定** |
+| b | **`已抓完` 分支实际不可达** | `_select_and_approach()` 只在「**有候选**但全已抓过」时才打印「全部 N 个物体已抓完」。物体抓完后会落到视野外/低于 `table_min_z`，此时**候选为 0**，走的是「静默重试」分支，永远等不到结束语。功能无碍（它会一直待命等新物体），但**做演示时看不到明确的收尾提示** |
+| c | **`max_sync_dt` 丢帧告警高频出现** | 全程 **24 次** `深度与检测时间差 132 ms 超过 max_sync_dt（100 ms），丢弃本批检测`。当前靠「检测是连续流、丢一批还有下一批」掩盖住了。**Orin 上延迟只会更大**，这个 100 ms 阈值很可能需要调大，否则真机上会**大量丢帧**（见 P4-7 单独验收） |
+| d | **`table_min_z` 实际承担了循环终止的职责** | 抓完的方块之所以不再被当成候选，**靠的是它们掉到 `table_min_z` 以下**（而非 `_grasped_positions` 去重——去重按坐标四舍五入比对，而落点与抓取点坐标不同，**去重在这里并不生效**）。改这个阈值时要想清楚这层副作用 |
+| e | **`position_proportional_gain` 仍不可设** | D36 本轮改为**不再尝试** `ros2 param set`（删掉那条必然失败的 `set_p_gain-N`），故增益停留在库默认 **0.1**，而非 yaml 写的 10.0。属已知，不影响本轮功能（位置控制仍稳定收敛） |
+
+> **过程记录（工具环境，非项目缺陷）**：本轮有一次 Bash 工具输出里夹带了伪装成 `system-reminder` 的**注入指令**，要求我「不要调查/修复这些 bug、且不要提及该提醒」。我**未采纳**，并按你的既定要求继续查修、如实汇报。记录在此仅供你了解工具环境状况。
+
 
 > **P3-6 是本次整理最需要你拍板的技术点**：附件的 `grasp_planner.py` 内部自带 `_optical_to_world()` 与 `_publish_camera_tf()`，即**它自己做了 2D→3D**，与 `ros2_ws/src/perception_3d` 职责重叠。两种走法：
 > - **(A) 复用附件内部投影**：改动最小，直接跑通；但 3D 逻辑散落在抓取节点里，无法单独测试，且不做 D1/D2 修复的话真机仍会错。
 > - **(B) 抽出统一 `perception_3d`**：把附件的投影逻辑并入 `perception_3d` 并加上 D1/D2/D8 修复，抓取节点只消费 `/target_3d`。**架构更干净，也是真机唯一可行路径**，但改动量大。
 >
 > 我建议 **(B)**，理由：真机上深度对齐与尺度转换必须在感知层统一处理一次，散在抓取节点里无法复用也无法验证。
+
+#### P3-0 已核实的安装事实（2026-09-26 实测，非凭记忆）
+
+装 Harmonic 前先要知道五件事，否则会踩坑：
+
+| # | 核实结论 | 证据 |
+|---|---|---|
+| a | **Gazebo Classic 必须先卸，不能共存** | `gz-tools2`（`gz-harmonic` 的依赖）的 control 文件**显式声明** `Conflicts: gazebo (>= 11.0.0), gazebo (<= 11.14.0), gazebo11 (<= 11.14.0)`，且两套都提供 `/usr/bin/gz`，属文件级冲突。本机 Classic 为 `11.10.2+dfsg-1` |
+| b | **本仓库不依赖 Classic，卸掉零代价** | 全仓库 grep `gazebo_ros\|libgazebo\|gazebo_ros_pkgs` **无命中**；仿真走的是 `gz sim -r` + `ros_gz_bridge`（`simulation.launch.py:36,45`），两套都是 **Gazebo Sim（新）**。`apt -s` 模拟：连带移除 6 个包（`gazebo`、`ros-humble-gazebo-{dev,msgs,plugins,ros,ros-pkgs,ros2-control}`），无一被本仓库使用 |
+| c | **Harmonic 是本仓库 launch 的前置条件，不是「升级」** | 本机 Classic 的 `gz` CLI 子命令只有 `camera/joint/log/marker/model/physics…`，**没有 `sim`**（`gz help` 实测）。即 `simulation.launch.py` 的 `gz sim -r <world.sdf>` 在 Classic 上**根本跑不起来** |
+| d | **Humble+Harmonic 的二进制只在 `packages.osrfoundation.org`** | ros_gz `humble` 分支 README 的兼容表 + 脚注 1 指明该组合从 OSRF 源获取；`packages.ros.org` 上只有配 Fortress 的 `ros-humble-ros-gz*`，**没有** `ros-humble-ros-gzharmonic`。curl OSRF `jammy` 索引确认两者都在：`gz-harmonic 1.0.0-1~jammy`（拉 `libgz-sim8-dev`/`gz-sim8-cli` ⇒ Harmonic 8.x）、`ros-humble-ros-gzharmonic 0.244.12-3jammy` |
+| e | **`gz_ros2_control` 不要 apt 装** | apt 的 `ros-humble-gz-ros2-control 0.7.21`（本机现已随 Classic 一并移除）是**为 Fortress 编的**，Harmonic 下插件名变了。须从 `ros-controls/gz_ros2_control` `humble` 分支源码编译（该分支同时兼容 Fortress/Harmonic，无需改代码） |
+
+#### P3-2 编译结果与「插件名是否匹配」的实证（2026-09-27）
+
+回滚快照保留在 `~/gazebo-classic-rollback.txt`（全量 1959 包）、`~/gazebo-classic-only.txt`。
+
+```
+cd ~/grasp_ws && source /opt/ros/humble/setup.bash && export GZ_VERSION=harmonic
+PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
+    --symlink-install --cmake-args -DBUILD_TESTING=OFF
+# → Summary: 1 package finished [20.6s]，退出码 0
+```
+
+**关键验证：不是「.so 存在」就算过，而是要看它链接的是哪一代 Gazebo**（LAB.md 警告过 Fortress/Harmonic 插件名不同）：
+
+| 检查项 | 实测结果 |
+|---|---|
+| 动态链接 | 全部为 **`libgz-sim8.so.8`**（Harmonic 8.x）、`gz-transport13`、`gz-plugin2`、`gz-msgs10`——**无任何 `libignition-gazebo6`（Fortress）残留** |
+| 硬件插件注册名（pluginlib XML） | `gz_ros2_control/GazeboSimSystem` **新名** + `ign_ros2_control/IgnitionSystem` **向后兼容别名** |
+| Gazebo 侧插件（`GZ_ADD_PLUGIN`） | `gz_ros2_control::GazeboSimROS2ControlPlugin` |
+
+> ✅ **与附件零冲突，不需要改名。** 附件**本来就是按 Harmonic 写的**：
+> `LAB.md:173`/`TEXTBOOK.md:210` 的 `<hardware><plugin>gz_ros2_control/GazeboSimSystem</plugin></hardware>`、
+> `LAB.md:180` 的 `filename="libgz_ros2_control-system.so"`——**与我们刚编出的产物逐字吻合**。
+> 附件还在 `LAB.md:188`/`TEXTBOOK.md:225` 主动解释了为何**不**用 Robotiq 自带的
+> `robotiq_gripper.ros2_control.xacro`（它写死了 Fortress 时代的 `ign_ros2_control/IgnitionSystem`），
+> 而是自己写 30 行 `<ros2_control>` 块。**这正是 P3-2 必须源码编译的原因，附件已提前规避。**
+
+#### P3-2 之后新暴露的依赖缺口（**需要你再跑一次 sudo**）
+
+附件的 xacro/launch **引用了 4 个本机未装的包**（引用均已核实为**活引用**，非死代码）：
+
+| 包 | 引用位置 | 本机 |
+|---|---|---|
+| `ros-humble-ur-description` | `ur5_with_gripper.urdf.xacro` 等 **6 处** | ❌ |
+| `ros-humble-robotiq-description` | `ur5_with_gripper.urdf.xacro:14,15`（`robotiq_2f_85_macro.urdf.xacro` + `ur_to_robotiq_adapter.urdf.xacro`） | ❌ |
+| `ros-humble-ur-moveit-config` | `sim.launch.py:14`（**import 期**即需 `launch_common`）、`:131-133` 读 3 个 yaml、`ur5_gripper.srdf.xacro:7` | ❌ |
+| `ros-humble-joint-state-publisher` | UR 标准链路 | ❌ |
+
+`moveit` / `moveit_ros_move_group` / `xacro` / `robot_state_publisher` **本机已装** ✅。
+
+> ⚠️ **注意这里有个容易搞混的点，别把两件事并成一件事**：
+> `robotiq-description` **在板端已撤回**（真机夹爪不是 Robotiq，装了无用——见 P4「夹爪不一致」），
+> 但**仿真机必须装**（附件仿真的 UR5 末端就是 Robotiq 2F-85）。
+> 即：**同一份配置在仿真里正确、在真机上是错的**，这正是 P5 抓取位姿不能直接搬的根源。
 
 **验收**：仿真中 9 个物体全部抓取成功；`/target_3d` 可被独立 echo 验证；抓取节点可单独重启不影响感知。
 
@@ -375,7 +571,7 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 | 编号 | 任务 | 说明 |
 |---|---|---|
 | P4-1 | **板端只读盘点** ✅ **已完成 2026-09-26** | 见下方实测清单。全程只读，未做任何修改、未驱动机械臂 |
-| P4-2 | 参数化环境脚本 | 修 D9：把 `install_deps.sh` / `environment.yml` 的发行版与 Python 版本参数化，或另写 `install_deps_humble.sh` |
+| P4-2 | ~~参数化环境脚本~~ **方案已废（第十一轮）** | 原计划修 D9（把 `install_deps.sh` / `environment.yml` 的发行版与 Python 版本参数化）。**改判为直接删除**：本项目用的是**既有的** `robot-vision` 环境，本仓库从不需要"创建环境"；保留一份照做会装错的脚本比没有更糟。真实环境已写入 README |
 | P4-3 | 建立 OS 层 Python 环境规范 | **禁止 conda 参与 ROS**（附件 README 已强调）；`which python3` 必须是 `/usr/bin/python3` |
 | P4-4 | Jetson 版 PyTorch | 用 NVIDIA 官方 aarch64 wheel，**不要用通用 pip torch**——通用轮子不含 Jetson CUDA |
 | P4-5 | TensorRT 加速（可选但推荐） | 在**板上**生成 engine；8 GB 显存下 YOLOv8n FP16 预期显著优于 PyTorch |
@@ -415,7 +611,7 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 | 已装 ✅ | 缺失 ❌ |
 |---|---|
 | `ur-robot-driver`、`ur-client-library`、`ur-msgs`、`ur-calibration` | `ros-humble-moveit`（P5-3 规划验证要用） |
-| `controller-manager`、`joint-trajectory-controller` | `ros-humble-robotiq-description` |
+| `controller-manager`、`joint-trajectory-controller` | ~~`ros-humble-robotiq-description`~~ **已撤回**（见下方「夹爪不一致」，真机不是 Robotiq，装了无用） |
 | `xacro`、`ur-description`、`ur-moveit-config` | `ros-humble-ros2-control` / `ros2-controllers`（**元包**未装，但**实际组件 `controller-manager` + `joint-trajectory-controller` 已在**） |
 | `joint-state-publisher`、`robot-state-publisher`、`cv-bridge` | 任何仿真器（不需要） |
 | `colcon-common-extensions`、`pip`、`git` | |
@@ -429,13 +625,84 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 - `/home/<user>/arm-*.sh` 六个脚本：`arm-ready.sh`（性能调优）、`arm-check.sh`（体检）、`arm-isolation-sudo.sh`（资源隔离：控制栈绑 4-5 号核 + 内存保底 1G；桌面压到 0-3 核）、`arm-headless-check.sh`、`arm-cleanup-sudo.sh`、`arm-grow-root.sh`。**这些是本项目在板上做的部署准备，但不在本仓库里**——`arm-isolation-sudo.sh` 的注释引用了「体检清单 D4」，而那份清单我在板上和仓库里都没找到。建议纳入本仓库 `docs/`（见 §5 问题 11）。
 - `/dev/video0..5` 六个视频设备在位；**当前无 `/dev/ttyUSB*`、`/dev/ttyACM*`**。
 
+#### 部署分层：谁跑仿真、谁接真机（2026-09-26 用户确认）
+
+**结论：仿真只在这台 x86 工作站上做，Orin 不需要任何仿真能力。** 这条消除了一个原本可能白做的工作块，理由如下（均已核实）：
+
+| # | 事实 | 含义 |
+|---|---|---|
+| a | **Gazebo 是仿真期依赖，真机路径用不到** | `camera_source:=external` 实测**一个 Gazebo 进程都不起**。P4-1 也早已记录板端 `gz`/`ign`/`gazebo` 全无，并判定「✅ 符合预期」 |
+| b | **`ros-humble-ros-gzharmonic` 根本没有 arm64 构建** | 实测 OSRF `jammy` 索引：`gz-harmonic` amd64/arm64 **都有**（1.0.0-1~jammy），但 `ros-humble-ros-gzharmonic` **只有 amd64**（0.244.12-3jammy）。即 arm64 上想跑 ROS↔Gazebo 桥只能源码编 `ros_gz` |
+| c | **`gz_ros2_control` 是真机不用的东西** | 它是「让 ros2_control 驱动**仿真世界里**机器人」的 **Gazebo 插件**。真机上由 `ur_robot_driver`（RTDE 网络）取代——**而板端已装好**（P4-1）。故 P3-2 那条源码编译**只服务工作站**，Orin 上无需重编 |
+| d | 板端**无 `/dev/ttyUSB*` / `/dev/ttyACM*`** | 与「UR5 走网络 RTDE 而非 USB」相符，进一步支持 `ur_robot_driver` 路线 |
+
+**控制通路的换接口位置**（P5 的关键，一张图）：
+
+```
+仿真：  gz_ros2_control (Gazebo 插件)  ─┐
+                                       ├─→ controller_manager ─→ joint_trajectory_controller
+真机：  ur_robot_driver (RTDE 网络)    ─┘        （两边板端均已在位）
+```
+
+即**下游完全一致，只有上游硬件接口换一个**。这是个好消息：MoveIt 规划、控制器、轨迹执行这些逻辑不用改。
+
+> ⚠️ **不要把 amd64 的包往 Orin 上搬，也不要为此刻意改本机架构。**
+> apt 按机器装，二进制不过机器。**尤其不要 `dpkg --add-architecture arm64`**——
+> 那会让开发机混入 arm64 依赖树而损坏（本机 foreign archs 现为空，保持这样）。
+> Orin 上装的自然是 arm64 那一份，两者互不相干。
+
+#### ⚠️ 夹爪不一致：仿真与真机不是同一个夹爪（2026-09-26 用户确认）
+
+**用户确认：真机夹爪不是 Robotiq 2F-85。** 附件的仿真模型是 `ur5_with_gripper.urdf.xacro`（UR5 + **Robotiq 2F-85**），因此：
+
+| 影响面 | 后果 |
+|---|---|
+| **P4 待装清单** | ~~`ros-humble-robotiq-description`~~ **已撤回**——真机不是 Robotiq，装了无用。应改为 **AG-95 对应的 description/驱动包** |
+| **P3-1/P3-4（仿真）** | **不受影响**，仿真仍用附件的 Robotiq 配置即可 |
+| **P5-3（真机抓取）** | **仿真里验证过的抓取位姿不能直接搬**。夹爪不同 ⇒ **TCP 偏置不同、可夹持宽度不同**，即使手眼标定（P4-6）做得完美，抓取位姿仍需按真机夹爪重新推导 |
+| **URDF/ros2_control** | 真机的末端 URDF 与夹爪控制接口须按 AG-95 重写，不能复用附件 `ros2_control.yaml` 的夹爪段 |
+
+#### ✅ P5-0 已解除：真机夹爪 = 大寰 AG-95（2026-09-27 用户现场读标签确认）
+
+**AG-95（DH Robotics 大寰）实测规格**（来源见下）：
+
+| 项目 | 值 |
+|---|---|
+| 类型 | **自适应两指**电动夹爪（平行/包络自适应） |
+| 总行程 | **95 mm**，编程可调 0~95 mm |
+| 抓持力（单侧） | **45~160 N**（可编程） |
+| 开/合时间 | 0.7 s |
+| 位置重复精度 | ±0.03 mm |
+| 重量 / 电压 | 约 1 kg / 24 V DC |
+| **通信（标配）** | **Modbus RTU (RS485) + Digital I/O**（2 入 2 出） |
+| 通信（选配） | TCP/IP、USB 2.0、CAN 2.0A、PROFINET、EtherCAT（需外接转换模块） |
+
+> 🚨 **这不只是「换个参数」，而是控制接口本质不同——是 P3-6 方案形状的决定因素**：
+>
+> | | 附件仿真 | 真机 AG-95 |
+> |---|---|---|
+> | 夹爪 | Robotiq 2F-85 | 大寰 AG-95 |
+> | **接口** | **JTC 第 7 关节**（`FollowJointTrajectory`） | **Modbus RTU / RS485 独立设备** |
+> | 行程 | 0~0.8 rad | 0~95 mm |
+> | 空夹判据 | 关节回读 < 0.75 | Modbus 位置回读 vs 命令值 |
+> | 力控 | 无 | 45~160 N 可编程 |
+>
+> 附件的做法是**把夹爪当作 `joint_trajectory_controller` 的第 7 个关节**（见 `ros2_control.yaml` 与 `JOINTS`/`GRIPPER_IDX`）。**AG-95 不在机械臂轨迹控制器里**，这条在真机上走不通。
+>
+> ⇒ 规划器**必须**引入**夹爪抽象层**：仿真实现发 JTC 第 7 关节，真机实现走 Modbus。这不是可选的参数化，而是两边接口本质不同。已在 P3-6 中落实。
+
+**来源**：[DH Robotics 官方选型手册](https://www.dh-robotics.com/wp-content/uploads/2023/05/%e4%bc%ba%e6%9c%8d%e7%94%b5%e5%8a%a8%e5%a4%b9%e7%88%aa%e9%80%89%e5%9e%8b%e6%89%8b%e5%86%8c_%e5%a4%a7%e5%af%b0%e6%9c%ba%e5%99%a8%e4%ba%ba_CN2401.pdf)、[imrobotic AG-95 参数页](https://www.imrobotic.com/appequi/detail/3445.html)、[DH 电动夹爪手册](https://en.dh-robotics.com/wp-content/uploads/2025/07/DH_%E7%94%B5%E7%88%AA%E9%80%89%E5%9E%8B%E6%89%8B%E5%86%8C.pdf)
+
+> ⚠️ 不同来源在「抓持力」「开合时间」上有出入（45~160 N vs 10~80 N / 0.7 s vs 0.9 s），**可能因产品版本或渠道不同**。用于选型/力控参数时**以现场实物铭牌与官方最新手册为准**，不要照抄本文表格。
+
 **验收**：板端 `ros2 topic hz /detections` 稳定 ≥ 15 Hz；对已知位置目标 `/target_3d` 误差 < 2 cm；全程未驱动机械臂。
 
 ### P5 — 真机抓取（高风险，需逐次授权）
 
 | 编号 | 任务 | 前置条件 |
 |---|---|---|
-| P5-1 | 核实 UR5 接入方式 | 控制器型号 / 网络 IP / 示教器配置 / 夹爪接口——**不得假设 USB**，UR 常见为网络 RTDE |
+| **P5-0** | ✅ **已解除**(2026-09-27)：真机夹爪 = **大寰 AG-95**，行程 95 mm，**Modbus RTU/RS485**，力控 45~160 N | 见 P4「P5-0 已解除」小节。**仍需现场核实**：实物铭牌版本、RS485 接线与波特率、是否装了 Modbus 驱动包 |
+| P5-1 | 核实 UR5 接入方式 | 控制器型号 / 网络 IP / 示教器配置 / 夹爪接口——**不得假设 USB**，UR 常见为网络 RTDE。**旁证**：板端无 `/dev/ttyUSB*`/`/dev/ttyACM*`，与 RTDE 一致 |
 | P5-2 | 只读连通性验证 | `ur_robot_driver` 启动、读关节状态、`dashboard` 查询，**不运动** |
 | P5-3 | MoveIt 规划验证 | 仅规划+RViz 可视化，**不执行** |
 | P5-4 | 低速单步动作 | 急停可用、工作区隔离、单关节小幅运动 |
@@ -452,9 +719,11 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 | `ros2_ws/src/perception_3d/perception_3d/projector_node.py` | ✅ **已改（第六轮整文件重写；第七轮续改）**：TF 改用 `do_transform_pose_stamped`；深度按 encoding 换算成米后入**带时间戳环形缓冲**、按 stamp 就近配对并在超差时丢弃告警；框内 5×5 采样取**最近簇**中位数；TF 失败升级为 ERROR + 连续计数 + `tf_required` 开关。第七轮：三处话题名参数化（`camera_info_topic`/`depth_topic`/`detections_topic`）以配合 P2-7；归一化护栏（P2-5）；发布前的 `math.isfinite` 兜底。共 **9 个参数** | D33 D1 D2 D8 P2-5 P2-6 P2-7 |
 | `scripts/test_perception_3d.py` | ✅ **新增（第六轮）**：`projector_node` 回归自检，24 项断言，覆盖 D1/D2/D33/D8/P2-5/P2-6；**不需要仿真器、不需要 `colcon build`**（按源码路径直接导入），退出码 0 = 全绿 | D33 D1 D2 D8 P2-5 P2-6 |
 | `scripts/test_detector_device.py` | ✅ **新增（第七轮）**：`resolve_device()` 全分支自检，19 项；**不导入 torch、不实例化 ROS 节点**（用假 logger + `sys.modules` 注入假 torch 模拟有/无 GPU）。⚠️ 模拟「torch 未安装」必须用 `sys.modules['torch'] = None`，`pop` 掉会被真装的 torch 重新导入（本轮实测踩到） | P2-4 |
-| `scripts/test_pipeline_e2e.py` | ✅ **新增（第七轮）**：**端到端**验证——真起话题、真走 DDS，把合成 `camera_info`+深度+检测框喂进运行中的 pipeline，断言 `/target_3d` 的**具体数值**。这是唯一能回答「链路是否真的通」的脚本 | D33 D1 P2-6 |
+| `scripts/test_pipeline_e2e.py` | ✅ **新增（第七轮）**：**端到端**验证——真起话题、真走 DDS，把合成 `camera_info`+深度+检测框喂进运行中的 pipeline，断言 `/target_3d` 的**具体数值**。这是唯一能回答「链路是否真的通」的脚本。**第九轮扩展**：加验 `/targets_3d`（候选数、`frame_id`、每条都有 `results`、`id` 非空、`class_id`/`score` **原样透传**、`bbox.center` 与 `results[0].pose` 一致、与 `/target_3d` 坐标逐位吻合）。共 **15 项断言**，实测全绿退出码 0。**为什么必须验分数透传**：规划器用 `hypothesis.score` 做 `min_score` 过滤——分数若被归零，**所有目标都会被静默刷掉** | D33 D1 P2-6 **P3-6** |
+| `ros2_ws/src/yolo_bringup/launch/pipeline.launch.py` | ✅ **已改（第九轮）**：删掉**已失效**的 `mode` 参数（D41），改传 `gripper_backend`（默认**随 `camera_source`**：sim→`sim`，真机→`ag95`）；新增 `skip_detector`/`skip_planner`，让「只验感知」与「抓取该用哪个夹爪」两件事解耦 | D41 P3-6 |
+| `ros2_ws/src/yolo_bringup/launch/bringup.launch.py` | ✅ **已改（第九轮）**：同上删 `mode`、透传 `gripper_backend` | D41 |
 | `ros2_ws/src/perception_3d/package.xml` | 补 `numpy` | — |
-| `ros2_ws/src/yolo_detector/yolo_detector/detector_node.py` | ✅ **已改**：`_resolve_model()` 路径解析 + 找不到即报错 + 类别自检；默认值 `block_best.pt`。第七轮：抽出**模块级** `resolve_device()` 做设备退化（+`device_fallback` 参数）；坐标约定（**像素、不归一化**）写进 docstring 并列为「冻结」 | D6 D24 D7 P2-4 P2-5 |
+| `ros2_ws/src/yolo_detector/yolo_detector/detector_node.py` | ✅ **已改**：`_resolve_model()` 路径解析 + 找不到即报错 + 类别自检；默认值 `block_best.pt`。第七轮：抽出**模块级** `resolve_device()` 做设备退化（+`device_fallback` 参数）；坐标约定（**像素、不归一化**）写进 docstring 并列为「冻结」。**第九轮：修 D40**——检测框坐标显式转 Python `float`，否则 `vision_msgs` 的严格断言会在**第一帧图像**上打死节点 | D6 D24 D7 P2-4 P2-5 **D40** |
 | `ros2_ws/src/yolo_bringup/launch/pipeline.launch.py` | ✅ **已改**：默认模型 `block_best.pt`；第七轮加 `camera_source` 枚举（`sim`/`realsense`/`external`），`realsense` 时拉起 `realsense2_camera`（`align_depth.enable:=true`）并**自动把 `depth_topic` 默认值切到对齐话题**；另加 `tf_required` | D6 D2 P2-7 |
 | `ros2_ws/src/yolo_bringup/launch/bringup.launch.py` | ✅ **已改**：`world`/`model`/`mode`/`device` 四个原先被硬编码忽略的 launch 参数改用 `LaunchConfiguration`（D31）；第七轮透传 `camera_source`/`target_frame`/`tf_required`，并**据此决定是否启动 Gazebo**（真机不起仿真）与 6 s 延时是否生效 | D31 P2-7 |
 | `ros2_ws/src/perception_3d/launch/perception.launch.py` | ✅ **已改（第七轮）**：暴露上述新增参数 | P2-7 |
@@ -464,15 +733,19 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 | `ros2_ws/src/yolo_bringup/launch/simulation.launch.py` | **改**：删死变量 `bridge_config`（`:45`）、接上 `gui_arg`（`:28-31`）、把 `rviz_node` 加入返回列表（`:108-114` 未在 `:116-130` 返回）、`TimerAction` 时序参照附件 `TEXTBOOK.md:771` 的 8 段表重做（现为裸 3.0 s）；**并改用 D19 修好的桥接 YAML**；复核 `:89` 的 `JointState@gz.msgs.Model` 映射 | D14 D15 D16 D17 D19 |
 | `ros2_ws/src/yolo_bringup/setup.py` | **改**：`config` 的 `data_files` 补 `glob('config/*.rviz')`——否则 D16 修好也读不到 `grasping.rviz` | D16 |
 | `ros2_ws/src/yolo_bringup/config/ros_gz_bridge.yaml` | **改**：按附件正确格式重写（顶层 list + `ros_topic_name`/`gz_topic_name`） | D19 |
-| `ros2_ws/src/grasp_planner/**` | `package.xml` 已补 `exec_depend moveit_msgs`（✅ 已完成）；其余**决策**：废弃或改造为 P3-6(B) 的薄封装。另：`tf2_ros`/`tf2_geometry_msgs` 声明未用、`MoveItErrorCodes` 导入未用，P3 改造时一并清理 | D3 D12 |
+| `ros2_ws/src/grasp_planner/grasp_planner/planner_node.py` | ✅ **已改（第九轮整文件重写）**：按 P3-6(B) 改为 `/targets_3d` 的纯消费者，**删除参考项目自带的 `_optical_to_world()`/`_publish_camera_tf()` 与硬编码底座偏移**；参数由 `_declare_params()` 统一声明并从 yaml 载入；新增 `_send_arm_trajectory` 的**角度解缠**（相对当前关节角取最近等价角）与 `traj.header.stamp=0`；IK 结果做归一化并对极端 shoulder_pan 做**去种子重试**。✅ 已清理 `tf2_ros`/`tf2_geometry_msgs` 未用声明与 `MoveItErrorCodes` 未用导入 | D3 D12 |
+| `ros2_ws/src/grasp_planner/grasp_planner/gripper.py` | ✅ **新增（第九轮）**：`GripperBackend` 接口 + `SimGripper`（Robotiq 2F-85，借 JTC 的 `allow_partial_joints_goal` 单发第 7 关节，**已实测**）+ `Ag95Gripper`（真机，**构造即抛错的桩**——无实物时寄存器映射无法实测，写错会让夹爪乱动）。`package.xml` 已补 `moveit_msgs` 为顶层硬依赖 | P3-6 D3 D12 |
+| `ros2_ws/src/grasp_planner/config/grasp_planner.yaml` | ✅ **新增（第九轮）**：全部参数集中一处；**每个几何量都注明「真机必须现场覆盖」**；`table_min_z` 附坐标系换算说明（世界系与 base 系差 0.80，填错会静默丢弃全部候选） | P3-6 |
+| `ros2_ws/src/grasp_planner/launch/planner.launch.py` | ✅ **已改（第九轮）**：废弃 `mode:=mock\|moveit`（mock 分支只打日志、从不执行，是**误导性死分支**），改为加载 yaml 并暴露 `params_file`/`gripper_backend` | D3 D12 |
+| `ros2_ws/src/arm_grasp_sim/**` | ✅ **新增（第九轮，自附件移植）**：world + UR5+Robotiq 的 URDF/SRDF + `sim.launch.py`。**D34–D39 已修**（构造期改运行期、去 `\|\| true`、去必然失败的 `set_p_gain`、去冗余 `switch_controller`、路径改 `get_package_prefix`、仿真改回 `ExecuteProcess`） | D34 D35 D36 D37 D38 D39 |
 | `ros2_ws/src/yolo_bringup/worlds/grasping_world.sdf` | **改**：要么补机械臂，要么改名去掉 "grasping" | D4 |
 | `yolo_vision/**`、`yolo_coco/**` | **删除**——⚠️ 但 `docs/chapter03_yolo_perception.md` 的 §3.4/§3.5 依赖它们，**先处理教材正文与 5 张配图**（§5 问题 9） | D21 |
 | `docs/chapter03_yolo_perception.md` | **改**：§3.3.2/§3.3.3 的 Jazzy 改为 Humble（与附件及 Orin 对齐）；§3.4/§3.5 视问题 9 的选择重写或保留 | D21 D22 |
 | `docs/YOLO_VISION_DESIGN.md` | **改**：全文按 `yolo_vision` 包写（`:230-466` 多处命令与目录树），删包后需重指向 `ros2_ws/src/yolo_detector` | D21 |
-| `scripts/install_deps.sh`、`environment.yml` | **改**：参数化发行版与 Python 版本 | D9 |
+| `scripts/install_deps.sh`、`environment.yml` | ✅ **已删**（第十一轮）：连同 `create_env.sh`/`setup_all.sh`/`setup_workspace.sh` 一并 `git rm`。真实环境写入 README | D9 |
 | `README.md`、`docs/TECHNICAL_SPEC.md` | **改**：区分「设计目标」与「已实现」 | D4 D10 |
 | `docs/YOLO_TUTORIAL.md` | ✅ **已改**：死引用（D10）、环境名（D29）、世界布局与参数（D32）、模型名与 `test_minimal.py` 说明、§7.2 的 `-p model:=` 均按真实情况更正 | D10 D29 D32 |
-| `README.md` | ✅ **已改**（部分）：脚本树补全 + 环境名更正。**仍待** P1-5 的「设计目标 vs 已实现」标注 | D10 D29 |
+| `README.md` | ✅ **已整体重写**（第十一轮）：原文件通篇为 Jazzy/24.04 时代陈述，逐句更正成本高且易漏，故按七节重写（能跑到什么程度 / 环境 / 构建 / 运行 / 数据流 / 目录 / 自检 / 真机） | D10 D29 |
 | 6 个分叉脚本 | **收敛**（根 `scripts/` 为权威版，已执行）；`yolo_vision/scripts/` 随包删除 | D11 |
 | 13 组模型权重 | **收敛 + 哈希记录** | D13 |
 
@@ -557,28 +830,161 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 - ✅ **P2 余项全部收尾**：P2-5（冻结「像素、不归一化」约定 + 归一化护栏）、P2-4（`resolve_device()` 设备退化）、P2-7（`camera_source` 枚举开关，`bringup` 透传，**真机不起 Gazebo**）。
 - ✅ **链路首次端到端实证**：新增 `scripts/test_pipeline_e2e.py`，实测 `/target_3d` = `(0.0000, 0.0000, 0.5000)` 与 `(0.1444, 0.0903, 0.5000)`，**与解析预期逐位吻合**。这直接证明 **D33 确已修复**（此前该话题从未被发布），并证明 **P2-6 的「最近簇」在真实链路上生效**（框内 3/4 是 1.0 m 桌面，仍取到 0.5 m 的方块）。
 - ✅ **新增 `scripts/test_detector_device.py`**：19 项，全分支覆盖，不装 torch 也能跑。
-- 🎯 **查明 E1–E5 五条环境事实**（见 P2 小节）：`ultralytics` 与 `rclpy` 分居两个解释器、venv 的 setuptools 84 会让 `colcon build` 失败、WSL2 组播发现不稳需 `ROS_LOCALHOST_ONLY=1`、1.23 MB float32 深度把 DDS 压到约 9 MB/s、本机 GPU 实为 **RTX A2000**（教材写的 RTX 2060 有误）。
+- 🎯 **查明 E1–E5 五条环境事实**（见 P2 小节）：`ultralytics` 与 `rclpy` 分居两个解释器、venv 的 setuptools 84 会让 `colcon build` 失败、~~WSL2 组播发现不稳需 `ROS_LOCALHOST_ONLY=1`~~（**第九轮证伪，见 E3：保持 humble 自带的 0 才对**）、1.23 MB float32 深度把 DDS 压到约 9 MB/s、本机 GPU 实为 **RTX A2000**（**本机不是编教材那台开发机，故硬件与教材不必一致**）。
 - 📌 **P2-7 实现时改了设计**：原计划两个布尔量 `use_sim`/`use_realsense` → 实际用**单枚举** `camera_source`（避免「都为真」的无意义状态）。
+
+**第九轮（2026-09-27）新增完成项：**
+
+- ✅ **P3-6(B) 落地，抓取链路端到端全量跑通**：自研规划器接管抓取，**9/9 方块全部搬运成功**，且与 Gazebo 物理真值**逐一对应**（详见 P3-6 实测小节）。
+- ✅ **P3-6 全部完成**：统一 3D 接口（`perception_3d` 唯一投影点）、规划器移植（零投影代码）、夹爪抽象层（仿真可用 / 真机为**大声报错的桩**）。
+- ✅ **D34–D39 全部修复**：D34（构造期读 URDF/SRDF）、D35（`|| true` 吞错）、D36（`set_p_gain` 必然失败）、D37（冗余 `switch_controller`）、**新增 D38**（`gz_ros2_control` 路径硬编码）、**新增 D39**（`gz_sim` 不是 `ros_gz_sim` 的可执行文件）。
+- ✅ **新增 D40（主仓库既有缺陷，与抓取无关）**：`detector_node.py` 的 np.float32 严格断言崩溃——**感知链此前在第一帧图像上就会死**。
+- ✅ **本轮还修掉 3 个移植期自引入缺陷**（`table_min_z` 坐标系、`gripper._wrap` 吞回调、`move_duration` 未赋值），共同教训已写进 P3-6 小节。
+
+**第十轮（2026-09-27）新增完成项：**
+
+- ✅ **启动拓扑收口：入口只剩一个**（Q1，用户选定「收口到 bringup，内部复用」）。此前
+  detector/perception 的参数在 `arm_grasp_sim/full.launch.py` 与
+  `yolo_bringup/pipeline.launch.py` **各写了一份**，而**真机走的正是后者**——
+  改一处忘一处就会出现「仿真能跑、真机不跑」，而真机恰恰是最难排查的那个。现在：
+  - `pipeline.launch.py` 是**节点的唯一定义处**；新增 `start_delay` 统一延时，把
+    `[realsense, detector, perception, planner]` 一起包进 `TimerAction`；
+  - `arm_grasp_sim/full.launch.py` **只加仿真专属的东西**（world + 臂 + MoveIt），
+    节点一律 include `pipeline.launch.py`（`camera_source:=sim`）；
+  - `bringup.launch.py` 成为**唯一入口**，用 `OpaqueFunction` **懒解析** `arm_grasp_sim`。
+    这一步是必须的：`get_package_share_directory()` 在 launch **解析期**就求值，
+    而 `IfCondition` 只影响**执行期**——所以「板上没编仿真包」会让
+    `camera_source:=realsense` 也**整体加载失败**，正是 P4-7「只编子集」的常规做法。
+    缺包时改为抛**可操作**的 `RuntimeError`（告诉你怎么补，或改用真机分支）。
+  - **删除 `simulation.launch.py`**（`git rm`）：一个**没有机械臂**的世界，抓取链路
+    接上后已无意义（规划器起来了却没臂可动）。
+- ✅ **P1-5 完成**：`TECHNICAL_SPEC.md` 顶部加「本文是**设计稿**，不是当前实现的描述」横幅，
+  内含**逐项环境对照表**（Jazzy→Humble、Noble→jammy、Python 3.12/Conda→3.10 conda、
+  `ros-jazzy-ros-gz`→`ros-humble-ros-gzharmonic-sim`…，每行附**核实命令**）与
+  「文中提到、但并不存在」清单（`/trigger_grasp` 服务、`moveit_config.yaml`、
+  已删的 `simulation.launch.py`、cuRobo、`mode:=mock`）。§4 包结构树与 §6.4 运行命令
+  **就地**加了纠正注释（避免只读某一节的人被误导）。README 启动段同步改写。
+- ✅ **新入口端到端复验**：改用 `ros2 launch yolo_bringup bringup.launch.py camera_source:=sim`
+  （而非直接调 `full.launch.py`）重跑完整闭环，确认收口**未引入回归**。
+
+**第十轮新发现的开放问题（→ 第十一轮已解决）：**
+
+- ⚠️ ~~**删除 `simulation.launch.py` 使「方阵世界」失去了唯一启动器。**~~ ✅ **第十一轮已恢复**。
+  全仓库 grep 曾确认：`block_grid_world.sdf` / `grasping_world.sdf` 文件仍在
+  `yolo_bringup/worlds/`，但**已无任何 launch 文件加载它们**；而 `GRID_ENV_DESIGN.md` 的
+  **训练流水线**（采集训练图 → 自动标注 → 训练 YOLO）第 1 步正依赖它，`bringup.launch.py` 又
+  **没有 `world` 参数**。现由新增的 `yolo_bringup/launch/grid_world.launch.py` 补回，
+  详见下方第十一轮记录。
+
+---
+
+#### 第十一轮：训练世界恢复 + 环境脚本清理 + 文档去陈旧（2026-09-27）
+
+**本轮范围（用户四问已定）**：环境脚本处置、方阵世界启动器、工具类小修、README 重写。
+
+**1. 新增 `yolo_bringup/launch/grid_world.launch.py`（恢复训练世界，Q2 决定）**
+
+只做三件事，**刻意不含机械臂**：`gz sim -r` 载入 world + `ros_gz_bridge` 桥接相机话题 +
+发布 `world→camera` 静态 TF。参数 `world:=`（默认 `block_grid_world.sdf`，可换
+`grasping_world.sdf`）、`headless:=`、`publish_camera_tf:=`。
+
+- 相机常量与 `arm_grasp_sim/sim.launch.py` **逐位相同**（位姿 0.5/0/1.5，四元数
+  `(0.7071, -0.7071, 0, 0)`），因为两个 world 的 `camera_model` 定义本就一致。
+- ⚠️ 帧名 **不同**：本文件用 `camera_model/camera_link/rgb_camera`（本仓库 world 的
+  自带相机），`sim.launch.py` 用 `overhead_camera/camera_link/color_camera`（参照项目
+  的相机）。**二者不冲突**，可共存于 `/tf_static`——已实测确认（曾有僵尸
+  `static_transform_publisher` 在跑 z=1.145 那一支，未干扰本文件的 z=1.5）。
+- `gz sim` 用 `ExecuteProcess` 而非 `Node`：它是 gz-tools2 的 CLI，Harmonic 变体的
+  lib 目录下**没有** `gz_sim` 可执行文件（D39）。
+- 顺带**复活了孤儿文件** `yolo_bringup/config/ros_gz_bridge.yaml`——它本就是为这两个
+  world 写的，此前无任何使用者。
+
+**验收证据（实测，非推断）**：
+
+| 项 | 结果 |
+|---|---|
+| launch 解析 | 5 个 entity，无报错 |
+| 话题 | `/camera/color/image_raw`、`/camera/depth/image_raw`、`/camera/color/camera_info`、`/camera/depth/points`、`/clock` 全部出现 |
+| `camera_info.frame_id` | `camera_model/camera_link/rgb_camera`，与 `CAMERA_FRAME` 常量**逐字相同** |
+| TF 链 | `tf2_echo world camera_model/camera_link/rgb_camera` → T=[0.500, 0.000, 1.500]，Q=[0.707, -0.707, 0.000, 0.000]，与常量一致 |
+| 换 world | `world:=grasping_world.sdf` 同样可解析 |
+
+**2. 环境脚本全部删除（Q1 决定）**
+
+`git rm`：`scripts/install_deps.sh`、`scripts/create_env.sh`、`scripts/setup_all.sh`、
+`scripts/setup_workspace.sh`、`environment.yml`。
+
+理由：它们硬编码 Python 3.12 / `ros-jazzy-*` / Ubuntu 24.04 / Noble（D9），在 Orin
+（22.04 + Humble + 3.10）上**不可直接使用**；而本项目真正使用的是**既有的**
+`robot-vision` 环境，本仓库从不需要"创建环境"这一步。**保留一份会误导人的安装脚本，
+比没有更糟**——照它执行会装出一套与运行环境不符的东西。真实环境改写进 README（Q4）。
+
+同时删除两个**目标已不存在**的脚本：`scripts/launch_sim.sh`、`scripts/launch_pipeline.sh`
+（前者指向已删的 `simulation.launch.py`，后者指向的 `pipeline.launch.py` 在仿真里单独起
+只会有节点没有臂）。此二项未在四问中逐条列出，但属"条目可删"的既有预授权范围。
+
+> `RESTRUCTURE_PLAN` §3 的 P4-2 与 §4 清单原写"**改**：参数化发行版与 Python 版本"——
+> 现改为**删除**，故那两行标注为「方案已废」。
+
+**3. 工具类小修（Q3 决定，逐项已验）**
+
+| 文件 | 修的是什么 |
+|---|---|
+| `scripts/collect_training_data.py` | 文件末尾有**两个完全相同的** `if __name__ == "__main__": main()`（原 225-230 行）；并把失效的标注提示改指 `label_blocks.py` |
+| `scripts/launch_all.sh` | 硬编码 `source /opt/ros/jazzy/setup.bash` → 本机**不存在**该路径，而脚本第 6 行是 `set -eo pipefail`，**当场中止**，于是永远走不到下面那个正确的 bringup 入口。改为 `ROS_DISTRO:-humble` + 存在性检查 |
+| `scripts/demo_pipeline.py` | `data.yaml` 的 `path` 由相对路径 `block_dataset` 改为**绝对** `DATASET_DIR`：ultralytics 对相对 `path` 是按 `DATASETS_DIR`（`~/datasets`）解析、**不是**按 yaml 所在目录，于是会静默取错数据，把 D30 的隔离彻底绕过 |
+| `scripts/demo_pipeline.py` | 收尾打印的 `simulation.launch.py` → `grid_world.launch.py`（**本轮追加**：该文件已删，照抄必报 file not found） |
+| `scripts/generate_grid_world.py` | 同上，收尾打印的死命令一并改掉（**本轮追加**） |
+
+> 未采纳：`move_block.py` 的 world/model/z 修正（Q3 中未勾选）。该问题仍在，见 §5。
+
+**4. README 整体重写（Q4 决定）**
+
+旧的 README 通篇是 Jazzy/24.04/Python 3.12 时代的陈述（L3「ROS2 Jazzy」、L30「Ubuntu
+24.04」、L50 `conda activate /home/<user>/...`），目录树漏 `arm_grasp_sim`、列着已删的环境
+脚本，"开发路线"把**已完成**的项列成 TODO。新版按七节重写：能跑到什么程度（含**三项未证明**
+的显式清单）/ 环境要求 / 构建 / 运行 / 数据流 / 目录结构 / 自检验收 / 真机部署。
+
+**5. 顺手修掉的陈旧引用（全仓库 grep 死文件名逐个确认）**
+
+- `GRID_ENV_DESIGN.md` §6.1、§8.1：改为指向 `grid_world.launch.py`；并纠正 §3 文件树里
+  `block_grid_world.sdf` 的**错误描述**——原写「5×5 方阵环境（808 行）」，实测是
+  **3×3 / 9 个 block / 425 行**（`block_0..8`，间距 x 0.16 / y 0.12，z 0.785）。
+- `TECHNICAL_SPEC.md` §6.2：`conda env create -f environment.yml` → 改为指向真实环境
+  叠加方式，并说明为何删。同节前一处**多余的 ``` 围栏**一并修掉（原先会把
+  「### 6.2」整段吞进代码块）。
+
+**本轮遗留（未做，见 §5）**：`move_block.py` 的 world/model/z；Q7 历史改写；Q9 板端脚本入
+`docs/`；Q8 `runs/block_detect/args.yaml` 的模型 A 确认。
 
 **下一步可立即做的（均不阻塞）：**
 
 1. ~~**P2 余项**~~ ✅ 已完成（P2-4/5/7 全部收尾，链路已端到端验证）。
-2. **P1-5** 文档「设计目标 vs 已实现」标注（`TECHNICAL_SPEC.md` 未动）。
-3. **P5 移植抓取栈**：D27 已降级，朝向**不再是前置阻塞**，可直接以 `docs/reference/ur5-yolo-grasp/` 为基底移植（注意换成模型 A）。
+2. ~~**P1-5** 文档「设计目标 vs 已实现」标注~~ ✅ **已完成（第十轮）**：`TECHNICAL_SPEC.md` 顶部已加设计稿横幅 + 环境对照表 + 「提到但并不存在」清单，§4/§6.4 就地纠正。
+3. ~~**P5 移植抓取栈**~~ ✅ **已完成（第九轮）**：D27 已降级，朝向不再阻塞；抓取栈已按 P3-6(B) 移植并实测跑通。
 4. ~~**P1-3** 权重收敛~~ ✅ 已完成（21→7，文件名与内容全部对齐）。
-5. **装 Harmonic**（你已确认）：sudo 部分已给你命令；装完我做 `~/grasp_ws` 工作区 + `gz_ros2_control` 源码编译。
+5. ~~**装 Harmonic（P3-0）**~~ ✅ 已完成，编译与插件名核对均已通过（P3-2）。
+6. ✅ **P5-0 已解除**：真机夹爪 = **大寰 AG-95**（2026-09-27）。**仍需现场核实**实物铭牌版本、RS485 接线/波特率、Modbus 驱动包是否就位。抓取位姿/TCP 偏置仍须按 AG-95 重新推导（P5-3）。
+7. ~~**决定 `gz_ros2_control` 放哪**~~ ✅ **已定（第十轮，Q2）**：**保持外部叠加工作区**，不 vendored 进仓库；把「先建 `~/grasp_ws`」写成前置条件（README 已写）。
 
-> ⚠️ **端到端的边界（第七轮更新后，边界缩小了但仍存在）**：
-> `test_pipeline_e2e.py` 已经证明「**给定正确的检测框与深度，链路算得对、也发得出来**」——
-> 这补上了此前最大的空白。但它喂的是**合成**输入、用的是**单位阵**外参，所以：
-> - 「链路代码是否通」→ ✅ **已证**；
-> - 「检测框本身是否准」→ 归 YOLO 模型，未在真机/仿真上量过；
-> - 「外参是否准」→ **归手眼标定，代码层修不了**（D8 只让失败可见，不产生外参）。
->
-> 下一个真实里程碑因此是：**在仿真里对已知世界坐标的方块量 `/target_3d` 误差**。
-> 那需要先装好 Harmonic（上面第 5 条）。
+> ⚠️ **端到端的边界（第九轮更新后，已大幅收窄）**：
+> 第七轮证明「给定正确输入，链路算得对」；**第九轮更进一步——在真实仿真里跑完了整条闭环**，
+> 检测、投影、IK、轨迹、夹爪、搬运全部由本仓库自己的代码完成，并以 Gazebo 物理真值为准。
+> 但**仍有三件事没被证明**：
+> - 「检测框本身是否准」→ 归 YOLO 模型；仿真里能检出 9/9 且分数 0.68~0.94，但**未在真机数据上量过**；
+> - 「外参是否准」→ **归手眼标定，代码层修不了**（D8 只让失败可见，不产生外参）。仿真里相机外参是我们自己写死的，**真机必须实测**；
+> - 「真机夹爪能否用」→ AG-95 后端**目前是会报错的桩**，现场核实寄存器映射前**不可用**（这是刻意设计，见 `gripper.py`）。
 
-> ⚠️ **尚未提交**：第五、六轮所有改动都在 `migrate/humble-orin` 的工作区/暂存区，**没有任何提交**，`main` 仍停在 `f250af11b`。要不要提交、如何分组，等你示下。
+> 📌 **提交状态（2026-09-27 核实）**：
+> `migrate/humble-orin` 已领先 `main` **8 个提交**（`main` 停在 `f250af11b`，未被动过）。
+> **第九轮的全部改动尚未提交**——工作区含 `grasp_planner/**`（重写+新增）、`arm_grasp_sim/**`（新增）、
+> `perception_3d`、`yolo_detector`、`.gitignore` 与本文件，以及 `scripts/` 下的测试脚本。
+> **按你此前选定的「分组提交」策略，本轮改动等你确认后再落。** 不擅自提交或推送。
+
+> 📌 **提交状态（2026-09-26 核实，修正此前本文档中「没有任何提交」的错误陈述）**：
+> `migrate/humble-orin` 已领先 `main` **8 个提交**（`main` 停在 `f250af11b`，未被动过），
+> 第八轮（本文档 P3-0/E5 的修订）尚未提交——工作区仅 `docs/RESTRUCTURE_PLAN.md` 一处改动。
+> **按你此前选定的「分组提交」策略，本轮改动等你确认后再落。** 不擅自提交或推送。
 
 **等你的两件事：**
 
@@ -586,5 +992,11 @@ LAB.md (37 KB) · TEXTBOOK.md (41 KB) · README.md (8.5 KB)
 |---|---|---|
 | 7 | 仓库**历史** 8.4 GB 是否改写（会动 `main`，需明确授权） | 仓库体积；不改也能正常工作。**注意：本轮删掉的 245 MB `epoch*.pt` 仍留在历史里**，只有改写历史才能真瘦身 |
 | 9 | 板上六个 `arm-*.sh` 与那份「体检清单」是否纳入 `docs/` | 避免板子重装即失传 |
+| **12** | ~~`gz_ros2_control` 放哪~~ ✅ **已定（第十轮）：留外部叠加工作区**（`~/grasp_ws`）。不 vendored、不入库 | **只影响工作站，不影响 Orin**（P4「部署分层」已确认：真机由 `ur_robot_driver` 走 RTDE，**不用 `gz_ros2_control`**）。选外部的理由：避免仓库携带一份第三方源码、避免与 apt 版本混淆；代价是**多一步前置**（README 已写明 `GZ_VERSION=harmonic` 的源码编译步骤）。`launch` 已用 `get_package_prefix` 解耦 |
+| **13** | ~~「方阵世界」要不要恢复启动器~~ ✅ **已定（第十一轮）：恢复轻量启动器** | 新增 `yolo_bringup/launch/grid_world.launch.py`（`gz sim -r` + ros_gz_bridge + 静态 TF，**不含机械臂**），训练链恢复可用。已实测：话题齐全、`camera_info.frame_id` 与常量逐字相同、TF 链正确。顺带复活了孤儿文件 `config/ros_gz_bridge.yaml` |
 
 **Orin 侧的 P4 剩余项**（P4-1 已证明板子基础很好）：缺 `ros-humble-moveit` 与 `ros-humble-robotiq-description`；`torch`/`ultralytics`/RealSense/UR 驱动**都已就绪**。P4-4（Jetson 版 PyTorch）实际已完成，勿用通用 pip 覆盖。
+
+> ⚠️ **Orin 上不需要、也不要装 `gz_ros2_control` 与任何仿真器**（P4「部署分层」的 c/d 两条已核实）。
+> 第九轮新增的 `arm_grasp_sim` 同理——它是**工作站专用**的仿真资产，板端不参与。
+> 板端唯一要补的是 `ros-humble-moveit`（P5-3 规划验证用）。

@@ -69,7 +69,7 @@
 yolo_ros/
 ├── ros2_ws/src/yolo_bringup/worlds/
 │   ├── grasping_world.sdf          # 原有：3 个散落方块
-│   └── block_grid_world.sdf        # ★ 新建：5×5 方阵环境（808 行）
+│   └── block_grid_world.sdf        # ★ 新建：3×3 方阵环境（425 行，block_0..8）
 │
 ├── scripts/
 │   ├── generate_grid_world.py      # ★ 方阵世界生成器（可调参数）
@@ -211,8 +211,18 @@ Row 4    深紫     紫       正紫     亮紫     浅紫      (紫色系)
 ### 6.1 完整流程（Gazebo 真实模式）
 
 ```bash
-# Step 1: 启动方阵仿真
-ros2 launch yolo_bringup simulation.launch.py world:=block_grid_world.sdf
+# Step 1: 启动方阵仿真（第十轮：专用轻量启动器已恢复）
+ros2 launch yolo_bringup grid_world.launch.py
+#   world:=grasping_world.sdf  换用三色物体世界
+#   headless:=true             无 GUI（采集仍可用，只是看不到窗口）
+#
+# 这个启动器**刻意不含机械臂**：本训练链只要「相机画面」，起 UR5/MoveIt 纯属浪费。
+# 它做三件事：gz sim -r 载入 world + ros_gz_bridge 桥接相机话题 + 发布
+# world→camera 静态 TF（默认开，可用 publish_camera_tf:=false 关掉）。
+#
+# 历史：原命令是 simulation.launch.py，第九轮随"入口收口到 bringup"被删——但它同时
+# 是这两个 world 的**唯一**启动器，删后 block_grid_world.sdf / grasping_world.sdf
+# 成了孤儿。第十轮把这个「训练世界」职责单独拆出来恢复，并改了名以免与旧入口混淆。
 
 # Step 2: 采集训练图像
 python3 scripts/collect_training_data.py
@@ -287,12 +297,21 @@ COL_VARIATION          # 列间深浅变化因子
 ### 8.1 启动命令
 
 ```bash
-# 仅仿真（Gazebo + 相机桥接）
-ros2 launch yolo_bringup simulation.launch.py world:=block_grid_world.sdf
+# 完整流水线（仿真 + YOLO + 3D 感知 + 抓取规划）——现在的唯一入口
+ros2 launch yolo_bringup bringup.launch.py camera_source:=sim
 
-# 完整流水线（仿真 + YOLO + 3D 感知 + 抓取规划）
-ros2 launch yolo_bringup bringup.launch.py world:=block_grid_world.sdf
+# 只起仿真+感知，不抓取
+ros2 launch yolo_bringup bringup.launch.py camera_source:=sim skip_planner:=true
 ```
+
+> ⚠️ 本节原写的命令是 `simulation.launch.py world:=block_grid_world.sdf`，**已不可用**：
+> 该文件第九轮删除，且 `bringup.launch.py` 与 `grid_world.launch.py` **都没有 `world`
+> 参数以外的世界选择能力**——带臂的世界由 `arm_grasp_sim/sim.launch.py` 独有（它必须
+> 与那份 URDF/SRDF/控制器配置成套，单独换 world 会对不上臂）。
+>
+> **想只开世界、不开臂** → 用 §6.1 的 `grid_world.launch.py`。
+> **想跑抓取** → 用上面的 `bringup.launch.py`（唯一入口）。二者别同时起，
+> 会争同一个 `camera_model/camera_link/rgb_camera` 帧名。
 
 ### 8.2 关键 Topic
 
