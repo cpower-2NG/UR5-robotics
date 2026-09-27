@@ -1,82 +1,162 @@
 # YOLO + ROS2 视觉抓取系统 (YOLO-ROS)
 
-> 基于 ROS2 Jazzy + YOLOv8 + Gazebo Harmonic + MoveIt2 的机器人视觉抓取系统。  
-> 目标：在仿真中复现 YOLO 检测 → 3D 定位 → IK 求解 → 抓取执行的完整闭环。
+> YOLOv8 检测 → 2D→3D 投影 → MoveIt2 逆解 → UR5 抓取，**仿真闭环已全量跑通**。
+> 部署目标：**NVIDIA Orin（JetPack 6.2 / aarch64）接真机 UR5**。
 
 ---
 
-## 系统架构
+## 现在能跑到什么程度
 
-```
-Gazebo Harmonic 仿真
-    │
-    ├── RGBD 相机 (RealSense D435)
-    │       ↓ /rgb, /depth, /camera_info
-    ├── yolo_detector (YOLOv8 2D 检测)
-    │       ↓ /detections
-    ├── perception_3d (2D→3D 投影 + TF 变换)
-    │       ↓ /target_3d
-    └── grasp_planner (MoveIt2 IK + 轨迹执行)
-            ↓ 关节指令
-        机械臂抓取
-```
+**仿真里 9/9 方块全自动搬运成功**，且经 Gazebo 物理真值核对（不是关节回读）：
+
+| 证据 | 实测值 |
+|---|---|
+| 搬运数量 | 9/9，与规划器日志「累计 9 个」逐一对应 |
+| 落点一致性 | x 跨度 0.7 mm、y 跨度 10.1 mm |
+| 堆叠高度 | z 0.020 → 0.340（九层，每层 40 mm 方块） |
+
+**尚未证明的三件事**（别把上表读成「全都行了」）：
+
+- **检测框本身准不准** → 归 YOLO 模型。仿真里 9/9 检出、分数 0.68~0.94，但**未在真机数据上量过**。
+- **相机外参准不准** → 归**手眼标定**。仿真里相机位姿是我们自己写死的常量，真机必须实测；代码层修不了。
+- **真机夹爪能不能用** → AG-95 后端**目前是「构造即报错」的桩**（刻意设计，见 `gripper.py`），现场核实 Modbus 寄存器映射前**不可用**。
+
+> 真机动作属高风险操作，需当次明确授权与安全条件确认后才可启动。
 
 ---
 
 ## 环境要求
 
-| 组件 | 版本 | 说明 |
-|------|------|------|
-| OS | Ubuntu 24.04 | WSL2 + WSLg |
-| ROS2 | Jazzy Jalisco | 系统级 apt 安装，**必须 Python 3.12** |
-| Gazebo | Harmonic (gz-sim8) | 通过 ros-jazzy-ros-gz-sim vendor 包提供 |
-| Conda Python | 3.12 | rclpy 仅为 Python 3.12 编译 |
-| numpy | < 2.0 | cv_bridge 基于 numpy 1.x 编译 |
-| CUDA | 13.2 | GPU 加速 YOLO |
-| YOLO | YOLOv8 (ultralytics) | pip 安装 |
+实测环境（**以 Orin 的兼容性为准**，故全线用 Humble）：
+
+| 组件 | 实际版本 | 核实命令 |
+|---|---|---|
+| OS | Ubuntu 22.04.5 LTS (jammy) | `cat /etc/os-release` |
+| ROS 2 | **Humble** | `ls /opt/ros/` |
+| Gazebo | Harmonic，`gz sim 8.15.0` | `gz sim --versions` |
+| ROS↔GZ 桥 | `ros-humble-ros-gzharmonic-sim` | 注意是 **gzharmonic 变体**，非默认 `ros-gz` |
+| MoveIt2 | `ros-humble-moveit` | |
+| Python | **3.10.21**，conda 环境 `robot-vision` | `~/robotics/venvs/robot-vision/bin/python --version` |
+| 关键包 | numpy 1.26.4 / torch 2.5.1+cu121 / ultralytics 8.3.99 | 该环境内 `python -c "import numpy,torch,ultralytics"` |
+
+> ⚠️ 本仓库的 `docs/TECHNICAL_SPEC.md` 写作时假定的是 **Jazzy / 24.04 / Python 3.12**，
+> 与上表**不符**。该文档顶部有完整对照表，请对照阅读。
+
+**两个解释器问题（必须理解，否则节点起不来）**：`ultralytics`/`torch` 装在 conda 环境里，
+而 `rclpy` 在 `/opt/ros/humble`。运行时要把两者**叠加**（见下方"运行"）。
 
 ---
 
-## 快速上手
-
-### 1. 一键配置
-
-```bash
-# 安装系统依赖 (ROS2 + Gazebo + MoveIt2)
-bash scripts/install_deps.sh
-
-# 创建 Conda 环境 + 依赖
-bash scripts/create_env.sh
-conda activate /home/<user>/robotics/venvs/robot-vision
-
-# 运行最小验证测试 (无需 ROS2/Gazebo)
-python scripts/test_minimal.py
-```
-
-### 2. 构建 ROS2 工作区
+## 构建
 
 ```bash
 cd ros2_ws
-colcon build --symlink-install
+colcon build                 # 不要加 --symlink-install
 source install/setup.bash
 ```
 
-### 3. 启动仿真抓取
+两个坑：
+
+- **构建必须在纯净 ROS 环境下做**。若先叠加了 Python 依赖环境，`colcon build` 会因
+  新版 setuptools 移除了 `setup.py develop --uninstall` 而失败。构建期用干净环境，
+  **运行期**才叠加。
+- **不要用 `--symlink-install`**，它同样会触发上面那条路径。
+
+---
+
+## 运行
+
+### 仿真
 
 ```bash
-# 完整启动 (Gazebo + 感知流水线)
-ros2 launch yolo_bringup bringup.launch.py
+# 1) 先叠加 gz_ros2_control（见下，只需准备一次）
+source ~/grasp_ws/install/setup.bash
 
-# 分步启动:
-# 终端 1: Gazebo 仿真
-ros2 launch yolo_bringup simulation.launch.py
+# 2) 叠加驱动 YOLO 的 Python 环境
+source /opt/ros/humble/setup.bash
+export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
 
-# 终端 2: 感知流水线
-ros2 launch yolo_bringup pipeline.launch.py mode:=mock
-
-# 终端 3: 触发抓取
-ros2 service call /trigger_grasp std_srvs/srv/Trigger
+# 3) 起车（唯一入口）
+source ros2_ws/install/setup.bash
+ros2 launch yolo_bringup bringup.launch.py camera_source:=sim
 ```
+
+约 20 秒后机械臂开始自主抓取。**无需外部触发**——规划器订阅 `/targets_3d`，
+每来一帧就选一个目标去抓（按 Y 从左到右、跳过已抓过的），抓完自动进入下一轮。
+
+常用开关：
+
+```bash
+... camera_source:=sim skip_planner:=true    # 只起仿真+感知，调 YOLO 用
+... camera_source:=sim headless:=true        # 无 GUI
+... camera_source:=sim model:=其他.pt device:=cpu
+```
+
+### `gz_ros2_control` 前置（仿真必需，真机不需要）
+
+apt 上的 `ros-humble-gz-ros2-control` **依赖 Fortress（gz-sim6）**，与 Harmonic
+（gz-sim8）ABI 不通，装了也跑不起来。必须用 `GZ_VERSION=harmonic` 源码编译，且
+**放在外部叠加工作区**（本仓库不携带这份第三方源码）：
+
+```bash
+mkdir -p ~/grasp_ws/src && cd ~/grasp_ws/src
+git clone -b humble https://github.com/ros-controls/gz_ros2_control
+cd ~/grasp_ws && export GZ_VERSION=harmonic
+colcon build --packages-up-to gz_ros2_control
+```
+
+### 训练数据（方阵世界，可选）
+
+`docs/GRID_ENV_DESIGN.md` 的训练流水线（采集图 → 标注 → 训 YOLO）需要**没有机械臂**
+的方阵世界：
+
+```bash
+ros2 launch yolo_bringup grid_world.launch.py                    # 3×3 方阵
+ros2 launch yolo_bringup grid_world.launch.py world:=grasping_world.sdf
+```
+
+### 真机首验（相机来源三选一）
+
+`camera_source` 决定**谁提供 `/camera/*` 话题**，也顺带决定起不起仿真：
+
+| 值 | 起相机驱动？ | 起 Gazebo？ | 用途 |
+|---|---|---|---|
+| `sim`（默认） | — | ✅ | 仿真 |
+| `realsense` | ✅ RealSense 驱动 | ❌ | 接真机 RealSense |
+| `external` | ❌ | ❌ | 话题已由别处提供（rosbag / 自建 launch） |
+
+```bash
+# 真机 + RealSense，只验感知不抓取（先跑通这条再谈抓取）
+ros2 launch yolo_bringup bringup.launch.py \
+    camera_source:=realsense skip_planner:=true tf_required:=true
+```
+
+`tf_required:=true` 是**真机建议值**：查不到 TF 就让 `perception_3d` 报错退出，
+而不是发一帧坐标可疑的数据下去——仿真里默认 `false`（TF 树起得慢，早几帧查不到是正常的）。
+真机还需把 `camera_source` 带来的 `gripper_backend:=ag95` 一并处理（见上）。
+
+> 真机上的**夹爪默认后端是 `ag95`**，而它当前是「构造即报错」的桩。若你只想先验感知，
+> 务必带 `skip_planner:=true`，否则这个桩会按设计**立刻报错退出**、把日志搞脏。
+
+---
+
+## 数据流
+
+```
+yolo_detector/detector_node
+    ↑ /camera/color/image_raw        ↓ /detections
+perception_3d/projector_node         （唯一的 2D→3D 投影点）
+    ↑ /camera/depth/image_raw + /camera/*/camera_info + TF
+    ↓ /targets_3d   Detection3DArray — 全部候选（含 id/类别/分数）
+    ↓ /target_3d    PoseStamped     — 最高分那一个（向后兼容）
+grasp_planner/planner_node           （零投影代码，只消费 /targets_3d）
+    ↓ FollowJointTrajectory → joint_trajectory_controller
+UR5 + 夹爪
+```
+
+**为什么是两个话题**：规划器要按 Y 排序、按世界坐标去重、取最高分，这三件事都需要
+「全部候选」；而一个 `PoseStamped` 只装得下一个目标且不含 id/分数，订阅者无法分辨
+哪条是哪个物体。投影**只在 `perception_3d` 里发生一次**，真机与仿真共用同一条路径。
 
 ---
 
@@ -84,71 +164,74 @@ ros2 service call /trigger_grasp std_srvs/srv/Trigger
 
 ```
 yolo_ros/
-├── README.md
-├── environment.yml                  # Conda 环境定义
-├── docs/
-│   ├── TECHNICAL_SPEC.md           # 详细技术方案文档
-│   ├── GRID_ENV_DESIGN.md          # 方阵环境设计文档
-│   ├── YOLO_TUTORIAL.md            # YOLO 训练+检测完整教程
-│   └── YOLO_VISION_DESIGN.md       # ★ yolo_vision 子项目详细设计
-├── scripts/
-│   ├── install_deps.sh             # 一键安装系统依赖
-│   ├── create_env.sh               # 创建 Conda 环境
-│   ├── setup_workspace.sh          # 初始化 ROS2 工作区
-│   ├── generate_grid_world.py      # 方阵世界生成器
-│   ├── collect_training_data.py    # Gazebo 图像采集
-│   ├── auto_label_grid.py          # 自动标注（相机投影）
-│   ├── train_yolo_block.py         # YOLO 训练
-│   ├── demo_pipeline.py            # 端到端演示
-│   ├── label_blocks.py             # 交互式标注（matplotlib）
-│   ├── move_block.py               # 移动仿真方块（set_pose 服务）
-│   ├── generate_synthetic_data.py  # 批量合成数据 + 自动标注
-│   └── test_minimal.py             # 最小验证测试（无需 ROS/Gazebo）
-└── ros2_ws/src/
-    ├── yolo_detector/              # YOLOv8 检测节点
-    ├── perception_3d/              # 2D→3D 投影节点
-    ├── grasp_planner/              # 抓取规划节点
-    └── yolo_bringup/               # 顶层启动 + Gazebo 场景
-        ├── launch/                 # 启动文件
-        ├── config/                 # ros_gz_bridge / RViz 配置
-        └── worlds/                 # Gazebo 仿真场景
+├── ros2_ws/src/
+│   ├── yolo_detector/     # YOLOv8 检测；设备退化、权重路径解析
+│   ├── perception_3d/     # 2D→3D 投影（唯一投影点）；深度尺度/时间戳配对/TF
+│   ├── grasp_planner/     # 抓取规划；夹爪抽象层（sim / ag95）
+│   ├── arm_grasp_sim/     # 仿真世界 + UR5 + 控制器 + MoveIt  ← 工作站专用
+│   └── yolo_bringup/      # 唯一入口 bringup + pipeline + 方阵世界
+├── scripts/               # 自检、训练、数据合成脚本
+└── docs/
+    ├── RESTRUCTURE_PLAN.md   # ★ 缺陷台账 + 改造计划 + 验收证据（先读这个）
+    ├── TECHNICAL_SPEC.md     # 设计稿（含环境对照表，注意其前提已过时）
+    ├── GRID_ENV_DESIGN.md    # 方阵世界与训练流水线
+    ├── MIGRATION_HANDOFF.md  # Orin 迁移交接
+    ├── YOLO_TUTORIAL.md, YOLO_VISION_DESIGN.md
+    └── reference/            # 外部参考项目（不入库）
 ```
 
 ---
 
-## 开发路线
+## 自检与验收
 
-- [x] 环境配置 + 技术文档
-- [x] YOLOv8 检测 ROS2 节点
-- [x] 2D→3D 投影 + TF 坐标变换
-- [x] Mock 抓取规划节点 (测试用)
-- [x] Gazebo Harmonic 仿真场景（静态物体）
-- [x] 3 节点流水线联调通过（`ros2 node list` 验证）
-- [ ] Gazebo 中接入 RGBD 相机传感器 + ros_gz_bridge 桥接
-- [ ] YOLO 实时检测 Gazebo 场景中的物体
-- [ ] MoveIt2 完整 IK 集成
-- [ ] UR5/UR10 机械臂 URDF
-- [ ] 端到端抓取闭环测试
-- [ ] cuRobo IK 替换
+三个脚本，**层层递进**，都不需要 Gazebo：
 
-## 已知问题
+```bash
+source /opt/ros/humble/setup.bash
 
-| 问题 | 解决方案 |
-|------|----------|
-| 清华镜像 403 | `sed -i` 替换为阿里云 `mirrors.aliyun.com` |
-| CoppeliaSim Qt5 冲突 | `~/.bashrc` 改为 alias，不设全局 `LD_LIBRARY_PATH` |
-| Python 3.10 → 3.12 | Conda 环境必须用 3.12（ROS2 Jazzy rclpy 要求） |
-| numpy 2.x 不兼容 | `pip install "numpy<2" deprecated` |
+python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学
+python3 scripts/test_perception_3d.py    # 感知单元：24 项断言
+python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
+```
 
-详见 [`docs/TECHNICAL_SPEC.md` §9](docs/TECHNICAL_SPEC.md)。
+**端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
+
+```bash
+# 终端 1
+ros2 launch yolo_bringup pipeline.launch.py camera_source:=external
+# 终端 2
+python3 scripts/test_pipeline_e2e.py     # 15 项断言
+```
+
+它真起话题、真走 DDS，把合成的 `camera_info`+深度+检测框喂进运行中的 pipeline，
+再断言 `/target_3d` 与 `/targets_3d` 的**具体数值**。
+
+> ⚠️ 跑之前先清残留节点（上一次仿真没退干净的进程会发假 TF，症状酷似链路 bug）：
+> `ps -eo pid,comm | grep -E "static_transf|projector|detector|planner"`。
+> 清理用 `pkill -9 -x <精确进程名>`，**不要用 `pkill -f`**——它会匹配到执行该命令的
+> shell 自己。
+
+---
+
+## 真机部署（Orin）
+
+- 部署分层：真机由 `ur_robot_driver` 走 **RTDE（以太网）**，**不装 Gazebo /
+  `gz_ros2_control` / `arm_grasp_sim`**（那些是工作站专用）。
+- 板上需补 `ros-humble-moveit`；`torch`/`ultralytics`/RealSense/UR 驱动都已就绪。
+- 板端只编子集即可，`bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错。
+- 夹爪 = **大寰 AG-95**（Modbus RTU / RS485），是**独立设备**，不在 JTC 关节里。
+- 前置：手眼标定（外参）、AG-95 寄存器映射现场核实、抓取位姿/TCP 偏置按 AG-95 重新推导。
+
+详见 [`docs/MIGRATION_HANDOFF.md`](docs/MIGRATION_HANDOFF.md) 与
+[`docs/RESTRUCTURE_PLAN.md`](docs/RESTRUCTURE_PLAN.md)（P4/P5 组）。
 
 ---
 
 ## 参考资料
 
-- [详细技术方案](docs/TECHNICAL_SPEC.md)
-- [ROS2 Jazzy 文档](https://docs.ros.org/en/jazzy/)
+- [改造计划与缺陷台账](docs/RESTRUCTURE_PLAN.md) ← **先读这个**
+- [技术方案文档](docs/TECHNICAL_SPEC.md)（设计稿，注意顶部前提对照）
+- [方阵环境与训练流水线](docs/GRID_ENV_DESIGN.md)
 - [Gazebo Harmonic 文档](https://gazebosim.org/docs/harmonic)
 - [MoveIt2 文档](https://moveit.picknik.ai/)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/)
-
