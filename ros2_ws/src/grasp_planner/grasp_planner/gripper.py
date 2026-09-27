@@ -30,6 +30,30 @@ AG-95 **不在机械臂的轨迹控制器里**，所以「把夹爪当第 7 个�
 关节**的轨迹——已实测该路径可用（见 RESTRUCTURE_PLAN 的 P3-5 实测）。
 真机后端改走 Modbus。两边对规划器暴露同一个接口，规划器的状态机完全不必分叉。
 
+单位契约：参数面是毫米，寄存器面是千分位（D56）
+=================================================
+**Python 这一侧一律用毫米**：参数 `ag95_stroke_mm` / `ag95_open_mm` /
+`ag95_close_mm`、`_write_position()` 的入参、`_read_position()` 的返回值、
+`is_empty()` 里的比较，全都是毫米，彼此同量纲。
+
+**只有** `_write_position()` / `_read_position()` 内部与寄存器打交道时才换算成
+**千分位（0–1000）** —— AG-95 的 `0x0103`（目标位置）与 `0x0202`（实时位置）
+都是千分位，**不是毫米**：
+
+    往 0x0103 写 500  ⇒  走一半行程（95 mm 的夹爪上是 47.5 mm），而不是 500 mm
+
+这个坑很安静：本文件旧版的文档字符串写着「回读值 0~95 mm」，照着它实现就会
+把寄存器原值（0–1000）当毫米返回，于是 `is_empty()` 里的
+`isclose(回读, 95)` 恒为 False —— **规划器会永远以为夹爪里夹着东西**，
+空夹也照样往放置区搬。换算统一走 `mm_to_permille()` / `permille_to_mm()`
+两个纯函数，可在没有硬件、没有 ROS 的情况下离线自测
+（`scripts/test_ag95_units.py`）。
+
+⚠️ 千分位的**方向**（1000 是全开还是全闭）大寰手册没有写明，网上两种说法都有，
+**不要猜**：现场手动把手指掰到全开、读一次 `0x0202` 即可判决（读到 1000 就是
+1000=全开）。两个换算函数因此把方向做成**必填的关键字参数**，不给默认值 ——
+写实现的人必须自己确认过一次才能写出调用。
+
 ⚠️ 真机后端的现状
 ==================
 `Ag95Gripper` 目前是**会大声报错的桩**，不是可用实现。原因不是偷懒，而是：
@@ -44,11 +68,82 @@ AG-95 **不在机械臂的轨迹控制器里**，所以「把夹爪当第 7 个�
 `_read_position()` 即可，规划器侧无需改动。
 """
 
-import math
 import threading
 from typing import Callable, List, Optional
 
 from sensor_msgs.msg import JointState
+
+#: AG-95 位置寄存器（0x0103 目标 / 0x0202 实时）的满量程，单位**千分位**。
+#: 手册写的是「0–1000 千分比」，对应 16 进制 0x0000–0x03E8。
+AG95_PERMILLE_FULL = 1000
+
+#: `is_empty()` 判定「手指到头了」的容差（毫米）。保守起点，现场用实测值替换。
+AG95_EMPTY_TOLERANCE_MM = 5.0
+
+
+def validate_ag95_geometry(open_mm: float, close_mm: float,
+                           stroke_mm: float) -> None:
+    """检查三个毫米参数自洽，不自洽就抛 ``ValueError``。
+
+    做成独立的纯函数（而不是塞在 ``Ag95Gripper.__init__`` 里）是为了**现在就能测**：
+    ``Ag95Gripper`` 是构造即报错的桩，构造函数里的任何检查在今天都是死代码。
+
+    报错而不是夹取：这三个值全部来自参数文件，填错属于配置错误，
+    而且症状是「夹爪行程不对」——一个只有撞坏东西才会被发现的错误。
+    """
+    if stroke_mm <= 0:
+        raise ValueError(f"ag95_stroke_mm 必须为正，收到 {stroke_mm!r}")
+    if close_mm < 0 or open_mm > stroke_mm:
+        raise ValueError(
+            f"ag95 行程越界：要求 0 <= close_mm <= open_mm <= stroke_mm，"
+            f"收到 close={close_mm!r} open={open_mm!r} stroke={stroke_mm!r}"
+        )
+    if close_mm > open_mm:
+        raise ValueError(
+            f"ag95 close_mm({close_mm!r}) 不应大于 open_mm({open_mm!r})："
+            "本驱动约定「数值 = 两指开口宽度」，闭合的开口不会比张开还大"
+        )
+
+
+def mm_to_permille(mm: float, stroke_mm: float, *, open_is_high: bool) -> int:
+    """开口宽度（毫米）→ AG-95 位置寄存器的千分位值。
+
+    :param mm: 两指开口宽度，0 = 全闭、``stroke_mm`` = 全开
+    :param stroke_mm: 全行程（AG-95 为 95.0）
+    :param open_is_high: 千分位的方向。**必须现场实测确认，无默认值**——
+        手册只写了「0–1000 千分比」，没写 1000 对应全开还是全闭。
+        确认方法：手动把手指掰到**全开**，读 ``0x0202``：
+        读到 1000 ⇒ ``open_is_high=True``；读到 0 ⇒ ``open_is_high=False``。
+    :raises ValueError: 毫米值超出 ``[0, stroke_mm]`` —— 越界**不静默饱和**：
+        一个悄悄夹到 1000 的命令，现场看起来就是「夹爪行程莫名不对」。
+    """
+    if stroke_mm <= 0:
+        raise ValueError(f"stroke_mm 必须为正，收到 {stroke_mm!r}")
+    if not 0.0 <= mm <= stroke_mm:
+        raise ValueError(
+            f"开口 {mm!r} mm 超出 [0, {stroke_mm!r}] mm；"
+            "请检查 ag95_open_mm/ag95_close_mm 与 ag95_stroke_mm 是否自洽"
+        )
+    frac = mm / stroke_mm
+    if not open_is_high:
+        frac = 1.0 - frac
+    return int(round(frac * AG95_PERMILLE_FULL))
+
+
+def permille_to_mm(raw: int, stroke_mm: float, *, open_is_high: bool) -> float:
+    """AG-95 位置寄存器的千分位值 → 开口宽度（毫米）。
+
+    方向参数的含义与越界行为见 :func:`mm_to_permille`。这里对超出 0–1000 的
+    回读值**夹到边界并照常返回**：回读噪声不该让规划器在某一步崩掉，
+    而 `is_empty()` 的两个判据都在边界上，夹取不会改变结论。
+    """
+    if stroke_mm <= 0:
+        raise ValueError(f"stroke_mm 必须为正，收到 {stroke_mm!r}")
+    raw = min(max(int(raw), 0), AG95_PERMILLE_FULL)
+    frac = raw / AG95_PERMILLE_FULL
+    if not open_is_high:
+        frac = 1.0 - frac
+    return frac * stroke_mm
 
 
 class GripperBackend:
@@ -125,16 +220,21 @@ class SimGripper(GripperBackend):
         于是**调用方的回调被静默吞掉**——夹爪动作做完了，规划器却永远等不到
         完成回调，卡在初始位姿、``_first_home_sent`` 一直是 False，所有检测
         都被丢弃。症状是「夹爪动了但规划器毫无反应」，且一句报错都没有。
+
+        ⚠️ 签名必须与 `_send_trajectory` 的 ``done_cb`` 契约一致：**两个参数**
+        ``(goal_status, result)``（D52）。写成单参数 ``_cb(result)`` 会让每次
+        夹爪动作都以 ``TypeError`` 收场——而回调是在 action 的 future 里调的，
+        异常不会让节点退出，只会让状态机**停在原地**，又一次「动了但没反应」。
         """
         if done_cb is None:
             return None
         called = threading.Event()
 
-        def _cb(result):
+        def _cb(status, result):
             if called.is_set():
                 return
             called.set()
-            done_cb(result)
+            done_cb(status, result)
 
         return _cb
 
@@ -178,7 +278,8 @@ class Ag95Gripper(GripperBackend):
 
     现场核实后需要补的三件事：
       1. `_write_position()`：按 AG-95 的 Modbus 寄存器表写目标位置与力；
-      2. `_read_position()`：读实际位置（回读值 0~95 mm），用于 `is_empty()`；
+      2. `_read_position()`：读实际位置，**返回值必须是毫米**（见模块文档的
+         单位契约；寄存器里是千分位，用 `permille_to_mm()` 换算）；
       3. 串口/总线参数（端口、波特率、从站地址）从 ROS 参数读入。
 
     行程 0~95 mm：`close` 对应 0 mm、`open` 对应 95 mm（或按现场实测标定）。
@@ -198,6 +299,10 @@ class Ag95Gripper(GripperBackend):
         self._stroke_mm = stroke_mm
         self._open_mm = open_mm
         self._close_mm = close_mm
+        # 先校验几何再连硬件：三个毫米参数彼此矛盾属于**配置错误**，
+        # 应该在碰串口之前就报出来（而且今天这条路径的下一行必然抛错，
+        # 这个校验是给将来实现 _connect 的人留的门槛）。
+        validate_ag95_geometry(open_mm, close_mm, stroke_mm)
         self._connect()
 
     def _connect(self):
@@ -222,9 +327,26 @@ class Ag95Gripper(GripperBackend):
         )
 
     def _write_position(self, mm: float):
+        """把**毫米**开口宽度写进 AG-95。
+
+        实现要点（现场核实后照此写）：
+          1. 先用 `mm_to_permille(mm, self._stroke_mm, open_is_high=...)`
+             换算成千分位，**不要**直接把毫米写进寄存器；
+          2. 顺序是「先写力（0x0101）再写位置（0x0103）」，位置一旦写入手指
+             立即移动；未初始化（0x0100）时位置回读没有意义；
+          3. 这是**会动**的写，属有风险操作：必须满足「夹爪已从机械臂上拆下、
+             放在工作台、急停在手边」才允许调用（见 RESTRUCTURE_PLAN 的 W3）。
+        """
         raise NotImplementedError
 
     def _read_position(self) -> Optional[float]:
+        """读 AG-95 实时位置（`0x0202`，只读，不会产生任何动作）。
+
+        **返回值单位是毫米**，与 `self._open_mm` / `self._close_mm` 同量纲 ——
+        寄存器读回来的千分位值必须先经
+        `permille_to_mm(raw, self._stroke_mm, open_is_high=...)` 换算。
+        读不到（超时 / CRC 错 / 未初始化）返回 ``None``。
+        """
         raise NotImplementedError
 
     def open(self, done_cb: Optional[Callable] = None) -> None:
@@ -237,12 +359,27 @@ class Ag95Gripper(GripperBackend):
         return self._read_position()
 
     def is_empty(self) -> bool:
+        """位置回读推断是否空夹。判据与 `SimGripper.is_empty` **同构**，
+        但方向相反 —— AG-95 的数值是「两指开口宽度」，越大越开：
+
+        1. 回读 ≤ ``close_mm + 容差``：手指**走到了闭合位**，中间没东西挡着
+           ⇒ 空夹。**这是最常见的空夹情形**，旧实现漏掉了它。
+        2. 回读 ≥ ``open_mm - 容差``：几乎没动过（仍停在张开位）⇒ 命令根本没
+           生效，同样按空夹处理，否则会带着空夹爪白抬一趟。
+
+        中间那一段才是「夹到东西、被手指挡住停在中途」。
+
+        ⚠️ 这里曾写成 `isclose(pos, self._open_mm)`，只覆盖第 2 条：夹到空气
+        一路闭合到 0 mm 时它判「夹住了」。再加上模块文档说的单位错位
+        （回读值当毫米用），实际效果是 `is_empty()` **恒 False**。
+        """
         pos = self._read_position()
         if pos is None:
+            # 与 SimGripper 同一种保守取向：读不到状态时宁可当作「夹到了」，
+            # 也不要因为一次读取失败就把已经抓起来的物体在半空中松开。
             return False
-        # 命令闭合（close_mm），若回读仍接近 open_mm ⇒ 中途被物体挡住 ⇒ 夹到了。
-        # 阈值 5 mm 是保守起点，现场用实测值替换。
-        return math.isclose(pos, self._open_mm, abs_tol=5.0)
+        return (pos <= self._close_mm + AG95_EMPTY_TOLERANCE_MM
+                or pos >= self._open_mm - AG95_EMPTY_TOLERANCE_MM)
 
     def describe(self) -> str:
         return (f"Ag95Gripper(port={self._port}, baudrate={self._baudrate}, "
