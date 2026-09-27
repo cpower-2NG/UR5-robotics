@@ -1,0 +1,81 @@
+# grasp_planner 参数。
+#
+# 这些值原先硬编码在参考项目的 grasp_sim/scripts/grasp_planner.py 里；
+# 移植时全部提出来做成参数，因为**真机与仿真的几何完全不同**：
+#   仿真：相机 0.5,0,1.145 俯视、UR5 底座在 (-0.1,0,0.80)、桌面 z=0.41
+#   真机：底座在工作台上、相机由手眼标定决定、桌面高度实测
+# 所以下面凡是几何量，真机上线前都必须按现场实测覆盖。
+#
+# 用法：
+#   ros2 launch grasp_planner planner.launch.py
+#   或由 arm_grasp_sim/full.launch.py 带 gripper_backend:=sim 覆盖
+
+grasp_planner:
+  ros__parameters:
+    # ---- 接口 ----
+    targets_topic: /targets_3d          # perception_3d 发布的全部候选
+    ik_service: /compute_ik             # MoveIt
+    trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
+    base_frame: base_link               # /targets_3d 已在 此帧下
+    ik_group: ur5_manipulator
+    ik_link: tool0
+    ik_timeout: 2.0
+
+    # ---- 机械臂 ----
+    arm_joint_names:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+
+    # 末端姿态（弧度）：π,0,0 = 工具朝下（参考项目实测可用值）
+    grasp_rpy: [3.141592653589793, 0.0, 0.0]
+
+    # 折叠位姿：两次抓取之间回到这里
+    home_joints: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+    # 左侧放置位姿：与 HOME 同为折叠，但 shoulder 左转 90°
+    left_drop_joints: [1.57, -1.57, 1.57, -1.57, -1.57, 0.0]
+
+    # 前伸 IK 种子：**必须固定**。用当前关节角当种子会在回到 HOME 后解出
+    # 极端的 shoulder_pan（参考项目实测）。
+    ik_seed: [-0.551, -0.429, 2.045, 3.094, -1.571, -2.122]
+
+    # ---- 几何（真机必须按现场实测覆盖）----
+    tool0_to_fingertip: 0.13    # tool0 → 指尖（m）
+    approach_clearance: 0.05    # 接近点在抓取高度之上多少（m）
+    lift_height: 0.15           # 抓起后抬多高（m）
+
+    # 低于此高度视为「已掉到地上」的物体，跳过。
+    # ⚠️ 单位是 **base_frame 的 z**，不是世界系的 z！两者差一个底座高度：
+    #   仿真里 UR5 底座在世界系 z=0.80、桌面 0.41 ⇒ base_frame 桌面 ≈ -0.39，
+    #   桌上方块实测投影 z ≈ -0.350，地上方块 ≈ -0.78，故取 -0.5 分开两者。
+    #   若误填世界系的 0.3，则所有候选都会被丢弃且**不报任何错**。
+    # 真机：按现场底座安装高度与桌面高度重新标定这个值。
+    table_min_z: -0.5
+    min_score: 0.3              # 最低置信度
+
+    # ---- 时序 ----
+    move_duration: 2.0
+    descend_duration: 1.5
+    gripper_duration: 3.0
+    close_settle: 0.5
+    retry_delay: 0.5
+
+    # ---- 夹爪 ----
+    # sim  = 仿真 Robotiq 2F-85，JTC 的第 7 个关节
+    # ag95 = 真机大寰 AG-95，Modbus RTU 独立设备（尚未实现，构造即报错）
+    gripper_backend: sim
+    sim_gripper_joint: robotiq_85_left_knuckle_joint
+    sim_gripper_open: 0.0
+    sim_gripper_close: 0.8
+    sim_gripper_empty_threshold: 0.75
+    sim_gripper_barely_moved: 0.02
+    ag95_port: /dev/ttyUSB0
+    ag95_baudrate: 115200
+    ag95_slave_id: 1
+    ag95_force: 50
+    ag95_stroke_mm: 95.0
+    ag95_open_mm: 95.0
+    ag95_close_mm: 0.0

@@ -11,6 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/planner.launch.py']),
+        ('share/' + package_name + '/config', ['config/grasp_planner.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
