@@ -14,8 +14,13 @@ Launch 文件: 启动感知+抓取流水线 (不含 Gazebo)
 
 相机来源用**单个枚举**而不是 use_sim/use_realsense 两个布尔量：
 两个布尔量存在「都为真」这种无意义且必须额外校验的状态，枚举没有。
-三者对上层节点完全透明——话题名一致，故 yolo_detector / perception_3d /
-grasp_planner 的参数不变。
+对上层节点 yolo_detector / perception_3d / grasp_planner 而言**话题名一致**，
+故它们的参数不变。
+
+⚠️ 「话题名一致」不是天生的，是**本文件保证**的：仿真的 ros_gz_bridge 同名
+直通，而真机 realsense2_camera 会多一层 `/camera/camera/...`，靠这里的一组
+remap 收回单层（实测与理由见下方 REALSENSE_REMAPS）。**真机与仿真的差异
+只在本文件里被吸收**，别把这一层泄漏到下游节点的默认值里。
 """
 
 import os
@@ -35,6 +40,56 @@ from launch_ros.actions import Node
 # 那个是**未对齐**的）。D2 要求用对齐深度配彩色内参，故真机走这个。
 REALSENSE_ALIGNED_DEPTH = '/camera/aligned_depth_to_color/image_raw'
 SIM_DEPTH = '/camera/depth/image_raw'
+
+# ── 真机上相机话题名多一层（实测）───────────────────────────────────────
+# 本文件头写着「三者对上层节点完全透明——话题名一致」。仿真那一半成立
+# （ros_gz_bridge 的同名直通，见 config/ros_gz_bridge.yaml），
+# **但真机那一半原先不成立**：realsense2_camera 的话题是
+# `<camera_namespace>/<camera_name>/...`，两个默认值都是 `camera`，
+# 于是它发的是 `/camera/camera/color/image_raw` —— 比下游期望的多一层。
+#
+# 2026-09-27 在板子（Orin，D435i 实物）上 `ros2 topic list` 实测：
+#     /camera/camera/color/image_raw
+#     /camera/camera/aligned_depth_to_color/image_raw
+#     /camera/camera/color/camera_info
+# 而下游三处都写死成单层：
+#     detector_node 的彩色订阅（硬编码 `/camera/color/image_raw`）
+#     projector_node 的 `camera_info_topic` 默认 `/camera/color/camera_info`
+#     本文件的 REALSENSE_ALIGNED_DEPTH
+#
+# 失效症状是**静默的**：检测器一帧都收不到 → 没有 /detections → 规划器
+# 一直没有目标，日志里只有「没目标」，看起来像「检测器坏了」或「模型不行」。
+# 所以在这里**一次性**把话题名改回单层，而不是去改三个下游节点的默认值：
+# 后者要动 detector_node 的硬编码订阅，且真机/仿真的默认值会分叉。
+#
+# ⚠️ `camera_namespace:=` 是**改不掉的**：实测传 `-p camera_namespace:=""`
+# 被 rcl 直接拒（`RCLInvalidROSArgsError`），用 params 文件传空串虽被接受
+# 但**话题前缀不变**。所以 remap 是这里唯一可行的做法。
+REALSENSE_REMAPS = [
+    ('/camera/camera/color/image_raw', '/camera/color/image_raw'),
+    ('/camera/camera/aligned_depth_to_color/image_raw', REALSENSE_ALIGNED_DEPTH),
+    ('/camera/camera/color/camera_info', '/camera/color/camera_info'),
+]
+
+# ── IK 组名与轨迹 action：真机与仿真**不同名** ─────────────────────────
+# 组名是 SRDF 里的**派生值**（`${prefix}${name}_manipulator`），不是固定串：
+#     仿真  ur5_gripper.srdf.xacro 的 name:=ur5  → ur5_manipulator
+#     真机  ur_moveit.launch.py **硬编码** name:=ur → ur_manipulator
+# 两边各自的 kinematics.yaml 与自己的 SRDF 对齐，所以 grasp_planner.yaml 里
+# 写的 `ur5_manipulator` 在仿真里是**对的**，真机必须覆盖。
+# 官方那行还留了句注释解释为什么不用 ur_type：「then the planning group
+# names in yaml configs has to be updated!」
+#
+# 轨迹 action 同理：`joint_trajectory_controller` 在真机驱动里存在，但官方
+# 默认起的是 **scaled_** 那个（ur_control.launch.py:581-585），它尊重示教器
+# 速度滑条 —— 对第一次真机动作是明显更安全的默认。真机若不覆盖，action
+# 会指向一个**没起来的控制器**，症状是「找不到 action server」。
+#
+# `ik_link: tool0` 两侧一致（官方 SRDF 的 tip_link 就是 tool0），无需覆盖。
+SIM_IK_GROUP = 'ur5_manipulator'
+REAL_IK_GROUP = 'ur_manipulator'
+SIM_TRAJECTORY_ACTION = '/joint_trajectory_controller/follow_joint_trajectory'
+REAL_TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_trajectory'
 
 
 def _default_planner_params_file():
@@ -115,8 +170,40 @@ def generate_launch_description():
     ])
     gripper_backend_arg = DeclareLaunchArgument(
         'gripper_backend', default_value=gripper_backend_default,
-        description='sim | ag95 — 夹爪后端。sim = JTC 第 7 关节；'
-                    'ag95 = 独立 Modbus 设备（真机）。默认随 camera_source。'
+        description='sim | ag95 | none — 夹爪后端。sim = JTC 第 7 关节；'
+                    'ag95 = 独立 Modbus 设备（真机）；none = 不驱动夹爪，'
+                    '只配 carry_objects:=false。默认随 camera_source。'
+    )
+    # IK 组名与轨迹 action 的默认值同样**随 camera_source 变**，理由与
+    # gripper_backend / depth_topic 一致：这两项在真机与仿真上是**不同的名字**，
+    # 固定默认值必然是「仿真对、真机错」或反过来。详见文件头 SIM_/REAL_ 常量。
+    ik_group_default = PythonExpression([
+        "'" + SIM_IK_GROUP + "' if '", LaunchConfiguration('camera_source'),
+        "' == 'sim' else '" + REAL_IK_GROUP + "'",
+    ])
+    ik_group_arg = DeclareLaunchArgument(
+        'ik_group', default_value=ik_group_default,
+        description='MoveIt 规划组名。仿真 ur5_manipulator / 真机 ur_manipulator'
+                    '（SRDF 派生名，两侧不同）。默认随 camera_source。'
+    )
+    trajectory_action_default = PythonExpression([
+        "'" + SIM_TRAJECTORY_ACTION + "' if '",
+        LaunchConfiguration('camera_source'),
+        "' == 'sim' else '" + REAL_TRAJECTORY_ACTION + "'",
+    ])
+    trajectory_action_arg = DeclareLaunchArgument(
+        'trajectory_action', default_value=trajectory_action_default,
+        description='臂 FollowJointTrajectory action。仿真 joint_trajectory_'
+                    'controller / 真机 scaled_joint_trajectory_controller'
+                    '（尊重示教器速度滑条）。默认随 camera_source。'
+    )
+    # 只走位演示（第一个真机 demo）要用 carry_objects:=false，否则规划器会去
+    # 闭合一个不存在的夹爪。它**必须**和后端一起给：none 后端 + true 会在
+    # planner_node 启动时直接抛错（刻意如此，见 gripper.py 的 NullGripper）。
+    carry_objects_arg = DeclareLaunchArgument(
+        'carry_objects', default_value='true',
+        description='false = 只走位、不夹持（第一个真机 demo）。'
+                    '须与 gripper_backend:=none 成对使用。'
     )
     # 感知单测 / 真机分阶段验收需要**只起感知、不起抓取**。
     # 这与 gripper_backend 的默认值是两个正交的问题：前者是「本轮验不验抓取」，
@@ -180,6 +267,8 @@ def generate_launch_description():
         parameters=[{
             'align_depth.enable': True,
         }],
+        # 把 `/camera/camera/...` 收回单层，理由与实测见文件头 REALSENSE_REMAPS。
+        remappings=REALSENSE_REMAPS,
     )
 
     # ---- YOLO 检测节点 ----
@@ -227,6 +316,13 @@ def generate_launch_description():
         {
             'gripper_backend': LaunchConfiguration('gripper_backend'),
             'table_scene_enabled': LaunchConfiguration('table_scene_enabled'),
+            # 这两项在真机与仿真上**名字不同**（SRDF 派生名 + 官方默认控制器），
+            # 必须覆盖，理由见文件头 SIM_/REAL_ 常量。
+            'ik_group': LaunchConfiguration('ik_group'),
+            'trajectory_action': LaunchConfiguration('trajectory_action'),
+            # 只走位演示：规划器不闭合夹爪，但仍走完「接近→下降→抬起→HOME→
+            # 放置位→下降→抬起→HOME」的完整动作序列。
+            'carry_objects': LaunchConfiguration('carry_objects'),
         },
     ]
     planner = Node(
@@ -247,6 +343,9 @@ def generate_launch_description():
         depth_topic_arg,
         tf_required_arg,
         gripper_backend_arg,
+        ik_group_arg,
+        trajectory_action_arg,
+        carry_objects_arg,
         skip_detector_arg,
         skip_planner_arg,
         planner_params_arg,
