@@ -13,18 +13,18 @@
 ==========================
 第九轮删掉了 `simulation.launch.py`——它是个**没有机械臂**的世界，抓取链路接上
 后作为「仿真入口」已无意义（规划器起来了却没臂可动）。但它同时还是**训练世界**
-的唯一启动器，删掉后 `block_grid_world.sdf` / `grasping_world.sdf` 就**没有
+的唯一启动器，删掉后 `block_grid_world.sdf` / `color_objects_world.sdf` 就**没有
 任何 launch 文件加载**了，而训练链第 1 步正依赖它。故这里把「训练世界」这一
 职责单独拆出来保留，且只保留它。（第十轮）
 
 用法
 ====
   ros2 launch yolo_bringup grid_world.launch.py
-  ros2 launch yolo_bringup grid_world.launch.py world:=grasping_world.sdf
+  ros2 launch yolo_bringup grid_world.launch.py world:=color_objects_world.sdf
   ros2 launch yolo_bringup grid_world.launch.py headless:=true
 
 两个 world 都可用：`block_grid_world.sdf`（3×3 方阵，方块名 `block_0..8`，
-训练主用）与 `grasping_world.sdf`（红/蓝方块 + 绿圆柱）。二者相机参数一致
+训练主用）与 `color_objects_world.sdf`（红/蓝方块 + 绿圆柱）。二者相机参数一致
 （见下方 CAMERA_* 常量），故共用同一套桥接与 TF。
 """
 import os
@@ -41,8 +41,9 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 # ── 相机（两个 world 的 camera_model 完全一致）──────────────────────────
-# block_grid_world.sdf:140-142 与 grasping_world.sdf:181-184 都是
-#   <model name="camera_model"><pose>0.5 0.0 1.5 0.0 1.5708 0.0</pose>
+# 两边都有一段 `<model name="camera_model">`（grep 定位；**故意不写行号**——
+# 行号会随编辑漂，本轮就因为往文件头加了注释而失效过一次）：
+#   <pose>0.5 0.0 1.5 0.0 1.5708 0.0</pose>
 #   <link name="camera_link"> 内挂 rgb_camera / depth_camera 两个 sensor
 # 故帧名遵循 gz 的 `<model>/<link>/<sensor>` 约定。
 #
@@ -128,7 +129,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "world", default_value="block_grid_world.sdf",
             description="worlds/ 下的文件名：block_grid_world.sdf（3×3 方阵，"
-                        "训练主用）| grasping_world.sdf（三色物体）",
+                        "训练主用）| color_objects_world.sdf（三色物体）",
         ),
         DeclareLaunchArgument(
             "headless", default_value="false",

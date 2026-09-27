@@ -270,7 +270,7 @@ ros2_ws/src/
     │   ├── ros_gz_bridge.yaml
     │   └── grasping.rviz
     ├── worlds/
-    │   ├── grasping_world.sdf
+    │   ├── color_objects_world.sdf
     │   └── block_grid_world.sdf
     └── package.xml
 ```
@@ -424,7 +424,7 @@ alias coppeliasim='$HOME/workspace/CoppeliaSim/CoppeliaSim_Edu_V4_1_0/coppeliaSi
 ```bash
 QT_QPA_PLATFORM_PLUGIN_PATH= \
 LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | sed 's|:/home/<user>/workspace/CoppeliaSim/CoppeliaSim_Edu_V4_1_0||g') \
-gz sim -r src/yolo_bringup/worlds/grasping_world.sdf
+gz sim -r src/yolo_bringup/worlds/color_objects_world.sdf
 ```
 
 ### 9.3 Python 版本不匹配（3.10 vs 3.12）

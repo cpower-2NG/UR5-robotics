@@ -9,7 +9,7 @@
 #
 # ⚠️ 话题名为什么用 topic_name（同名直通）而不用 ros_topic_name/gz_topic_name：
 #   本项目的 world 已把 Gazebo 侧话题**显式命名成与 ROS 同名**，见
-#   worlds/grasping_world.sdf 与 worlds/block_grid_world.sdf：
+#   worlds/color_objects_world.sdf 与 worlds/block_grid_world.sdf：
 #       <sensor name="rgb_camera"   type="camera">       <topic>/camera/color/image_raw</topic>
 #       <sensor name="depth_camera" type="depth_camera"> <topic>/camera/depth/image_raw</topic>
 #   故此处直通即可。

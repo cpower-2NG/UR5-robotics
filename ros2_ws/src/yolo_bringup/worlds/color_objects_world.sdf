@@ -1,15 +1,19 @@
 <?xml version="1.0" ?>
 <!--
-Gazebo Harmonic 仿真场景：桌面抓取演示
+Gazebo Harmonic 仿真场景：桌面彩色物体（YOLO 检测训练用）
 - 地面 + 桌子（带四条腿）
 - 桌面放置彩色方块 + 圆柱（供 YOLO 检测训练）
-- 可扩展：UR5 机械臂 + 夹爪
+
+⚠️ **本世界没有机械臂，也做不了抓取**（`grep -c '<joint'` = 0）。
+它原先叫 `grasping_world.sdf`，名不副实，已按 D4 改名为 `color_objects_world.sdf`。
+真正的抓取仿真是 `arm_grasp_sim/worlds/grasp_world.sdf`（带 UR5 + 控制器）。
 
 用法:
-  gz sim -r grasping_world.sdf
+  gz sim -r color_objects_world.sdf
+  或   ros2 launch yolo_bringup grid_world.launch.py world:=color_objects_world.sdf
 -->
 <sdf version="1.11">
-  <world name="grasping_world">
+  <world name="color_objects_world">
 
     <!-- 物理 -->
     <physics name="1ms" type="dart">

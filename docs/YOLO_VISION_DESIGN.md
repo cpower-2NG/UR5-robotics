@@ -247,7 +247,7 @@ ros2 launch yolo_vision detect.launch.py model:=/path/to/custom.pt confidence:=0
 
 ```bash
 ros2 launch yolo_vision sim_detect.launch.py
-ros2 launch yolo_vision sim_detect.launch.py world:=grasping_world.sdf
+ros2 launch yolo_vision sim_detect.launch.py world:=color_objects_world.sdf
 ```
 
 参数：
