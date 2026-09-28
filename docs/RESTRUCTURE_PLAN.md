@@ -2873,3 +2873,138 @@ $ ros2 topic list | grep -i camera | sort
   ⚠️ 清理时有一条命令**被权限拦下**：我写了 `rm -rf /tmp/buildcheck* /tmp/launch_params_*`，
   而 `/tmp` 是共享目录、那个 glob 会扫到**不是我建的**文件（`launch_params_*` 里有
   9-26 就存在的）。拦得对，改成只删自己建的两个目录。
+
+#### 第二十四轮：钉住「传进别人 launch 文件的参数名」—— 一个静默的错字开关（2026-09-28）
+
+##### 一、为什么查这里
+
+第二十二轮在板上验 real.launch.py 时，注意力都在「包缺不缺、路径对不对」。
+但 `real.launch.py` 里有**另一种**失效方式，它既不缺包、也不报错：
+
+```python
+IncludeLaunchDescription(..., launch_arguments={"launch_servo": "false", ...})
+```
+
+`launch_arguments` 里出现一个**上游没声明的键**时，launch 不会报错、不会警告 ——
+它只是把这个键塞进 `launch_configurations`，而上游照旧用自己的默认值。行为与
+「没传这个参数」**完全一样**。于是 `"launch_servo"` 一旦手滑写成 `"launch_servoo"`：
+
+- `ur_moveit.launch.py` 的 `launch_servo` 退回默认值 **`true`**（D59）；
+- 起的是 `moveit_servo` —— 一个**能直接指挥机器人**的节点（第十八轮起的编号里
+  它是唯一「能动臂」的节点）；
+- 在 7.4 GiB 的 Orin 上还白占一份内存。
+
+这个错的**发现时机**很坏：本机没有 `ur_robot_driver`，这条分支根本不走；
+真机上要到「servo 怎么起来了」才被发现，而那时候臂**已经接上了**。
+⇒ 值得一条**静态**断言在事前拦下。
+
+##### 二、做法：问 launch 自己，不猜
+
+不重写一遍「哪些键合法」的清单（清单会漏，是 D69 的教训），而是把
+`real.launch.py` **载入**，取出它真正持有的 `launch_arguments`，再拿**被 include 的
+那个文件自己的声明**去比。三个 include 分两处产出，两边都要取：
+
+| include | 在哪 | 为什么不能只取一处 |
+|---|---|---|
+| `ur_control.launch.py` | `_driver`（OpaqueFunction，**执行期**返回） | 只在实体树里找会漏掉 |
+| `ur_moveit.launch.py` | `_moveit`（同上） | 同上 |
+| `pipeline.launch.py` | `generate_launch_description()` 的实体树 | 只在 OpaqueFunction 里找会漏掉 |
+
+⚠️ 这正是第二十二轮那条教训的另一面：**`OpaqueFunction` 的实体在解析期不存在**。
+只取一处的话，「比过几条」的对照会**假装通过**（比了 2 条而不是 3 条），
+所以本段末尾专门有一条**正控**：
+
+```
+[PASS] 至少真的比过一条 include（否则上面几条是空断言）  实际比了 3 条   ← 板上
+[PASS] 至少真的比过一条 include（否则上面几条是空断言）  实际比了 2 条   ← 本机
+```
+
+##### 三、踩到的第一个坑：第一版是**静默空转**的
+
+第一版里我写了 `e.launch_file_path` —— 这个属性**不存在**。它不抛异常，
+只是回 `None`，于是每一条都走到 `skip(... "没读到路径或键")`：
+
+```
+--- W2-16 ... ---
+  [SKIP] _driver 的 include 参数名核对  没读到路径或键
+  [SKIP] _moveit 的 include 参数名核对  没读到路径或键
+  [SKIP] generate_launch_description 的 include 参数名核对  没读到路径或键
+  [FAIL] 至少真的比过一条 include（否则上面几条是空断言）  实际比了 0 条
+```
+
+**全部 SKIP + 一条 FAIL** —— 而那一条 FAIL 就是**正控**。仓库的约定
+「缺依赖 ⇒ SKIP 并说原因」在这里恰好是危险的：三条 SKIP 看起来像「环境不满足」，
+很容易被当成正常而放过。**是那句「实际比了 0 条」把它抓出来的。**
+
+真路径在 `_IncludeLaunchDescription__launch_description_source` 的
+`_LaunchDescriptionSource__location` 里，是一串 substitution，要用
+`perform_substitutions(LaunchContext(), ...)` 解出来。
+
+##### 四、第二、三个坑：顺序与假路径
+
+- **`/nonexistent/...` 是故意的。** `load_launch` 为了让自检读**源码**而不是
+  `install/` 里的拷贝，把 `get_package_share_directory` 换成了
+  `/nonexistent/<pkg>`。所以读到这种路径时不能当作「环境里拿不到」，要用**真的**
+  查包函数重新解一次 —— 否则本机明明装了 `ur_moveit_config` 也会 SKIP。
+- **本仓库的文件要先认。** 板子上没 `colcon build` 时 `yolo_bringup` 解不出来，
+  于是**本仓库自己的** `pipeline.launch.py` 反而被 SKIP。改成本仓库源码
+  （`LAUNCH_DIR` 下的同名文件）**优先**，再去解别人的包路径。
+  这一条是第一版在板子上跑出来的顺序错。
+
+##### 五、变异测试：证明这条断言真的会响
+
+把 `real.launch.py` 里的 `"launch_servo": "false"` 临时改成
+`"launch_servoo": "false"`，重跑：
+
+```
+[FAIL] ur_moveit.launch.py：real.launch.py 传了 4 个参数，都在它自己的声明里（_moveit）  它没声明: ['launch_servoo']
+FAILED: 2 项 -> ['launch_servo 关掉（moveit_servo 能直接指挥机器人）',
+                 'ur_moveit.launch.py：real.launch.py 传了 4 个参数，都在它自己的声明里（_moveit）']
+```
+
+**两**条一起响：W2-16 抓「键名上游没声明」，第二十二轮就有的那条抓「你没关掉
+servo」。两条互相独立，都能定位到同一个错字。改回后重跑**全绿**，`git status`
+只剩本轮该有的两个文件（`real.launch.py` 未留改动）。
+
+##### 六、本机与板上的项数不一样，是**正常的**
+
+| 环境 | 结果 | 原因 |
+|---|---|---|
+| 本机（amd64 工作站） | **55 PASS / 1 SKIP** | 没装 `ur_robot_driver` ⇒ `_driver` 那条 SKIP |
+| 板上（aarch64 Orin） | **56 PASS / 0 SKIP** | 三个包都在，三条 include 全比到 |
+
+```
+板上:
+  [PASS] ur_control.launch.py：real.launch.py 传了 5 个参数，都在它自己的声明里（_driver）
+  [PASS] ur_moveit.launch.py：real.launch.py 传了 4 个参数，都在它自己的声明里（_moveit）
+  [PASS] pipeline.launch.py：real.launch.py 传了 8 个参数，都在它自己的声明里（generate_launch_description）
+  [PASS] 至少真的比过一条 include（否则上面几条是空断言）  实际比了 3 条
+```
+
+⇒ 板上那条 `_driver` 的核对（`ur_control.launch.py` 的 5 个键）**只可能在板上跑**，
+这是第二次出现「本机项数 < 板上项数」（第一次是 W2-15 的 `arm_grasp_sim`）。
+README 里两个数都写了，免得以后拿本机的 55 去对板上的 56。
+
+##### 七、未验证 / 未做
+
+- 板上那次是在**临时目录** `/tmp/launchcheck` 里跑的（已删），**不是**正式部署；
+  正式部署（甲-7 ~ 甲-10）仍未开始。
+- 这条断言只管**键名**，不管**值**：`"launch_servo": "yes"` 这种上游不认的值
+  它抓不到（那属于 launch 自己的类型/取值校验，不在本段范围）。
+- 只覆盖 `real.launch.py` 里传出去的参数名；`bringup.launch.py` 传进
+  `pipeline.launch.py` 的那批**没纳入**（它们走的是另一条路径，且已有别的断言覆盖）。
+- 真机 launch（W2）与现场步骤（W5）不变。
+
+##### 八、状态
+
+- 本轮 3 个提交，按文件切开：`scripts/test_real_launch.py`（W2-16 本体）、
+  `README.md`（项数与「本机/板上项数不同」的说明）、本节所在台账提交。
+- `git rev-list --count main..migrate/humble-orin` 实测 **61**（本轮提交前）。
+- **未推送**，`main` 未动（仍为 `0ab13ec`）。
+- 板子状态：`/tmp/launchcheck` 与 `/tmp/lc.out`（本轮板端自检的输出）
+  都已删（`ls` 复核「No such file or directory」）；进程复核无 `realsense2` /
+  无残留；`~/yahboom_ws`、`~/ultralytics` 未被动过；未装任何包。
+  ⚠️ `/tmp/launch_params_*` **留着没动**：今天（9-28 14:15~14:21）跑 launch
+  产生的那些是本轮产物，但同目录里还有 **9-26** 的几份、不是本轮建的，
+  而它们全都是 launch 自己写的临时文件（最大 2.4 KB）。按第二十三轮那次
+  被权限拦下的教训，不做 glob 清扫、只删自己**确知**的整份产物。
