@@ -206,13 +206,21 @@ yolo_ros/
 
 ```bash
 source /opt/ros/humble/setup.bash
+# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余四个不需要，
+# 但叠了一起跑没问题）。不加这一行，test_minimal 会报「ultralytics 未安装」，
+# 看起来像项目坏了 —— 其实只是解释器不对。
+export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
 
-python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学
-python3 scripts/test_perception_3d.py    # 感知单元：24 项断言
+python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学（3 项）
+python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
 python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
-python3 scripts/test_real_launch.py      # launch 参数面：39 项断言
-python3 scripts/test_ag95_probe.py       # AG-95 只读探针：38 项断言（无 pymodbus 时 9 项 SKIP）
+python3 scripts/test_real_launch.py      # launch 参数面：52 项断言
+python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
+                                         #   没有 pymodbus 时 → 26 PASS / 6 SKIP（**不算通过**）
 ```
+
+> 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
+> —— 写错不影响运行，但会让人以为「我这边少跑了几项」。
 
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 

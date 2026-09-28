@@ -2134,3 +2134,123 @@ def _slave_kwarg(client_cls) -> Optional[str]:
 
 - `migrate/humble-orin`：本轮 1 个提交（修 D66，代码与文档同一个提交），
   **未推送**，`main` 未动。
+
+---
+
+#### 第十八轮：板端「只编子集」的那条容错，从「文档说了」变成「测过了」（2026-09-28）
+
+##### 一、这一轮要回答什么
+
+第十七轮末把**板端部署**列为「还没开始」。而板端部署的第一步就是——
+**Orin 上没有 `arm_grasp_sim`，也没有任何仿真资产**，按子集编译是既定做法
+（`docs/待执行命令.md` 的「别做」一节与 README 的「板端只编子集即可」都这么写）。
+
+那么整条部署路径就压在**一条从没被执行过的代码**上：`bringup.launch.py` 在
+`arm_grasp_sim` 缺席时，真机分支**必须照样加载**。它此前只出现在 README 与台账的
+**陈述句**里（「对缺 `arm_grasp_sim` 做了容错并给出可操作报错」）——
+按 [[verify-before-asserting]]，陈述句不算证据。这是**第一个真机命令**会走到的代码，
+所以先把它钉住。
+
+##### 二、claim 的机制（复核代码，`bringup.launch.py:86-130`）
+
+```python
+def _sim_backend(context):                     # 执行期才跑
+    if context.launch_configurations.get('camera_source', 'sim') != 'sim':
+        return []                              # ← 非仿真：连查包都不查
+    try:
+        full_launch = os.path.join(get_package_share_directory('arm_grasp_sim'), ...)
+    except PackageNotFoundError:
+        raise RuntimeError(...)                # ← 报错里带补编命令 + 绕开办法
+```
+
+它被注册成 `OpaqueFunction(function=_sim_backend)`（`:270`），**不是**
+`IncludeLaunchDescription(..., condition=sim_only)`。原因写在文件里：
+launch 在**解析期**求值 `get_package_share_directory`，而 `IfCondition` 只影响**执行**。
+注册处也因此是**两个** `OpaqueFunction`（`:259` 的真机后端同理，理由同一个）。
+
+##### 三、反例实验：这条理由是真的，还是「听起来对」？
+
+我不想只引用注释，就**照注释描述的反面**写了一个最小 launch 文件
+（`condition` 恒为假 —— 等价于 `camera_source:=realsense`）并构造它：
+
+```
+$ python3 -c "… generate_launch_description() …"
+解析期就炸了： PackageNotFoundError: "package 'arm_grasp_sim' not found, searching: ['/opt/ros/humble']"
+```
+
+**条件为假也照样炸。** 于是「缺仿真包会让真机分支一起加载失败」不是一个假想，
+而且它给出的报错会是「找不到 arm_grasp_sim」——**把方向指错**，让人去查仿真资产，
+而真机根本就不需要那个包。`OpaqueFunction` 这一层因此是**必需的**，不是风格偏好。
+
+##### 四、新增自检：`test_real_launch.py` 的 W2-15（8 项）
+
+用法是「把查包函数换成一个**只在被问 `arm_grasp_sim` 时才炸**的探测器」：
+
+| 断言 | 证明什么 |
+|---|---|
+| `camera_source:=realsense` → 一个包都不查、返回 `[]` | 真机分支**根本不碰**仿真包 |
+| `camera_source:=external` → 同上 | external 同理（它是「别碰机械臂」那条路） |
+| 缺包时 `generate_launch_description()` 仍能构造，且**恰好 2 个 `OpaqueFunction`** | 解析期不查仿真包；后端是执行期构造，不是带 condition 的 include |
+| `camera_source:=sim` 且缺包 → 抛 `RuntimeError` | 不是**静默空启动**（那种失败最难查） |
+| 报错里含 `colcon build --packages-select arm_grasp_sim` | 给出补编命令 |
+| 报错里含 `camera_source:=realsense` | 给出绕开办法（真机部署就是这条路） |
+| 报错里含 `Orin` | 点明板上不需要仿真资产，免得用户以为部署缺东西 |
+| **包在时 `sim` 仍然 include 仿真后端** | 上面 7 条不是在一个彻底坏掉的函数上全 PASS |
+
+最后一条是**防空断言**的：只验坏路径坏得对，不验好路径仍然好，等于什么都没验。
+
+##### 五、这一轮新写的测试**自己**犯了一个错，被抓出来了
+
+第一版探测器写成「**任何**查包都炸」，结果第 3 条断言 FAIL：
+
+```
+AssertionError: 不该在这里查包：yolo_bringup
+```
+
+这不是代码的缺陷，是**测试的缺陷** —— 而且顺带查实了一件值得记的事：
+`generate_launch_description()` **确实**会在解析期查 `yolo_bringup` **自己**，
+因为 D50 的修复把 `grasp_planner.yaml` 的路径解在
+`get_package_share_directory('yolo_bringup')` 上。那个包就是正在加载的这个包，
+永远存在 —— **查它是对的**。
+
+⇒ 记一条判据：「解析期查包」本身不是缺陷，**要问的是查谁**：
+查「正在加载的包」没问题，查「可能没编的别的包」就必须挪到执行期（`OpaqueFunction`）。
+探测器现在只对 `arm_grasp_sim` 炸，其余包放行（`bringup.launch.py:132` 附近有同样的说明）。
+
+##### 六、顺带查出来的：README 的自检计数是**陈旧的**（并已更正）
+
+核对计数时把五个脚本各跑了一遍，发现 README 的自检块有三处对不上实测
+（陈旧不影响运行，但会让人以为「我这边少跑了几项」）：
+
+| 脚本 | README 原写 | 实测（2026-09-28） |
+|---|---|---|
+| `test_perception_3d.py` | 24 项 | **23 项** |
+| `test_real_launch.py` | 39 项 | **44 项**（本轮之前）→ **52 项**（本轮之后） |
+| `test_ag95_probe.py` | 38 项；无 pymodbus 时 9 项 SKIP | **40 项**；无 pymodbus 时 **26 PASS / 6 SKIP** |
+
+`test_detector_device.py` 的 19 项是对的。`test_pipeline_e2e.py` 的 15 项取自
+第十五轮实测（该文件自那以后未改动），保留。
+
+**还改了一处会真让人白忙的**：自检块的命令只写了 `source /opt/ros/humble/setup.bash`，
+而 `test_minimal.py` 要 `import ultralytics`（在 conda 环境里）。照 README 原样跑，
+它会打印「ultralytics 未安装」并**FAIL** —— 看起来像项目坏了，实际只是解释器不对。
+已补上 `export PYTHONPATH=…/robot-vision/lib/python3.10/site-packages` 那一行，
+并注明其余四个脚本不需要它。
+
+> 实测：叠加该 PYTHONPATH 后，五个脚本一次跑完 **3 / 23 / 19 / 52 / 26(6 SKIP)**，
+> 0 FAIL。`test_ag95_probe.py` 在叠加 `/tmp/pmb315`（板子的 3.15.0）后 **40 PASS / 0 SKIP**。
+
+##### 七、未验证 / 未做（不变）
+
+- **板端部署本身仍未开始**：仓库还没弄上板子。本轮验的是**它的前置条件**之一
+  （缺仿真包时不炸），不是部署本身。
+- 板上没有真串口 ⇒ AG-95 探针没对**真夹爪**跑过（只验过 pty 回环）。
+- W3 写路径仍是桩；甲-1 的 `sudo ufw status` 仍未查。
+- 真机 launch（W2）与现场步骤（W5）按决策 9 推迟，不变。
+
+##### 八、状态
+
+- 本轮 2 个提交：一条更正第十七轮状态条的计数；一条是 W2-15 自检 + README 计数更正。
+- `migrate/humble-orin` 领先 `main` 的提交数**不写死**（写下它那个提交本身就会 +1）：
+  本轮开始时实测 **50**。
+- **未推送**，`main` 未动（仍为 `0ab13ec`）。

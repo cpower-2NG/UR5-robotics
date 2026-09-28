@@ -484,6 +484,86 @@ def main():
         check(f"{label}.launch.py **不**声明 max_sync_dt（第二处定义会静默抢走）",
               "max_sync_dt" not in names)
 
+    # ---------------------------------------- 板端只编子集时，非仿真分支仍能加载
+    print("\n--- W2-15 板端只编子集：环境里没有 arm_grasp_sim 时，非仿真分支照样加载 ---")
+    # 这条不是「防御性编程」，是**板端部署的既定做法**：Orin 上不需要任何仿真
+    # 资产，按子集编译（`colcon build --packages-select yolo_bringup perception_3d
+    # ...`）就是正常路径。而 launch 在**解析期**求值
+    # `get_package_share_directory('arm_grasp_sim')`，`IfCondition` 只影响
+    # **执行**、不影响解析 —— 所以只要有人把它写成 `IncludeLaunchDescription
+    # (..., condition=...)`，缺包就会让**真机分支**（乃至 `--show-args`）一起
+    # 加载失败，而报错会是「找不到 arm_grasp_sim」，把方向指错。
+    # 用「查包就抛」的探测器来证明：真机/外部分支**连查都不查**。
+    if bringup is None:
+        skip("arm_grasp_sim 缺包容错", "bringup.launch.py 不存在")
+    else:
+        real_lookup = bringup.get_package_share_directory
+
+        def _boom(pkg):
+            # ⚠️ 只对 arm_grasp_sim 炸。本文件**确实**会在解析期查 `yolo_bringup`
+            # 自己（D50 的修复把 grasp_planner.yaml 的路径解在
+            # `get_package_share_directory('yolo_bringup')` 上）—— 那个包就是
+            # 正在加载的这个包，永远存在，查它是**对的**。探测范围放大到「任何
+            # 查包都炸」会把这条正确行为误判成缺陷（第一版就是这么写的，被抓到了）。
+            if pkg == "arm_grasp_sim":
+                raise AssertionError(f"不该在这里查包：{pkg}")
+            return real_lookup(pkg)
+
+        def _probe(src, lookup):
+            """换掉查包函数后跑一次 _sim_backend，返回 (结果, 异常描述)。"""
+            bringup.get_package_share_directory = lookup
+            try:
+                return bringup._sim_backend(ctx(camera_source=src)), ""
+            except Exception as exc:  # noqa: BLE001 —— 这里就是要看它抛什么
+                return None, f"{type(exc).__name__}: {exc}"
+
+        for src in ("realsense", "external"):
+            out, err = _probe(src, _boom)
+            check(f"camera_source:={src} → 一个包都不查、返回空列表",
+                  out == [] and not err,
+                  err or (f"返回了 {out!r}" if out != [] else ""))
+
+        # 最强的一条：整个入口在「没有 arm_grasp_sim」的环境里必须能构造出来
+        bringup.get_package_share_directory = _boom
+        try:
+            desc = bringup.generate_launch_description()
+            ops = [type(e).__name__ for e in desc.entities
+                   if type(e).__name__ == "OpaqueFunction"]
+            # 真正的结构证据：两个后端都是 OpaqueFunction（执行期构造），
+            # 而不是 `IncludeLaunchDescription(..., condition=...)`。
+            check("缺 arm_grasp_sim 时 generate_launch_description() 仍能构造（解析期不查包）",
+                  len(desc.entities) > 0 and len(ops) == 2,
+                  f"实体 {len(desc.entities)} 个，其中 OpaqueFunction {len(ops)} 个（应为 2）")
+        except Exception as exc:  # noqa: BLE001
+            check("缺 arm_grasp_sim 时 generate_launch_description() 仍能构造（解析期不查包）",
+                  False, f"{type(exc).__name__}: {exc}")
+
+        # 反过来：真选 sim 且缺包时，报错必须**可操作** —— 给出补编命令与绕开办法。
+        def _missing(pkg):
+            raise bringup.PackageNotFoundError(pkg)
+
+        out, err = _probe("sim", _missing)
+        check("camera_source:=sim 且缺包 → 抛 RuntimeError（不是静默空启动）",
+              out is None and err.startswith("RuntimeError"), err or "没有抛")
+        msg = err
+        for want, why in (
+            ("colcon build --packages-select arm_grasp_sim", "给出补编命令"),
+            ("camera_source:=realsense", "给出绕开办法（真机部署就是这条路）"),
+            ("Orin", "点明板上不需要仿真资产，免得用户以为部署缺东西"),
+        ):
+            check(f"报错里{why}", want in msg,
+                  "" if want in msg else f"缺 {want!r}")
+
+        # 不能只证明「坏路径坏得对」——还得证明**好路径仍然好**（否则上面几条
+        # 在一个彻底坏掉的函数上也会全 PASS）。
+        bringup.get_package_share_directory = lambda pkg: f"/nonexistent/{pkg}"
+        out, err = _probe("sim", bringup.get_package_share_directory)
+        check("包在时 camera_source:=sim 仍然 include 仿真后端（上面几条不是空断言）",
+              isinstance(out, list) and len(out) == 1 and not err,
+              err or f"返回了 {out!r}")
+
+        bringup.get_package_share_directory = real_lookup
+
     # ------------------------------------------------------------------ 收尾
     print("\n" + "=" * 56)
     if _skipped:
