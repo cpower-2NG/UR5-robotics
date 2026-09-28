@@ -201,7 +201,7 @@ yolo_ros/
 
 ## 自检与验收
 
-五个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py` 与 `test_real_launch.py`
+六个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py` 与 `test_real_launch.py`
 连真夹爪、真串口都不需要 —— 前者用一个手写的 Modbus 从站接在 pty 上验）：
 
 ```bash
@@ -215,6 +215,7 @@ python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学�
 python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
 python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
 python3 scripts/test_real_launch.py      # launch 参数面：52 项断言
+python3 scripts/test_model_resolution.py # 加载的是哪个模型：12 项断言（D67）
 python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
                                          #   没有 pymodbus 时 → 26 PASS / 6 SKIP（**不算通过**）
 ```
@@ -248,7 +249,14 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 - **MoveIt 板上已经装好**（`ros-humble-moveit-*` 2.5.10，2026-09-27 只读实测）—— **不用再装**。
   `torch`/`ultralytics`/RealSense/UR 驱动同样就绪。缺的只有 AG-95 侧的 `pymodbus`
   （⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的 `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
-- 板端只编子集即可，`bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错。
+- 板端只编子集即可，`bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错
+  （这条由 `test_real_launch.py` 的 W2-15 钉住）。
+- **模型权重必须显式指定，别依赖「按目录找」**（D67）。`block_best.pt` 在仓库根、
+  被跟踪，所以能随 clone 过去；但 `model:=block_best.pt` 这个**相对名**是按
+  **启动时的 CWD** 解析的 —— 从仓库根启动才找得到。板上的推荐写法是
+  `export YOLO_MODEL_DIR=<放权重的目录>`（或直接传绝对路径），这样与 CWD 无关。
+  包内**刻意不放任何权重**：找不到时会抛出可操作的 `FileNotFoundError`，
+  而不是静默换一个别的模型。
 - 夹爪 = **大寰 AG-95**（Modbus RTU / RS485），是**独立设备**，不在 JTC 关节里。
 - 前置：手眼标定（外参）、AG-95 寄存器映射现场核实、抓取位姿/TCP 偏置按 AG-95 重新推导。
 

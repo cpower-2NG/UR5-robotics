@@ -2254,3 +2254,126 @@ AssertionError: 不该在这里查包：yolo_bringup
 - `migrate/humble-orin` 领先 `main` 的提交数**不写死**（写下它那个提交本身就会 +1）：
   本轮开始时实测 **50**。
 - **未推送**，`main` 未动（仍为 `0ab13ec`）。
+
+---
+
+#### 第十九轮：D67 —— 「同名不同物」在**部署路径**上复发（2026-09-28）
+
+##### 一、D67：`block_best.pt` 这个名字下有两个不同的模型
+
+承接第十八轮：既然板端部署的既定做法是**只编子集、从仓库外启动**，那就要问
+「从仓库外启动时，检测节点加载的是哪个模型」。答案不是一个模型，是**两个**：
+
+| 启动目录 | 解析到 | 来源 run | epoch | mAP50-95 | md5 |
+|---|---|---|---|---|---|
+| 仓库根 | `<repo>/block_best.pt`（**模型 A**，被跟踪） | `runs/block_detect` | 100 | **0.9655** | `4916bd5e` |
+| `~` / `/tmp` / 任何仓库外目录 | 包内 `models/block_best.pt`（**模型 B**，未被跟踪） | `runs/detect/block_grid_demo` | 50 | 0.9064 | `87fb7035` |
+
+实测（`_resolve_model` 是纯函数，用占位 self 直接调）：
+
+```
+CWD=/home/<user>/robotics/repos/yolo_ros_original -> <repo>/block_best.pt
+CWD=/tmp                                        -> <install>/share/yolo_detector/models/block_best.pt
+CWD=/home/<user>                                  -> <install>/share/yolo_detector/models/block_best.pt
+```
+
+**这不是新知识，是旧缺陷的复发。** 第十六轮之前的台账第 8 问已经查清「模型 A / 模型 B」
+两个 run 的存在，并写下「**可与 B 区分**：模型 B 的 `args.yaml` 是 `epochs: 50` /
+`name: block_grid_demo`，两者不会混」。那句话对**训练产物**成立，对**运行期解析**
+不成立 —— 两个 `best.pt` 被摆成了**同一个文件名**，而 `_resolve_model` 的第 4 步
+（包内 `models/`）恰好会去捡包内那份。
+
+⇒ **D67：同一个文件名下存在两个不同源的模型，加载到哪一个取决于启动时的 CWD；
+而节点自带的「用错模型」自检看不见它。**（两个模型 `names` 都是 `['block']`，
+实测 —— 那条自检挡的是 COCO 权重，挡不住「另一个方块模型」。）
+
+**这是 D6 的同一个形状。** `scripts/train_yolo_block.py:158-161` 的注释里写着
+D6「同名不同物」当年是怎么被制造出来的（旧版把方块模型覆盖到仓库根的
+`yolov8n.pt`，真 COCO 反被赶到 `*_backup.pt`）。这次的制造者不同，形状一样：
+**一个名字，两个物**。
+
+##### 二、包内那份的来源与性质
+
+- **未被跟踪**（`.gitignore:28` 忽略 `ros2_ws/src/yolo_detector/models/*.pt`），
+  且与**被跟踪**的 `runs/detect/block_grid_demo/weights/best.pt` **逐字节相同**
+  （sha256 `b9baf6f1…`）⇒ 删掉不丢东西，一条 `cp` 就能复现。
+- **不是训练脚本放的**：`train_yolo_block.py:149-152` 只往**仓库根**写
+  `block_best.pt`。所以它是旧工作流（`demo_pipeline.py` 那个
+  `block_grid_demo` run 时代）手工留下的遗留物。
+- `setup.py:20` 的 `glob('models/*.pt')` 是**有意的**逃生口（有人刻意想让模型随包
+  安装时可以放），所以**保留**那段代码，只把文件删掉。
+
+##### 三、处置（用户选定「删掉包内那份」）
+
+已删除两处：源目录 `ros2_ws/src/yolo_detector/models/block_best.pt` 与 install 里
+那份 `install/yolo_detector/share/yolo_detector/models/block_best.pt`（后者是构建
+产物副本，不删则本地仍会解析到模型 B）。删除后实测：
+
+```
+CWD=<repo>  -> <repo>/block_best.pt        ← 模型 A（与仿真 9/9 那套一致）
+CWD=/tmp    -> None                        ← 明确报错，不再静默换模型
+CWD=~       -> None
+```
+
+**这是「宁可启动失败，也不要静默地用错模型」** —— 那句话本来就写在
+`_resolve_model` 的文档字符串里，本轮只是让它对**方块模型之间**也成立。
+
+⚠️ 因为两处都未被跟踪，**这次删除不会出现在 git 历史里**。故把哈希与两个 run 的
+对应关系写在这里（上表），并对「同名必须同源」加了一条自检断言（见下）。
+
+##### 四、新增自检 `scripts/test_model_resolution.py`（12 项）
+
+四类：
+
+1. **解析顺序**：绝对路径（存在→原样、不存在→`None`，不退回按名字猜）；
+   `$YOLO_MODEL_DIR` 优先于 CWD 及父目录；没有 env 时逐级向上找（含祖父目录）；
+   哪一级都没有 → `None`。用**唯一临时名**做探针，避免被 `/tmp`、`/` 里的同名文件干扰。
+2. **同名必须同源**（D67 的钉子）：包内 `models/*.pt` 若有文件，必须与仓库根同名
+   文件**逐字节相同**；不同源则 FAIL，并把两边归到**已知的来源 run**上
+   （报错直接说「这是 `runs/block_detect` 100 epoch 那份 vs `runs/detect/block_grid_demo`
+   50 epoch 那份」—— 「哪份是哪份」正是当年查不出来的东西）。
+3. **不许联网兜底**：源码里必须有 `raise FileNotFoundError`、必须**先解析后加载**
+   （`YOLO(str(model_path))`）、不得有裸的 `YOLO(raw_model)`、报错里要给
+   `YOLO_MODEL_DIR` 与绝对路径两条出路。
+4. 类别自检仍在（它挡不住同名不同物，但能挡住 COCO 权重）。
+
+##### 五、这条自检**第一版是空的**，被变异测试抓到
+
+第一版把 `MODELS_DIR` 写成 `src/yolo_detector/**yolo_detector**/models`（多了一层
+内层 python 包名 —— 真实位置是**包根**下的 `models/`，`setup.py` 的 glob 也是相对
+包根）。于是它去一个不存在的目录 glob，**恒为空、恒 PASS**。
+
+抓法不是读代码，是**变异测试**：把模型 B 放回 `models/` 再跑一遍，
+「同名必须同源」那条**没有响** —— 空断言当场暴露。修好之后两个方向都验了：
+
+| 变异 | 期望 | 实测 |
+|---|---|---|
+| 放入**模型 B**（不同源） | 必须 FAIL，且指出两边各是哪个 run | ✅ 2 项 FAIL，报错给出两个 run 名 |
+| 放入**模型 A**（同源） | 必须 PASS（刻意同源复制是允许的） | ✅ 全 PASS |
+| 什么也不放（当前状态） | 必须 PASS | ✅ 全 PASS |
+
+> 这与第十七轮 D66、第十八轮那个「探测器范围开太大」是同一类教训：
+> **新写的断言要能失败**才算断言。三次都是靠「让它响一次」发现的。
+
+##### 六、顺带记录：`train_yolo_block.py` 的注释里本来就有 D6 的成因
+
+`scripts/train_yolo_block.py:158-161` 已写明旧版如何把两个模型弄成同名。本轮
+不再重复造轮子，只把「同名必须同源」变成**可执行断言**，并把部署要求写进
+`README` 与 `docs/待执行命令.md` 的**甲-7**（板上用 `YOLO_MODEL_DIR` 或绝对路径
+把模型钉死，与 CWD 无关）。
+
+##### 七、未验证 / 未做
+
+- 板上**还未部署**（甲-7 是给部署那天准备的，未执行）。
+- 「换成模型 A 会不会影响仿真 9/9」**不需要重验**：从仓库根启动一直解析到模型 A，
+  那条路径**从未改变**；本轮删掉的是从仓库外启动时的**另一份**。
+- 两个 run 的 mAP 取自各自的 `results.csv`（训练期验证集），**不是**在同一个
+  测试集上重测的 —— 所以 0.966 vs 0.906 只用于「哪个是哪个」的区分，
+  不当成严格的能力对比。
+
+##### 八、状态
+
+- 本轮 1 个提交（新增 `test_model_resolution.py` + README/待执行命令/台账更新）。
+  删除的两个权重文件**未被跟踪**，不进提交。
+- `migrate/humble-orin` 领先 `main` 的提交数**不写死**：本轮开始时实测 **52**。
+- **未推送**，`main` 未动（仍为 `0ab13ec`）。
