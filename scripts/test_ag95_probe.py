@@ -92,17 +92,33 @@ def _reply(slave: int, fc: int, payload: bytes) -> bytes:
 class _RtuSlave:
     """手写的最小 Modbus RTU 从站，跑在 pty 的 **master** 端。
 
-    只实现探针会用到的那一种请求：**读 1 个寄存器**（FC3/FC4，共 8 字节），
-    所以请求长度固定，不需要通用解析。寄存器值由 `regs` 给定；不在表里的地址
-    回**异常码 2（非法地址）**，`slave_id` 之外的一律**静默**（真夹爪也是这样：
-    地址不对就没人应答，表现为超时）。
+    实现两种请求，都是 **8 字节定长**，所以不需要通用解析：
+
+      · **读 1 个寄存器**（FC3/FC4）—— 探针用
+      · **写 1 个寄存器**（FC6，`write_register`）—— `Ag95Gripper` 的写路径用，
+        应答按规范**原样回显**，写过的值记在 `self.writes` 里供断言
+
+    寄存器值由 `regs` 给定；不在表里的地址回**异常码 2（非法地址）**，
+    `slave_id` 之外的一律**静默**（真夹爪也是这样：地址不对就没人应答，表现为超时）。
+
+    可选的**运动模拟**（`target_reg` / `actual_reg` / `step`）：给了这两个寄存器
+    地址之后，读 `actual_reg` 时会让它朝 `target_reg` 里的值走一步（每读一次走
+    `step` 千分位）。`Ag95Gripper._wait_until()` 是「轮询 0x0202 直到到位」，
+    没有这一步模拟，写路径的自检要**真等满 3 秒超时**才能跑完（测试会慢得没有意义），
+    也测不出「到位」这一分支。默认不给 ⇒ 行为与从前完全一样（探针的读测试不受影响）。
     """
 
-    def __init__(self, master_fd: int, regs: dict, slave_id: int = 1):
+    def __init__(self, master_fd: int, regs: dict, slave_id: int = 1, *,
+                 target_reg: int = None, actual_reg: int = None,
+                 step: int = 250):
         self.fd = master_fd
         self.regs = dict(regs)
         self.slave_id = slave_id
         self.seen = []                                # 收到的有效请求，供断言
+        self.writes = []                              # (地址, 值)，FC6
+        self.target_reg = target_reg
+        self.actual_reg = actual_reg
+        self.step = step
         self._stop = threading.Event()
         flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
         fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -113,7 +129,20 @@ class _RtuSlave:
         return self
 
     def stop(self):
+        """停从站线程，并**等它真的退出**。
+
+        ⚠️ 只 ``set`` 事件是不够的，必须 ``join``。``_loop`` 把 ``OSError`` 当成
+        「暂时没数据」**吞掉继续轮询**，所以线程不会因为 fd 被关而退出 —— 一旦
+        调用方 ``pair.close()`` 之后又建了新的 pty，**这个线程就会开始读新的
+        master fd**：两个从站抢同一个 fd，请求被僵尸从站吃掉、回的是上一段的
+        寄存器值。症状极具迷惑性，看起来像「被测代码写丢了」「读到了旧值」。
+
+        ``join`` 之后「停止」是一个确定的时点：返回时保证没有任何一次 ``os.read``
+        在这个 fd 上还悬着。本文件原先只有一处从站、又只建一对 pty，所以侥幸
+        没事；`test_ag95_gripper.py` 有九段、每段一对 pty，当场踩到了。
+        """
         self._stop.set()
+        self._t.join(timeout=1.0)
 
     def _loop(self):
         buf = b""
@@ -131,6 +160,17 @@ class _RtuSlave:
                 req, buf = buf[:8], buf[8:]
                 self._handle(req)
 
+    def _step_towards_target(self):
+        """让「实时位置」朝「目标位置」走一步（模拟手指运动）。"""
+        if self.target_reg is None or self.actual_reg is None:
+            return
+        cur = self.regs.get(self.actual_reg, 0)
+        want = self.regs.get(self.target_reg, cur)
+        if cur < want:
+            self.regs[self.actual_reg] = min(want, cur + self.step)
+        elif cur > want:
+            self.regs[self.actual_reg] = max(want, cur - self.step)
+
     def _handle(self, req: bytes):
         sid, fc = req[0], req[1]
         addr = (req[2] << 8) | req[3]
@@ -139,6 +179,17 @@ class _RtuSlave:
         if sid != self.slave_id:
             return                                    # 不是我的地址：静默
         self.seen.append((fc, addr))
+
+        if fc == 6:
+            # 写单个寄存器：写进表里，应答是**原样回显**（Modbus RTU 规范）。
+            value = (req[4] << 8) | req[5]
+            self.regs[addr] = value
+            self.writes.append((addr, value))
+            os.write(self.fd, req)
+            return
+
+        if addr == self.actual_reg:
+            self._step_towards_target()
         val = self.regs.get(addr)
         if val is None:
             os.write(self.fd, _reply(sid, fc | 0x80, bytes([0x02])))
