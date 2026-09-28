@@ -215,9 +215,11 @@ export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PY
 python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学（3 项）
 python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
 python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
-python3 scripts/test_real_launch.py      # launch 参数面：70 项（本机，另有 1 项 SKIP）
-                                         #   板上是 71 项、0 SKIP（ur_robot_driver 只有板上有）
-                                         #   本机的 SKIP 是因为没装 ur_robot_driver
+python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生：77 项（本机，另有 2 项 SKIP）
+                                         #   板上是 78 项、1 SKIP（ur_robot_driver 只有板上有）
+                                         #   本机的两个 SKIP：一个是没装 ur_robot_driver，
+                                         #   一个是 planner_node 回调里没有 publish（不适用）
+                                         #   其中 9 项是「收工时必须是 cleanly」（W2-9，D70）
 python3 scripts/test_model_resolution.py # 加载的是哪个模型：12 项断言（D67）
 python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
                                          #   没有 pymodbus 时 → 26 PASS / 6 SKIP
@@ -234,6 +236,19 @@ python3 scripts/test_ag95_gripper.py     # AG-95 驱动（读 / dry-run 闸门 /
 >   所以缺了直接**退出码 2**（按 `test_real_launch.py` / `test_model_resolution.py`
 >   的先例）。它**不假装跑了一部分**。
 > - 全跑的办法都一样：`pip3 install "pymodbus>=3.6"`。
+
+**Ctrl-C 收工验收**（**在板子上跑**，不是 WSL）——「正常收工」这件事只有真被 Ctrl-C
+一次才知道，静态检查只能保证写法对：
+
+```bash
+python3 scripts/board_ctrlc_check.py     # 真起 pipeline，25 秒后写 \x03（真 Ctrl-C）
+                                         # 判据：4 个节点全报 `finished cleanly`、
+                                         #       无 Traceback、launch 退出码 0
+```
+
+它用 pty 复现真终端的中断，因为 `timeout` 和 `命令 &` **都会给出假结论**（整组信号
+＋ `SIGINT` 继承），理由写在脚本 docstring 里 —— 那条值得一读，否则容易照着假故障去
+改本来正确的代码。
 
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 
