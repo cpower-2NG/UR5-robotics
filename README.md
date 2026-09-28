@@ -187,6 +187,7 @@ yolo_ros/
 ├── scripts/               # 自检、训练、数据合成脚本
 └── docs/
     ├── RESTRUCTURE_PLAN.md   # ★ 缺陷台账 + 改造计划 + 验收证据（先读这个）
+    ├── 待执行命令.md          # ★ 要**你亲自执行**的命令（sudo / 板子 / 真机），带勾选与执行记录
     ├── TECHNICAL_SPEC.md     # 设计稿（含环境对照表，注意其前提已过时）
     ├── GRID_ENV_DESIGN.md    # 方阵世界与训练流水线
     ├── MIGRATION_HANDOFF.md  # Orin 迁移交接
