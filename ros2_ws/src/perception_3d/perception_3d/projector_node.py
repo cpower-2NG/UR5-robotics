@@ -45,6 +45,7 @@ from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
@@ -507,11 +508,23 @@ def main(args=None):
     node = Perception3D()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # 两个都要接：`ros2 launch` 下的 Ctrl-C 走的是 rclpy 自己的信号处理器，
+        # 它关掉 context 之后 `spin()` 抛的是 **`ExternalShutdownException`**，
+        # 不是 `KeyboardInterrupt`。只接后者的话它一路逃出 main()。
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # ⚠️ 必须先 `rclpy.ok()`：信号处理器已经调过一次 `rcl_shutdown`，
+        # 再无条件调一次会抛
+        #     RCLError: failed to shutdown: rcl_shutdown already called
+        # 而**在 finally 里抛出的异常会顶掉原本那个**，于是
+        # `ros2 launch` 报「process has died ... exit code 1」——功能上无害，
+        # 但**每次正常收工都像崩了**（2026-09-28 板端实测：同一份 launch 里
+        # 有这道闸的 planner_node 报 `process has finished cleanly`，
+        # 没有它的本节点报 `process has died ... exit code 1`）。
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

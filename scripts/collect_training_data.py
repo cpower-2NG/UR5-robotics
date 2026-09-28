@@ -213,7 +213,13 @@ def main():
         collector.stop()
         if USE_ROS:
             collector.destroy_node()
-            rclpy.shutdown()
+            # 已关过就别再关：`rclpy.init()` 装的信号处理器在 SIGINT 时
+            # 已经调过一次 `rcl_shutdown`，再无条件调一次会抛
+            #     RCLError: failed to shutdown: rcl_shutdown already called
+            # —— 一个「正常退出」于是看起来像崩了。采集是本仓库在**真机**上
+            # 要用的脚本（W4），别让它每次都留一段 traceback。
+            if rclpy.ok():
+                rclpy.shutdown()
         if spin_thread:
             spin_thread.join(timeout=1.0)
 

@@ -83,7 +83,7 @@ from moveit_msgs.msg import CollisionObject, PlanningScene
 from moveit_msgs.srv import ApplyPlanningScene, GetPositionFK, GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
@@ -1503,7 +1503,14 @@ def main(args=None):
     executor.add_node(node)
     try:
         executor.spin()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # 两个都要接，且**不是**防御性写法：Ctrl-C 下 rclpy 先由自己的信号
+        # 处理器关掉 context，然后**哪一个异常先到是竞态** —— 信号处理器抛的
+        # `KeyboardInterrupt`，或等待被中断时 `spin_once` 抛的
+        # `ExternalShutdownException`。2026-09-28 板端实测：同一份 launch 里
+        # 本节点走了 KeyboardInterrupt 那条（报 cleanly），而用
+        # `rclpy.spin()` 的 detector / projector 走了另一条（报 died）。
+        # 只接一个就等于把「收工干不干净」交给运气。
         pass
     finally:
         node._gripper.shutdown()

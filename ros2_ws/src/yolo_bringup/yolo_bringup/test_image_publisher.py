@@ -10,6 +10,7 @@
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 import numpy as np
@@ -144,11 +145,17 @@ def main(args=None):
     node = TestImagePublisher()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Ctrl-C 下 `spin()` 抛的是 `ExternalShutdownException`，不是
+        # `KeyboardInterrupt`（rclpy 自己的信号处理器先关了 context）。
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # 已关过就别再关：无条件调会抛 RCLError，把「正常收工」变成
+        # `process has died ... exit code 1`。理由与闸门写法同
+        # `detector_node.py` / `projector_node.py`。
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
