@@ -3286,3 +3286,159 @@ FAIL」来兜。这是静态可达性分析，**不是**运行时可达性的证
   即台账提交之前）。**未推送**，`main` 未动（仍为 `0ab13ec`）。工作区干净。
 - 本机临时件 `/tmp/mut8b.py`、`/tmp/mut8b2.py`（变异脚本，已删）；
   `/tmp/pmb315`、`/tmp/pmb369` 继续留着。
+
+---
+
+## 第二十七轮：把甲-9 跑完 —— 一条会去碰机械臂的「安全建议」，和一个只有 Ctrl-C 才看得见的缺陷（2026-09-28）
+
+这一轮是**在板子上**做的（`ssh jetson`），主题是「把甲-9 真的跑通」。过程中
+查出一个**文档错误**、一个**命令缺陷**、和一个**只有现场才暴露的代码缺陷**。
+
+##### 一、先说那条文档错误：它指向的是「会动臂」的那条路
+
+甲-9 原先写：「要么改用 `camera_source:=realsense`（仓库自己起相机并 remap）」。
+
+**这句话是错的**，而且错的方向最不该错 —— 它出现在一份「不碰臂」的条目里。
+`camera_source` 在**两个入口里含义不同**（`bringup.launch.py:132 _real_backend`）：
+
+| 你敲的命令 | 实际走到哪 | 起了什么 |
+|---|---|---|
+| `bringup.launch.py camera_source:=realsense` | **`real.launch.py`** | UR **驱动** + **MoveIt** + 相机 TF + 上层节点。驱动默认 `start_ur_driver:=true`，`robot_ip` 必填（`real.launch.py:107` 的守卫：只有显式 `start_ur_driver:=false` 才免填） |
+| `bringup.launch.py camera_source:=external` | `pipeline.launch.py` | 只起上层节点 |
+| **`pipeline.launch.py camera_source:=realsense`** | （它自己） | **相机 + 上层节点**；不含驱动、不含 MoveIt |
+
+`real.launch.py` 才是 include 那两个包的地方，所以**「只想要相机」只能直接调
+`pipeline.launch.py`** —— 这个用法就写在 `pipeline.launch.py` 自己的文件头
+（`:9-10`）。
+
+值得说清的是**为什么这一档可信**：它不碰臂是**结构性的**（驱动与 MoveIt 的
+launch 根本没被 include），而不是「记得关两个开关」。对一条安全路径而言，
+前者不依赖人的记忆 —— 后者已经被这次证明会写错。
+
+##### 二、`external` 那一档还缺两个参数（原先的命令跑不到底）
+
+`gripper_backend` 的默认值**随 `camera_source` 变**（`pipeline.launch.py:224`：
+`'sim' if camera_source == 'sim' else 'ag95'`）。所以 `external` 的默认值是
+**`ag95`**，而它是**构造即报错的桩** ⇒ `planner_node` **启动就死**：
+
+```
+planner_node ... process has died [exit code 1]
+RuntimeError: 打不开串口 /dev/ttyUSB0        ← 板上没有 USB-串口芯片
+```
+
+⇒ 甲-9 的命令补成 `... camera_source:=external gripper_backend:=none
+carry_objects:=false`。原先那条命令**不是**「不碰臂」写错了（它确实不碰臂，
+`ag95` 死在开串口那一步），而是**根本跑不到「四个节点都活着」**。
+
+##### 三、真相机跑通了（9b）
+
+`pipeline.launch.py camera_source:=realsense gripper_backend:=none carry_objects:=false`：
+
+| 检查 | 实测 |
+|---|---|
+| `ros2 node list` | `/camera/camera`、`/yolo_detector`、`/perception_3d`、`/grasp_planner` —— **四个全活** |
+| 彩色 | `1280×720`、`distortion_model: plumb_bob`、`average rate: 29.988`（**真内参**，不是仿真的 hfov 反算） |
+| 对齐深度 | `average rate: 28.986` |
+| **三条 remap** | **全部生效** —— `/camera/color/image_raw`、`/camera/color/camera_info`、`/camera/aligned_depth_to_color/image_raw` 都在，而**两层的那几个不在话题表里**（`ros2 topic list` 实测：是被**改名**，不是多一个别名） |
+| `/detections` | 有数据在发，`frame_id: camera_color_optical_frame` —— 正是 `perception_3d` 期望的那个光学系 |
+| `/targets_3d` | **空**，且 `projector_node` 每 5 s 报一次 `TF 查询失败（连续 N 次）… 需要 base_link → camera_color_optical_frame 的变换` |
+| 规划器 | `动作模式=只走位（不夹持） | 肘高护栏=True（台面 -0.390） | 桌面进场景=False` |
+| 收工 | `planner_node`/`realsense2_camera_node`：`process has finished cleanly`；`detector_node`/`projector_node`：`process has died ... exit code 1` ← 见第六节 |
+
+##### 四、`/targets_3d` 空着是对的 —— 于是把第 5 步的判据改窄
+
+空不是故障：`/targets_3d` 需要 `base_link → camera_color_optical_frame`，
+而它来自**手眼标定**（W5 第 2 步，还没做）。两件事同时被这次实测证实：
+
+- **D8 那处修正是有效的** —— TF 缺失是**响亮**的（每 5 s 一条 ERROR），
+  不是静默失效；
+- `tf_required` 默认 `false` ⇒ 节点不退出、其余链路照跑。
+
+但这也意味着「板端部署」第 5 步原先的判据（**`/detections` 与 `/targets_3d`
+都有数据**）**是做不到的** —— 照它验会得出「现场坏了」的错误结论。已改成
+只到 `/detections` 为止，并写明 `/targets_3d` 卡在哪一步。
+
+##### 五、D50 的修复：用一个**区分性实验**验，而不是读代码
+
+D50（真实入口从不加载 `grasp_planner.yaml`）上一轮已修，但「修好了」当时只是
+读代码得出的。这次在板上验：把**安装树里**那份 yaml 复制到 `/tmp/probe.yaml`，
+只改 `table_plane_z` 为 `-0.111`，用 `planner_params_file:=/tmp/probe.yaml` 起 ——
+
+```
+[planner_node-3]   动作模式=只走位（不夹持） | 肘高护栏=True（台面 -0.111） | 桌面进场景=False
+```
+
+**`-0.111` 到了节点里** ⇒ 这条链在板端安装树里是通的。
+
+⚠️ 为什么非要做这个实验：`grasp_planner.yaml:170` 的值是 `-0.39`，
+而 `planner_node.py:511` 的**硬编码默认值也是 `-0.39`** —— 只跑默认那份的话，
+两种可能（yaml 生效 / 没生效）**输出完全一样**。这类「改一个值看它跟不跟」
+的实验，是唯一能把「读代码以为通了」变成证据的办法。
+
+⇒ 反过来的结论更要紧：**`-0.39` 是仿真台面**（yaml 自己那行注释写着「真机 ≈ 0」），
+真机上线**必须显式覆盖**，否则肘高护栏（D49）守的是仿真那层台面。
+
+##### 六、D70：一个只有 Ctrl-C 才看得见的缺陷
+
+同一份 launch 里，四个节点收工时报了两种完全不同的结果：
+
+```
+[INFO]  [planner_node-4]:      process has finished cleanly
+[ERROR] [detector_node-2]:     process has died ... exit code 1
+[ERROR] [projector_node-3]:    process has died ... exit code 1
+```
+
+**功能上无害**（节点确实退出了），但**每次正常收工都像崩了** —— 演示时操作员
+看到 traceback 会以为刚才那一轮失败了。两个独立的原因，都在 `main()` 里：
+
+1. `spin()` 抛的是 **`ExternalShutdownException`**，不是 `KeyboardInterrupt`。
+   `rclpy.init()` 装的信号处理器先关掉 context，等待被中断时
+   `_wait_for_ready_callbacks` 于是抛它（板端 traceback 里那一行就是
+   `executors.py:612  raise ExternalShutdownException()`）。只接
+   `KeyboardInterrupt` 的文件接不住。
+2. `finally` 里的 `rclpy.shutdown()` **无条件**调用。context 已关 ⇒ 抛
+   `RCLError: failed to shutdown: rcl_shutdown already called`，而
+   **finally 里抛出的异常会顶掉原本那个** —— 日志里那两段 traceback 正是
+   `During handling of the above exception, another exception occurred`。
+
+`planner_node` 早就有第 2 条的闸门（`if rclpy.ok():`，注释也写得很清楚），
+所以它是 cleanly；但**第 1 条它同样没有** —— 它这次干净收工，是因为
+Ctrl-C 下「信号处理器抛的 `KeyboardInterrupt`」与「等待被中断时抛的
+`ExternalShutdownException`」**哪一个先到是竞态**。也就是说：**收工干不干净
+本来靠运气**。四个文件统一成 `except (KeyboardInterrupt,
+ExternalShutdownException)` + `if rclpy.ok():`（`collect_training_data.py`
+只补第 2 条 —— 它的 Ctrl-C 走 cv2 主循环，不是 `spin()`）。
+
+##### 七、把这个缺陷钉住：自检 W2-9（9 项）+ 四个变异
+
+它**只有真的跑起来再 Ctrl-C 才看得见**（源码层面完全合法：能退出、不抛未捕获
+异常、上一行还是一条 INFO）。所以拿 `scripts/test_real_launch.py` 的 W2-9 按
+语法树钉住：`main()` 里每处 `rclpy.shutdown()` 必须在 `if rclpy.ok():` 里；
+包着 `spin()` 的 try 必须接 `ExternalShutdownException`。
+
+⚠️ 第一版**只认 `rclpy.spin`**，而 planner 用的是
+`MultiThreadedExecutor().spin()` ⇒ 那条变成 SKIP、看起来「不适用」，
+实际它同样会被竞态打中。改成认任何 `.spin()` 后 SKIP 从 2 项降到 1 项
+（剩下的 1 项是本机没装 `ur_robot_driver`）。
+
+| 变异（作用在真实文件上，跑真实自检） | 实测 |
+|---|---|
+| 去掉 detector 的 `if rclpy.ok():` 闸门 | exit 1，报出未挡住的行号 |
+| detector 的 except 去掉 `ExternalShutdownException` | exit 1 |
+| planner 的 `executor.spin()` 不接 `ExternalShutdownException` | exit 1 |
+| 把 `NODE_MAINS` 清空（正向对照） | exit 1，`实际查了 0 个` |
+| 基线 | exit 0，9/9 PASS |
+
+##### 八、稳定性与未验证
+
+- 本机全套自检：`test_real_launch` **70 PASS / 1 SKIP / 0 FAIL**（原 61 项），
+  `test_perception_3d` 23、`test_label_projection` 31、`test_ag95_units` 25、
+  `test_detector_device` 19、`test_model_resolution` 12、`test_ag95_probe`
+  26 PASS / 6 SKIP（本机没装 pymodbus；`test_ag95_gripper` 因此 exit 2 ——
+  这是既定约定，不是回归）。
+- **未验证**：D70 的修复**还没在板上复验**（本轮的板端证据是修复**之前**跑的）。
+  板端部署第 1~5 步已完成，但板上快照停在 `778a852`，而 `ros2_ws/` 与
+  `scripts/` 这轮都改过 ⇒ **需要再推一次**（按甲-9 那张「什么时候要重新推」表），
+  推完重跑 9b 看是否四项都 cleanly。**这一步还没做。**
+- 仍未做：手眼标定（`/targets_3d` 的前置）、`table_plane_z` 的真机覆盖值、
+  甲-1 的 `sudo ufw status`（要 sudo）、丙-1（AG-95 仍缺适配器）。
