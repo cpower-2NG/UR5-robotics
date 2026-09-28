@@ -206,7 +206,7 @@ yolo_ros/
 
 ```bash
 source /opt/ros/humble/setup.bash
-# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余四个不需要，
+# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余五个不需要，
 # 但叠了一起跑没问题）。不加这一行，test_minimal 会报「ultralytics 未安装」，
 # 看起来像项目坏了 —— 其实只是解释器不对。
 export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
@@ -217,11 +217,14 @@ python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
 python3 scripts/test_real_launch.py      # launch 参数面：52 项断言
 python3 scripts/test_model_resolution.py # 加载的是哪个模型：12 项断言（D67）
 python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
-                                         #   没有 pymodbus 时 → 26 PASS / 6 SKIP（**不算通过**）
+                                         #   没有 pymodbus 时 → 26 PASS / 6 SKIP
 ```
 
 > 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
 > —— 写错不影响运行，但会让人以为「我这边少跑了几项」。
+> ⚠️ `test_ag95_probe.py` 在没有 pymodbus 时**退出码仍是 0**（SKIP 不算失败，这是本仓库
+> 自检的统一约定）。所以**别只看退出码**：`26 PASS / 6 SKIP` 这次运行覆盖不全，
+> 不能当「验过了」。要全跑就 `pip3 install "pymodbus>=3.6"`。
 
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 
@@ -247,10 +250,55 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 - 部署分层：真机由 `ur_robot_driver` 走 **RTDE（以太网）**，**不装 Gazebo /
   `gz_ros2_control` / `arm_grasp_sim`**（那些是工作站专用）。
 - **MoveIt 板上已经装好**（`ros-humble-moveit-*` 2.5.10，2026-09-27 只读实测）—— **不用再装**。
-  `torch`/`ultralytics`/RealSense/UR 驱动同样就绪。缺的只有 AG-95 侧的 `pymodbus`
-  （⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的 `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
-- 板端只编子集即可，`bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错
-  （这条由 `test_real_launch.py` 的 W2-15 钉住）。
+  `torch`/`ultralytics`/RealSense/UR 驱动同样就绪。
+- ⚠️ **但板上还缺一个会挡住整条链路的包：`vision_msgs`**（2026-09-28 实测）。
+  三个节点都在**模块级** `from vision_msgs.msg import ...`，所以缺它的表现是
+  **三个节点全都起不来** —— 看起来像项目坏了或 Python 环境错了，唯独不像「少装一个消息包」。
+  修法是 apt，不是 pip（`pip3 install vision_msgs` 会白忙）：
+
+  ```bash
+  sudo apt install ros-humble-vision-msgs        # 板上有 4.1.1-1jammy arm64
+  ```
+
+  另缺 AG-95 侧的 `pymodbus`（⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的
+  `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
+- **别靠人肉比对清单**：依赖散在四个 `package.xml` 和若干**函数体内**的 `import` 里，
+  靠眼睛看必然漏（`vision_msgs` 就是这么漏掉的）。用
+  [`scripts/check_board_deploy.py`](scripts/check_board_deploy.py) 在板上跑一遍 ——
+  它**自己从代码推导**该查什么，缺什么直接给出该装哪一条：
+
+  ```bash
+  source /opt/ros/humble/setup.bash
+  python3 scripts/check_board_deploy.py          # 0 = 就绪；1 = 有缺失（逐条给修法）
+  ```
+- **板端只编四个包**，且**必须带 `--packages-ignore arm_grasp_sim`**（实测，见下）：
+
+  ```bash
+  cd ros2_ws
+  colcon build --packages-select yolo_bringup perception_3d yolo_detector grasp_planner \
+      --packages-ignore arm_grasp_sim
+  ```
+
+  ⚠️ **不带那个 flag 会构建失败**，报错是
+  `Failed to find ... arm_grasp_sim/share/arm_grasp_sim/package.sh` /
+  `Check that the following packages have been built: arm_grasp_sim` —— 而
+  **那个包正是你不想在板上编的**。原因：`yolo_bringup` 声明了
+  `exec_depend arm_grasp_sim`，colcon 构建 Python 包时需要**工作区内依赖**的 install
+  环境，即使它没被选中。另一种等效做法是**部署时就不把 `arm_grasp_sim` 的源码拷到板上**
+  （工作区里没有它，自然不用 ignore）。
+- `bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错
+  （由 `test_real_launch.py` 的 W2-15 钉住）。
+- ⚠️ **`camera_source` 的默认值是 `sim`**，所以在板上**不能**直接
+  `ros2 launch yolo_bringup bringup.launch.py` —— 那会去找 `arm_grasp_sim` 并中止
+  （实测：报错文案里就写着该改用哪条命令，且**什么都没启动**）。板上的第一条命令按目的选：
+
+  ```bash
+  # 只想验感知链路（不碰驱动、不碰 MoveIt、不碰臂）—— 板上最安全的第一步
+  ros2 launch yolo_bringup bringup.launch.py camera_source:=external
+
+  # 完整真机链路（需要控制箱 IP；臂没接上/没配好时先别跑这条）
+  ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense robot_ip:=<控制箱 IP>
+  ```
 - **模型权重必须显式指定，别依赖「按目录找」**（D67）。`block_best.pt` 在仓库根、
   被跟踪，所以能随 clone 过去；但 `model:=block_best.pt` 这个**相对名**是按
   **启动时的 CWD** 解析的 —— 从仓库根启动才找得到。板上的推荐写法是
