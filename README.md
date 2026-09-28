@@ -215,8 +215,8 @@ export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PY
 python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学（3 项）
 python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
 python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
-python3 scripts/test_real_launch.py      # launch 参数面：55 项（本机，另有 1 项 SKIP）
-                                         #   板上是 56 项、0 SKIP（ur_robot_driver 只有板上有）
+python3 scripts/test_real_launch.py      # launch 参数面：61 项（本机，另有 1 项 SKIP）
+                                         #   板上是 62 项、0 SKIP（ur_robot_driver 只有板上有）
                                          #   本机的 SKIP 是因为没装 ur_robot_driver
 python3 scripts/test_model_resolution.py # 加载的是哪个模型：12 项断言（D67）
 python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言

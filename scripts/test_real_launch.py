@@ -36,6 +36,7 @@
 退出码 0 = 全通过。
 """
 
+import ast
 import importlib.util
 import os
 import sys
@@ -180,6 +181,167 @@ def declared_names(mod):
         subs = getattr(entity, "default_value", None)
         out.append((name, None if subs is None else _resolve_default(subs)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# 只走位模式的可达性：解析 planner_node.py，而不是 grep 行号（W2-8b）
+# ---------------------------------------------------------------------------
+
+PLANNER_NODE_PY = (PROJECT_ROOT / "ros2_ws" / "src" / "grasp_planner"
+                   / "grasp_planner" / "planner_node.py")
+
+GRIPPER_METHODS = ("open", "close", "current_position", "is_empty")
+
+
+def _is_carry_guard(test):
+    """认出 ``if not self.carry_objects:`` 这个测试表达式（不看注释、不看缩进）。"""
+    return (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+            and isinstance(test.operand, ast.Attribute)
+            and test.operand.attr == "carry_objects"
+            and isinstance(test.operand.value, ast.Name)
+            and test.operand.value.id == "self")
+
+
+def _own_nodes(stmts):
+    """遍历一串语句，但**不进入**内层 ``def`` 的函数体。
+
+    不这样做，``_open_and_reset`` 里那个嵌套的 ``_then_open`` 会被数两遍
+    （一次算在外层头上、一次算在自己头上）—— 本函数的第一版就是这么错的，
+    被自检当场抓出来（``open()`` 的调用点从 3 个变成 4 个）。
+    """
+    stack = list(stmts)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue                      # 它自己由调用方收录，函数体归它自己
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _collect_functions(tree):
+    """把每个函数（含嵌套 ``def``）的「自有节点 + 守卫行号」收出来。
+
+    键是限定名：``_on_descend_done`` 或 ``_open_and_reset._then_open``。
+    """
+    out = {}
+
+    def visit(func, prefix):
+        qname = prefix + func.name
+        own, nested = [], []
+        for stmt in func.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                nested.append((stmt, qname + "."))
+                own.append(stmt)          # ``def`` 这条语句本身留着（用于认名字）
+            else:
+                own.extend(_own_nodes([stmt]))
+        # 守卫必须是**函数体顶层**的 ``if not self.carry_objects:`` 且**真的返回**
+        guards = [s.lineno for s in func.body
+                  if isinstance(s, ast.If) and _is_carry_guard(s.test)
+                  and any(isinstance(b, ast.Return) for b in s.body)]
+        out[qname] = (own, guards)
+        for stmt, pfx in nested:
+            visit(stmt, pfx)
+
+    def scan(body):
+        # ⚠️ 必须**进到 class 里面**去：这些方法都挂在 ``class PlannerNode`` 上，
+        # 只看模块顶层的 ``def`` 会一个方法都找不到（第一版就是这么错的，
+        # 于是「解析到 0 处引用」把每一条断言都变成了 FAIL —— 而这恰好是
+        # 正向对照存在的意义：空解析**不会**伪装成通过）。
+        for stmt in body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(stmt, "")
+            elif isinstance(stmt, ast.ClassDef):
+                scan(stmt.body)
+
+    scan(tree.body)
+    return out
+
+
+def _ref_line(node):
+    """一个 ``self.X`` / ``self._gripper.X`` 形式的引用；不是就返回 None。
+
+    ``self._gripper.is_empty`` 是「属性套属性」，所以这里要分两层看。
+    """
+    if not isinstance(node, ast.Attribute):
+        return None
+    base = node.value
+    if isinstance(base, ast.Name) and base.id == "self":
+        return ("self", node.attr)
+    if (isinstance(base, ast.Attribute) and base.attr == "_gripper"
+            and isinstance(base.value, ast.Name) and base.value.id == "self"):
+        return ("gripper", node.attr)
+    return None
+
+
+def relay_mode_reachability():
+    """只走位模式（``carry_objects:=false``）下，哪些函数 / 夹爪方法**到不了**。
+
+    返回 ``(到不了的集合, 夹爪方法的引用明细)``。判定规则 ——
+    一个函数**到不了**，当且仅当它有入边、且**每一条**入边都满足
+    「被 ``not self.carry_objects`` 的早返回挡在前面」**或**「来自另一个到不了的
+    函数」。**没有入边的函数一律当作到得了** —— 拿不出证据就假设它是活的，
+    反过来会把危险的方法判成安全，那是这个自检最坏的一种错。
+
+    ⚠️ 为什么必须做这层**传递**：``is_empty()`` / ``current_position()`` 只被
+    ``_evaluate_grasp`` 调用，而 ``_evaluate_grasp`` 只被 ``_on_close_done`` 里的
+    ``Timer`` 挂上、``_on_close_done`` 又只作为 ``done_cb`` 挂在**守卫之后**那次
+    ``close()`` 上。只看**直接**外层函数会得出「没有守卫 ⇒ 到得了」的错误结论。
+    """
+    tree = ast.parse(PLANNER_NODE_PY.read_text(encoding="utf-8"))
+    funcs = _collect_functions(tree)
+    plain = {}
+    for qname in funcs:
+        plain.setdefault(qname.split(".")[-1], []).append(qname)
+    local = {p: qs[0] for p, qs in plain.items() if len(qs) == 1}
+
+    # 入边：target -> [(来源函数, 行号, 在来源函数里是否已被守卫挡住)]
+    in_edges = {}
+
+    def add_edge(target, src, lineno, guarded):
+        in_edges.setdefault(target, []).append((src, lineno, guarded))
+
+    gripper_refs = []
+    for qname, (nodes, guards) in funcs.items():
+        for node in nodes:
+            hit = _ref_line(node)
+            if hit is None:
+                continue
+            kind, name = hit
+            guarded = any(g < node.lineno for g in guards)
+            if kind == "gripper":
+                if name in GRIPPER_METHODS:
+                    target = f"_gripper.{name}"
+                    add_edge(target, qname, node.lineno, guarded)
+                    gripper_refs.append((name, qname, node.lineno, guarded))
+            elif name in funcs:                     # self.<某方法>
+                add_edge(name, qname, node.lineno, guarded)
+            elif name in local:                     # 嵌套局部函数（self._then_open 少见）
+                add_edge(local[name], qname, node.lineno, guarded)
+            # 局部函数按**裸名字**被引用（``done_cb=_then_open``）—— 只有它确实是
+            # 本文件里定义过的函数名才算，免得把 ``result`` 这类普通变量认成调用。
+        for node in nodes:
+            name = getattr(node, "id", None)
+            if name in local and local[name] != qname:
+                guarded = any(g < node.lineno for g in guards)
+                add_edge(local[name], qname, node.lineno, guarded)
+
+    # 不动点：反复摘掉「所有入边都被挡住」的节点，剩下的就是到得了的。
+    alive = set(funcs) | {f"_gripper.{m}" for m in GRIPPER_METHODS}
+
+    def blocked(src, guarded):
+        return guarded or src not in alive
+
+    changed = True
+    while changed:
+        changed = False
+        for node in sorted(alive):
+            edges = in_edges.get(node)
+            if edges and all(blocked(src, g) for src, _, g in edges):
+                alive.discard(node)
+                changed = True
+
+    return {n for n in (set(funcs) | {f"_gripper.{m}" for m in GRIPPER_METHODS})
+            if n not in alive}, gripper_refs
 
 
 def _src(name):
@@ -359,6 +521,44 @@ def main():
     check("第一个 demo 的默认组合 = 不夹取（gripper_backend=none + carry_objects=false）",
           dict(declared_names(real)).get("gripper_backend") == "none"
           and dict(declared_names(real)).get("carry_objects") == "false")
+
+    # ------------------------------------ 上面那个组合**为什么**安全（W2-8b）
+    print("\n--- W2-8b 只走位模式的可达性：NullGripper 那张表按结构核一遍 ---")
+    # `NullGripper` 只实现 `open()`，其余三个方法**抛 RuntimeError**。这个设计的
+    # 依据是「只走位模式下那三个调用点不可达」—— 一条**关于 planner_node.py 结构**
+    # 的断言，而它原先只写在 gripper.py 的文档字符串里，没人核。文档里的行号已经
+    # 漂过一次（八个数字齐齐偏 20 行，且不报错），所以这里解析语法树、按**函数名**
+    # 核结构：调用点挪到守卫之前，判定会**当场**翻转。
+    #
+    # 判据的强弱要说清：「到不了」这一侧是**可靠**的 —— 函数体顶层、调用点之前的
+    # 早返回确定地挡住了它（传递闭包只在**每一条**入边都被挡住时才判到不了）；
+    # 「到得了」那一侧只是**必要条件**（没守卫 ≠ 运行时会走到），所以后两条配了
+    # 精确计数，靠「数量对不上就 FAIL」来兜。
+    if not PLANNER_NODE_PY.exists():
+        skip("NullGripper 的可达性表", f"{PLANNER_NODE_PY} 不存在")
+    else:
+        unreachable, refs = relay_mode_reachability()
+        check("解析到了 planner_node 里的夹爪引用（否则下面全是空断言）",
+              len(refs) >= 4,
+              f"实际 {len(refs)} 处: {[(n, ln) for n, _, ln, _ in refs]}")
+        for meth in ("close", "is_empty", "current_position"):
+            mine = [r for r in refs if r[0] == meth]
+            check(f"``{meth}()`` 在只走位模式下到不了"
+                  f"（NullGripper 才敢对它抛错而不是静默）",
+                  bool(mine) and f"_gripper.{meth}" in unreachable,
+                  f"引用点 {[(r[1], r[2]) for r in mine]}"
+                  + ("" if f"_gripper.{meth}" in unreachable
+                     else "，**但可达性分析说它到得了**"))
+        opens = [r for r in refs if r[0] == "open"]
+        live = [r for r in opens if not r[3]]
+        check("``open()`` 恰有两处**可达**（初始化 + 失败恢复）"
+              " —— 这就是 NullGripper 只实现 open() 的根据",
+              len(opens) == 3 and len(live) == 2,
+              f"共 {len(opens)} 处，其中可达 {len(live)} 处 "
+              f"{[(r[1], r[2]) for r in live]}")
+        check("…剩下那一处 open()（放置松开）是被守卫挡住的",
+              len(opens) - len(live) == 1 and "_gripper.open" not in unreachable,
+              f"被挡 {[(r[1], r[2]) for r in opens if r[3]]}")
 
     print("\n--- W2-9 参数名唯一（重复声明会让后一个静默失效）---")
     for mod, label in ((real, "real"), (bringup, "bringup")):
