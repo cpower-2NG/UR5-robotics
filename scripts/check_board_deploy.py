@@ -68,15 +68,31 @@ FIX_HINTS = {
 }
 
 _failed = []
+_failed_keys = set()
+_dupes = 0
 
 
 def ok(msg):
     print(f"  [OK]   {msg}")
 
 
-def bad(msg, fix):
+def bad(msg, fix, key=None):
+    """报告一项缺失。**同一根因只计一次**（`key` 同名即视为同一件事）。
+
+    为什么需要：`vision_msgs` 会**同时**在第 1 段（它被 `package.xml` 声明、
+    而板上没装）和第 2 段（模块 import 失败）各报一次 —— 那是**同一个包的同一件事**。
+    不合并的话摘要会印「有 **2** 项缺失」，而实际只差一个 apt 包：
+    部署时看这个数字的人会以为有两处要修。板子上实测过这个观感问题。
+    `key` 只影响**计数**，两段的 `[MISS]` 行照旧各印各的（各自的信息都有用）。
+    """
+    global _dupes
     print(f"  [MISS] {msg}")
     print(f"         修法: {fix}")
+    k = msg if key is None else key
+    if k in _failed_keys:
+        _dupes += 1
+        return
+    _failed_keys.add(k)
     _failed.append(msg)
 
 
@@ -175,14 +191,14 @@ def main():
                 ok(f"{name} → 模块 {mod} 在  (被 {owners} 需要)")
             except Exception as exc:  # noqa: BLE001
                 bad(f"{name} → 模块 {mod} 不在（{type(exc).__name__}）(被 {owners} 需要)",
-                    FIX_HINTS.get(mod, f"pip3 install {mod}"))
+                    FIX_HINTS.get(mod, f"pip3 install {mod}"), key=mod)
             continue
         try:
             get_package_share_directory(name)
             ok(f"{name}  (被 {owners} 需要)")
         except PackageNotFoundError:
             bad(f"{name}  (被 {owners} 需要)",
-                f"sudo apt install {ros_dep_to_deb(name)}")
+                f"sudo apt install {ros_dep_to_deb(name)}", key=name)
 
     print("\n--- 2. Python 模块（从节点源码的 import 推导，含函数体内）---")
     mods = declared_py_modules()
@@ -199,7 +215,8 @@ def main():
                 fix = f"sudo apt install {ros_dep_to_deb(name)}"
             else:
                 fix = FIX_HINTS.get(name, f"pip3 install {name}")
-            bad(f"{name}  (被 {owners} import) —— {type(exc).__name__}: {exc}", fix)
+            bad(f"{name}  (被 {owners} import) —— {type(exc).__name__}: {exc}", fix,
+                key=name)
 
     print("\n--- 3. 模型权重解析（D67 的现场体检：默认参数在当前目录解析到哪）---")
     pkg_py = SRC / "yolo_detector"
@@ -220,7 +237,10 @@ def main():
 
     print("\n" + "=" * 60)
     if _failed:
-        print(f"有 {len(_failed)} 项缺失 —— 修完再跑一遍本脚本：")
+        extra = (f"（另有 {_dupes} 条 [MISS] 是同一根因的重复报告，"
+                 f"已合并计数 —— 比如 vision_msgs 会同时以「ROS 包」和「Python 模块」"
+                 f"两种身份出现）" if _dupes else "")
+        print(f"有 {len(_failed)} 项缺失{extra} —— 修完再跑一遍本脚本：")
         for f in _failed:
             print(f"  · {f}")
         return 1
