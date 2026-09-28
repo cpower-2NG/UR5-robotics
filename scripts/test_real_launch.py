@@ -355,6 +355,8 @@ NODE_MAINS = [
     "ros2_ws/src/perception_3d/perception_3d/projector_node.py",
     "ros2_ws/src/grasp_planner/grasp_planner/planner_node.py",
     "ros2_ws/src/yolo_bringup/yolo_bringup/test_image_publisher.py",
+    # 无臂预检的垫片也是节点 main（会被人单独跑），同样按这套卫生标准查
+    "scripts/fake_joint_states.py",
 ]
 
 
@@ -367,15 +369,18 @@ def _is_attr_call(node, obj, attr):
 
 
 def _is_spin_call(node):
-    """``rclpy.spin(...)`` 或 ``executor.spin()`` —— 两者抛的是同一族异常。
+    """``rclpy.spin(...)`` / ``executor.spin()`` / ``spin_once(...)`` —— 同一族异常。
 
     ⚠️ 只认 ``rclpy.spin`` 会漏掉 planner_node（它用
     ``MultiThreadedExecutor().spin()``），而漏掉的后果是那条断言变成 SKIP、
     看上去「不适用」，实际它**同样**会被 Ctrl-C 那段竞态打中。
+    ⚠️ 同理 ``spin_once``：`fake_joint_states.py` 用「while ＋ spin_once(0.03)」
+    打泵，Ctrl-C 打断的正是某一次 ``spin_once`` —— 与 ``spin`` 抛的是同一族
+    异常，必须落在接住它们的那个 try 里。
     """
     return (isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "spin")
+            and node.func.attr in ("spin", "spin_once"))
 
 
 def shutdown_hygiene(path):
