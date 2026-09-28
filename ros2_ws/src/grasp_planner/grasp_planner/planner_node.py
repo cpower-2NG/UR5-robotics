@@ -1513,9 +1513,29 @@ def main(args=None):
         # 只接一个就等于把「收工干不干净」交给运气。
         pass
     finally:
-        node._gripper.shutdown()
-        executor.shutdown()
-        node.destroy_node()
+        # ⚠️ 收工清理要扛得住**第二次 SIGINT**。`ros2 launch` 收到 SIGINT 后会把
+        # SIGINT **转发**给每个子进程（日志里的 `sending signal 'SIGINT' to
+        # process[...]`），加上终端/进程组那一次，子进程一共收到两次。实测第二次
+        # 落在 `destroy_node()` 里面（rclpy 的 `client.destroy_when_not_in_use`），
+        # 抛 `KeyboardInterrupt` 从 finally 逃出去 ⇒ 一段 traceback ＋
+        # `process has died ... exit code -2`。2026-09-28 板端：`set -m` ＋ 整组
+        # SIGINT 可稳定复现（pty 真 Ctrl-C 那次反倒是干净的 —— 这个面只在
+        # 「launch 转发得比子进程退得早」的时候露头）。
+        # 收工阶段没有「失败要处理」这回事，信号更不是错误 ⇒ 只吞
+        # KeyboardInterrupt，别的异常照旧让它现形。三步各自包一层：前一步被信号
+        # 打断不该把后面两步一起跳过。
+        try:
+            node._gripper.shutdown()
+        except KeyboardInterrupt:
+            pass
+        try:
+            executor.shutdown()
+        except KeyboardInterrupt:
+            pass
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
         # ⚠️ 必须先 `rclpy.ok()`：SIGINT/SIGTERM（`ros2 launch` 下的 Ctrl-C、
         # 或者超时杀进程）会先由 rclpy 自己的信号处理器调一次 rcl_shutdown，
         # 之后再无条件调一次会抛
@@ -1523,7 +1543,10 @@ def main(args=None):
         # 并打出一整段 traceback。功能上无害，但**每次正常收工都像出了故障**：
         # 演示时操作员看到 traceback 会以为刚才那一轮失败了。
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == "__main__":

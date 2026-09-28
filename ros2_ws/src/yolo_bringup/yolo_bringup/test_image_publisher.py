@@ -159,12 +159,28 @@ def main(args=None):
         if rclpy.ok():
             raise
     finally:
-        node.destroy_node()
+        # ⚠️ 收工清理要扛得住**第二次 SIGINT**。`ros2 launch` 收到 SIGINT 后会把
+        # SIGINT **转发**给每个子进程（日志里的 `sending signal 'SIGINT' to
+        # process[...]`），加上终端/进程组那一次，子进程一共收到两次。实测第二次
+        # 落在 `destroy_node()` 里面（rclpy 的 `client.destroy_when_not_in_use`），
+        # 抛 `KeyboardInterrupt` 从 finally 逃出去 ⇒ 一段 traceback ＋
+        # `process has died ... exit code -2`。2026-09-28 板端：`set -m` ＋ 整组
+        # SIGINT 可稳定复现（pty 真 Ctrl-C 那次反倒是干净的 —— 这个面只在
+        # 「launch 转发得比子进程退得早」的时候露头）。
+        # 收工阶段没有「失败要处理」这回事，信号更不是错误 ⇒ 只吞
+        # KeyboardInterrupt，别的异常照旧让它现形。
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
         # 已关过就别再关：无条件调会抛 RCLError，把「正常收工」变成
         # `process has died ... exit code 1`。理由与闸门写法同
         # `detector_node.py` / `projector_node.py`。
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == '__main__':
