@@ -48,6 +48,8 @@
 """
 
 import argparse
+import functools
+import inspect
 import sys
 import time
 import unicodedata
@@ -205,9 +207,15 @@ def _yaml_defaults() -> dict:
 def _pymodbus():
     """惰性导入 pymodbus，并把「装错版本」这件事说清楚。
 
-    板子上 apt 的 `python3-pymodbus` 是 **2.1.0**，而 2.x/3.x 的 API 不同
-    （`read_holding_registers(..., slave=)` vs `unit=`）。装错的表现是
-    `TypeError: unexpected keyword argument` —— 看起来像脚本坏了。
+    **3.x 自己就有两代 API，这是本脚本踩过的真坑**（2026-09-28）：
+
+      2.x        `unit=`        apt 的 `python3-pymodbus` 是 2.1.0
+      3.6–3.7    `slave=`       本机自检最初装的是 3.6.9
+      3.8+       `device_id=`   **板子上实测是 3.15.0**
+
+    按 `slave=` 写死在 3.15.0 上是 `TypeError: unexpected keyword argument`，
+    而当时的报错文案却说「需要 3.x」—— **板子上明明是 3.x**，等于把原因指反了。
+    所以现在改为**按签名探测参数名**（`_slave_kwarg`），并且把探测结果印出来。
     """
     try:
         import pymodbus
@@ -220,6 +228,36 @@ def _pymodbus():
     return pymodbus, ModbusSerialClient
 
 
+# 从站号参数在历代 pymodbus 里的名字。**按顺序探测**，先新后旧。
+_SLAVE_KWARGS = ("device_id", "slave", "unit")
+
+
+@functools.lru_cache(maxsize=None)
+def _slave_kwarg(client_cls) -> Optional[str]:
+    """探测这一版 pymodbus 用哪个关键字传从站号。
+
+    用**签名探测**而不是 try/except：探测出的名字能直接印给现场看，
+    而且失败时能说清「我看到的签名长什么样」，而不是只说一句「版本不对」。
+    按类缓存，所以每次读寄存器不会重复做这件事。
+    """
+    try:
+        params = inspect.signature(client_cls.read_holding_registers).parameters
+    except (ValueError, AttributeError):                      # pragma: no cover
+        return None
+    for name in _SLAVE_KWARGS:
+        if name in params:
+            return name
+    return None
+
+
+def _signature_of(client_cls) -> str:
+    """给报错用：把这一版真实的方法签名打出来。"""
+    try:
+        return f"read_holding_registers{inspect.signature(client_cls.read_holding_registers)}"
+    except (ValueError, AttributeError):                      # pragma: no cover
+        return "（连签名都读不到）"
+
+
 def _make_client(ModbusSerialClient, port: str, baudrate: int, timeout: float):
     """造一个 RTU 客户端。**不 connect**，由调用点决定何时开串口。"""
     return ModbusSerialClient(port=port, baudrate=baudrate, bytesize=8,
@@ -229,16 +267,22 @@ def _make_client(ModbusSerialClient, port: str, baudrate: int, timeout: float):
 def _read(client, address: int, fc: int, slave: int):
     """发一次**只读**请求，返回 (ok, raw_or_error)。
 
-    `slave=` 是 pymodbus 3.x 的写法（2.x 叫 `unit=`）。这里**不**做兼容分支：
-    混用两个大版本只会让「读到的数与预期不符」更难查 —— 直接要求 3.x。
+    从站号的**关键字名字按版本探测**（`device_id` / `slave` / `unit`），不写死 ——
+    3.15.0 上写死 `slave=` 就是死路（见 `_pymodbus` 的注释）。
     """
+    kw = _slave_kwarg(type(client))
+    if kw is None:
+        return False, (f"认不出这一版 pymodbus 的从站号参数"
+                       f"（见过的名字只有 {_SLAVE_KWARGS}）；实测签名：{_signature_of(type(client))}")
     try:
         if fc == 3:
-            rr = client.read_holding_registers(address, count=1, slave=slave)
+            rr = client.read_holding_registers(address, count=1, **{kw: slave})
         else:
-            rr = client.read_input_registers(address, count=1, slave=slave)
-    except TypeError as exc:                      # pymodbus 2.x 的典型症状
-        return False, f"pymodbus 版本不对（{exc}）—— 需要 3.x"
+            rr = client.read_input_registers(address, count=1, **{kw: slave})
+    except TypeError as exc:
+        # 走到这里说明签名探测与实际调用不符（版本又变了）。**把真实签名打出来**，
+        # 而不是只说一句「版本不对」—— 上一版的教训就是这个。
+        return False, f"调用签名不符：{exc}；实测签名：{_signature_of(type(client))}"
     except Exception as exc:                      # 串口/CRC/超时都归这里
         return False, f"{type(exc).__name__}: {exc}"
     if rr is None:
@@ -268,9 +312,13 @@ def cmd_frames(args) -> int:
     print("=" * 72)
     for raw in (0, 250, 500, 750, 1000):
         print(f"  {raw:4d} → {interpret(raw, args.stroke_mm)}")
-    pymodbus, _ = _pymodbus()
-    print(f"\npymodbus: {'已装 ' + pymodbus.__version__ if pymodbus else '未装'}"
-          f"（--frames 不需要它；--dump/--watch 需要）")
+    pymodbus, ClientCls = _pymodbus()
+    if pymodbus:
+        kw = _slave_kwarg(ClientCls)
+        print(f"\npymodbus: {pymodbus.__version__}"
+              f"（从站号参数名：{kw or '认不出！见 _SLAVE_KWARGS'}）")
+    else:
+        print("\npymodbus: 未装（--frames 不需要它；--dump/--watch 需要）")
     print("串口默认值来源: " + _yaml_defaults()["source"])
     return 0
 

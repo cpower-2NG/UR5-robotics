@@ -206,6 +206,16 @@ def main() -> int:
     check("源码里没有功能码 6 / 16 的常量",
           not re.search(r"\b0x0?06\b|\b0x10\b", src))
 
+    # ---- 1b. 从站号参数名不得写死（2026-09-28 的真坑）---------------------
+    # 板子上实测是 pymodbus **3.15.0**，用 `device_id=`；而 3.6/3.7 是 `slave=`、
+    # 2.x 是 `unit=` —— **3.x 自己就有两代 API**。写死任何一个，在另一代上就是
+    # `TypeError`。这里钉住两处读调用**必须**用探测出来的名字。
+    read_calls = [ln for ln in src.splitlines()
+                  if "read_holding_registers(" in ln or "read_input_registers(" in ln]
+    check("两处读调用都用探测出来的从站号参数名（**{kw: slave}）",
+          len(read_calls) == 2 and all("**{kw: slave}" in ln for ln in read_calls),
+          f"实际 {len(read_calls)} 处：{[ln.strip() for ln in read_calls]}")
+
     # ---- 2. 换算：不重复实现 --------------------------------------------
     print("\n[2] 换算复用（不重复实现）")
     gripper_mod = None
@@ -306,6 +316,11 @@ def main() -> int:
                      "dump 对非法地址报错", "FC4 也试", "全失败时给排查顺序"):
             check(name, False, pymodbus_why, skip=True)
     else:
+        from pymodbus.client import ModbusSerialClient as _ClientCls
+        kw = PROBE._slave_kwarg(_ClientCls)
+        check(f"探测出的从站号参数名是已知的一代（本机 = {kw}）",
+              kw in PROBE._SLAVE_KWARGS, f"{kw}（签名：{PROBE._signature_of(_ClientCls)}）")
+
         pair = _PtyPair()
         slave = _RtuSlave(pair.master_fd, FAKE_REGS, slave_id=1).start()
         try:

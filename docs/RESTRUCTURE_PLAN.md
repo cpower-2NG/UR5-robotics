@@ -2030,3 +2030,106 @@ W1b 第 3 项（给 AG-95 补 URDF 连杆，好让碰撞检查覆盖夹爪本体
   📌 顺带更正上一轮的一处计数：第十五轮第八节原写「共领先 44 个提交」，**实测当时是 45**。
   数字差 1 不影响任何结论，但计数是会被后来人直接引用的，所以按实测改。
 - 板端本轮**只读**：拷一个脚本到 `/tmp` 跑了两条只读命令，**跑完已删**；未装包、未改配置、未触发任何运动。
+
+---
+
+#### 第十七轮：用户执行了板端清单 → 核对结果 → **pymodbus 3.15.0 把探针打死**（2026-09-28）
+
+第十六轮把板端清单交给用户执行（`docs/待执行命令.md`），用户执行完让我 SSH 核对。
+核对本身顺利，**但核对过程中发现探针在板子上根本跑不起来** —— 本轮就是修这个。
+
+##### 一、板端清单的执行结果（只读实测，逐条对）
+
+| 项 | 期望 | 实测 | |
+|---|---|---|---|
+| 甲-2 ollama | 停且禁用 | `active=inactive`、`enabled=disabled` | ✅ |
+| 甲-3 桌面 | 停且默认 target 换掉 | `gdm active=inactive`、`get-default` = `multi-user.target` | ✅ |
+| 甲-3 内存效果 | 释放内存 | available **4.2 GiB → 6.1 GiB**（`free` 列 2.3 GiB） | ✅ |
+| 甲-4 dialout | 进组、**新会话**可见 | 新 SSH 会话 `id` 里有 `20(dialout)` | ✅ |
+| 甲-5 pymodbus | 3.x | **3.15.0** | ⚠️ 见 D66 |
+| 甲-6 MoveIt | 已在 | `/opt/ros/humble` | ✅ |
+| 串口节点权限 | 够 | `/dev/ttyTHS1` = `root:dialout 660` + 已在 `dialout` ⇒ 可打开 | ✅ |
+| 适配器 | —— | **仍然没有**（`lsusb` 无串口芯片） | 阻塞真读数 |
+| 甲-1 的 `sudo ufw status` | —— | **没查**（要 sudo，我不跑）；已在 `待执行命令.md` 记明 | 待办 |
+
+内存那一条值得记一个数：**+1.9 GiB**，而且省下来的主要是**桌面**（`gdm`），
+不是 ollama（`systemd` 报的 ollama 常驻只有 24 MB，与第十四轮的推断一致）。
+
+##### 二、D66（新）：**pymodbus 3.x 自己有两代 API**，探针写死了其中一代
+
+`scripts/ag95_probe.py` 的 `_read()` 原本写死 `slave=slave`：
+
+```python
+rr = client.read_holding_registers(address, count=1, slave=slave)   # ← 3.15.0 上是 TypeError
+```
+
+而板子上装到的是 **3.15.0**，它的签名是：
+
+```
+read_holding_registers(self, address, *, count=1, device_id=1, no_response_expected=False)
+```
+
+| 版本 | 从站号参数 | 依据 |
+|---|---|---|
+| 2.x（apt 的 `python3-pymodbus`） | `unit=` | 第十四轮记录 |
+| 3.6–3.7 | `slave=` | **本机自检最初装的就是 3.6.9** |
+| **3.8+（板子 = 3.15.0）** | **`device_id=`** | 2026-09-28 板端实测签名 |
+
+**为什么这是个值得编号的缺陷**（而不是「改个参数名」）——三点：
+
+1. **本机验过不等于板子上能跑。** 我第十六轮在**本机**用 pymodbus 3.6.9 跑通了 40 项
+   自检，就以为「探针可用」。而 `settings` 里写的是 `pymodbus>=3.6`，板子上拿到的
+   是最新版。**同一个大版本号下有两代不兼容 API**，这条约束我原先根本不知道。
+2. **报错文案把原因指反了**，这是更坏的一半。原来的 `except TypeError` 写的是
+   「pymodbus 版本不对（…）—— 需要 3.x」。板子上**就是** 3.x，照着这句话查会往
+   「版本太老」的方向走，而真因是「**太新**」。⇒ 现在改成把**真实签名**打出来。
+3. 它正好落在**这份脚本唯一的用途**上：只读探测是现场第一个动作，
+   在板子上跑不起来等于这个交付物是零。
+
+**修法**（不写死任何一代）：按**签名探测**参数名，按类缓存，并把结果印出来。
+
+```python
+_SLAVE_KWARGS = ("device_id", "slave", "unit")          # 先新后旧
+
+@functools.lru_cache(maxsize=None)
+def _slave_kwarg(client_cls) -> Optional[str]:
+    params = inspect.signature(client_cls.read_holding_registers).parameters
+    return next((n for n in _SLAVE_KWARGS if n in params), None)
+```
+
+`--frames` 现在会直接印出结论：`pymodbus: 3.15.0（从站号参数名：device_id）` ——
+**现场不用等失败就能看见**它在用哪个名字。
+
+##### 三、验收：三代 API 里能装的都装了一遍，**并在板子上真跑**
+
+| 环境 | pymodbus | 结果 |
+|---|---|---|
+| 本机 | **3.6.9**（`slave=`） | `test_ag95_probe.py` **40 项全 PASS** |
+| 本机 | **3.15.0**（`device_id=`） | **40 项全 PASS**（含 pty 回环：真的读到了 637‰） |
+| **板子（aarch64 / Python 3.10.12）** | **3.15.0** | **40 项全 PASS，0 SKIP** —— 含第 2/3 段（`gripper.py` 能导入，说明 `control_msgs` 等也在）与 pty 回环 |
+| 板子 | 无 pymodbus 时 | 20 PASS / 9 SKIP / 0 FAIL（SKIP 打印原因，**不算 PASS**） |
+
+自检新增 2 项**结构性**断言，钉住这次的修法：两处读调用**必须**用探测出来的名字
+（`**{kw: slave}`），且探测结果必须落在已知的三个名字里。
+
+> 顺带记一句设计上被验证到的东西：本机 `/tmp/pmb` 被 `systemd-tmpfiles` 清掉之后，
+> 自检**没有**假装通过，而是如实退成 9 项 SKIP 并打印「没有 pymodbus」。
+> 「缺依赖 ⇒ SKIP 并说原因」这条在真实场景里生效了。
+
+##### 四、板端本轮动作（只读，已清场）
+
+拷了 5 个文件到板子 `/tmp/ag95check/`（探针、自检、`gripper.py`、`__init__.py`、
+`grasp_planner.yaml` —— 保持相对目录结构，好让自检的路径推导成立），跑完
+**已 `rm -rf`**。未装包、未改配置、未触发任何运动、未碰板子家目录。
+
+##### 五、未验证 / 未做
+
+- ⚠️ **真设备仍然没有**（板上无 USB-RS485 适配器）⇒ `--scan-slaves` / `--dump` /
+  `--watch` 对**真夹爪**从未跑过。已验的是 pty 回环（本机两代 + 板子上）。
+- **W3 写路径仍未实现**（`Ag95Gripper` 仍是构造即报错的桩），闸门不变。
+- 甲-1 的 `sudo ufw status` 未查。
+- 板端部署（把仓库弄上板子、编子集）**还没开始**。
+
+##### 六、状态
+
+- `migrate/humble-orin`：本轮 2 个提交（修 D66 + 文档），**未推送**，`main` 未动。
