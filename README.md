@@ -279,12 +279,20 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
       --packages-ignore arm_grasp_sim
   ```
 
+  ✅ **这条命令已在板上实测通过**（Orin aarch64 / Python 3.10.12 / setuptools 59.6.0，
+  `4 packages finished [5.48s]`，2026-09-28）。注意当时 `vision_msgs` **还没装** ——
+  它只是 `exec_depend`，**构建期不需要它**。所以「编过了」不等于「能跑」，
+  见上面那条。
+
   ⚠️ **不带那个 flag 会构建失败**，报错是
   `Failed to find ... arm_grasp_sim/share/arm_grasp_sim/package.sh` /
   `Check that the following packages have been built: arm_grasp_sim` —— 而
   **那个包正是你不想在板上编的**。原因：`yolo_bringup` 声明了
   `exec_depend arm_grasp_sim`，colcon 构建 Python 包时需要**工作区内依赖**的 install
   环境，即使它没被选中。另一种等效做法是**部署时就不把 `arm_grasp_sim` 的源码拷到板上**
+  （也在板上实测通过：`4 packages finished [5.36s]`）。⚠️ 但两条**不是**完全等价 ——
+  「不带 flag」只在**源码也不在**时成立；源码在而你不带 flag，colcon 会去编它，
+  而它要 Gazebo / `gz_ros2_control`，板上没有。
   （工作区里没有它，自然不用 ignore）。
 - `bringup.launch.py` 对缺 `arm_grasp_sim` 做了容错并给出可操作报错
   （由 `test_real_launch.py` 的 W2-15 钉住）。
