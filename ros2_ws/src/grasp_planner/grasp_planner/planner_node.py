@@ -483,6 +483,12 @@ class GraspPlanner(Node):
         d("ag95_stroke_mm", 95.0)
         d("ag95_open_mm", 95.0)
         d("ag95_close_mm", 0.0)
+        # ⚠️ **默认只读**：写寄存器会让手指动，而寄存器映射与千分位方向都还
+        # 没有实物复核过。翻成 false 的前提是「夹爪已从臂上拆下」（见 W3）。
+        d("ag95_dry_run", True)
+        # 千分位方向：1000 是全开（true）还是全闭（false）。**手册没写**，
+        # 现场手动掰到全开读一次 0x0202 判决。只有 dry_run=false 时才影响动作。
+        d("ag95_open_is_high", True)
 
         # ---- 姿态安全：肘高护栏（D49）----
         # `_ik_request` 里的 `avoid_collisions=True` **只在规划场景里有东西时才
