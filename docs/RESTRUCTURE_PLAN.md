@@ -2466,7 +2466,9 @@ Gazebo，板上没有也不需要）。照报错去做，只会在板上白装�
 
 ##### 八、状态
 
-- 本轮 1 个提交（README + 待执行命令 + 本节）。
+- 本轮与第二十一轮一起提交，共 3 个（脚本 1 个、README+待执行命令 1 个、台账 1 个）
+  —— 两轮的改动混在同一批文件里，按文件切不开，所以按「工具 / 面向用户的文档 /
+  台账」切。⚠️ 因此本轮状态条里的这份清单**不在**某个单独的提交里。
 - `migrate/humble-orin` 领先 `main` 的提交数**不写死**：本轮开始时实测 **53**。
 - **未推送**，`main` 未动（仍为 `0ab13ec`）。
 
@@ -2596,7 +2598,9 @@ $ ssh jetson 'bash -c "source /opt/ros/humble/setup.bash; apt-cache policy \
 
 ##### 八、状态
 
-- 本轮 1 个提交（`scripts/check_board_deploy.py` + README + 待执行命令 + 本节）。
+- 本轮与第二十轮一起提交，共 3 个：`8f02c17` 脚本、`685c0b0` README+待执行命令、
+  本节所在的台账提交。两轮的改动混在同一批文件里（本节与第二十轮在同一份
+  `RESTRUCTURE_PLAN.md` 里追加），按文件切不开，所以按「工具 / 面向用户的文档 / 台账」切。
 - `migrate/humble-orin` 领先 `main` 的提交数**不写死**：实测 `git rev-list --count
   main..migrate/humble-orin` = **53**（第二十、二十一轮的改动尚未提交，提交后会更多）。
 - **未推送**，`main` 未动（仍为 `0ab13ec`）。
