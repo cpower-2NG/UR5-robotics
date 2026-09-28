@@ -2730,3 +2730,146 @@ $ ros2 launch yolo_bringup bringup.launch.py camera_source:=external
 - `git rev-list --count main..migrate/humble-orin` 实测 **57**（本轮提交前）。
 - **未推送**，`main` 未动（仍为 `0ab13ec`）。
 - 板子状态：临时目录已删、无残留进程、`~/yahboom_ws` 与 `~/ultralytics` 未被动过。
+
+#### 第二十三轮：板端把「检测」这一半真的跑通了 —— 以及相机那一层的一步之差（2026-09-28）
+
+##### 一、为什么查这里
+
+甲-10（装 `vision_msgs`）之前，链路里有一大块**不需要 `vision_msgs`、也不需要 sudo**
+就能验的东西：权重能不能被板上的 torch/ultralytics 读进去、能不能真的推出框、
+相机能不能出图。这三件事平时被归到「等部署那天再说」，但它们恰恰是**版本兼容**
+最容易咬人的地方（板上是 `torch 2.5.0a0+nv24.08` + `ultralytics 8.4.26`，
+与工作站的 `2.5.1+cu121` + `8.3.99` **都不是同一份**）。所以先验掉，省得部署那天
+把「版本不兼容」误判成「项目坏了」。
+
+##### 二、先确认权重**随仓库走**（甲-7 的前提）
+
+甲-7 让现场「把权重放到位」。但权重到底要不要**另外**弄上去？查 git：
+
+```
+$ git ls-files | grep -i '\.pt$'
+block_best.pt                         ← 6.2 MB，被跟踪
+runs/block_detect/weights/best.pt
+runs/block_detect/weights/last.pt
+runs/detect/block_grid_demo/weights/best.pt
+runs/detect/block_grid_demo/weights/last.pt
+yolo26n.pt
+yolov8n_coco.pt
+$ git check-ignore -v block_best.pt   → （未被 ignore）
+$ sha256sum block_best.pt             → a926d959b5aa9f9e2435c2deb9666803...
+```
+
+⇒ **`git clone` 就带过来了**，与第十九轮记的 sha256 一致。甲-7 要做的只是
+「别让它按 CWD 解析到别处」，不是「把文件传上去」。
+
+##### 三、板端加载 + 推理：通过
+
+```
+$ python3 -c "..."
+torch 2.5.0a0+872d972e41.nv24.08 | cuda available: True
+ultralytics 8.4.26
+加载耗时 0.1s
+names: {0: 'block'}
+task: detect
+空图推理耗时 0.89s, 框数 0        ← 含 CUDA 首次预热
+预热后单帧推理: 38 ms
+```
+
+##### 四、拿真图验：9 个标签 / 9 个框，逐对 IoU 全部 ≥ 0.966
+
+用的是 `block_dataset/val/images/img_0001.jpg`（该图有 9 个标注框），做**贪心匹配**
+后逐对算 IoU：
+
+```
+标签 9 个 / 检出 9 个
+逐对 IoU: 0.966 0.969 0.972 0.976 0.976 0.978 0.980 0.983 0.988
+conf 区间: 0.913 ~ 0.966
+```
+
+⚠️ **这张图是那次训练自己的 `val` 划分**（`train_yolo_block.py:49-51` 就取
+`block_dataset/val`），所以「9/9 恰好对上」**不构成泛化性的证据**。它证明的是
+**另一件事、也是本轮要证的事**：板端（aarch64 + 那份 NGC torch + ultralytics 8.4.26）
+**复现了工作站上那个模型的行为**，没有因为版本不同而退化。
+
+##### 五、38 ms/帧顺带回答了一个 W2 的担心
+
+W2 里担心过 `max_sync_dt`（默认 0.1 s，超过就**丢弃整批检测**，
+`projector_node.py:348-352`）——当时的假设是「Orin 更慢，会更频繁超时」。
+实测预热后单帧 **38 ms**（约 26 FPS），比那 0.1 s 的窗口宽裕得多。
+⚠️ 这只是**裸推理**的耗时，不含取图、投影、TF；真正的端到端延迟没测。
+
+##### 六、相机那一层：**差一步就静默失效**（本轮唯一的新增可操作发现）
+
+先按最朴素的方式起相机：
+
+```
+$ ros2 launch realsense2_camera rs_launch.py enable_depth:=false
+$ ros2 topic list | grep camera
+/camera/camera/color/image_raw          ← 两层！
+/camera/camera/color/camera_info
+$ ros2 topic hz /camera/color/image_raw
+WARNING: topic [/camera/color/image_raw] does not appear to be published yet
+```
+
+**最后那条 WARNING 就是现场会看到的症状**：相机明明在出图，而下游订阅的
+`/camera/color/image_raw`「还没有发布」—— 于是检测器一帧都收不到、没有 `/detections`、
+规划器永远没目标，日志里只有「没目标」。看起来像检测器坏了或模型不行。
+
+这件事**不是新发现**：两层命名空间是 2026-09-27 就在板上量到的，
+`pipeline.launch.py` 里已有 `REALSENSE_REMAPS` 修好它。本轮复现了那次测量
+（独立确认），**但发现了一个没写进文档的边界**：
+
+| 谁起相机 | 入口 | remap 生效？ | 结果 |
+|---|---|---|---|
+| **仓库自己** | `camera_source:=realsense` | ✅ 生效 | 单层话题，下游能收到 |
+| **别人**（包括你手敲 `rs_launch.py`） | `camera_source:=external` | ❌ **不生效** | 两层话题，**静默**收不到 |
+
+原因是 remap 挂在**相机节点**上（`pipeline.launch.py:318-327`），
+只有仓库自己拉那个节点时才带得上。⇒ **甲-9 推荐的正是 `external`**，而它没有
+这一句警告。已补进甲-9。
+
+顺带把 remap 的作用范围量清了（免得以后误以为「remap 把相机全改成单层了」）：
+
+```
+$ ros2 launch yolo_bringup pipeline.launch.py camera_source:=realsense
+$ ros2 topic list | grep -i camera | sort
+/camera/aligned_depth_to_color/image_raw        ← 三个要用的：只剩单层
+/camera/color/camera_info
+/camera/color/image_raw
+/camera/camera/aligned_depth_to_color/camera_info   ┐
+/camera/camera/aligned_depth_to_infra1/...          │ 其余 16 个仍是两层,
+/camera/camera/color/metadata                       │ 但**没有下游消费**
+/camera/camera/depth/image_rect_raw                 │ （infra / metadata /
+/camera/camera/extrinsics/...                       │  extrinsics / 未对齐深度）
+/camera/camera/infra1|infra2/...                    ┘
+```
+
+三个被 remap 的话题**在两层位置上都不再出现**（不是「多发一份」），
+`/camera/camera/color/image_raw` 与 `/camera/camera/color/camera_info` 都不在表里。
+
+##### 七、未验证 / 未做
+
+- 板的链路**仍然没起来过**：上面那次 `pipeline.launch.py` 里三个节点照旧因为
+  `vision_msgs` 全死（`grep -c "process has died"` = 3）。本轮验的是**检测与相机
+  各自那一半**，**不是**「它们接过来了」—— 端到端要等甲-10。
+- **投影那一半没验**（`perception_3d` 要 `vision_msgs`，且要真 TF）。
+  所以「板端 38 ms 推出来的框，投到 3D 对不对」**没测**。
+- 相机只验了**彩色**：`enable_depth:=false`（第一次），第二次走仓库分支时深度话题
+  在，但**没有真去取一帧深度值**。D2 要的「对齐深度 + 彩色内参」组合
+  **没有端到端验过**。
+- 内参只确认了 `width: 1280 / height: 720` 与 `camera_info` 话题有数据，
+  **没有读 fx/fy/cx/cy 的具体数值**（grep 没匹配到 K 矩阵的格式）。
+- 正式部署（甲-7 ~ 甲-10）仍未开始；本轮用的还是临时目录。
+- 真机 launch（W2）与现场步骤（W5）不变。
+
+##### 八、状态
+
+- 本轮 1 个提交（README 的相机边界 + 甲-9 的警告 + 本节）。
+- `git rev-list --count main..migrate/humble-orin` 实测 **59**（本轮提交前）。
+- **未推送**，`main` 未动（仍为 `0ab13ec`）。
+- 板子状态：`/tmp/bc`、`/tmp/bc2` 已删；第一次探测留下的相机进程按 PID 停掉
+  （`kill 91352 91354 91355`，没用 `pkill -f`）；`ps` 复核**无残留**；
+  `~/yahboom_ws`、`~/ultralytics` 未被动过。
+  ⚠️ 清理时有一条命令**被权限拦下**：我写了 `rm -rf /tmp/buildcheck* /tmp/launch_params_*`，
+  而 `/tmp` 是共享目录、那个 glob 会扫到**不是我建的**文件（`launch_params_*` 里有
+  9-26 就存在的）。拦得对，改成只删自己建的两个目录。
