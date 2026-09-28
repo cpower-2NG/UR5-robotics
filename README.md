@@ -201,12 +201,13 @@ yolo_ros/
 
 ## 自检与验收
 
-六个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py` 与 `test_real_launch.py`
-连真夹爪、真串口都不需要 —— 前者用一个手写的 Modbus 从站接在 pty 上验）：
+七个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`
+与 `test_real_launch.py` 连真夹爪、真串口都不需要 —— 前两个用一个手写的 Modbus 从站
+接在 pty 上验）：
 
 ```bash
 source /opt/ros/humble/setup.bash
-# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余五个不需要，
+# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余六个不需要，
 # 但叠了一起跑没问题）。不加这一行，test_minimal 会报「ultralytics 未安装」，
 # 看起来像项目坏了 —— 其实只是解释器不对。
 export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
@@ -220,13 +221,19 @@ python3 scripts/test_real_launch.py      # launch 参数面：55 项（本机，
 python3 scripts/test_model_resolution.py # 加载的是哪个模型：12 项断言（D67）
 python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
                                          #   没有 pymodbus 时 → 26 PASS / 6 SKIP
+python3 scripts/test_ag95_gripper.py     # AG-95 驱动（读 / dry-run 闸门 / 写）：51 项断言
+                                         #   没有 pymodbus 时 → **退出码 2**（见下）
 ```
 
 > 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
 > —— 写错不影响运行，但会让人以为「我这边少跑了几项」。
-> ⚠️ `test_ag95_probe.py` 在没有 pymodbus 时**退出码仍是 0**（SKIP 不算失败，这是本仓库
-> 自检的统一约定）。所以**别只看退出码**：`26 PASS / 6 SKIP` 这次运行覆盖不全，
-> 不能当「验过了」。要全跑就 `pip3 install "pymodbus>=3.6"`。
+> ⚠️ **三个脚本缺依赖时的行为不一样，别只看退出码**：
+> - `test_ag95_probe.py`：只有第 2 段要 pymodbus，所以缺了会**降级**跑其余部分，
+>   报 `26 PASS / 6 SKIP` 且**退出码 0** —— 这次运行覆盖不全，不能当「验过了」。
+> - `test_ag95_gripper.py`：每一项都走 pymodbus 的串口客户端，**没有可降级的部分**，
+>   所以缺了直接**退出码 2**（按 `test_real_launch.py` / `test_model_resolution.py`
+>   的先例）。它**不假装跑了一部分**。
+> - 全跑的办法都一样：`pip3 install "pymodbus>=3.6"`。
 
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 
