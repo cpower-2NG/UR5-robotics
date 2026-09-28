@@ -72,6 +72,31 @@ FALLBACK = {
 PARAM_NAMES = list(FALLBACK)
 
 
+# MoveItErrorCodes 的数字 → 名字。运行期从 moveit_msgs 取（与板上装的版本一致），
+# 取不到（老版本没有那些负数常量）就退回这份 Humble 实测的表。
+# ⚠️ 这个映射有实际用途：-21（FRAME_TRANSFORM_FAILURE）和「服务不回话」是
+#    **环境问题**（少 robot_state_publisher / 少 /joint_states），不是解不出来；
+#    只有 -31（NO_IK_SOLUTION）才是「这个点位真不可达」。今天三者曾被一锅炖成
+#    「IK 失败 44/44」，把无臂预检环境的问题误报成了 44 个不可达点位。
+def _error_names():
+    try:
+        from moveit_msgs.msg import MoveItErrorCodes as E
+        m = {v: k for k, v in vars(E).items()
+             if k.isupper() and isinstance(v, int) and k != "SLOT_TYPES"}
+        return m or _FALLBACK_ERROR_NAMES
+    except Exception:
+        return _FALLBACK_ERROR_NAMES
+
+
+_FALLBACK_ERROR_NAMES = {
+    1: "SUCCESS", -15: "INVALID_GROUP_NAME", -17: "INVALID_ROBOT_STATE",
+    -18: "INVALID_LINK_NAME", -21: "FRAME_TRANSFORM_FAILURE",
+    -23: "ROBOT_STATE_STALE", -31: "NO_IK_SOLUTION", 99999: "FAILURE",
+}
+
+ERROR_NAMES = _error_names()
+
+
 def rpy_to_quat(rpy):
     """与 planner_node.rpy_to_quat 逐字一致 —— 位姿必须和规划器发的一模一样。"""
     cr, sr = math.cos(rpy[0] / 2), math.sin(rpy[0] / 2)
@@ -142,6 +167,11 @@ class Probe(Node):
 
     # ---- IK / FK ----
     def solve_ik(self, p, x, y, z, seed, grip):
+        """返回 ``(解或 None, 失败原因或 None)``。
+
+        ⚠️ 「服务没回话」和「回了但解不出来」必须分开报：前者是
+        move_group 的环境问题（见 main 里的提示），后者才是几何问题。
+        """
         r = GetPositionIK.Request().ik_request
         r.group_name = p["ik_group"]
         r.ik_link_name = p["ik_link"]
@@ -174,13 +204,14 @@ class Probe(Node):
         fut = self.ik.call_async(GetPositionIK.Request(ik_request=r))
         rclpy.spin_until_future_complete(self, fut, timeout_sec=15.0)
         if not fut.done() or fut.result() is None:
-            return None
+            return None, "服务未应答(15s)"
         resp = fut.result()
         if resp.error_code.val != 1:
-            return None
+            return None, ERROR_NAMES.get(resp.error_code.val,
+                                         f"error_code={resp.error_code.val}")
         sol = dict(zip(resp.solution.joint_state.name,
                        resp.solution.joint_state.position))
-        return [sol[n] for n in p["arm_joint_names"]]
+        return [sol[n] for n in p["arm_joint_names"]], None
 
     def fk_heights(self, p, angles, links):
         req = GetPositionFK.Request()
@@ -276,12 +307,14 @@ def main():
 
         cases = build_cases(p, args.grid, stress=args.stress)
         print(f"{'候选位姿':<28}{'tool0 z':>9}{'夹爪':>6}   各连杆 z")
-        worst, unsolved, rejected = {}, 0, []
+        worst, unsolved, rejected, reasons = {}, 0, [], {}
         for label, x, y, z, grip in cases:
-            arm = pr.solve_ik(p, x, y, z, p["ik_seed"], grip)
+            arm, why = pr.solve_ik(p, x, y, z, p["ik_seed"], grip)
             if arm is None:
-                print(f"{label:<28}{z:>+9.3f}{grip:>6.2f}   ⛔ IK 失败")
+                print(f"{label:<28}{z:>+9.3f}{grip:>6.2f}   ⛔ IK 失败"
+                      f"（{why}）")
                 unsolved += 1
+                reasons[why] = reasons.get(why, 0) + 1
                 continue
             zs = pr.fk_heights(p, arm, links)
             bad = [k for k, v in zs.items() if v < floor]
@@ -306,6 +339,22 @@ def main():
 
         print(f"\nIK 解不出来的候选：{unsolved} / {len(cases)}"
               + ("（这些点位规划器会跳过并告警，不会硬发）" if unsolved else ""))
+        for why, cnt in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(f"     · {why}: {cnt} 个")
+            if "未应答" in why:
+                print("       ↳ 服务在但不回话：move_group 没有 /joint_states 时"
+                      " CurrentStateMonitor 拿不到状态，/compute_ik 会**挂住**。"
+                      "真机由 UR 驱动发 /joint_states；无臂预检要自己补"
+                      "（假 /joint_states，见 scripts/moveit_only_check.py）。")
+            elif why == "FRAME_TRANSFORM_FAILURE":
+                print("       ↳ 请求帧（base_frame）的 TF 查不到：无臂预检时"
+                      "**少 robot_state_publisher**（真机上由驱动顺带起）—— "
+                      "不是解不出来。")
+            elif why == "NO_IK_SOLUTION":
+                pass  # 不可达；边界上的属预期，下面的区提示已经覆盖
+            else:
+                print("       ↳ 含义见 moveit_msgs/MoveItErrorCodes；"
+                      "若集中在所有点位上，多半也是环境而不是几何。")
         if unsolved:
             # 区分「护栏问题」与「区框太大」：这是两种完全不同的处置。
             xs = [float(c[1]) for c in cases]
