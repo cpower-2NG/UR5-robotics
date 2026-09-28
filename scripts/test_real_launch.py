@@ -348,6 +348,87 @@ def _src(name):
     return (LAUNCH_DIR / name).read_text(encoding="utf-8")
 
 
+# 真机 / 仿真两条链路会起的可执行文件（含一个手工使用的）。D70 说的是它们
+# **收工时的样子** —— 只有在板上真的跑一遍才看得出来，所以拿自检钉住。
+NODE_MAINS = [
+    "ros2_ws/src/yolo_detector/yolo_detector/detector_node.py",
+    "ros2_ws/src/perception_3d/perception_3d/projector_node.py",
+    "ros2_ws/src/grasp_planner/grasp_planner/planner_node.py",
+    "ros2_ws/src/yolo_bringup/yolo_bringup/test_image_publisher.py",
+]
+
+
+def _is_attr_call(node, obj, attr):
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == attr
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == obj)
+
+
+def _is_spin_call(node):
+    """``rclpy.spin(...)`` 或 ``executor.spin()`` —— 两者抛的是同一族异常。
+
+    ⚠️ 只认 ``rclpy.spin`` 会漏掉 planner_node（它用
+    ``MultiThreadedExecutor().spin()``），而漏掉的后果是那条断言变成 SKIP、
+    看上去「不适用」，实际它**同样**会被 Ctrl-C 那段竞态打中。
+    """
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "spin")
+
+
+def shutdown_hygiene(path):
+    """检查一个节点文件的 ``main()`` 能不能**干净收工**（D70）。
+
+    返回 ``(找到几处 rclpy.shutdown(), 没被 rclpy.ok() 挡住的那些的行号,
+     spin 所在的 try 有没有接 ExternalShutdownException)``。
+
+    两条要求，都是 2026-09-28 板端实测出来的：
+      1. ``rclpy.shutdown()`` 必须包在 ``if rclpy.ok():`` 里。``rclpy.init()``
+         装的信号处理器在 SIGINT 时已经关过一次 context，**在 finally 里**再
+         无条件关一次会抛 ``RCLError``，而 finally 里抛出的异常**顶掉**原本那个
+         ⇒ launch 报 ``process has died ... exit code 1``。
+      2. ``rclpy.spin()`` 的那个 try 必须接 ``ExternalShutdownException``。
+         Ctrl-C 下 rclpy 抛的是它、**不是** ``KeyboardInterrupt``（只接后者的
+         话它一路逃出 main()，同样是一段 traceback）。
+    """
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    mains = [n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name == "main"]
+    calls, unguarded = [], []
+    spin_ok = None
+    for fn in mains:
+        for node in ast.walk(fn):
+            if _is_attr_call(node, "rclpy", "shutdown"):
+                calls.append(node.lineno)
+                if not _inside_rclpy_ok(fn, node):
+                    unguarded.append(node.lineno)
+        for t in [n for n in ast.walk(fn) if isinstance(n, ast.Try)]:
+            if not any(_is_spin_call(c) for c in ast.walk(t)):
+                continue
+            caught = set()
+            for h in t.handlers:
+                if h.type is None:                       # 裸 except：什么都接得住
+                    caught.add("ExternalShutdownException")
+                for sub in ast.walk(h.type) if h.type else []:
+                    if isinstance(sub, ast.Name):
+                        caught.add(sub.id)
+                    elif isinstance(sub, ast.Attribute):
+                        caught.add(sub.attr)
+            spin_ok = "ExternalShutdownException" in caught
+    return calls, unguarded, spin_ok
+
+
+def _inside_rclpy_ok(fn, target):
+    """``target`` 是否落在 ``fn`` 里某个 ``if rclpy.ok():`` 的分支内。"""
+    for node in ast.walk(fn):
+        if isinstance(node, ast.If) and _is_attr_call(node.test, "rclpy", "ok"):
+            if any(target is d for b in node.body for d in ast.walk(b)):
+                return True
+    return False
+
+
 def _lc_name(v):
     """取参数值指向的 launch 参数名。
 
@@ -878,6 +959,40 @@ def main():
         # 永远拿得到）。否则「一条都没比到」会伪装成全部通过。
         check("至少真的比过一条 include（否则上面几条是空断言）", seen >= 1,
               f"实际比了 {seen} 条")
+
+    # ------------------------------------------- W2-9 收工时的样子（D70）
+    # 2026-09-28 板端实测：同一份 launch 里，有 `rclpy.ok()` 闸门的
+    # planner_node 报 `process has finished cleanly`，没有它的 detector_node /
+    # projector_node 每次都报 `process has died ... exit code 1` ＋ 一段
+    # traceback。功能上无害，但**每次正常收工都像崩了**。
+    print("\n" + "-" * 56)
+    print("W2-9 收工时必须是「cleanly」，不是「died」（D70）")
+    seen_mains = 0
+    for rel in NODE_MAINS:
+        path = PROJECT_ROOT / rel
+        if not path.exists():
+            check(f"{Path(rel).name}：文件在", False, f"{path} 不存在")
+            continue
+        calls, unguarded, spin_ok = shutdown_hygiene(path)
+        name = Path(rel).name
+        if not calls:
+            check(f"{name}：main() 里找得到 rclpy.shutdown()", False,
+                  "一处都没找到 —— 断言会是空的（别让它静默通过）")
+            continue
+        seen_mains += 1
+        check(f"{name}：{len(calls)} 处 rclpy.shutdown() 都在 `if rclpy.ok():` 里",
+              not unguarded,
+              f"没挡住的行: {unguarded}" if unguarded else "")
+        if spin_ok is None:
+            skip(f"{name}：spin 的 try 接了 ExternalShutdownException",
+                 "main() 里没有 rclpy.spin —— 不适用")
+        else:
+            check(f"{name}：spin 的 try 接了 ExternalShutdownException", spin_ok,
+                  "" if spin_ok else
+                  "只接 KeyboardInterrupt 的话，Ctrl-C 会带着 traceback 逃出 main()")
+    # 正向对照：**必须**真的查到文件。查不到就是「0 个文件全部通过」那种假绿。
+    check("至少真的查了 3 个节点文件（否则上面几条是空断言）", seen_mains >= 3,
+          f"实际查了 {seen_mains} 个")
 
     # ------------------------------------------------------------------ 收尾
     print("\n" + "=" * 56)
