@@ -149,6 +149,15 @@ def main(args=None):
         # Ctrl-C 下 `spin()` 抛的是 `ExternalShutdownException`，不是
         # `KeyboardInterrupt`（rclpy 自己的信号处理器先关了 context）。
         pass
+    except Exception:
+        # D70 的第二个面：SIGINT 落在**定时器回调执行到 `publish` 那一行**时，
+        # rclpy 会把回调里的异常从 `spin_once` 重新抛出
+        # （`RCLError: Failed to publish: publisher's context is invalid`），
+        # 它绕过上面那个 except ⇒ 「正常收工」报成 `process has died`。
+        # 用 `rclpy.ok()` 而不是异常类型来判：rclpy 没有公开的 `RCLError` 别名。
+        # context 还活着就照抛，别把真正的发布失败一起藏起来。
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         # 已关过就别再关：无条件调会抛 RCLError，把「正常收工」变成

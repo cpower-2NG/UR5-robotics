@@ -382,9 +382,10 @@ def shutdown_hygiene(path):
     """检查一个节点文件的 ``main()`` 能不能**干净收工**（D70）。
 
     返回 ``(找到几处 rclpy.shutdown(), 没被 rclpy.ok() 挡住的那些的行号,
-     spin 所在的 try 有没有接 ExternalShutdownException)``。
+    spin 所在的 try 有没有接 ExternalShutdownException,
+    收工竞态有没有被 rclpy.ok() 闸门吞掉, main() 之外有几处 publish)``。
 
-    两条要求，都是 2026-09-28 板端实测出来的：
+    三条要求，都是 2026-09-28 板端实测出来的：
       1. ``rclpy.shutdown()`` 必须包在 ``if rclpy.ok():`` 里。``rclpy.init()``
          装的信号处理器在 SIGINT 时已经关过一次 context，**在 finally 里**再
          无条件关一次会抛 ``RCLError``，而 finally 里抛出的异常**顶掉**原本那个
@@ -392,12 +393,15 @@ def shutdown_hygiene(path):
       2. ``rclpy.spin()`` 的那个 try 必须接 ``ExternalShutdownException``。
          Ctrl-C 下 rclpy 抛的是它、**不是** ``KeyboardInterrupt``（只接后者的
          话它一路逃出 main()，同样是一段 traceback）。
+      3. 还要有一条**只在 context 还活着时才 re-raise** 的兜底：SIGINT 落在
+         回调执行到 ``publish`` 那一行时，rclpy 把回调里那个异常从 ``spin_once``
+         重新抛出，而它既不是第 1 种也不是第 2 种（见 `main()` 里那段注释）。
     """
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
     mains = [n for n in ast.walk(tree)
              if isinstance(n, ast.FunctionDef) and n.name == "main"]
     calls, unguarded = [], []
-    spin_ok = None
+    spin_ok = race_ok = None
     for fn in mains:
         for node in ast.walk(fn):
             if _is_attr_call(node, "rclpy", "shutdown"):
@@ -408,6 +412,7 @@ def shutdown_hygiene(path):
             if not any(_is_spin_call(c) for c in ast.walk(t)):
                 continue
             caught = set()
+            race_ok = False
             for h in t.handlers:
                 if h.type is None:                       # 裸 except：什么都接得住
                     caught.add("ExternalShutdownException")
@@ -416,8 +421,24 @@ def shutdown_hygiene(path):
                         caught.add(sub.id)
                     elif isinstance(sub, ast.Attribute):
                         caught.add(sub.attr)
+            # 第 3 条：某个处理器里有「`if rclpy.ok(): raise`」这道闸
+            for h in t.handlers:
+                for node in ast.walk(h):
+                    if (isinstance(node, ast.If)
+                            and _is_attr_call(node.test, "rclpy", "ok")
+                            and any(isinstance(d, ast.Raise)
+                                    for b in node.body for d in ast.walk(b))):
+                        race_ok = True
             spin_ok = "ExternalShutdownException" in caught
-    return calls, unguarded, spin_ok
+    # 回调里（= main() 之外）到底有没有 publish —— 第 3 条只对**有发布**的文件
+    # 成立。planner_node 一处 publish 都没有（它只发 action / service 请求），
+    # 拿这条去要求它就是个假阳性。
+    pub_lines = [n.lineno for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "publish"
+                 and not any(n is d for fn in mains for d in ast.walk(fn))]
+    return calls, unguarded, spin_ok, race_ok, pub_lines
 
 
 def _inside_rclpy_ok(fn, target):
@@ -973,7 +994,7 @@ def main():
         if not path.exists():
             check(f"{Path(rel).name}：文件在", False, f"{path} 不存在")
             continue
-        calls, unguarded, spin_ok = shutdown_hygiene(path)
+        calls, unguarded, spin_ok, race_ok, pub_lines = shutdown_hygiene(path)
         name = Path(rel).name
         if not calls:
             check(f"{name}：main() 里找得到 rclpy.shutdown()", False,
@@ -990,6 +1011,16 @@ def main():
             check(f"{name}：spin 的 try 接了 ExternalShutdownException", spin_ok,
                   "" if spin_ok else
                   "只接 KeyboardInterrupt 的话，Ctrl-C 会带着 traceback 逃出 main()")
+            if not pub_lines:
+                skip(f"{name}：收工竞态有 `if rclpy.ok(): raise` 兜底",
+                     "本文件在回调里一处 publish 都没有 —— 那条竞态不适用")
+            else:
+                check(f"{name}：收工竞态有 `if rclpy.ok(): raise` 兜底", bool(race_ok),
+                      "" if race_ok else
+                      f"回调里有 {len(pub_lines)} 处 publish（行 "
+                      f"{pub_lines}）：SIGINT 落在其中一行时，异常会从 spin_once "
+                      f"重抛出来、绕过上面那个 except"
+                      f"（板端实测：publisher's context is invalid）")
     # 正向对照：**必须**真的查到文件。查不到就是「0 个文件全部通过」那种假绿。
     check("至少真的查了 3 个节点文件（否则上面几条是空断言）", seen_mains >= 3,
           f"实际查了 {seen_mains} 个")

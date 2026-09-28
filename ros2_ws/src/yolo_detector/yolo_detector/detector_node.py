@@ -233,6 +233,12 @@ class YoloDetector(Node):
 
     def image_callback(self, msg: Image):
         """RGB 图像回调：运行 YOLO 推理，发布结果。"""
+        # 收工途中到达的帧直接丢：此时 context 已经无效，往下走必然在
+        # `publish` 上抛 `RCLError`（D70 的第二个面，见 `main()` 里那段说明）。
+        # 顺带省掉一次无用的推理。
+        if not rclpy.ok():
+            return
+
         try:
             # ROS Image → OpenCV BGR
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -352,6 +358,21 @@ def main(args=None):
         # 它关掉 context 之后 `spin()` 抛的是 **`ExternalShutdownException`**，
         # 不是 `KeyboardInterrupt`。只接后者的话它一路逃出 main()。
         pass
+    except Exception:
+        # D70 的**第二个面**（板端实测抓到的，第一个面修完才露出来）：
+        # SIGINT 落在**回调执行到 `publish` 那一行时**，rclpy 会把回调里的异常
+        # 从 `spin_once` 重新抛出（`executors.py:736 raise handler.exception()`）：
+        #
+        #     RCLError: Failed to publish: publisher's context is invalid
+        #
+        # 它既不是 `KeyboardInterrupt` 也不是 `ExternalShutdownException`，
+        # 于是绕过上面那个 except 逃出 main() —— 又是一个「正常收工看起来像崩了」。
+        # 判据用 `rclpy.ok()` 而**不是异常类型**：rclpy 没有公开的 `RCLError`
+        # 别名（实测 `rclpy.exceptions` 里没有它，只有私有的
+        # `rclpy._rclpy_pybind11.RCLError`），而「context 还活着吗」正是我们要
+        # 区分的那件事 —— context 活着就照抛，免得把真正的发布失败一起藏起来。
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         # ⚠️ 必须先 `rclpy.ok()`：信号处理器已经调过一次 `rcl_shutdown`，
