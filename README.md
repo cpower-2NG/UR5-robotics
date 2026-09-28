@@ -262,6 +262,20 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 
   另缺 AG-95 侧的 `pymodbus`（⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的
   `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
+- ✅ **检测这一半已在板上跑通**（2026-09-28 实测）：权重 `block_best.pt` **被 git 跟踪**，
+  `clone` 即得（sha256 `a926d959…`）；板上 `torch 2.5.0a0+nv24.08` + `ultralytics 8.4.26`
+  加载 0.1 s、`names={0:'block'}`、CUDA 可用；拿数据集里一张真图（9 个标注框）推理，
+  **9 个框全部对上、逐对 IoU ≥ 0.966**；预热后**单帧 38 ms**（约 26 FPS）。
+- 📷 **相机话题的「两层命名空间」陷阱**（真机部署最容易白忙一场的地方）：
+  `realsense2_camera` 发的是 **`/camera/camera/color/image_raw`**（`camera_namespace` 与
+  `camera_name` 默认都是 `camera`），而下游三处都写死单层。仓库里那组
+  `REALSENSE_REMAPS`（`pipeline.launch.py`）把它收回单层，**但它挂在相机节点上** ——
+  ⇒ 只有 `camera_source:=realsense`（**仓库自己拉相机**）才生效；
+  用 `camera_source:=external` 而自己手敲 `rs_launch.py` 起相机，**remap 不会生效**。
+  症状是**静默的**：`ros2 topic hz /camera/color/image_raw` 报
+  `does not appear to be published yet`，而相机其实在出图 —— 于是没有 `/detections`，
+  看起来像检测器坏了。2026-09-28 板端实测复现；`camera_namespace:=""` 改不掉（被 rcl 拒），
+  只能用 remap。
 - **别靠人肉比对清单**：依赖散在四个 `package.xml` 和若干**函数体内**的 `import` 里，
   靠眼睛看必然漏（`vision_msgs` 就是这么漏掉的）。用
   [`scripts/check_board_deploy.py`](scripts/check_board_deploy.py) 在板上跑一遍 ——
