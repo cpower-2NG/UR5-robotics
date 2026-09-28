@@ -215,10 +215,11 @@ export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PY
 python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学（3 项）
 python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
 python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
-python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生：77 项（本机，另有 2 项 SKIP）
-                                         #   板上是 78 项、1 SKIP（ur_robot_driver 只有板上有）
-                                         #   本机的两个 SKIP：一个是没装 ur_robot_driver，
-                                         #   一个是 planner_node 回调里没有 publish（不适用）
+python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生：80 项（本机，另有 3 项 SKIP）
+                                         #   板上是 81 项、2 SKIP（ur_robot_driver 只有板上有）
+                                         #   本机的三个 SKIP：没装 ur_robot_driver；
+                                         #   planner_node 与 fake_joint_states 回调里
+                                         #   没有 publish（那条竞态断言不适用）
                                          #   其中 9 项是「收工时必须是 cleanly」（W2-9，D70）
 python3 scripts/test_model_resolution.py # 加载的是哪个模型：12 项断言（D67）
 python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
@@ -249,6 +250,18 @@ python3 scripts/board_ctrlc_check.py     # 真起 pipeline，25 秒后写 \x03�
 它用 pty 复现真终端的中断，因为 `timeout` 和 `命令 &` **都会给出假结论**（整组信号
 ＋ `SIGINT` 继承），理由写在脚本 docstring 里 —— 那条值得一读，否则容易照着假故障去
 改本来正确的代码。
+
+**无臂 MoveIt 预检**（**在板子上跑**）——机械臂还没接线时，把 MoveIt 链路
+除驱动外的部分整条验一遍，顺带拿到抓取区/放置区的肘高余量：
+
+```bash
+python3 scripts/moveit_only_check.py     # 起无驱动 real.launch + RSP + 假 /joint_states，
+                                         # 再跑肘探针。零运动风险（没有 controller_manager）
+```
+
+⚠️ 它用**未标定** URDF，结论是「链路通＋余量级」；上电前的最终判读必须用
+`ur_calibration` 校准后的 URDF 重跑。两个实测踩过的坑（少 RSP ⇒ `FRAME_TRANSFORM_
+FAILURE`、少 `/joint_states` ⇒ `/compute_ik` **挂住不回话**）都写在脚本注释里。
 
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 
