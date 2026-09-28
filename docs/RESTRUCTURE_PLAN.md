@@ -2377,3 +2377,226 @@ CWD=~       -> None
   删除的两个权重文件**未被跟踪**，不进提交。
 - `migrate/humble-orin` 领先 `main` 的提交数**不写死**：本轮开始时实测 **52**。
 - **未推送**，`main` 未动（仍为 `0ab13ec`）。
+
+---
+
+#### 第二十轮：板端部署的第一条命令，实测**是坏的**（2026-09-28）
+
+##### 一、那个「既定做法」从来没被执行过
+
+台账与 README 一路写着「板端只编子集即可」。第十九轮验了它的**下半段**（缺
+`arm_grasp_sim` 时 launch 不会炸）。这一轮验**上半段**：那条 `colcon build` 命令本身。
+
+做法是**不碰现有 install**：把 build/install/log 都指到临时目录，在工作站上跑板子
+将要跑的那条命令。
+
+##### 二、D68：`--packages-select` 那四包，在完整工作区里**构建失败**
+
+```
+$ colcon --log-base /tmp/sublog build --packages-select yolo_bringup perception_3d \
+      yolo_detector grasp_planner --build-base /tmp/subbuild --install-base /tmp/subinstall
+Starting >>> grasp_planner / perception_3d / yolo_detector
+Finished <<< grasp_planner [1.27s] / perception_3d [1.25s] / yolo_detector [1.25s]
+Starting >>> yolo_bringup
+[1.860s] ERROR:colcon.colcon_ros.task.ament_python.build:Failed to find the following files:
+- /tmp/subinstall/arm_grasp_sim/share/arm_grasp_sim/package.sh
+Check that the following packages have been built:
+- arm_grasp_sim
+Failed   <<< yolo_bringup [0.00s, exited with code 1]
+```
+
+**三个包成功，`yolo_bringup` 失败** —— 而它正是「唯一入口」，没有它这条链路什么都起不来。
+
+报错本身**把人往错方向指**：它让你「检查 `arm_grasp_sim` 有没有编译」，而
+`arm_grasp_sim` 恰恰是**板上不该编、也编不了**的那个包（它依赖 `gz_ros2_control`、
+Gazebo，板上没有也不需要）。照报错去做，只会在板上白装一整套仿真后端。
+
+**原因**：`yolo_bringup/package.xml` 声明了 `exec_depend arm_grasp_sim`（那是有意的，
+注释里写明了理由），而 colcon 构建 Python 包时需要**工作区内依赖**的 install 环境 ——
+即使该依赖**没有被选中**。所以「包在源码树里」和「包被编出来」两件事，colcon 在这里
+是分开算的：前者足以让它期待后者的 `package.sh`。
+
+##### 三、两个可行的做法（都实测过）
+
+| 做法 | 命令 | 实测 |
+|---|---|---|
+| **加一个 flag**（推荐） | `colcon build --packages-select <四包> --packages-ignore arm_grasp_sim` | ✅ 4 个包，2.11 s |
+| **工作区里根本没有它** | 部署时不把 `arm_grasp_sim/` 拷到板上，然后普通 `colcon build` | ✅ 4 个包，2.17 s |
+
+第二种是把「板上不需要仿真资产」贯彻到**部署内容**上，更彻底；第一种在
+「clone 整个仓库」这种最省事的部署方式下也能用。两条都写进了 README。
+
+##### 四、顺带验完的：子集装好之后能不能真的加载（板子的真实形状）
+
+用临时 install 目录 + **环境里确实没有 `arm_grasp_sim`**（实测 `PackageNotFoundError`
+的搜索路径里只有那四个包与 `/opt/ros/humble`）跑了两条：
+
+| 命令 | 期望 | 实测 |
+|---|---|---|
+| `bringup.launch.py camera_source:=realsense --show-args` | 能加载并列出参数 | ✅ 正常列出（含 `--show-args` 不再被缺包拖死，这正是第十八轮那条的**端到端**验证） |
+| `bringup.launch.py`（默认 `camera_source:=sim`） | 中止 + 可操作报错 + **什么都不启动** | ✅ 报错文案完整（含补编命令与 `camera_source:=realsense` 的出路），无任何节点启动 |
+
+⇒ **第十八轮验的是「函数在缺包时不会炸」，这一轮验的是「真按板子的形状装出来、
+真用 `ros2 launch` 起」** —— 两件事不是一回事，都能过才是真的。
+
+##### 五、新登记的一个坑：板上**不能**直接 `ros2 launch yolo_bringup bringup.launch.py`
+
+`camera_source` 的默认值是 **`sim`**。所以板上那条最自然的命令会去找
+`arm_grasp_sim` 并中止。这不是缺陷（默认值必须有一个，工作站上 `sim` 是对的，
+而且报错文案明确给了出路），但它是**板上的第一脚就会踩到**的东西，故写进 README：
+板上第一条命令按目的选 `camera_source:=external`（只起上层四节点，不碰驱动/MoveIt/臂）
+或 `camera_source:=realsense robot_ip:=<控制箱 IP>`。
+
+##### 六、新增到 `docs/待执行命令.md` 的条目
+
+- **甲-8**：编子集（含 `--packages-ignore` 及**不带它的实际报错**）。
+- **甲-9**：编完先跑 `camera_source:=external` 验感知链路（不碰臂）。
+- 新增「**板端部署（整条路）**」一节：4 步的顺序表，并点明**走到第 4 步都不需要
+  机械臂上电、不需要控制箱、不需要授权**；第 4 步之后的真机步骤仍在 W5。
+
+##### 七、未验证 / 未做
+
+- **板上仍未部署**：甲-7 ~ 甲-9 全部未执行。本轮验的是**命令的形状**（本机预演），
+  不是「板上能过」—— 板上还多两个变量：**aarch64** 与**板的 Python 3.10.12**
+  （本机预演用的是工作站环境）。⚠️ 这两个变量没有通过预演消除，别把本节读成
+  「板上一定行」。
+- 板上有没有 `image_geometry` / `cv_bridge` / `vision_msgs` 等**运行期**依赖，
+  仍未逐个核对（`control_msgs` 已由 D66 那次板上自检间接证明存在）。
+- 真机 launch（W2）与现场步骤（W5）不变。
+
+##### 八、状态
+
+- 本轮 1 个提交（README + 待执行命令 + 本节）。
+- `migrate/humble-orin` 领先 `main` 的提交数**不写死**：本轮开始时实测 **53**。
+- **未推送**，`main` 未动（仍为 `0ab13ec`）。
+
+#### 第二十一轮：板上缺的**不是** pymodbus，是 `vision_msgs`（2026-09-28）
+
+##### 一、上一轮留下的那句话，这一轮去掉了
+
+第二十轮第七节写着「板上有没有 `image_geometry` / `cv_bridge` / `vision_msgs` 等运行期
+依赖，仍未逐个核对」。这一轮就是把这句话执行掉 —— 方法是**从代码推导出该核对什么**，
+而不是照着一份人手写的清单去问。理由见第四节：`vision_msgs` 正是被清单漏掉的那一个。
+
+##### 二、D69：`vision_msgs` 在板上不存在，而三个节点都在**模块级** import 它
+
+```
+$ ssh jetson 'bash -c "source /opt/ros/humble/setup.bash; python3 -c \
+    \"import vision_msgs\""'
+ModuleNotFoundError: No module named 'vision_msgs'
+
+$ ssh jetson 'bash -c "source /opt/ros/humble/setup.bash; apt-cache policy \
+    ros-humble-vision-msgs"'
+  Installed: (none)
+  Candidate: 4.1.1-1jammy.20260907.225757   # jammy/main arm64，能装
+```
+
+三个节点都是**模块级** import（不是函数体内，所以没有「先起来再崩」的中间态）：
+
+| 文件 | 行 | import |
+|---|---|---|
+| `yolo_detector/detector_node.py` | 38 | `from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose` |
+| `perception_3d/projector_node.py` | 51 | `from vision_msgs.msg import (...)` |
+| `grasp_planner/planner_node.py` | 91 | `from vision_msgs.msg import Detection3DArray` |
+
+**后果是「三个节点全都起不来」**，而不是「少一个消息包」。这个症状离原因很远：
+看起来像项目坏了、像 Python 环境错了、像 colcon 装错了，唯独不像缺一个 apt 包。
+按部署次序（`docs/待执行命令.md` 的「板端部署（整条路）」），它卡在**第 2 步之后、
+第 4 步（起上层链路）**上 —— 而第 2 步 `colcon build` 是**会成功的**，因为
+`vision_msgs` 只被 `exec_depend` 声明，构建期不需要它。于是现场会看到
+「装得好好的，一 launch 三个节点全死」。
+
+顺带确证：板上**没有** `pymodbus` 之外的第二类问题被混淆 —— README 原先那句
+「缺的只有 AG-95 侧的 `pymodbus`」**是错的**，本轮已改。
+
+##### 三、为什么这次不是「再看一遍文档」
+
+依赖在仓库里有两个来源，**人眼看必然漏**：
+
+1. 四个 `package.xml` 的 `depend` / `exec_depend` / `build_depend` —— 这部分还算好查；
+2. 节点源码里**函数体内**的 `import` —— 这部分最容易被漏，而且漏了以后症状更晚出现：
+   `detector_node.py:85` 的 `import torch` 在 `__init__` 里、
+   `:148` 的 `from ultralytics import YOLO` 在**加载模型时**才执行。
+   这类缺失的表现是「节点起来了，一加载模型就崩」，比模块级缺失更难归因。
+
+所以新增了 [`scripts/check_board_deploy.py`](../scripts/check_board_deploy.py)：
+它在板上跑，**自己从代码里推导要检查什么**（两个来源都扫），只读、不需要 sudo、
+不启动任何节点。缺什么直接给出该装哪一条，装完再跑一遍即可。三段输出：
+
+| 段 | 检查什么 | 数据来源 |
+|---|---|---|
+| 1 | ROS 包依赖 | 四个 `package.xml`（跳过板上刻意不装的 `arm_grasp_sim`） |
+| 2 | Python 模块 | 四个节点源码的**全部** `import`，含函数体内；滤掉标准库与包内自引用 |
+| 3 | 模型权重解析 | **调用** `detector_node._resolve_model()` 本体（不重写它的逻辑） |
+
+第 3 段是 D67 的现场体检：它回答「默认参数在当前目录解析到哪个 `block_best.pt`」，
+并提示「启动日志里的 `Loading YOLO model:` 应当就是这一行」。
+
+##### 四、这个工具**自己的第一个板端运行**就抓到了它自己的一个错
+
+这是本轮最值得记的一条。第一版第 2 段这样判断「该 apt 还是该 pip」：**去 ament 索引里
+问「这是不是 ROS 包」**。而在板上跑出来的正是：
+
+```
+  [MISS] vision_msgs  (被 grasp_planner/perception_3d/yolo_detector 需要)
+         修法: sudo apt install ros-humble-vision-msgs      ← 第 1 段，对的
+  [MISS] vision_msgs  (被 ... import) —— ModuleNotFoundError
+         修法: pip3 install vision_msgs                     ← 第 2 段，**错的**
+```
+
+错因是**循环**：这个包**正因为缺失**才在索引里查不到，于是「是不是 ROS 包」必然答
+「不是」，于是给出 pip 建议。**一个用于防止「报错文案把方向指反」的工具，自己在同一个
+位置给出了指反的建议** —— 与 D66（探针把「参数名换代」说成「版本太老」）是同一类错误。
+
+改法：不再问环境（环境正是因为缺失才答不了），改成**静态判据** ——
+在 `package.xml` 里声明过，或者名字符合 ROS 生态的惯例（`*_msgs` 后缀、
+`rclpy`/`cv_bridge`/`image_geometry`、`tf2*`/`ament_*`/`launch*` 前缀）。
+后者不是拍脑袋：`planner_node.py:89` 的 `shape_msgs` 与 `:78` 的 `action_msgs`
+**都没在 `package.xml` 里声明**，但确实由 ROS 提供 —— 只靠「声明过」判断会把它们
+误判成 pip 包。
+
+并给这个纯函数加了 `--self-test`（9 条，不需要 ROS、本机可跑），把这次的错钉住：
+`vision_msgs → apt`、`action_msgs → apt`（未声明但 ROS 提供）、`ultralytics → pip`。
+
+##### 五、实测结果
+
+| 环境 | 结果 |
+|---|---|
+| 本机（工作站 venv + `ros2_ws/install`） | **全部就绪**（exit 0）。第 3 段解析到仓库根那份 `block_best.pt`，正是第十九轮处置后期望的状态 |
+| **板子（Orin）** | 第 1、2 段**各报一条 `vision_msgs` MISS，两处的修法都已是 apt**；第 3 段按设计降级为 `[SKIP]`，并说明「上一条的缺失就是原因」（exit 1） |
+
+第 3 段的 `[SKIP]` 是**故意的**：`detector_node` 因为缺 `vision_msgs` 根本 import 不进来，
+所以「读不到 `_resolve_model`」这件事不可能是别的原因。这条降级路径在板端实际走到了。
+
+板子上的 `/tmp/deploycheck`（本轮为验证建的临时仓库副本，244 KB）**已删除**；
+`apt-cache policy` 只读；没装任何包、没改板子状态。
+
+##### 六、顺带更正的两处说法
+
+- **README**「缺的只有 AG-95 侧的 `pymodbus`」→ 改为把 `vision_msgs` 放在前面，
+  并给出 apt 那一行；同时把「别靠人肉比对清单」写进去、指向新脚本。
+- **我自己的**：`check_board_deploy.py` 第一版的 docstring 拿
+  「`gripper.py` 里的 `pymodbus`」当「函数体内 import」的例子 —— **是错的**。
+  `gripper.py` 全文没有 `pymodbus` 的 import（`:332` 只是报错文案里提到它；
+  `Ag95Gripper` 目前仍是构造即报错的桩）。例子已换成真实存在的
+  `detector_node.py:85` 的 `import torch`（`__init__` 里）与 `:148` 的
+  `from ultralytics import YOLO`（加载时）。⇒ 工具扫出来的结果是对的，**注释是错的**，
+  这类错不会让自检变红，只能靠读。
+
+##### 七、未验证 / 未做
+
+- **没在板上装 `vision_msgs`**（要 sudo；命令已进 `docs/待执行命令.md` 的甲-10）。
+  所以「装完之后三个节点是否真能起来」**仍未验证** —— 本轮的结论只到
+  「缺它 ⇒ 起不来」这一步。
+- 本轮的板端检查是在**临时副本** `/tmp/deploycheck` 上跑的，**不是**在板上正式部署的
+  仓库里。真正的部署（甲-7 ~ 甲-10）仍未开始。
+- `ros2_ws/src` 之外的东西（`scripts/ag95_probe.py` 需要的 `pymodbus`）不在本脚本范围，
+  由甲-5 覆盖 —— 原因是它属于部署第 5 步，晚于本脚本要回答的「链路能不能起来」。
+- 真机 launch（W2）与现场步骤（W5）不变。
+
+##### 八、状态
+
+- 本轮 1 个提交（`scripts/check_board_deploy.py` + README + 待执行命令 + 本节）。
+- `migrate/humble-orin` 领先 `main` 的提交数**不写死**：实测 `git rev-list --count
+  main..migrate/humble-orin` = **53**（第二十、二十一轮的改动尚未提交，提交后会更多）。
+- **未推送**，`main` 未动（仍为 `0ab13ec`）。
