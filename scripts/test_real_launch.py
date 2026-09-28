@@ -37,9 +37,19 @@
 """
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
+
+try:  # 只为 W2-16 里「把别人包的真路径解回来」用；缺了也不该让整份自检跑不起来
+    from ament_index_python.packages import (
+        PackageNotFoundError,
+        get_package_share_directory as _gpsd,
+    )
+except ImportError:  # pragma: no cover —— 没 source ROS 时下面会先报错退出
+    PackageNotFoundError = Exception  # type: ignore[assignment,misc]
+    _gpsd = None  # type: ignore[assignment]
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LAUNCH_DIR = PROJECT_ROOT / "ros2_ws" / "src" / "yolo_bringup" / "launch"
@@ -563,6 +573,111 @@ def main():
               err or f"返回了 {out!r}")
 
         bringup.get_package_share_directory = real_lookup
+
+    # ------------------------------------ 传给「别人的」launch 文件的参数名必须真实存在
+    print("\n--- W2-16 传进被 include 的文件里的参数名，必须真被那个文件声明 ---")
+    # 为什么值得单独钉：**参数名拼错在 launch 里是静默的**。`launch_arguments`
+    # 写一个上游没声明的键，launch 只是把它塞进 launch_configurations，上游照旧
+    # 用自己的默认值 —— 不报错、不警告，行为与「没传」完全一样。于是
+    # `"launch_servo": "false"` 一旦写成 `"launch_servoo"`，就悄悄退回 `true`，
+    # 起一个**能直接指挥机器人**的节点（D59）。真机上这种错要靠「怎么 servo 起来了」
+    # 才被发现，而那时候臂已经接上了。
+    #
+    # 做法是**问 launch 自己**而不是猜：载入 real.launch.py，把三个 include 拿
+    # 出来，读它真正持有的 launch_arguments，再拿被 include 的文件的声明去比。
+    # ⚠️ 读私有字段是有意的（同 `node_params`）：`IncludeLaunchDescription` 的
+    # 这两个东西没有公开访问器，而我们在执行前读。
+    if real is None:
+        skip("include 参数名核对", "real.launch.py 不存在")
+    else:
+        from launch import LaunchContext
+        from launch.actions import IncludeLaunchDescription
+        from launch.utilities import perform_substitutions
+
+        confs = {"start_ur_driver": "true", "start_moveit": "true",
+                 "start_pipeline": "true", "robot_ip": "1.2.3.4"}
+
+        def _includes(mod):
+            """[(来源标签, IncludeLaunchDescription 实体, 出错说明)]。
+
+            三个 include 分两处产出：驱动与 move_group 是 `_driver` / `_moveit`
+            两个 OpaqueFunction **执行期**返回的，pipeline 那个在
+            `generate_launch_description()` 的实体树里（裹在 IfCondition 里）。
+            两边都取，别只取一处 —— 只取实体树会漏掉两个 ur_*，
+            那样「比过几条」的对照还会假装通过。
+            """
+            out = []
+            for fn in (mod._driver, mod._moveit):
+                try:
+                    ents = list(fn(ctx(**confs)))
+                except Exception as exc:  # noqa: BLE001 —— 缺包时这里会抛（正常）
+                    out.append((fn.__name__, None, f"{type(exc).__name__}: {exc}"))
+                    continue
+                out += [(fn.__name__, e, None) for e in _walk(ents)
+                        if isinstance(e, IncludeLaunchDescription)]
+            out += [("generate_launch_description", e, None)
+                    for e in _walk(mod.generate_launch_description().entities)
+                    if isinstance(e, IncludeLaunchDescription)]
+            return out
+
+        seen = 0
+        for label, e, err in _includes(real):
+            if err is not None or not isinstance(e, IncludeLaunchDescription):
+                # 缺包（本机没有 ur_robot_driver）—— 按仓库约定 SKIP 并给原因，
+                # 不当成通过。板子上这几个包都在，同一条断言在板上会真跑。
+                skip(f"{label} 的 include 参数名核对",
+                     f"环境里拿不到：{err.splitlines()[0] if err else '?'}")
+                continue
+            src_obj = e._IncludeLaunchDescription__launch_description_source
+            # 路径藏在 `location` 里，是一串 substitution（**没有** `launch_file_path`
+            # 这种属性 —— 找它只会得到 None，于是整条断言静默变 SKIP，第一版就是这样）。
+            path = perform_substitutions(
+                LaunchContext(), src_obj._LaunchDescriptionSource__location)
+            keys = sorted(k for k, _ in e._IncludeLaunchDescription__launch_arguments)
+            if not path or not keys:
+                skip(f"{label} 的 include 参数名核对", "没读到路径或键")
+                continue
+            # 先认**本仓库的源码**：`LAUNCH_DIR` 下的同名文件就是它。
+            #   · `install/` 是拷贝安装、可能滞后（launch 改了要重新 colcon build）；
+            #   · `load_launch` 还**故意**把查包函数换成 `/nonexistent/<pkg>`，
+            #     所以本仓库文件的路径到这里本来就是假的。
+            # 这一条要在「解包路径」**之前**判：否则板子上没 colcon build 时，
+            # yolo_bringup 解不出来，本仓库自己的 pipeline.launch.py 反而被 SKIP
+            # （第一版就是这个顺序，板子上看到的结果就是这么来的）。
+            local = LAUNCH_DIR / Path(path).name
+            if local.is_file():
+                target = local
+            else:
+                # 别人包的路径是假的时候，用**真的**查包函数重新解一次 ——
+                # 否则本机明明装了 ur_moveit_config，也会因为读到
+                # `/nonexistent/...` 而 SKIP，白白少测一条。
+                if path.startswith("/nonexistent/"):
+                    rest = path[len("/nonexistent/"):]
+                    pkg, tail = rest.split("/", 1)
+                    try:
+                        path = os.path.join(_gpsd(pkg), tail)
+                    except PackageNotFoundError:
+                        skip(f"{label} 的 include 参数名核对",
+                             f"没装 {pkg}（不在 /opt/ros/humble 里）")
+                        continue
+                target = Path(path)
+            mod = load_launch_at(target)
+            if mod is None:
+                skip(f"{label} 的 include 参数名核对", f"载入不了 {target}")
+                continue
+            declared = {n for n, _ in declared_names(mod)}
+            undeclared = [k for k in keys if k not in declared]
+            seen += 1
+            check(f"{Path(path).name}：real.launch.py 传了 {len(keys)} 个参数，"
+                  f"都在它自己的声明里（{label}）",
+                  bool(declared) and not undeclared,
+                  f"它没声明: {undeclared}" if undeclared else
+                  ("" if declared else "读不到任何声明 —— 断言是空的"))
+
+        # 正向对照：**必须**至少比过一条（pipeline 那个是本仓库自己的文件，
+        # 永远拿得到）。否则「一条都没比到」会伪装成全部通过。
+        check("至少真的比过一条 include（否则上面几条是空断言）", seen >= 1,
+              f"实际比了 {seen} 条")
 
     # ------------------------------------------------------------------ 收尾
     print("\n" + "=" * 56)
