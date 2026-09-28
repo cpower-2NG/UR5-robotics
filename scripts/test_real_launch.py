@@ -383,9 +383,10 @@ def shutdown_hygiene(path):
 
     返回 ``(找到几处 rclpy.shutdown(), 没被 rclpy.ok() 挡住的那些的行号,
     spin 所在的 try 有没有接 ExternalShutdownException,
-    收工竞态有没有被 rclpy.ok() 闸门吞掉, main() 之外有几处 publish)``。
+    收工竞态有没有被 rclpy.ok() 闸门吞掉, main() 之外有几处 publish,
+    main() 里有几处 destroy_node, 其中没挡住 KeyboardInterrupt 的行号)``。
 
-    三条要求，都是 2026-09-28 板端实测出来的：
+    四条要求，都是 2026-09-28 板端实测出来的：
       1. ``rclpy.shutdown()`` 必须包在 ``if rclpy.ok():`` 里。``rclpy.init()``
          装的信号处理器在 SIGINT 时已经关过一次 context，**在 finally 里**再
          无条件关一次会抛 ``RCLError``，而 finally 里抛出的异常**顶掉**原本那个
@@ -396,18 +397,29 @@ def shutdown_hygiene(path):
       3. 还要有一条**只在 context 还活着时才 re-raise** 的兜底：SIGINT 落在
          回调执行到 ``publish`` 那一行时，rclpy 把回调里那个异常从 ``spin_once``
          重新抛出，而它既不是第 1 种也不是第 2 种（见 `main()` 里那段注释）。
+      4. ``destroy_node()`` 必须挡住 ``KeyboardInterrupt``。``ros2 launch`` 收到
+         SIGINT 后会把 SIGINT **转发**给每个子进程，于是子进程一共收到两次；实测
+         第二次落在 ``destroy_node()`` 里面（rclpy 的
+         ``client.destroy_when_not_in_use``），抛 ``KeyboardInterrupt`` 从
+         finally 逃出去 ⇒ traceback ＋ ``process has died ... exit code -2``。
     """
     tree = ast.parse(Path(path).read_text(encoding="utf-8"))
     mains = [n for n in ast.walk(tree)
              if isinstance(n, ast.FunctionDef) and n.name == "main"]
     calls, unguarded = [], []
     spin_ok = race_ok = None
+    teardown, teardown_unguarded = [], []
     for fn in mains:
         for node in ast.walk(fn):
             if _is_attr_call(node, "rclpy", "shutdown"):
                 calls.append(node.lineno)
                 if not _inside_rclpy_ok(fn, node):
                     unguarded.append(node.lineno)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr == "destroy_node":
+                teardown.append(node.lineno)
+                if not _protected_from(fn, node):
+                    teardown_unguarded.append(node.lineno)
         for t in [n for n in ast.walk(fn) if isinstance(n, ast.Try)]:
             if not any(_is_spin_call(c) for c in ast.walk(t)):
                 continue
@@ -438,7 +450,25 @@ def shutdown_hygiene(path):
                  and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "publish"
                  and not any(n is d for fn in mains for d in ast.walk(fn))]
-    return calls, unguarded, spin_ok, race_ok, pub_lines
+    return calls, unguarded, spin_ok, race_ok, pub_lines, teardown, teardown_unguarded
+
+
+def _protected_from(fn, target, names=("KeyboardInterrupt", "BaseException")):
+    """``target`` 是否落在 ``fn`` 里某个 ``try`` 的**体**内，且那个 try 的处理器
+    接得住 ``names`` 里的异常（裸 ``except`` 也算）。"""
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Try):
+            continue
+        if not any(target is d for b in node.body for d in ast.walk(b)):
+            continue
+        for h in node.handlers:
+            if h.type is None:
+                return True
+            for sub in ast.walk(h.type):
+                name = sub.id if isinstance(sub, ast.Name) else getattr(sub, "attr", None)
+                if name in names:
+                    return True
+    return False
 
 
 def _inside_rclpy_ok(fn, target):
@@ -994,7 +1024,8 @@ def main():
         if not path.exists():
             check(f"{Path(rel).name}：文件在", False, f"{path} 不存在")
             continue
-        calls, unguarded, spin_ok, race_ok, pub_lines = shutdown_hygiene(path)
+        calls, unguarded, spin_ok, race_ok, pub_lines, teardown, teardown_bad = \
+            shutdown_hygiene(path)
         name = Path(rel).name
         if not calls:
             check(f"{name}：main() 里找得到 rclpy.shutdown()", False,
@@ -1021,6 +1052,17 @@ def main():
                       f"{pub_lines}）：SIGINT 落在其中一行时，异常会从 spin_once "
                       f"重抛出来、绕过上面那个 except"
                       f"（板端实测：publisher's context is invalid）")
+            # 第 4 条：收工清理本身要扛得住第二次 SIGINT（`ros2 launch` 会把
+            # SIGINT 转发给子进程，于是子进程收到两次）。
+            if not teardown:
+                skip(f"{name}：收工清理扛得住第二次 SIGINT",
+                     "main() 里没有 destroy_node —— 不适用")
+            else:
+                check(f"{name}：{len(teardown)} 处 destroy_node() 挡住了 KeyboardInterrupt",
+                      not teardown_bad,
+                      f"没挡住的行: {teardown_bad}（第二次 SIGINT 落进去就是一段 "
+                      f"traceback ＋ `process has died ... exit code -2`）"
+                      if teardown_bad else "")
     # 正向对照：**必须**真的查到文件。查不到就是「0 个文件全部通过」那种假绿。
     check("至少真的查了 3 个节点文件（否则上面几条是空断言）", seen_mains >= 3,
           f"实际查了 {seen_mains} 个")
