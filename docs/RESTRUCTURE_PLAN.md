@@ -2132,4 +2132,5 @@ def _slave_kwarg(client_cls) -> Optional[str]:
 
 ##### 六、状态
 
-- `migrate/humble-orin`：本轮 2 个提交（修 D66 + 文档），**未推送**，`main` 未动。
+- `migrate/humble-orin`：本轮 1 个提交（修 D66，代码与文档同一个提交），
+  **未推送**，`main` 未动。
