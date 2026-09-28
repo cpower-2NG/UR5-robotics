@@ -2604,3 +2604,129 @@ $ ssh jetson 'bash -c "source /opt/ros/humble/setup.bash; apt-cache policy \
 - `migrate/humble-orin` 领先 `main` 的提交数**不写死**：实测 `git rev-list --count
   main..migrate/humble-orin` = **53**（第二十、二十一轮的改动尚未提交，提交后会更多）。
 - **未推送**，`main` 未动（仍为 `0ab13ec`）。
+
+#### 第二十二轮：把第二十轮那句「板上一定行」实测掉（板端 aarch64）（2026-09-28）
+
+##### 一、上一轮明确留下的缺口
+
+第二十轮的第七节自己写着：
+
+> 「不是「板上能过」—— 板上还多两个变量：**aarch64** 与**板的 Python 3.10.12**
+> （本机预演用的是工作站环境）。⚠️ 这两个变量没有通过预演消除，别把本节读成
+> 「板上一定行」。」
+
+这一轮就是去消掉它。第二十一轮又把「装 `vision_msgs` 之前 `colcon build`
+**会成功**」写进了 README 与甲-10 —— 那也是**断言**，而且正好落在 D68 同一类
+（colcon 到底会不会去找工作区外、又装不上的依赖？D68 已经证明它会去要
+`arm_grasp_sim` 的 install 环境）。所以两件事一起验。
+
+##### 二、做法：往板子的 `/tmp` 拷一份源码，build/install 全指到临时目录
+
+不碰板上任何既有目录（`~/yahboom_ws`、`~/ultralytics` 都原样）。源码只有 776 KB
+（五个包都是纯 Python，最大的 `yolo_bringup` 196 KB）。
+
+```
+$ tar cz -C ros2_ws src | ssh jetson 'rm -rf /tmp/buildcheck && mkdir -p \
+      /tmp/buildcheck/ros2_ws && tar xz -C /tmp/buildcheck/ros2_ws && du -sh /tmp/buildcheck'
+776K	/tmp/buildcheck
+```
+
+##### 三、甲-8 那条命令，在板上**确实通过**（且 `vision_msgs` 没装）
+
+```
+$ ssh jetson   # source /opt/ros/humble/setup.bash
+$ cd /tmp/buildcheck/ros2_ws
+$ colcon --log-base /tmp/buildcheck/log build \
+      --packages-select yolo_bringup perception_3d yolo_detector grasp_planner \
+      --packages-ignore arm_grasp_sim \
+      --build-base /tmp/buildcheck/build --install-base /tmp/buildcheck/install
+Starting >>> grasp_planner / perception_3d / yolo_detector
+Finished <<< yolo_detector [3.00s] / perception_3d [3.04s] / grasp_planner [3.06s]
+Starting >>> yolo_bringup
+Finished <<< yolo_bringup [1.83s]
+
+Summary: 4 packages finished [5.48s]
+colcon exit=0
+```
+
+⇒ 第二十轮那句缺口**消掉了**：aarch64 + Python 3.10.12 + `setuptools 59.6.0`
+（板上的，比工作站的旧）都通过。同时这也确证了「**没装 `vision_msgs` 也能编过**」——
+`vision_msgs` 只是 `exec_depend`，构建期真的不需要它。这条正是甲-10 存在的理由：
+**第 3 步会成功，问题要到第 5 步才炸**。
+
+##### 四、README 给的「等效做法」也在板上通过
+
+README 说「另一种等效做法是**部署时就不把 `arm_grasp_sim` 拷到板上**」。把它从工作区
+删掉、**不带** `--packages-ignore` 再编一遍：
+
+```
+Summary: 4 packages finished [5.36s]
+colcon exit=0
+```
+
+两条路都在板上实测通过。⚠️ 但两条**不是**完全等价：如果 `arm_grasp_sim` 的源码在板上
+而你不带 flag，colcon 会去编它 —— 那个包要 Gazebo / `gz_ros2_control`，板上没有。
+所以「不带 flag」只在**源码也不在**时成立。
+
+##### 五、甲-9 的形状：今天跑，三个节点**确实全死**（这就是甲-10 的现场）
+
+第二十一轮只能从「模块级 import」推断症状。这一轮把它**跑出来**：
+
+```
+$ source /tmp/buildcheck/install/setup.bash
+$ ros2 launch yolo_bringup bringup.launch.py camera_source:=external
+[INFO] [detector_node-1]: process started with pid [90935]
+[INFO] [projector_node-2]: process started with pid [90937]
+[INFO] [planner_node-3]: process started with pid [90939]
+[detector_node-1]  from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
+[detector_node-1]  ModuleNotFoundError: No module named 'vision_msgs'
+[projector_node-2] from vision_msgs.msg import (
+[projector_node-2] ModuleNotFoundError: No module named 'vision_msgs'
+[planner_node-3]   from vision_msgs.msg import Detection3DArray
+[planner_node-3]   ModuleNotFoundError: No module named 'vision_msgs'
+[ERROR] [detector_node-1]: process has died [pid 90935, exit code 1, ...]
+[ERROR] [projector_node-2]: process has died [pid 90937, exit code 1, ...]
+[ERROR] [planner_node-3]: process has died [pid 90939, exit code 1, ...]
+```
+
+三个都**起来了又立刻死**（exit code 1），每一个的 traceback 末行都是同一件事。
+**这就是第二十一轮说的「看起来像项目坏了、像 Python 环境错了」的现场长相** ——
+`process has died` 长得像崩溃，而它其实只是一个 apt 包没装。
+
+⇒ 「先装 `vision_msgs`（甲-10）再起链路（甲-9）」这个次序，现在是**实测**的，
+不是推断的。
+
+##### 六、顺带验完的：D50 的修复在真机入口下**真的生效**（aarch64 上）
+
+上面那次 launch 的 `planner_node` 命令行里带着：
+
+```
+/tmp/buildcheck/install/grasp_planner/lib/grasp_planner/planner_node
+  --ros-args -r __node:=grasp_planner
+  --params-file /tmp/buildcheck/install/grasp_planner/share/grasp_planner/config/grasp_planner.yaml
+  --params-file /tmp/launch_params_r9js2nk3
+```
+
+`grasp_planner.yaml` **在真实入口（`bringup.launch.py`）的参数表里** —— 这正是 D50
+当年缺的东西（当年只有 `{'gripper_backend': ...}`）。上一轮是在工作站上验的 D50，
+这一轮在板上、用真实 launch、看真实进程的命令行，得到同一结论。
+（路径解析在 `install/` 下、由 `get_package_share_directory('yolo_bringup')` 那条
+修法给出 —— 见第十八轮。）
+
+##### 七、未验证 / 未做
+
+- 板端这条链路**仍然没有跑起来过**：三个节点今天必然死，因为 `vision_msgs` 没装。
+  本轮验的是「缺它 ⇒ 死」，**不是**「装了就活」—— 后者要等甲-10 执行完。
+- 本轮用的仍是**临时目录**（`/tmp/buildcheck`、`/tmp/buildcheck2`，共 776 KB ×2），
+  **不是**板上正式部署的仓库。正式部署（甲-7 ~ 甲-10）仍未开始。
+- `arm_grasp_sim` 在板上**能不能编**没测（不需要测：它要 Gazebo，板上不装）。
+- 板子上 `ros2 launch` 留下的 `/tmp/launch_params_*` **没有清**：那是 ros2 自己建的、
+  且有几份是 9-26 就存在的（你先前跑的），不是本轮产物。它们各几百字节，无害。
+- 真机 launch（W2）与现场步骤（W5）不变。
+
+##### 八、状态
+
+- 本轮 1 个提交（README 的实测数字 + 待执行命令的甲-8/甲-10 验证行 + 本节）。
+- `git rev-list --count main..migrate/humble-orin` 实测 **57**（本轮提交前）。
+- **未推送**，`main` 未动（仍为 `0ab13ec`）。
+- 板子状态：临时目录已删、无残留进程、`~/yahboom_ws` 与 `~/ultralytics` 未被动过。
