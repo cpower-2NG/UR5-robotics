@@ -3442,3 +3442,152 @@ ExternalShutdownException)` + `if rclpy.ok():`（`collect_training_data.py`
   推完重跑 9b 看是否四项都 cleanly。**这一步还没做。**
 - 仍未做：手眼标定（`/targets_3d` 的前置）、`table_plane_z` 的真机覆盖值、
   甲-1 的 `sudo ufw status`（要 sudo）、丙-1（AG-95 仍缺适配器）。
+
+## 第二十八轮：D70 的第三个面，和三个会骗人的测量陷阱（2026-09-28）
+
+第二十七轮结尾留了一条「D70 的修复还没在板上复验」。这一轮就是去复验的，结果
+复验**把修复本身又推进了一步** —— 板的 Ctrl-C 干净了，但复验过程中我先后得出
+**三个错误结论**，每一个都差点被当成代码缺陷去改。所以这一轮分成两半：先说代码，
+再说**测量方法学**（后者对后面所有真机验收都成立）。
+
+##### 一、D70 的第三个面：第二次 SIGINT
+
+第二十七轮记了两个面（`ExternalShutdownException`、`shutdown()` 无条件调用）。
+板上复验时我把整组 SIGINT 打下去，仍然报 `exit code -2`。原因不在那两个面里：
+
+`ros2 launch` 收到 SIGINT 后会把信号**转发**给每个子进程 —— 日志里那行
+`sending signal 'SIGINT' to process[...]` 就是它。加上终端/进程组本来就发过一次，
+**每个子进程一共收到两次 SIGINT**。第二次落在 `main()` 的 `finally` 里：
+
+```
+finally → node.destroy_node() → rclpy client.destroy_when_not_in_use → KeyboardInterrupt
+```
+
+`KeyboardInterrupt` 从 `finally` 逃出去 ⇒ 一段 traceback ＋
+`process has died ... exit code -2`。**只有 Ctrl-C 打得够「整齐」才露头**：如果
+子进程在转发到达之前就退干净了，第二次信号落进一个已经结束的进程，什么也不会发生。
+这解释了为什么它是**偶发**的 —— 也正是它没在第二十七轮被发现的原因。
+
+修法（`80c0bac`）：收工清理的每一步各自包一层 `try/except KeyboardInterrupt`。
+只吞 `KeyboardInterrupt`（收工阶段没有「失败要处理」这回事，信号也不是错误），
+别的异常照旧现形。`planner_node.py` 的三步（`_gripper.shutdown()`、
+`executor.shutdown()`、`destroy_node()`）**各自包**，前一步被信号打断不该把后面
+两步一起跳过。
+
+**判别性 A/B**（板端，同一套复现方式，修前/修后）：
+
+| | 修前 | 修后 |
+|---|---|---|
+| traceback | 3 段 | 0 |
+| 收工行 | `process has died ... exit code -2` | 4× `process has finished cleanly` |
+| launch | `exit code -2` | 退出码 0，用时 2.026 s |
+
+##### 二、`exit code -2` 不是代码缺陷 —— 把它的含义说准
+
+上一轮和这一轮都出现过 `exit code -2`，值得写清楚它**到底在说什么**：
+
+它**不是**某个返回值，而是「子进程被信号打死、而不是自己退出的」。`ros2 launch`
+对**任何**被信号终止的子进程都会这么报。所以：
+
+- 它的**存在**只说明「有信号打到了子进程，且它没自己退出」；
+- 它**不能**单独区分「代码没扛住信号」（真缺陷）和「测法多打了一次信号」（假故障）。
+
+判据要看**同一段日志里的另外两样**：有没有 `Traceback`，以及有没有
+`finished cleanly`。**只有 `-2` 而没有 traceback 且节点另有 cleanly 行**时，
+才需要去查是不是测法的问题。把 `-2` 本身当验收对象会南辕北辙。
+
+##### 三、三个会骗人的测量陷阱（这一轮真正学到的东西）
+
+三个陷阱我都**实际被骗过**，而且每一个都让我得出过「代码有问题」的结论。记下来
+是因为后面每一个真机验收都要用同样的手法跑。
+
+**陷阱 1：`setsid 命令 &` 会让命令继承 `SIGINT=SIG_IGN`。**
+POSIX 规定：没有作业控制的非交互 shell 启动的后台任务，`SIGINT`/`SIGQUIT` 置为
+**忽略**。于是信号压根没送到，节点还活着，而脚本报「收工干净」—— 一个**假通过**。
+实测证据：`grep SigIgn /proc/<pid>/status`，`SIGINT`（`0x2`）那一位是置上的
+（`SigIgn: 0000000001001006`），而同一时刻子进程是 `SigCgt: 0000000100004002`。
+`set -m` 打开作业控制可以绕开继承 —— 但那也不是终端 Ctrl-C，是另一种信号投递方式。
+
+**陷阱 2：GNU `timeout` 默认把信号发给整个进程组**（`--foreground` 才只发子进程）。
+于是每次子进程都收**两次** SIGINT（`timeout` 的整组投递 + launch 的转发），
+第二次把它打死 ⇒ launch 报 `exit code -2`。**这个 `-2` 完全是测法造成的。**
+我最初就是拿 `timeout` 测的，得出「D70 还有第三个面」之后，差点又用同一个方法
+去「验证」修好了没有 —— 那会得到**修前修后都失败**的结论。
+
+**陷阱 3：僵尸进程满足 `kill(pid, 0)`。**
+`os.kill(pid, 0)` 只检查「进程项还在不在」，而**僵尸的进程项还在**，于是探活
+照样成功。我另写的一个探活脚本因此报「launch 还活着 60 秒」，实际它**早就退成
+僵尸**了 —— `/proc/<pid>/stat` 的 state 字段从 +0s 到 +20s 一直是 `Z`，
+`ppid` 是本脚本（我没收尸）。只有 `waitpid` 能分出「在跑」和「跑完了没人收尸」。
+同一个坑还有**第二半**，而且更隐蔽：子进程**正常退出**时 `waitpid` 返回的原始
+status 恰好是 **`0`**（falsy），与「还没收到尸」返回的 `(0, 0)` 用一个真值判断
+**分不开**。我第一版写成 `if status: …`，于是 launch 明明干净退出、就在那儿等着
+收尸，报告却印「宽限内没退，已强杀」。判据要用 `waitpid` 返回的**第一个元素**。
+
+⇒ 连带更正一条上一轮的记录：**「launch 收尾要等好几秒」是僵尸造成的假象。**
+收尸修对之后实测：launch 在 Ctrl-C 后**约 2 秒**退干净（退出码 0），
+并非先前测到的「>60 秒还在」。
+
+##### 四、还有一条**没修好就不能声称修好**的：D70 的第二个面
+
+第二个面（回调里 `publish` 撞上关停 → `publisher's context is invalid`，
+`executors.py:736 raise handler.exception()` 把它从 `spin_once` 抛出来）**是真的**：
+板端日志里出现过原文。但我要诚实说明它的验证状态 ——
+
+我造了一个合成复现装置（多线程 spin ＋ 一个在回调里 publish 的节点，故意把
+publish 窗口拉到 500 ms），**修前修后各 8 次，两组都是 0 次复现**。也就是说：
+**这个面无法按需复现**，它的触发窗口比「在回调里 publish」窄得多（大概要在关停
+与 publish 之间精确撞上）。因此这一面的验收只能退到**静态**：
+
+- W2-9 的语法树断言（`except Exception: if rclpy.ok(): raise`）＋ 变异测试；
+- 加一条推理说明它**不会**藏住真故障：那个 `except` 只在 `rclpy.ok()` 为假
+  （＝ 正在关停）时吞异常，context 还活着就照抛，所以真正的发布失败仍会现形。
+
+这是**次优但诚实**的验收 —— 比「跑一次没复现就说修好了」强，但**不等于**板端
+已验证过这一面。板上那次干净收工，主要证明的是第一个面和第三个面。
+
+##### 五、把这个面也钉进自检：W2-9 从 9 项扩到含收工清理
+
+`shutdown_hygiene()` 原先查三件事，漏了第三个面。新增 `_protected_from()`：判定
+某个调用是否落在**某段 try 的体内**、且该 try 的处理器接得住 `KeyboardInterrupt`
+（裸 `except` 也算）。这样「把 `destroy_node()` 挪进 try 里」和「换一种写法但
+依然接住」都算通过，不会把断言钉死在某种排版上。文件里没有 `destroy_node` 的
+报 SKIP 而不是 FAIL —— **不适用不等于缺陷**。
+
+| 变异（作用在真实文件上，跑真实自检） | 实测 |
+|---|---|
+| G：删掉 `destroy_node` 那层 `except KeyboardInterrupt` | exit 1，报出行号 |
+| H：把 `destroy_node` 挪到 try **外面** | exit 1 |
+| 旧变异：去掉 `if rclpy.ok():` 闸门 / 去掉 `ExternalShutdownException` | 仍 exit 1 |
+
+##### 六、板端 Ctrl-C 验收工具（`da84e6a`）
+
+新增 `scripts/board_ctrlc_check.py`：**在板子上**起真 pipeline，25 秒后往 pty 主端
+写 `\x03`。真终端 Ctrl-C 走的就是这条路：行规程把 `\x03` 变成 SIGINT 发给该 pty 的
+**前台进程组**，launch 与所有子进程各收一次。上面三个陷阱都写进了它的 docstring
+—— 免得后人照着假故障去改本来正确的代码。它还带一个「残留守卫」（上一轮的进程会让
+pid/进程组归属变乱，实测会得出假的 `exit code -2`），守卫要排除**自己和自己那条
+ssh `bash -c`**（命令行里就带着 pgrep 的模式，会把自己匹配上 —— 实测误报过 3 条，
+pid 全是同一条 ssh 命令的 shell）。
+
+板端实测（干净板子，默认入口＝不含机械臂）：
+
+```
+cleanly=4  died=0  traceback/RCLError=0  launch 退出码=0   用时 27s
+PASS：全部 cleanly、无 traceback。
+```
+
+##### 七、结论与状态
+
+- D70 三个面**全部修好**；第三个面有**判别性 A/B**（§一），第二个面按 §四 说明
+  只能静态验收。
+- 第二十七轮那条「D70 还没在板上复验」**关闭**：板端快照已推到含三个面修复的
+  版本，四项全 cleanly。
+- 本机自检：`test_real_launch` **77 PASS / 2 SKIP / 0 FAIL**（第二十七轮是 70 项）；
+  板上 **78 PASS / 1 SKIP / 0 FAIL**（板上多 `ur_robot_driver`，少一个「回调里没有
+  publish」的 SKIP）。
+- 仍未做（不变）：手眼标定（`/targets_3d` 的前置）、`table_plane_z` 的真机覆盖值
+  （`-0.39` 是仿真台面）、甲-1 的 `sudo ufw status`、丙-1（AG-95 仍缺适配器）。
+- 提交：`1a29a5c`（面 1）、`81ad614`（面 2）、`80c0bac`（面 3）、`5f282c6`（自检）、
+  `da84e6a`（板端工具）、`25fd5f6`（README 计数）。`main` 仍在 `0ab13ec` 未动，
+  未推送。
