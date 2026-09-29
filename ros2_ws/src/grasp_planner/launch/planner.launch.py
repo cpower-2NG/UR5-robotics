@@ -14,6 +14,8 @@
 由 ``gripper_backend`` 和后端参数决定（见 grasp_planner/gripper.py）。
 
 参数默认值全部来自 config/grasp_planner.yaml，**真机几何必须按现场实测覆盖**。
+（本入口下 `ik_group` / `trajectory_action` / `table_scene_enabled` / `carry_objects`
+是**真生效**的 —— 与全车入口相反；那张对照表在 yaml 的文件头。）
 """
 
 import os
@@ -36,7 +38,7 @@ def generate_launch_description():
     )
     backend_arg = DeclareLaunchArgument(
         "gripper_backend", default_value="sim",
-        description="sim = 仿真 Robotiq 2F-85（JTC 关节）| ag95 = 真机大寰 AG-95（Modbus，尚未实现）",
+        description="sim = 仿真 Robotiq 2F-85（JTC 关节）| ag95 = 真机大寰 AG-95（Modbus，已实现；写路径由 ag95_dry_run 卡着，默认只读）",
     )
 
     planner_node = Node(

@@ -12,14 +12,41 @@
 #   yolo_bringup/pipeline.launch.py，而**本文件正是被 pipeline.launch.py 显式加载**的
 #   （D50 —— 在此之前它其实不生效）。arm_grasp_sim/full.launch.py 会再覆写两项：
 #   `gripper_backend`（经 camera_source:=sim 派生）与 `table_scene_enabled:=true`。
+#
+# ⚠️⚠️ **下面有 5 个键在「全车入口」下是死键 —— 改了不生效，而且不报错。**
+#
+# 原因是 launch 的参数优先级：`pipeline.launch.py` 里那个
+#   `planner_params = [ <本文件>, { 覆盖项... } ]`
+# 赋值传的是**列表**，而列表里**后面的覆盖前面** —— 下面这 5 个键恰好都在覆盖项里。
+# （引用处不写行号：这类引用漂过好几轮，改用「`planner_params =` 那一处」这种锚点。）
+#
+# | 键 | 全车入口（bringup→pipeline） | 独立入口（planner.launch.py） |
+# |---|---|---|
+# | `gripper_backend`     | ❌ 死键 | ❌ 死键（那个 launch 的 `parameters=[...]` 也覆盖它） |
+# | `table_scene_enabled` | ❌ 死键 | ✅ 生效 |
+# | `ik_group`            | ❌ 死键 | ✅ 生效 |
+# | `trajectory_action`   | ❌ 死键 | ✅ 生效 |
+# | `carry_objects`       | ❌ 死键 | ✅ 生效 |
+#
+# ⇒ **在全车入口下要改这 5 个，必须走 launch 参数**，例如
+#     ros2 launch yolo_bringup bringup.launch.py table_scene_enabled:=true
+#   而改本文件会白忙 —— 这是 D50/D64 同一族的病（静默无效）。
+#   **之所以不把这 5 个键从本文件删掉**：独立入口下它们（除 `gripper_backend`）
+#   是真生效的，删了会让那条路退回节点里的硬编码默认值 —— 那是引入回归。
+#
+# 下面每个受影响的键旁边都有一行 `⚠️ 死键` 标记，改之前先看这张表。
 
 grasp_planner:
   ros__parameters:
     # ---- 接口 ----
     targets_topic: /targets_3d          # perception_3d 发布的全部候选
     ik_service: /compute_ik             # MoveIt
+    # ⚠️ 死键（全车入口下）：真机由 pipeline 覆盖成
+    #    /scaled_joint_trajectory_controller/follow_joint_trajectory。改这里无效。
     trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
     base_frame: base_link               # /targets_3d 已在 此帧下
+    # ⚠️ 死键（全车入口下）：真机要 ur_manipulator（SRDF 派生名），
+    #    由 pipeline 覆盖。改这里无效 —— 这是最容易被踩的一个。
     ik_group: ur5_manipulator
     ik_link: tool0
     ik_timeout: 2.0
@@ -144,6 +171,7 @@ grasp_planner:
     # false = **只做动作演示**：不闭合夹爪、不判空，臂照样走完
     # 「接近 → 下降 → 抬起 → HOME → 放置位 → 下降 → 抬起 → HOME」。
     # 给「第一个真机 demo」用（AG-95 还没接通，见 RESTRUCTURE_PLAN）。
+    # ⚠️ 死键（全车入口下）：由 pipeline 覆盖。改这里无效。
     carry_objects: true
 
     min_score: 0.3              # 最低置信度
@@ -176,6 +204,9 @@ grasp_planner:
     # 去撞）。默认**关闭**：仿真与真机的桌子不同，一个默认值不可能两边都对，
     # 而**错的碰撞体比没有更坏**（可能把正确解全拒掉，看起来像 IK 坏了）。
     # 仿真侧在 arm_grasp_sim 的 launch 里打开。
+    # ⚠️ 死键（全车入口下）：真机要开必须走 launch 参数
+    #    `... bringup.launch.py table_scene_enabled:=true`。改这里无效
+    #    （第 33 轮实测踩过：yaml 写 true，日志仍打「桌面进场景=False」）。
     table_scene_enabled: false
     table_box_size: [0.8, 0.6, 0.03]
     table_box_pose: [0.6, 0.0, -0.405, 0.0, 0.0, 0.0]
@@ -183,8 +214,13 @@ grasp_planner:
 
     # ---- 夹爪 ----
     # sim  = 仿真 Robotiq 2F-85，JTC 的第 7 个关节
-    # ag95 = 真机大寰 AG-95，Modbus RTU 独立设备（尚未实现，构造即报错）
+    # ag95 = 真机大寰 AG-95，Modbus RTU 独立设备。**已实现**（读/写/到位轮询/
+    #        写入生效校验都在 gripper.py），写路径由下面的 ag95_dry_run 卡着。
+    #        ⚠️ 今天仍会「构造即报错」，但那是因为**板上还没有 USB-RS485 适配器**
+    #        （`_connect()` 打不开串口就抛）—— 不是「尚未实现」。这两件事别混。
     # none = 不驱动夹爪，只配 carry_objects:=false（只走位、不夹持）使用
+    # ⚠️ 死键（两个入口都覆盖它：pipeline 与 planner.launch.py 都会覆盖）。
+    #    要改必须走 launch 参数 `gripper_backend:=...`。
     gripper_backend: sim
     # 仅 gripper_backend:=none 时有意义：写进启动日志的「为什么没有夹爪」。
     # 真机第一个 demo 由 real.launch.py 覆写成实际情况（AG-95 未接）。
