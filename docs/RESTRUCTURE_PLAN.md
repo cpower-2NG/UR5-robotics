@@ -3727,3 +3727,168 @@ inactive（不自启了）；`dialout` 已解决（甲-4 关闭）。
 真正的采购硬项只有 AG-95 那根 RS485 适配器**（夹爪链路），网卡是推荐项。
 采购视角的完整清单（含规格、证据、替代路线、优先级）已单独成文：
 **`docs/真机缺失项清单.md`**。
+
+---
+
+## 第三十轮：板子扛不扛得住 —— 真相机 + 真 YOLO 的端到端吞吐，和 arm64 上缺失的 Gazebo 桥（2026-09-29）
+
+用户去和负责人对接期间交代的任务：**「在板子上编译一下程序，然后仿真验证板子
+可不可以完成这个任务」**。本轮把「编译」和「不靠仿真器的全链路吞吐」做完了，
+「仿真」卡在一个新查明的硬缺口上（见 §六），需要 sudo。
+
+### 一、板端环境基线（本轮实测）
+
+| 项 | 实测 |
+|---|---|
+| 板卡 | `NVIDIA Jetson Orin NX Engineering Reference Developer Kit Super` |
+| JetPack | `R36 (release), REVISION: 4.3` |
+| 功耗模式 | **`MAXN_SUPER`**（满血档 —— 下面的性能数就是这个档位下的） |
+| torch | `2.5.0a0+872d972e41.nv24.08`，`torch.cuda.is_available() = True`，device `Orin` |
+| ultralytics / cv2 / numpy / pymodbus | `8.4.26` / `4.5.4` / `1.26.4` / `3.15.0` |
+| 空闲内存 | 约 1.0 / 7.4 GiB（`free` 可用 6.3 GiB） |
+| MoveIt | **在**，但**没有 `ros-humble-moveit` 元包** —— 组件是单独装的
+（`moveit_ros_move_group` 等 15 个），`/opt/ros/humble/lib/moveit_ros_move_group/move_group` 在位。
+⚠️ 以后别用 `dpkg -l ros-humble-moveit` 判断「MoveIt 装没装」，会得到假否定 |
+
+### 二、编译：板上四个包，5.63 秒
+
+```bash
+cd ros2_ws && source /opt/ros/humble/setup.bash
+colcon build --packages-select yolo_bringup perception_3d yolo_detector grasp_planner \
+    --packages-ignore arm_grasp_sim
+```
+→ `Summary: 4 packages finished [5.63s]`，零错误。
+`--packages-ignore arm_grasp_sim` 仍然是必需的（README 已记，复现无误）。
+
+`python3 scripts/check_board_deploy.py` → **「板端部署前置条件全部就绪」**。
+其中 D67 那条体检很有用，本轮它救了一次场（见 §七·1）：
+`block_best.pt → /home/<user>/yolo_ros_original/block_best.pt`。
+
+### 三、YOLO 单点性能（脱离 ROS，纯推理）
+
+同一张 1280×720 输入，warmup 后 20 次取中位数：
+
+| 设备 | mean | median | p95 | 折算 |
+|---|---|---|---|---|
+| `cuda:0` | 28.3 ms | **28.2 ms** | 29.4 ms | **35.4 FPS** |
+| `cpu` | 298.2 ms | 275.6 ms | 410.3 ms | 3.6 FPS |
+
+GPU 比 CPU 快 **约 10 倍**，且 `torch.cuda.is_available()` 为真 —— CUDA 真的在用。
+**检测器不是瓶颈**，这是本轮最先确立的事实。
+
+### 四、全链路吞吐：真相机 + 真 YOLO + 投影（新增板端脚本）
+
+板上那台**俯视 D435i 实物一直接着**，所以不需要仿真器、不需要合成图像，
+直接跑**真机部署配置**：`real.launch.py start_ur_driver:=false`（`camera_source`
+在 `real.launch.py` 里是**硬编码的 `realsense`**，于是 `ik_group` 自动取真机的
+`ur_manipulator`、`trajectory_action` 指向真机控制器、`max_sync_dt` 取 0.3）。
+没有驱动 ⇒ 没有 controller_manager ⇒ **物理上没有任何东西可动**。
+
+新增 `scripts/board_chain_check.py`（起 real.launch + RSP + 假 `/joint_states`
++ 相机占位 TF，逐级测吞吐）。**实测**：
+
+| 级 | 话题 | 实测 | 判据 |
+|---|---|---|---|
+| 相机彩色 | `/camera/color/image_raw` | **25.1 FPS** | ≥ 20 ✓ |
+| YOLO 检测 | `/detections` | **22.2 FPS** | ≥ 15 ✓ |
+| 三维目标 | `/targets_3d` | **22.6 FPS** | ≥ 15 ✓ |
+
+（对齐深度单独测过 29.9 FPS；`/detections` 与 `/targets_3d` 几乎同频，说明
+投影这一步**不是**额外瓶颈。）
+
+运行中资源：
+
+```
+内存     2.2 / 7.4 GiB          CPU 各核 [44, 36, 24, 25, 23, 64]
+GPU 负载 73%                    结温 57.6 °C
+整板功耗 11.5 W（其中 CPU+GPU 4.6 W）
+```
+
+**判读**：规划器只需要 1 Hz 级，这条链路跑 22 Hz ⇒ **余量十几倍**；
+2.2 GiB / 11.5 W / 57 °C 都说明板子很轻松。这是本轮的核心结论：
+**算力上，Orin NX 完成这个任务没有问题。**
+
+投影链路确实在算真东西 —— 抓到的一条 `/targets_3d` 实例：
+
+```
+class_id: block   score: 0.635
+position: x=1.144  y=-0.286  z=-0.009    (frame_id: base_link)
+```
+
+`z ≈ 0` 正好落在台面高度，说明**真相机的深度**与投影对上了。
+⚠️ 但方向**不可信**：本轮用的是**占位**相机外参（相机在 `base_link` 上方 1 m
+朝下看），只为把 TF 树接通。真外参要等手眼标定 —— 脚本 docstring 与 README
+都写明了这条，断言只针对「通不通、多快」，**不针对数值**。
+
+### 五、仍然没验到的那一段：运动
+
+`planner_node` 报 `轨迹 action 服务不可用（控制器起了吗？）` 然后 `初始 HOME失败`
+—— **预期内**：没有驱动就没有控制器，规划器的状态机走不动。
+（顺带确认 D52 的修复**已经生效**：现在报的是 `goal_status=<未知 None> error_code=None`，
+即外层 `GoalStatus` 被读到了，而不是过去那种「默认填充的 Result + error_code 恰为 0
+= 被当成成功」。）
+
+**所以本轮不覆盖运动** —— 那一步要么真臂，要么仿真器。
+
+### 六、⚠️ 本轮最要紧的发现：arm64 上**没有** ROS↔Gazebo 桥
+
+想在板上跑仿真，得先知道这条路通不通。查 OSRF `jammy` 索引（对照 amd64）：
+
+| 包 | arm64 | amd64 |
+|---|---|---|
+| `gz-harmonic`（仿真器本体） | ✅ 有 | ✅ 有 |
+| `gz-tools2`（提供 `gz` CLI） | ✅ 有 | ✅ 有 |
+| `libgz-sim8*` | ✅ 有 | ✅ 有 |
+| **`ros-humble-ros-gzharmonic`**（ROS↔Gazebo 桥） | ❌ **没有** | ✅ 有 |
+| 同上 `-bridge` / `-image` / `-interfaces` / `-sim` | ❌ **没有** | ✅ 有 |
+
+这与 `RESTRUCTURE_PLAN.md:635`（更早一轮的记录）完全一致，**旧记录准确，不是过期**。
+板上也**没配 OSRF 源**（`apt-cache policy gz-harmonic` 无输出）；
+`packages.ros.org` 上那些 `ros-humble-ros-gz-*` 是**配 Fortress 的**，与本项目的
+Harmonic（gz-sim8）ABI 不通。
+
+⇒ **板上跑 `arm_grasp_sim` 需要源码编译 `ros_gz`（humble 分支，`GZ_VERSION=harmonic`），
+外加同样源码编译的 `gz_ros2_control`**（apt 版本依赖 Fortress）。`gz-harmonic`
+本体可以 apt 装，但要先加 OSRF 源 —— **两条都需 sudo**。
+
+**价值判断（要如实说）**：真机部署**本来就不用 Gazebo**（走 `ur_robot_driver` 的 RTDE，
+见 `RESTRUCTURE_PLAN.md:1055`）。所以在板上装 Gazebo 买的不是「部署能力」，
+而是**「没有硬件时也能在目标平台上跑完整闭环」** —— 而算力问题 §四 已经回答了。
+用户已定：**先跑节点图（本轮 ✓），再上 Gazebo**。Gazebo 的 sudo 命令已备在
+`待执行命令.md` 甲-14。
+
+### 七、三个我踩到的编排陷阱（都不是板子的问题）
+
+1. **cwd 陷阱**：`detector_node` 的 `model` 默认值是相对路径 `block_best.pt`，
+   按**进程 cwd** 解析。我经 ssh 从家目录起，它 `FileNotFoundError` 崩掉，
+   而症状只是 `/detections` 没有消息 —— 离原因很远。
+   `check_board_deploy.py` 的 D67 就是为这个坑写的。**修法**：脚本开头直接
+   `chdir` 到仓库根（`board_chain_check.py` 已这么做），或用绝对路径。
+2. **`pkill -f` 自匹配（又一次）**：`pkill -f "tegrastats --interval 500"` 把
+   **执行这条命令的 ssh 会话自己**杀掉了（退出码 255）。这与早先
+   `pkill -f "bind..<host-ip>"` 杀自己那次是**同一类**。
+   **修法**：按 PID 杀（`kill $TP`），或用 `pkill -x <精确进程名>`（不带 `-f`）。
+3. **`tegrastats` 的缓冲**：`Popen(... stdout=PIPE)` 拿不到输出 —— 它不按行刷新，
+   进程被 kill 后管道里一个字节都没读到，**空输出会伪装成「机器上没有这个工具」**。
+   **修法**：`stdbuf -oL tegrastats ...` 重定向到文件再读。
+   （与第二十八轮 `systemctl is-active ufw` 那条同类：**一次状态查询报告的是它
+   自己那个对象的活性，不是你关心的东西**。）
+
+另有一条**不是陷阱但值得记**：`scripts/test_pipeline_e2e.py` **自己发布**
+`base_link → camera_color_optical_frame` 静态 TF，所以它**不能与真相机驱动同时跑**
+—— optical frame 会有两个父节点，TF 树直接坏掉。要用它就得
+`camera_source:=external`；同理 `real.launch.py` 硬编码 `camera_source:=realsense`，
+拿不到 external 那条路。
+
+### 八、结论与状态
+
+- **编译**：板上四包 `[5.63s]` 通过；`check_board_deploy.py` 报「前置条件全部就绪」。
+- **算力**：真相机 → 真 YOLO → 投影 **22~25 FPS** 端到端，2.2 GiB / 11.5 W / 57 °C。
+  **Orin NX 完成这个任务没有算力问题**（规划器只要 1 Hz 级）。
+- **新增**：`scripts/board_chain_check.py`（板端无臂全链路吞吐预检，可复用），
+  README 已补入脚本说明与实测数。
+- **未覆盖**：**运动**（无驱动 ⇒ 无控制器，规划器状态机走不动，预期）。
+- **新缺口**：arm64 无 `ros-humble-ros-gzharmonic` ⇒ 板上跑仿真必须源码编译
+  `ros_gz` + `gz_ros2_control`，且需 sudo 加 OSRF 源。命令备在 `待执行命令.md` 甲-14。
+- 全程**零运动**（不起驱动 ⇒ 无 controller_manager；未接任何执行机构）。
+- `main` 仍在 `0ab13ec` 未动，未推送。
