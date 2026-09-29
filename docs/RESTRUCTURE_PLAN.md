@@ -4178,3 +4178,253 @@ RViz 配置照旧订原始话题名（实测桥后 `/camera/color/image_raw` 出
 - **没有推送**，`main` 仍在 `0ab13ec`。
 - **没有解决可观测性缺口**：`planner_node` 不发布任何东西，所以规划器的决策在
   bag 与 RViz 里都看不见。这是下一步值得做的（成本不高：几条 `create_publisher`）。
+
+## 第三十三轮：把规划器的决策变成可观测的（遥测），并在板上把状态机**真跑一遍**（2026-09-29）
+
+上一轮结尾点名的那个缺口（「`planner_node` 不发布任何东西」）本轮补上了；
+更重要的是，**第三十轮 §五 明确记为「未覆盖」的『运动』那一段，本轮在板上补上了**
+（用动作级替身，不是靠 Gazebo）。
+
+### 一、遥测：让规划器的决策看得见（`grasp_planner/telemetry.py`，新增）
+
+动因是实测出来的：`planner_node` 1553 行里 `create_publisher` 出现 **0** 次，
+全部决策只走 `/rosout` 文本。后果是现场只能读日志猜「它现在在干什么」，
+而**录回来的 bag 里看不到**规划器瞄准了哪里、往哪个槽位放、为什么收工。
+
+三个**只读**话题（`telemetry.py` 的模块文档有完整表格）：
+
+| 话题 | 类型 | 回答的问题 |
+|---|---|---|
+| `/grasp_planner/current_target` | `geometry_msgs/PoseStamped` | 它现在瞄的是哪个 3D 点？ |
+| `/grasp_planner/place_slots` | `visualization_msgs/MarkerArray` | 哪些槽位空着/用过/被跳过？ |
+| `/grasp_planner/telemetry` | `diagnostic_msgs/DiagnosticArray` | 状态时间线、计数、**收工原因** |
+
+**为什么敢直接上真机**：本模块**只 publish**，不读也不改状态机变量（计数靠
+`snapshot` 回调取快照）。加发布者**不可能改变状态机行为**，所以它随时可摘。
+
+三处设计是「不这么做就会错」，各自在代码里写了理由：
+
+1. **`_place_index` 不能用来推占用** —— 它在「放成功」和「IK 解不出而跳过」两种
+   情况下**都会**自增，`i < place_index` 会把跳过的槽位错报成已占用。故遥测单独
+   记 `used` / `skipped`，对应绿/灰/橙三色。
+2. **`_finish` 的严重度必须显式传 `ok`，不能拿 `reason` 字符串匹配** —— 有**两处**
+   文案都是「槽位已用尽」而严重度相反（一处是正常收工，一处是「抓在手里却没地方
+   放」）。靠字符串判会判错。
+3. **`set_state` 必须做变化检测** —— `_reset_busy` 在闲着时会被 10 Hz 的检测流
+   每批调一次；无条件发布会把这个话题变成水龙头，把 bag 里真正的状态时间线淹掉。
+   实测：连发 20 次 `set_state("IDLE")` **只发 1 条**。
+
+### 二、一个「不报错」的坑：latched 只对**同样声明 transient_local 的订阅者**有效
+
+三个话题一律 `transient_local + reliable + depth 1`（晚开的 RViz 要能立刻看到，
+而一个抓取周期几十秒，等不起）。但发布方 latched **只表示它留了一份给晚到者** ——
+订阅方若声明 VOLATILE，就只收实时消息，**永远拿不到那份锁存，且不报任何错**。
+
+实测对照（同一个发布者、同一时刻）：
+
+```
+订阅者 VOLATILE（rclpy 的 create_subscription(..., 10) 默认）: []
+订阅者 TRANSIENT_LOCAL:                                        [3.0]
+```
+
+⇒ 写测试时栽在这里（第一版自检就是），也**同样适用于 RViz 与 `ros2 topic echo`**
+（后者默认也是 Volatile）。症状是「这个显示一直空着」，与「话题没在发」长得一模一样。
+已写进 `telemetry.py` 模块文档与自检的注释。
+
+另有一条测试方法学：**必须先发完再建订阅者**。反过来写会得到假的通过/失败 ——
+订阅者若在发送时已匹配上，那几条是作为**实时消息**投进**它自己**的 depth 队列的，
+与发布者的 depth=1 无关。
+
+### 三、RViz 配置：QoS 取值**必须写字符串**，写数字会被静默忽略
+
+修 `grasping.rviz` 时发现的，性质与前几轮那三条「打开一片空白」的坑不同 ——
+**它一个警告都不给**。RViz 的 QoS 属性存的是**枚举的名字**：
+
+| 写法 | 订阅出来的实际值 |
+|---|---|
+| `Durability Policy: 1` | VOLATILE（**被忽略**，退回默认） |
+| `Durability Policy: Transient Local` | TRANSIENT_LOCAL ✓ |
+
+（`Depth` 是整数属性，照常写数字。）先用 A/B 对照排除了「自省字段假象」：
+对一个**行为上已证明**是 transient_local 的订阅者做自省，它**正确**报出 TRANSIENT_LOCAL
+—— 所以是 RViz 真没读进去，不是自省不准。
+
+**为什么这条特别危险**：默认的 Reliability 恰好是 Reliable，而 RealSense 的彩色
+话题是 **BEST_EFFORT** 发的 —— 两边匹配不上，**订阅者收不到任何东西**。
+⇒「相机显示在仿真里好好的，接上真机就是黑的」。仿真里没暴露，是因为仿真侧的
+发布者恰好是 Reliable。这是典型的一条**只在真机上发作**的配置错。
+
+### 四、板端：编译 + 自检
+
+| 项 | 实测 |
+|---|---|
+| `colcon build --symlink-install`（**全部 5 个包**，含 `arm_grasp_sim`） | `Summary: 5 packages finished [6.33s]`，零错误 |
+| Python | 3.10.12（与开发机同一路径假设成立，自检里的 `python3.10` 硬编码有效） |
+| 自检 `scripts/test_planner_telemetry.py`（A/B/C 三段） | **全部通过，退出码 0** |
+| 空闲内存 | **6.1 GiB 可用**（第三十轮那会儿是 4.1 —— 桌面关掉之后宽裕多了） |
+
+自检的 B 段在板上**真的起了一个 `planner_node`** 并确认三个话题挂上图 ⇒
+20 处接线没有漏。
+
+### 五、⚠️ 本轮最要紧的：板上没有 Gazebo，但**状态机可以整条跑通**
+
+第三十轮 §五 把「运动」记为未覆盖，理由是「没有驱动就没有控制器，规划器的状态机
+走不动 —— 那一步要么真臂，要么仿真器」。本轮发现**还有第三条路**：规划器要的其实
+不是 Gazebo，只是一个**会应答的 FollowJointTrajectory action** 加一份 `/joint_states`。
+把它们造出来，状态机就能在板上真跑。
+
+**先说清这一段在整轮里的位置**：甲-12（`scripts/moveit_only_check.py` +
+`elbow_guard_probe.py`）已经验过「链路通 + IK 解得出 + 肘/大臂有余量」，但那个脚本
+**故意一条轨迹都不发**（它存在的前提就是「绝不发轨迹」），所以状态机**一步都没动**。
+§六 那批肘高数字属于甲-12 的**既有覆盖**（本轮只是换了一套几何复测，见 §六 的说明），
+**这一段才是本轮真正的增量**：状态机从 `STARTING` 一路走到 `FINISHED`。
+
+**做法**（全部零 sudo、零运动）：已入库为 `scripts/board_state_machine_check.py`
+（一次跑完，退出码 0；判据含「走完一轮」**和**「等到 FINISHED 且级别 OK」）：
+
+```
+robot_state_publisher + move_group     ← 用板上的 ur_description / ur_moveit_config
+   ↑ 这两个就是 arm_grasp_sim 里 MoveIt 那一半，且**不依赖 Gazebo**
+假 JTC（ActionServer）+ /joint_states   ← 动作级替身
+   ↑ 另外按 10 Hz 注入一个落在 pick_zone 里的合成目标
+planner_node（gripper_backend:=none, carry_objects:=false）
+   ↑ **由 real.launch.py 自己起** —— 别自己 ros2 run 一个，理由见下
+```
+
+**实测：整条状态机跑完了一个完整的抓→放周期。**
+
+```
+STARTING → INIT → IDLE → APPROACH → DESCEND → LIFT → HOME_WITH_OBJECT
+        → PLACE_APPROACH → PLACE_DESCEND → PLACE_RETREAT → IDLE → FINISHED
+```
+
+- 假臂共应答 **9 条轨迹**；`place_index` 0→1、`slots_used` 0→1、`grasped` 0→1
+- 放在槽位 `[0] = (0.440, 0.240)`（共 6 槽）
+- **全程零护栏告警**、零轨迹失败
+- 放完之后该方块不再是候选（pick/place 分区生效）→ 空闲 20 s → 按看门狗正常收工。
+  收工那条遥测的**原文**（`FINISHED`，级别 `OK`）：
+
+  > 空闲 20s 没有发起过任何一次抓取尝试（上限 idle_finish_timeout=20s）
+  > —— 抓取区已空 / 候选都已抓过 / 分数都不够
+
+- 遥测的三段式（只读、变化检测、`finish_reason` 进 values）在板上一并验过
+- 收尾**无残留进程**（`残留=0`），退出后板上可用内存 6.2 GiB
+
+**这说明了什么、没说明什么**（要如实说）：它证明**决策链、IK、肘高护栏、槽位记账、
+终止与收工路径、遥测**在板子的 Python 3.10 / Humble 上都成立；**没有**证明物理
+接触、Gazebo 世界、控制器容差下的轨迹跟踪。后两者仍要真臂或 Gazebo。
+
+**为了把这段变成可复跑的脚本，踩了两次同一个「配置来源」的坑**（都值得记，
+因为它们**都长得像别的问题**，而且这正是 `moveit_only_check.py` 当初只做
+「不发轨迹」那一段时不会遇到的）：
+
+| # | 症状 | 真因 |
+|---|---|---|
+| 1 | 每次 IK 都 −15，状态机空转 10 次判「卡住」 | 我**自己 `ros2 run` 了一个 `planner_node`**。那条路绕过 `pipeline.launch.py`，拿不到它对 `ik_group` 的覆盖 ⇒ 退回代码里仿真的 `ur5_manipulator`，而真机 move_group 是 `ur_manipulator`。（根因靠单独起 `real.launch.py`、看它的规划器打印 `IK组=ur_manipulator` 确认） |
+| 2 | 规划器连报**「轨迹 action 服务不可用（控制器起了吗？）」**，每条轨迹都失败，看起来像控制器坏了 | **假臂听错了 action 名**。`pipeline.launch.py:92` 按 `camera_source` 选名字：真机是 **`/scaled_joint_trajectory_controller/follow_joint_trajectory`**，我照仿真那个 `/joint_trajectory_controller/...` 起的 |
+| 3 | （改对名字后仍失败）INIT 阶段的「回 HOME」就挂了 | **假臂起太晚**：我从「等 `/compute_ik` 就绪（≈5 s）」之后才起，而规划器 INIT 只等这个 action 约 5 秒。已改成**假臂排在 launch 之后、RSP 之前** |
+
+⇒ 修完的脚本会**拿规划器在线的 `trajectory_action` 参数回头核对**一遍
+（板端实测回读 `/scaled_joint_trajectory_controller/follow_joint_trajectory`），
+不靠脚本里的常量自证。这三条也已写进 `docs/待执行命令.md` 的「别做」。
+
+**顺带修正 D48**：第三十轮已经查到「`ros-humble-moveit` **元包**缺失但组件齐」，
+本轮独立复核并再进一步 —— 板上 `move_group` 不只是存在，它**起得来**：
+裸跑 `--help` 会一路走到加载机器人模型，只因没给 `robot_description` 才停。
+⇒ **不要为了「装 MoveIt」去 `apt install ros-humble-moveit`**，那是装一个聚合器。
+唯一缺的组件是 `moveit_ros_perception`（octomap/深度碰撞），`/compute_ik` 用不到。
+
+### 六、肘高护栏（D49）：工具是现成的，本轮补的是**真机几何**下的复测
+
+**先把功劳还回去。** 量肘高这件事**早就有工具**，而且**已经在板上跑过**：
+
+- `scripts/elbow_guard_probe.py` —— 对抓取区/放置区扫格点逐个解 IK，再 FK 出护栏
+  连杆的高度，逐条报「拦下/放行」；
+- `scripts/moveit_only_check.py` —— 起那个无驱动的 MoveIt 半栈（`real.launch.py
+  start_ur_driver:=false` + 假 `/joint_states`）。
+
+甲-12 的结论（**仿真几何**，即探针沿用了规划器的 `table_plane_z = −0.39`）：
+
+| 甲-12（仿真几何） | 值 |
+|---|---|
+| 解出 / 候选总数 | 36 / 44（8 个失败全在抓取区最远边界 x=0.90，是真够不着） |
+| `wrist_1_link` 最低 | −0.138 m |
+| 护栏下限（−0.39 + 0.02） | −0.370 m |
+| 余量 | **+0.232 m** |
+
+⚠️ **本轮我先在 `/tmp` 里把同一套探针重造了一遍，没有先搜仓库** ——
+`/tmp/board_probe.launch.py`、`/tmp/board_ik_probe.py`、`/tmp/board_mock_arm.py`
+这三个临时文件从 `ur_description` 生成 URDF、起 `robot_state_publisher` +
+`move_group`、假发 `/joint_states`、逐位姿问 IK 再 FK，与上面两个**已入库**脚本做的是
+同一件事。**这是流程失误，记在这里**：动手前该先 `grep scripts/`。下面的数字由那套
+临时探针得到，已与 `elbow_guard_probe.py` 的算法逐项对齐（同样的组名、`ik_link`、
+`avoid_collisions`、种子与朝向）。
+
+**本轮真正新增的是「换几何」**：甲-12 量的是**仿真**（臂坐在 0.80 m 立柱上，台面在
+`base_link` 的 z ≈ −0.39）；而 D49 担心的是**真机**（臂直接装在台面上 ⇒ 台面在
+`base_link` 的 z ≈ 0、抓取点 ≈ +0.15）。同一套测量搬到真机几何：
+
+| tool0 目标 | `forearm_link` z | `wrist_1_link` z | 护栏（台面 0.0，余量 0.02） |
+|---|---|---|---|
+| (0.40, 0.00, 0.15) | **+0.514** | +0.232 | 放行 |
+| (0.50, 0.00, 0.15) | **+0.500** | +0.232 | 放行 |
+| (0.60, 0.00, 0.15) | **+0.472** | +0.232 | 放行 |
+| (0.50, 0.00, 0.25) | **+0.512** | +0.332 | 放行 |
+
+（表里 `wrist_1` 的 +0.232 与甲-12 那个「余量 +0.232」**数值相同纯属巧合**：一个是
+真机几何下腕 1 连杆的高度，一个是仿真几何下最低点减下限。别当成同一个量。）
+
+⇒ 用规划器自己的 `ik_seed`，KDL 解出的是**肘朝上**分支（肘在台面上方约 50 cm）。
+**D49 当初担心的「肘朝下、插进桌面 21 cm」那个分支，在实际配置的种子下没有出现**
+—— 手算预测的是一个**存在但未被选中**的解。所以护栏是**兜底**，不是主防线。
+
+**护栏确实会开火**（不是摆设），用 W1b 那条验证法在板上复现：把台面抬到 −0.10
+（`table_plane_z` 比真台面高，等效于「把桌子抬进肘部活动区」），同样的位姿
+**全部被拦下**（`wrist_1_link = +0.232 < 下限 −0.08`）。
+
+**另一条顺带实测**：同一个点**不带种子**解一次，`wrist_1_joint = −3.219`，
+而有种子是 `+3.064` —— 差 **6.283 = 2π**，即**同一个位姿**，只是角度绕了一圈。
+⇒ 这是 `_consistent_with` **必须先把角度归一化再比**的实证理由：不归一化的话，
+一个完全合法的解会被读成 6.28 rad 的「分支翻转」而被拒绝。
+
+### 七、一个自相矛盾，记下来给决策：仿真需要那个**被故意撤回**的包
+
+- `ros-humble-robotiq-description` 在板端是**故意撤回**的，理由写得很清楚：
+  **真机夹爪是 AG-95 不是 Robotiq，装了无用**（见本文件 §P4「夹爪不一致」）。
+- 但 `arm_grasp_sim` 的 `ur5_with_gripper.urdf.xacro:14,15` **硬依赖**它。
+  板上实测：
+
+  ```
+  xacro: error: PackageNotFoundError: "package 'robotiq_description' not found"
+  ```
+
+  ⇒ 板上跑仿真的**第一步（生成 URDF）就失败**，与 Gazebo 无关。
+
+⇒ 想让 `arm_grasp_sim` 上板，二选一：**装回 `ros-humble-robotiq-description`**
+（arm64 索引里有，`0.0.1-1jammy.20260908.074526`），或**把仿真的夹爪模型换成 AG-95**。
+后者才是与真机一致的方向，但工作量大。**这个取舍该由你定**，我没有擅自装 ——
+它与「真机是 AG-95」那条判断直接冲突。
+
+（注：§五 那条路**不需要**这个包 —— 我用的是官方 `ur_description` + `ur_moveit_config`
+的**不带夹爪**的 URDF，夹爪几何由规划器的 `tool0_to_fingertip` 这个标量吸收。
+所以要的是「状态机在板上跑」，§五 已经给了；只有要跑**完整 Gazebo 仿真**才需要它。）
+
+### 八、本轮没有做的事 / 状态
+
+- **没有接真机、零运动**：§五 那个假 JTC **不是**控制器，它只是把 action 应答掉；
+  全程没有 `/dev/tty*`、没有 `controller_manager`、没有 RTDE。
+- **没有跑甲-14（Gazebo）** —— 按你的决定「降级为可选，先不做」。
+- **没有装 `robotiq-description`** —— 理由见 §七，取舍留给你。
+- **没有推送**，`main` 仍在 `0ab13ec` 未动。
+- 板子跑完已**清场**（残留进程 0）。
+
+### 九、给现场的一条连带提醒
+
+`planner_node` 启动时会打这条 WARN（本轮实测原文）：
+
+> 未往规划场景里加桌面碰撞体（`table_scene_enabled=false`）：`avoid_collisions`
+> 现在**只防自碰撞**，桌子对 MoveIt 不可见。肘高护栏=True。真机上线前请按现场
+> 桌面尺寸打开它。
+
+即 W1b 第 2 项（桌子进规划场景）**已实现但默认关闭**。真机上线前必须打开并给对
+桌面尺寸，否则 D49 那类风险只剩肘高护栏一道防线。
