@@ -263,6 +263,23 @@ python3 scripts/moveit_only_check.py     # 起无驱动 real.launch + RSP + 假 
 `ur_calibration` 校准后的 URDF 重跑。两个实测踩过的坑（少 RSP ⇒ `FRAME_TRANSFORM_
 FAILURE`、少 `/joint_states` ⇒ `/compute_ik` **挂住不回话**）都写在脚本注释里。
 
+**板端全链路吞吐**（**在板子上跑**）——不接臂、不进仿真器，用**实物俯视相机**
+把感知链路整条拉起来测吞吐，回答「这块板子扛不扛得住真机那条链路」：
+
+```bash
+python3 scripts/board_chain_check.py     # 起无驱动 real.launch + RSP + 假 /joint_states
+                                         # + 相机占位 TF，逐级测相机→检测→三维目标
+```
+
+实测（Orin NX，2026-09-29）：相机 25.1 FPS → `/detections` **22.2 FPS** →
+`/targets_3d` **22.6 FPS**；运行中内存 **2.2 / 7.4 GiB**、GPU 73%、结温 57.6 °C、
+整板 **11.5 W**。规划器只要 1 Hz 级 ⇒ 余量十几倍。
+
+⚠️ 两个要点：① 它用**占位**相机外参（相机在上方 1 m 朝下看），只为接通 TF 树，
+所以 `/targets_3d` 的**数值不可信**，它断言的是链路通不通、跑多快；真外参等手眼标定。
+② `planner_node` 会报「轨迹 action 服务不可用」并停住 —— **预期**，没有驱动就没有
+控制器。**本脚本不覆盖运动**，那一步要真臂或仿真器。
+
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 
 ```bash
