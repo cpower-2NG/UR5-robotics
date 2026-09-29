@@ -286,6 +286,24 @@ python3 scripts/board_chain_check.py     # 起无驱动 real.launch + RSP + 假 
 ⇒ 必须加 OSRF 源装 `gz-harmonic`，再**源码编译** `ros_gz` 与 `gz_ros2_control`
 （`GZ_VERSION=harmonic`）。上游自己也把 Humble + Harmonic 列为 "build from source"。
 
+**板端录包 → 搬回开发机看**（板子的图形界面是关掉的，这样看最省事、零 sudo）：
+
+```bash
+# 板子上（链路要另开终端起着；本脚本只录不起链路）
+python3 scripts/board_bag_record.py --profile perception --seconds 30 --out ~/bags/pick_demo
+# 开发机上
+rsync -avP --info=progress2 jetson:~/bags/pick_demo ~/bags/
+ros2 bag play -l --clock ~/bags/pick_demo &
+ros2 run image_transport republish compressed raw --ros-args \
+    -r in/compressed:=/camera/color/image_raw/compressed -r out:=/camera/color/image_raw &
+rviz2 -d ros2_ws/src/yolo_bringup/config/grasping.rviz --ros-args -p use_sim_time:=true
+```
+
+实测 20 秒 perception 档 = **36.5 MB**，rsync 回来 **8.1 MB/s**；JPEG 后 **130 KB/帧**
+（原图 2.76 MB，小 21 倍）。⚠️ 三个坑都在 **甲-15** 里写清了：latched 话题要 QoS 覆盖
+（否则 `/tf_static` 空、回放 TF 断根）、`--clock` 与 `use_sim_time` 必须配对
+（否则模型僵住）、**RViz 的 `Transport Hint` 实测被忽略**（所以要用上面那条 republish 桥）。
+
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 
 ```bash
