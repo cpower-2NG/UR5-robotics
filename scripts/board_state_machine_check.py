@@ -35,8 +35,8 @@
      于是每次 IK 都返回 −15。本脚本第一版就踩了这个，见 `main()` 里的注释）
   5. 订阅 `/grasp_planner/telemetry`，把状态时间线打出来并**判它走完了一整轮**
 
-两个**顺序/名字**上的硬要求（各踩过一次，都写进 `main()` 的注释了）
---------------------------------------------------------------
+三个**顺序/名字/来源**上的硬要求（各踩过一次，都写进 `main()` 的注释了）
+--------------------------------------------------------------------
   · **action 名必须对**：`real.launch.py` 走 `camera_source:=realsense`，
     `pipeline.launch.py:92` 于是把 `trajectory_action` 覆盖成
     **`/scaled_joint_trajectory_controller/follow_joint_trajectory`**（不是仿真的
@@ -46,6 +46,14 @@
   · **假臂要先起**：规划器 INIT 阶段会「张开夹爪 → 回 HOME」，那里只等这个
     action 约 5 秒。等 `/compute_ik` 就绪（≈5 s）再起假臂**已经晚了** ——
     所以在 `main()` 里假臂排在 launch 之后、`robot_state_publisher` 之前。
+  · **不是所有参数都能靠 `--params-file` 改**：`pipeline.launch.py:380-393` 的
+    `planner_params` 是 `[yaml, {...覆盖项}]`，**后面的覆盖前面**，而覆盖项里有
+    `table_scene_enabled` / `ik_group` / `trajectory_action` / `gripper_backend` /
+    `carry_objects` 五个键 —— 这五个**永远取自 launch 参数，yaml 里写了也没用**
+    （实测：yaml 里 `table_scene_enabled: true`，规划器照样打「桌面进场景=False」）。
+    几何量（`pick_zone` / `place_z` / `place_slots` / `table_plane_z` /
+    `table_box_pose` …）不受影响，`--params-file` 对它们有效。
+    要开桌面碰撞体就用 `--table-scene`（它加的是 launch 参数）。
 
 判据（退出码 0 的必要条件）
 --------------------------
@@ -127,8 +135,9 @@ def make_mock_arm(rclpy):
     class MockArm(Node):
         """把规划器要的两件事凑出来，并记录遥测状态时间线。"""
 
-        def __init__(self, action_name):
+        def __init__(self, action_name, target_xyz):
             super().__init__("board_state_machine_mock_arm")
+            self._target = tuple(float(v) for v in target_xyz)
             self._q = list(HOME)
             self._lock = threading.Lock()
             self.n_goals = 0
@@ -167,14 +176,14 @@ def make_mock_arm(rclpy):
             #    _select_and_approach），**不是** bbox.center —— 只填 bbox 的话
             #    它看到的是 (0,0,0)，会被 pick_zone 滤掉，症状是「检测明明进来了
             #    但永远没有候选」。两处都填，与 projector_node 的输出一致。
-            hyp.pose.pose.position.x = TARGET_XYZ[0]
-            hyp.pose.pose.position.y = TARGET_XYZ[1]
-            hyp.pose.pose.position.z = TARGET_XYZ[2]
+            hyp.pose.pose.position.x = self._target[0]
+            hyp.pose.pose.position.y = self._target[1]
+            hyp.pose.pose.position.z = self._target[2]
             hyp.pose.pose.orientation.w = 1.0
             d.results.append(hyp)
-            d.bbox.center.position.x = TARGET_XYZ[0]
-            d.bbox.center.position.y = TARGET_XYZ[1]
-            d.bbox.center.position.z = TARGET_XYZ[2]
+            d.bbox.center.position.x = self._target[0]
+            d.bbox.center.position.y = self._target[1]
+            d.bbox.center.position.z = self._target[2]
             d.bbox.center.orientation.w = 1.0
             d.bbox.size.x = d.bbox.size.y = d.bbox.size.z = 0.04
             msg.detections.append(d)
@@ -231,6 +240,15 @@ def main():
     ap.add_argument("--finish-timeout", type=float, default=60.0,
                     help="走完一轮后等 FINISHED 的秒数（默认 60；规划器的空闲"
                          "看门狗 idle_finish_timeout 默认 20 s）")
+    ap.add_argument("--target", default="0.50,0.00,-0.35",
+                    help="合成目标 (x,y,z)（默认落在仿真几何的 pick_zone 里）")
+    ap.add_argument("--table-scene", action="store_true",
+                    help="打开 table_scene_enabled（把桌子发进规划场景）。"
+                         "⚠️ 真机上线**必须**打开，但这条路径从没在板端跑过")
+    ap.add_argument("--params-file", default=None,
+                    help="替换 grasp_planner 的参数文件（走 pipeline 的 "
+                         "planner_params_file）。要改 pick_zone / table_box_pose "
+                         "这类几何量时用它，比堆命令行覆盖干净")
     ap.add_argument("--log", default="/tmp/board_state_machine_check.log")
     ap.add_argument("--keep", action="store_true", help="跑完不清场（排障用）")
     args = ap.parse_args()
@@ -260,11 +278,19 @@ def main():
     rc = 2                     # 默认「环境不满足」；走到判据那步再改
     try:
         # 1) 真机入口，去掉驱动（与 moveit_only_check.py 同一条命令）
-        spawn("launch",
-              "ros2 launch yolo_bringup real.launch.py "
-              "start_ur_driver:=false publish_camera_tf:=false "
-              "tf_required:=false gripper_backend:=none carry_objects:=false",
-              args.log)
+        #    `table_scene_enabled` / `planner_params_file` 都是 pipeline.launch.py
+        #    声明过的参数，未在 real.launch.py 的 include 里列出**也能生效**
+        #    （顶层 launch 配置会被 include 继承；real.launch.py 里也有注释说明）。
+        launch_cmd = ("ros2 launch yolo_bringup real.launch.py "
+                      "start_ur_driver:=false publish_camera_tf:=false "
+                      "tf_required:=false gripper_backend:=none "
+                      "carry_objects:=false")
+        if args.table_scene:
+            launch_cmd += " table_scene_enabled:=true"
+        if args.params_file:
+            launch_cmd += f" planner_params_file:={args.params_file}"
+        print(f"入口：{launch_cmd}", flush=True)
+        spawn("launch", launch_cmd, args.log)
 
         # 2) 本进程内的假臂 —— ⚠️ **必须排在 planner 的 INIT 前面**。
         #    规划器启动后很快就要「回 HOME」，那里只等 action 服务约 5 秒；
@@ -274,7 +300,11 @@ def main():
         import rclpy
         from rclpy.executors import MultiThreadedExecutor
         rclpy.init()
-        mock = make_mock_arm(rclpy)(args.action)
+        mock = make_mock_arm(rclpy)(args.action, args.target.split(","))
+        # table_scene_enabled=true 时，规划器会打一行「桌面碰撞体已进入规划场景」
+        # —— 那是这条路径**唯一**的通过证据（没有它成功也只是「没报错」）。
+        if args.table_scene:
+            print("等桌面碰撞体进入规划场景 ……", flush=True)
         ex = MultiThreadedExecutor()
         ex.add_node(mock)
         threading.Thread(target=ex.spin, daemon=True).start()
@@ -382,6 +412,19 @@ def main():
         elif mock.finish_ok is not True:
             print("  ✗ 收工了，但遥测级别是 ERROR（不是正常收工）")
             ok = False
+        # 桌子进场景这条路径（真机上线必须打开）单独判 —— 它从没在板端跑过。
+        if args.table_scene:
+            log_txt = ""
+            try:
+                log_txt = open(args.log, errors="ignore").read()
+            except OSError:
+                pass
+            if "桌面碰撞体已进入规划场景" in log_txt:
+                print("  ✓ 桌面碰撞体已进入规划场景（avoid_collisions 名副其实）")
+            else:
+                print("  ✗ 桌面碰撞体**没有**进入规划场景 —— 见日志 "
+                      "`/apply_planning_scene` 那几行")
+                ok = False
         if ok:
             print("  ✓ 状态机走完了一整轮抓→放，并按看门狗正常收工")
             print("    （零运动：轨迹全部由桩应答）")
