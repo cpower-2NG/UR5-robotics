@@ -1,0 +1,33 @@
+# rosbag2 的 QoS 覆盖 —— 给 `board_bag_record.py` 用。
+#
+# **为什么必须有这个文件**
+# ----------------------
+# `ros2 bag record` 默认按**话题上已有发布者**的 QoS 去订阅；但对
+# **transient_local（latched）** 话题这一步有个众所周知的坑：
+# 录制器起得比发布者晚时，会以 VOLATILE 订阅上，于是**拿不到那条已经锁存的消息**
+# —— bag 里话题存在、消息数为 0。回放时表现为：
+#
+#   · `/tf_static` 空 ⇒ **TF 树断根**：RViz 里 RobotModel 不显示、
+#     `base_link` 不存在、相机外参丢失 —— 录制的东西基本看不了；
+#   · `/robot_description` 空 ⇒ RViz 的 RobotModel 拿不到 URDF。
+#
+# 所以这两个话题**必须显式声明 `transient_local`**，让录制器去接锁存值。
+#
+# 用哪个字段：`rosbag2` 的 `--qos-profile-overrides-path` 接受
+# `durability / reliability / history / depth` 四个（**不能**在这里设
+# deadline / lifespan，那是另一套）。`depth` 给大一点没坏处。
+#
+# ⚠️ 若某个话题在 bag 里**完全不存在**（不是「存在但 0 条」），说明它当时
+# 没被发布 —— 那要在录制前查，不是 QoS 的问题。
+
+/tf_static:
+  durability: transient_local
+  reliability: reliable
+  history: keep_last
+  depth: 100
+
+/robot_description:
+  durability: transient_local
+  reliability: reliable
+  history: keep_last
+  depth: 1
