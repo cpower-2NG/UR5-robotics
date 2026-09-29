@@ -1,56 +1,102 @@
+# 本文件里每一个类名和键名都是**实跑验证过**的，不是照着记忆写的。
+#
+# ⚠️ 修过三处会让它「打开是一片空白」的错误，逐条有实测证据：
+#
+# 1) 类名全错。原文件通篇 `rviz2/TF`、`rviz2/Image`、`rviz2/Displays` ——
+#    RViz 会把**所有**显示丢掉：
+#      [ERROR] PluginlibFactory: The plugin for class 'rviz2/TF' failed to load.
+#              ... Declared types are ... rviz_default_plugins/TF ...
+#    `rviz2/X` 这个写法 ROS 1（`rviz/X`）和 ROS 2 都不对，应是一次
+#    `rviz/` → `rviz2/` 的全局替换留下的。**也就是说本配置从未生效过。**
+#    正确的：显示用 `rviz_default_plugins/*`，面板用 `rviz_common/*`。
+#
+# 2) `/target_3d_marker` 是个**死话题** —— 全仓库没有任何地方发布它，
+#    那个 Marker 显示永远画不出东西。真正在发的是 `projector_node.py:141`
+#    的 `/target_3d`（`geometry_msgs/PoseStamped`），改用 Pose 显示。
+#
+# 3) RobotModel 没写 `Description Source`，rviz2 会退回默认的 File（路径为空）
+#    —— 即使打开也画不出模型。要点名走 Topic。
+#
+# ❌ 另外**不要**加 `Transport Hint: compressed`。实测 RViz2（Humble）
+#    **从配置文件加载时会忽略它**，永远订阅你写的那个原始话题名：
+#    只发布 `/probe_cmp/compressed`、显示写 `/probe_cmp` + hint compressed 时，
+#    RViz 仍然去订阅 `/probe_cmp`（那里没有发布者）。
+#    要看板子录回来的 JPEG，用开发机上的 `image_transport republish` 把它解回
+#    原始话题（命令见 `docs/待执行命令.md` 甲-15），本配置就照常能用。
+
 Panels:
-  - Class: rviz2/Displays
+  - Class: rviz_common/Displays
     Name: Displays
-  - Class: rviz2/Views
+  - Class: rviz_common/Views
     Name: Views
 
 Visualization Manager:
+  Class: ""
   Displays:
     # TF 框架
-    - Class: rviz2/TF
+    - Class: rviz_default_plugins/TF
       Name: TF
-      Enabled: true
+      Value: true
 
     # RGB 图像
-    - Class: rviz2/Image
+    # ⚠️ Reliability Policy 2（Best Effort）两边都对：
+    #   · 实时：RealSense 就是 Best Effort 发的；
+    #   · 回放：`image_transport republish` 按可靠发，Best Effort 订阅者能匹配它。
+    - Class: rviz_default_plugins/Image
       Name: RGB Camera
-      Enabled: true
+      Value: true
       Topic:
         Depth: 1
         Reliability Policy: 2  # Best Effort
         Value: /camera/color/image_raw
 
     # YOLO 检测标注
-    - Class: rviz2/Image
+    - Class: rviz_default_plugins/Image
       Name: YOLO Detections
-      Enabled: true
+      Value: true
       Topic:
         Depth: 1
         Reliability Policy: 2
         Value: /detections_image
 
-    # 3D 目标标记
-    - Class: rviz2/Marker
+    # 3D 目标点
+    - Class: rviz_default_plugins/Pose
       Name: Target 3D
-      Enabled: true
+      Value: true
       Topic:
-        Value: /target_3d_marker
+        Depth: 5
+        Reliability Policy: 1
+        Value: /target_3d
 
-    # 机器人模型（需 URDF）
-    - Class: rviz2/RobotModel
+    # 机器人模型。
+    # `/robot_description` 是 transient_local（latched），所以 Durability Policy
+    # 必须是 1（Transient Local）才收得到那条锁存消息。
+    #（板端录包时 `scripts/bag_qos_overrides.yaml` 保的也是这条。）
+    - Class: rviz_default_plugins/RobotModel
       Name: Robot Model
-      Enabled: false
+      Value: true
+      Description Source: Topic
       Description Topic:
+        Depth: 5
+        Durability Policy: 1  # Transient Local
+        Reliability Policy: 1
         Value: /robot_description
 
   Global Options:
-    Background Color: 48 48 48
+    Background Color: 48; 48; 48
     Fixed Frame: base_link
     Frame Rate: 30
 
+  Value: true
   Views:
-    - Class: rviz2/Orbit
-      Name: Current View
-      Target Frame: base_link
+    Current:
+      Class: rviz_default_plugins/Orbit
       Distance: 3.0
-      Focal Point: [0.5, 0.0, 0.5]
+      Focal Point:
+        X: 0.5
+        Y: 0.0
+        Z: 0.5
+      Name: Current View
+      Pitch: 0.4
+      Target Frame: base_link
+      Yaw: -0.6
