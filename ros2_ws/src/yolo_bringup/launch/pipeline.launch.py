@@ -218,8 +218,10 @@ def generate_launch_description():
     #   external
     # 真机上若仍默认 sim，规划器会去命令一个**真机不存在的关节**
     # robotiq_85_left_knuckle_joint——JTC 收下这条轨迹却不动任何东西，
-    # 于是「夹爪没反应」而不报错。故真机默认 ag95（其当前实现是**会大声报错的桩**，
-    # 现场核实 Modbus 寄存器映射前不可用，这是刻意设计，见 grasp_planner/gripper.py）。
+    # 于是「夹爪没反应」而不报错。故真机默认 ag95（它**会大声报错**：后端一构造就去
+    # 开串口，板上没适配器时抛 RuntimeError，见 grasp_planner/gripper.py）——
+    # 这里取的是「响亮失败」，不是「能跑」。⚠️ 只起上层节点时（external）记得传
+    # gripper_backend:=none，否则规划器启动即死。
     gripper_backend_default = PythonExpression([
         "'sim' if '", LaunchConfiguration('camera_source'),
         "' == 'sim' else 'ag95'",

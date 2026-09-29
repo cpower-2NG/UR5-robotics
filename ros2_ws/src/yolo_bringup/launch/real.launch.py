@@ -29,8 +29,10 @@
 
 ⚠️ 第一个真机 demo **不含抓取**，所以本文件的默认值就是那个组合：
 `gripper_backend:=none` + `carry_objects:=false`（只走位）。
-要真夹取得先把 AG-95 的写路径做出来（`ag95` 后端今天构造即报错），见
-`grasp_planner/gripper.py` 与 `docs/RESTRUCTURE_PLAN.md`。
+要真夹取，AG-95 的**代码侧已经就绪**（`ag95` 后端的读/写/到位轮询都在
+`grasp_planner/gripper.py`，写路径由 `ag95_dry_run` 卡着，默认只读）——
+挡着的**只有硬件**：板上还没有 USB-RS485 适配器，`_connect()` 打不开串口。
+硬件到位后按 `docs/待执行命令.md` 的 **丙-1**（判决方向 → 离臂试写 → 上臂）逐步走。
 """
 
 import os
@@ -272,8 +274,9 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "gripper_backend", default_value="none",
-            description="sim | ag95 | none。真机默认 none（只走位）—— ag95 后端"
-                        "尚未实现、构造即报错；要真夹取先做 W3",
+            description="sim | ag95 | none。真机默认 none（只走位）—— 不是 ag95"
+                        "没实现（代码侧已就绪），而是板上还没有 USB-RS485 适配器，"
+                        "ag95 现在构造就会因打不开串口而报错；见文件头的说明",
         ),
         DeclareLaunchArgument(
             "carry_objects", default_value="false",
