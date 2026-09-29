@@ -4447,6 +4447,24 @@ STARTING → INIT → IDLE → APPROACH → DESCEND → LIFT → HOME_WITH_OBJEC
 
 第 4 组就是真机上线要用的那套配置：**桌子作为真实碰撞体在 MoveIt 场景里**，
 `avoid_collisions` 第一次名副其实，而整条抓→放仍然解得开、走得完。
+
+**另加一组：换用文档里那条入口**（`--entry bringup.launch.py`）。
+前面几组都是直接起 `real.launch.py`，而**现场会照着 README 敲
+`bringup.launch.py camera_source:=realsense`** —— 于是那层 `include` 的参数穿透
+就成了一个没验过的环节，而 `bringup.launch.py` 自己写着这个机制是脆的
+（「参数只在 `real.launch.py` 里声明，本文件**故意不声明它们**」，靠 launch 配置
+继承穿透）。实测：**同样走完一整轮，退出码 0**。穿透确实成立，判据是
+`start_ur_driver:=false` 必须传到 —— 日志里 `ur_robot_driver` / `robot_ip`
+出现 **0** 次，全场只有 5 个节点：
+
+```
+[move_group-1] [realsense2_camera_node-2] [detector_node-3]
+[projector_node-4] [planner_node-5]
+```
+
+（**驱动一个字节都没起** —— 这就是零运动保证的现场版本：README 那条命令加上
+`start_ur_driver:=false`，物理上没有任何东西能执行轨迹。）
+
 启动横幅逐字（板端实测）：
 
 ```

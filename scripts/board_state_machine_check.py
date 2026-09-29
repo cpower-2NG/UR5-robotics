@@ -249,6 +249,11 @@ def main():
                     help="替换 grasp_planner 的参数文件（走 pipeline 的 "
                          "planner_params_file）。要改 pick_zone / table_box_pose "
                          "这类几何量时用它，比堆命令行覆盖干净")
+    ap.add_argument("--entry", default="real.launch.py",
+                    help="用哪个入口起（默认 real.launch.py）。改成 "
+                         "bringup.launch.py 可以顺带验**文档里那条命令**能不能跑通 "
+                         "—— 它的真机细分参数靠 launch 配置继承穿透，本文件自己 "
+                         "说了这个机制是脆的")
     ap.add_argument("--log", default="/tmp/board_state_machine_check.log")
     ap.add_argument("--keep", action="store_true", help="跑完不清场（排障用）")
     args = ap.parse_args()
@@ -281,7 +286,11 @@ def main():
         #    `table_scene_enabled` / `planner_params_file` 都是 pipeline.launch.py
         #    声明过的参数，未在 real.launch.py 的 include 里列出**也能生效**
         #    （顶层 launch 配置会被 include 继承；real.launch.py 里也有注释说明）。
-        launch_cmd = ("ros2 launch yolo_bringup real.launch.py "
+        #    `camera_source:=realsense` 对 real.launch.py 是**未声明参数**，
+        #    进 launch_configurations 后无人读，无害；对 bringup.launch.py 则
+        #    正是它分派到 real.launch.py 的依据。两边都传，一套命令通吃。
+        launch_cmd = (f"ros2 launch yolo_bringup {args.entry} "
+                      "camera_source:=realsense "
                       "start_ur_driver:=false publish_camera_tf:=false "
                       "tf_required:=false gripper_backend:=none "
                       "carry_objects:=false")
