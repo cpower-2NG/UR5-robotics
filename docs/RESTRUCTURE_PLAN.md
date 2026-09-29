@@ -739,8 +739,8 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 | `ros2_ws/src/grasp_planner/launch/planner.launch.py` | ✅ **已改（第九轮）**：废弃 `mode:=mock\|moveit`（mock 分支只打日志、从不执行，是**误导性死分支**），改为加载 yaml 并暴露 `params_file`/`gripper_backend` | D3 D12 |
 | `ros2_ws/src/arm_grasp_sim/**` | ✅ **新增（第九轮，自附件移植）**：world + UR5+Robotiq 的 URDF/SRDF + `sim.launch.py`。**D34–D39 已修**（构造期改运行期、去 `\|\| true`、去必然失败的 `set_p_gain`、去冗余 `switch_controller`、路径改 `get_package_prefix`、仿真改回 `ExecuteProcess`） | D34 D35 D36 D37 D38 D39 |
 | `ros2_ws/src/yolo_bringup/worlds/color_objects_world.sdf` | ✅ **已改（第十三轮）**：选「改名」而非补机械臂（补臂等于再造一个 `grasp_world.sdf`，而 `arm_grasp_sim` 里已经有一套成套的）。文件 + `<world name>` + 12 处引用全部更新 | D4 |
-| `yolo_vision/**`、`yolo_coco/**` | **删除**——⚠️ 但 `docs/chapter03_yolo_perception.md` 的 §3.4/§3.5 依赖它们，**先处理教材正文与 5 张配图**（§5 问题 9） | D21 |
-| `docs/chapter03_yolo_perception.md` | **改**：§3.3.2/§3.3.3 的 Jazzy 改为 Humble（与附件及 Orin 对齐）；§3.4/§3.5 视问题 9 的选择重写或保留 | D21 D22 |
+| `yolo_vision/**`、`yolo_coco/**` | ✅ **已删**（第十四轮）。原先挂着的前置条件（「先处理教材正文与 5 张配图」）已由第三十四轮了结 | D21 |
+| `docs/chapter03_yolo_perception.md` | ✅ **已删（第三十四轮）** —— 不是原先写的「改 Jazzy 为 Humble」。用户当面复核后仍选**全删**：教材项目已完结、不在此仓库开发，本仓库定位是「把项目再利用起来」。**同批删除**：`chapter03_yolo_perception.pdf`（1.34 MB，全仓库唯一 pdf）、`docs/render_math.py`（只为这一份渲染公式，`DOC` 路径写死）、`docs/images/`（26 张 `math_*.svg` + `random_detection_result.png`，后者只被该章 §3.6 引用）。删后全仓无残留引用 | D21 D22 |
 | `docs/YOLO_VISION_DESIGN.md` | **改**：全文按 `yolo_vision` 包写（`:230-466` 多处命令与目录树），删包后需重指向 `ros2_ws/src/yolo_detector` | D21 |
 | `scripts/install_deps.sh`、`environment.yml` | ✅ **已删**（第十一轮）：连同 `create_env.sh`/`setup_all.sh`/`setup_workspace.sh` 一并 `git rm`。真实环境写入 README | D9 |
 | `README.md`、`docs/TECHNICAL_SPEC.md` | **改**：区分「设计目标」与「已实现」 | D4 D10 |
@@ -760,7 +760,7 @@ PATH=/usr/bin:$PATH colcon build --packages-up-to gz_ros2_control \
 | 1 | P3-6 技术路线 | 路线 **(B)** 抽出统一 `perception_3d` |
 | 2 | `yolo_vision/` 去留 | **删除**（教学包，有独立备份） |
 | 3 | `yolo_coco/` 去留 | **删除**（教学包，有独立备份） |
-| 4 | 教材 `chapter03` 依赖待删包（D21）怎么办 | **全删**。用户明确：**教材项目已完结、也不在此仓库开发**，本仓库现在的定位是「把这个开发过的项目再利用起来」，不是继续写教材。故章节图链失效可接受 |
+| 4 | 教材 `chapter03` 依赖待删包（D21）怎么办 | **全删**。用户明确：**教材项目已完结、也不在此仓库开发**，本仓库现在的定位是「把这个开发过的项目再利用起来」，不是继续写教材。故章节图链失效可接受<br>✅ **已于第三十四轮执行**（当面复核后仍选全删，包括同批的 pdf / `render_math.py` / `docs/images/`） |
 | 5 | 仿真后端 | **Humble + Gazebo Harmonic，本机装**（已确认）。Orin 上不装仿真器 |
 | 6 | Orin 板地址 | ✅ **已自行找到**（🔒 具体地址与 SSH 接入方式**不入库**，见本地笔记）。P4-1 已完成 |
 | 7 | Python 环境策略 | 用**独立环境**，不动系统 Python。本机已有 conda（`/home/<user>/robotics/venvs/miniforge3`）及其 `robot-vision` 环境（numpy 1.26.4 / torch 2.5.1+cu121 / ultralytics 8.3.99），**numpy 已是 `<2`，cv_bridge 兼容性天然满足**（D23 的顾虑消解） |
@@ -4498,3 +4498,141 @@ z = 0、方块顶面 +0.04、`place_z` +0.04、抓取区与 4 个槽位是按这
 ⇒ 与 D50/D64 同一族：**改了没反应，且不报错**。现场要开桌面碰撞体，
 **必须走 launch 参数** `... real.launch.py table_scene_enabled:=true`（第 4 组就是这么跑通的），
 指望改 `grasp_planner.yaml` 会白忙。**这一条已写进 `docs/待执行命令.md`。**
+
+---
+
+## 第三十四轮：清单外的三件事 —— 死键的对照表、一个会误导人的旧说法、和教材第 3 章（2026-09-29）
+
+本轮起点是用户选的「**回计划主线 W1/W1b**」。**那一项已经没有工作了** ——
+逐个查证：`planner_node.py` 里 `traj_succeeded()`（要求 `STATUS_SUCCEEDED` 且
+`error_code == 0`，D52）、`pick_zone`/`place_slots` 与槽位收工路径（W1）、肘高护栏
++ 桌面进规划场景（W1b）都在；`gripper.py` 的 AG-95 读/写/到位轮询与 `ag95_dry_run`
+闸门在（W3）；`real.launch.py` 在（W2）；`block_dataset/data.yaml` 相对路径在（D57）。
+所以本轮没有去重做任何已完成的东西，转而清掉**盘点时冒出来、但不在任何 todo 清单上
+的三个问题**。三件都属于同一类：**文档说的和代码实际状态不一致，而且不报错。**
+
+### 一、5 个死键：把陷阱写在会被踩到的地方（`e1a2ae6`）
+
+第三十三轮已查明 `pipeline.launch.py` 的 `planner_params = [<yaml>, {覆盖项}]`
+是**后面的覆盖前面**，于是 `gripper_backend` / `table_scene_enabled` / `ik_group` /
+`trajectory_action` / `carry_objects` 这 5 个键**在 yaml 里改了不生效**。
+但那条结论当时只写在台账与命令文档里，而**踩坑的位置是 yaml 本身** ——
+有人打开 `grasp_planner.yaml`、改一行、重启、发现没变，再也不会想到去翻台账。
+
+本轮把对照表搬到 yaml 文件头：
+
+| 键 | 全车入口（bringup→pipeline） | 独立入口（planner.launch.py） |
+|---|---|---|
+| `gripper_backend`     | ❌ 死键 | ❌ 死键（那个 launch 的 `parameters=[...]` 也覆盖它） |
+| `table_scene_enabled` | ❌ 死键 | ✅ 生效 |
+| `ik_group`            | ❌ 死键 | ✅ 生效 |
+| `trajectory_action`   | ❌ 死键 | ✅ 生效 |
+| `carry_objects`       | ❌ 死键 | ✅ 生效 |
+
+⚠️ **为什么不干脆把这 5 个键删掉** —— 这是本轮唯一一个「按直觉做会引入回归」的决定。
+`planner.launch.py` 只覆盖 `gripper_backend`，其余四个在**独立入口**下是**真生效**的。
+删掉它们，那条路就退回 `planner_node._declare_params` 里的硬编码默认值，
+而那个默认值是照仿真几何定的 —— 等于把「独立入口能按现场覆盖」这个能力悄悄拿掉。
+所以改法是**保留键 + 就地标注**：文件头一张表 + 每个键旁边一行 `⚠️ 死键（全车入口下）`。
+
+顺带修掉两处**行号引用**（`pipeline.launch.py:379-394` → 「`planner_params =` 那一处」；
+`planner.launch.py:49` → 「那个 launch 的 `parameters=[...]`」）。这类引用本仓库
+已经栽过一次（`c8aeae8`：一个可达性表里八个行号齐齐漂了 20 行），锚点不会漂。
+
+### 二、「AG-95 是构造即报错的桩」——一族说到第二十五轮就过时、但有七处没改的话（`47b65cf`）
+
+第九轮的 `Ag95Gripper` 确实只是个抛错的桩。第二十五轮（`3b8f0c7`）落地了读路径 +
+`ag95_dry_run` 闸门，**这族说法就不成立了**，但七处没跟着改：
+
+| 位置 | 原文 |
+|---|---|
+| `real.launch.py` 文件头 | 「要真夹取得先把 AG-95 的写路径做出来」 |
+| `real.launch.py` `gripper_backend` 说明 | 「ag95 后端尚未实现、构造即报错；要真夹取先做 W3」 |
+| `planner.launch.py` `gripper_backend` 说明 | 同上 |
+| `gripper.py::validate_ag95_geometry` | 「`Ag95Gripper` 是构造即报错的桩，构造函数里的检查都是死代码」 |
+| `scripts/ag95_probe.py` 文件头 | 「`Ag95Gripper` 现在是构造即报错的桩」 |
+| `pipeline.launch.py:222` | 「其当前实现是会大声报错的桩」 |
+| `README.md`（两处） | 「目前是『构造即报错』的桩……现场核实寄存器映射前不可用」 |
+
+**危害不是措辞难听，是会让人去重做已经做完的 W3**：把「板上没插适配器」读成
+「代码还没写」，然后从零写一遍驱动。
+
+统一后的口径（三句话，其余地方都指向它）：
+
+1. **代码侧已就绪** —— 读/写/到位轮询/写入生效校验都在 `gripper.py`，
+   写路径由 `ag95_dry_run` 卡着、默认**只读**；
+2. 今天构造仍会失败，是因为 `_connect()` 打不开串口 —— **板上没有 USB-RS485 适配器**
+   （`lsusb` 无任何 USB-串口芯片）。**这与代码无关**；
+3. 适配器到位后的顺序不变：只读探映射 → 离臂试写 → 才准上臂（命令文档 **丙-1**）。
+
+#### 顺带纠正一处**我上一批自己写歪的**：`gripper_backend` 的默认值随入口变
+
+改 README 时发现原文那句「真机还需把 `camera_source` 带来的 `gripper_backend:=ag95`
+一并处理」**只对 `external` 成立**：
+
+| 入口 | 落到哪 | `gripper_backend` 默认 | 后果 |
+|---|---|---|---|
+| `camera_source:=realsense` | → `real.launch.py` | **`none`** | 只走位，不报错 |
+| `camera_source:=external` | → `pipeline.launch.py` | **`ag95`** | 后端一构造就开串口 ⇒ **规划器启动即死** |
+
+`real.launch.py` 自己声明了 `gripper_backend` 默认 `none`，而 `bringup.launch.py`
+**故意不声明**它（文件头有理由：声明过的参数会顺 include 链把仿真路径也改掉）——
+于是「谁声明、谁不声明」直接决定默认值。README 现在按入口分成两行写清楚。
+
+### 三、教材第 3 章：全删（本提交）
+
+`docs/chapter03_yolo_perception.md` 是 §5 问题 4 里已答复「全删」的那一条，
+但**没有执行**，且它属于「整份文档」而不是「条目」，故本轮当面复核了一次
+（用户仍选全删）。**同批删除**的还有它自己的一整套附属物：
+
+```
+docs/chapter03_yolo_perception.md     626 行 / 28 KB
+docs/chapter03_yolo_perception.pdf    1.34 MB   ← 全仓库唯一的 pdf
+docs/render_math.py                   只为这一份渲染公式（DOC 路径写死）
+docs/images/                          26 张 math_*.svg + random_detection_result.png
+```
+
+`docs/images/` 整个目录随之消失：那 26 张 SVG 全部是 `render_math.py` 生成的
+（文件名是 LaTeX 的 md5 前 8 位），`random_detection_result.png` 只被该章 §3.6 引用
+（第 573 行）——**删前逐一验过没有任何别处引用**，删后全仓 `git grep` 无残留。
+
+它坏在哪里（决定了「改」和「删」哪个才对）：
+
+| 位置 | 状态 |
+|---|---|
+| §3.4 实验一（142 行）、§3.5 实验二（218 行） | 教的就是 `yolo_coco` / `yolo_vision`，两个包**已删** |
+| 6 张插图里的 5 张 | 指向 `../yolo_coco/assets/*` 与 `../yolo_vision/images/*`，**全是死链** |
+| §3.3.2 安装 ROS2 **Jazzy** | 与 Orin 的 **Humble** 不兼容（D22），照做会装错发行版 |
+| §3.3.4 三个 conda 环境名 | 本机一个都不存在（D29） |
+
+⚠️ 一句实话：**§3.1/§3.2（YOLO 原理，124 行）本身没坏** —— 不依赖任何已删的包、
+与发行版无关，而且是本仓库**唯一**的 YOLO 原理正文（`YOLO_GUIDE.md` 与
+`YOLO_TUTORIAL.md` 都只讲采集/训练/部署的实操）。我把它作为独立选项摆出来过
+（「拆出原理再删」），用户仍选全删，理由是**本仓库已不是那本教材的开发地**。
+⇒ 这不是「坏掉的部分拖着好的部分一起死」，而是一次明确的定位选择。
+两个文件的完整内容在 `main` 与本分支的 git 历史里都在（`git show 0ab13ec:docs/chapter03_yolo_perception.md`）。
+
+### 四、自检
+
+`scripts/test_*.py` 共 11 个，**起 ROS 环境后 9 个通过**，2 个是环境依赖而非缺陷：
+
+| 脚本 | 结果 | 说明 |
+|---|---|---|
+| `test_ag95_gripper.py` | PASS 51 / SKIP 0 / FAIL 0 | 手写 Modbus 从站 + pty，数的是**从站收到了什么** |
+| `test_ag95_probe.py` | PASS 40 / SKIP 0 / FAIL 0 | ⚠️ 未 source ROS 时它会 FAIL 一条、并报 SKIP 3 —— 那是测试台没搭好，不是驱动坏了 |
+| `test_ag95_units.py` / `test_detector_device.py` / `test_label_projection.py` / `test_model_resolution.py` / `test_perception_3d.py` / `test_planner_telemetry.py` / `test_real_launch.py` | 全部通过 | `test_real_launch.py` 另跳过 3 项（需 UR 官方包在场） |
+| `test_minimal.py` | ✗ | `ultralytics 未安装` —— 它用的是**系统 python3**，而 torch/ultralytics 在 conda 的 `robot-vision` 里。换解释器即可 |
+| `test_pipeline_e2e.py` | ✗ | 需要**有管线在跑**（它订阅 `/targets_3d` 等） |
+
+### 五、未验证 / 未做
+
+- 本轮**没碰板子**，也没触发任何运动。
+- 台账里若干早期轮次的「未验证 / 未做」条目（`Ag95Gripper` 是桩、写路径未实现）
+  **保持原样不改** —— 那是各轮当时的实况记录，第二十五轮起已被后续轮次取代，
+  本轮只改**活着的**（§4 逐文件清单、§5 已答复表）。
+- 相机外参、真机几何实测值、`tool0_to_fingertip` 的 AG-95 真值仍缺（要现场）。
+- 甲-13 / 甲-14 / 甲-16 / 甲-17 / 甲-19 / 丙-0 / 丙-1 状态不变。
+
+### 六、状态
+
+`migrate/humble-orin` 上又添 3 个提交（本轮），`main` 仍在 `0ab13ec`，**未推送**。
