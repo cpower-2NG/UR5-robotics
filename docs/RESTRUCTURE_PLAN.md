@@ -3892,3 +3892,50 @@ Harmonic（gz-sim8）ABI 不通。
   `ros_gz` + `gz_ros2_control`，且需 sudo 加 OSRF 源。命令备在 `待执行命令.md` 甲-14。
 - 全程**零运动**（不起驱动 ⇒ 无 controller_manager；未接任何执行机构）。
 - `main` 仍在 `0ab13ec` 未动，未推送。
+
+
+### 六-bis、查证过、**否决**的一条更便宜的替代路线：Fortress
+
+交回 sudo 命令之前先自己试了一遍「有没有不用编译的走法」，因为 arm64 上
+`ros-humble-ros-gzharmonic` 缺失这件事值得再顶一次。结果：**satisfies 了「不编译」，
+但买不到「同一个问题」**。
+
+**板上 apt 索引里确实有整套 Fortress 的 arm64 二进制**，而且来自**已经配好的**
+`packages.ros.org`（板子本来就有 `deb [arch=arm64] ... packages.ros.org/ros2/ubuntu jammy main`）：
+
+```
+libignition-gazebo6-dev    6.18.0-1~jammy   ROS jammy:jammy [arm64]
+libignition-transport11-dev 11.4.2-1~jammy  ROS jammy:jammy [arm64]
+libsdformat12-dev           12.9.0-1~jammy  ROS jammy:jammy [arm64]
+ros-humble-ros-gz-sim       0.244.26-1jammy.20260908.015142   [arm64]
+ros-humble-ros-gz-bridge    0.244.26-1jammy.20260909.212033   [arm64]
+ros-humble-gz-ros2-control  0.7.21-1jammy.20260910.001526     [arm64]
+apt-get install -s ros-humble-ros-gz-sim   →  干跑通过，零报错
+```
+
+`ros-humble-ros-gz-sim` 的 `Depends` 写着 `libignition-gazebo6-dev` —— **Fortress（gz-sim6）**，
+不是 Harmonic（gz-sim8）。对照：`libgz-sim8-dev` 在板上索引里**不存在**，
+所以 Harmonic **只能**走 OSRF 源 + 源码编译（甲-14 的结论不变）。
+
+**移植代价**（不是配置差异，是 ABI 差异，要改三个文件五类标识符）：
+
+| 位置 | 现在（Harmonic） | Fortress |
+|---|---|---|
+| `grasp_world.sdf:4,7,10,13` 的 `filename=` | `gz-sim-*-system` | `ignition-gazebo-*-system` |
+| 同上四处的 `name=` | `gz::sim::systems::*` | `ignition::gazebo::systems::*` |
+| `ur5_with_gripper.urdf.xacro:102` | `gz_ros2_control/GazeboSimSystem` | `ign_ros2_control/IgnitionSystem` |
+| `sim.launch.py:150,157` | `gz sim -r`（`gz-tools2` 的 CLI） | `ign gazebo -r` |
+
+**否决的两条理由**（第二条是决定性的）：
+
+1. **会把仿真配置分叉**成「板上一份、工作站一份」，直接违反 `arm_grasp_sim` 反复强调的
+   单一真源原则（`full.launch.py` 的模块 docstring 就是为此写的）。
+2. **会让这次验证失去意义。** 这一步的全部目的是回答「**板子能不能完成这个任务**」。
+   仿真在工作站上**已验通（9/9 方块）**、跑的是 Harmonic。在板上换一个**大版本不同的
+   仿真器**去跑，答的就不是同一个问题了 —— 板上跑通也证明不了工作站的配置在板上成立。
+
+⇒ **甲-14 的 Harmonic 源码编译路线不变**；这条替代路线已查证并否决，不必再试。
+（顺带：`sim.launch.py:124-130` 的注释**早就写明了这条**——「不能用 apt 的
+`ros-humble-gz-ros2-control`，它依赖 `libignition-*`（Fortress/gz-sim6），而本项目跑的是
+Harmonic（gz-sim8），两者 ABI 不通」。仓库作者已知此事；本轮的增量是**在板上实测确认了
+「Fortress 那半边确实装得上」**，因此否决理由不能只说「ARM 上没有」，必须说「装得上但不该用」。）
