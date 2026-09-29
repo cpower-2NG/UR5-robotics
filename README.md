@@ -280,6 +280,12 @@ python3 scripts/board_chain_check.py     # 起无驱动 real.launch + RSP + 假 
 ② `planner_node` 会报「轨迹 action 服务不可用」并停住 —— **预期**，没有驱动就没有
 控制器。**本脚本不覆盖运动**，那一步要真臂或仿真器。
 
+⚠️ **要在板子上跑仿真，先看 `docs/待执行命令.md` 甲-14。** arm64 上**没有**
+`ros-humble-ros-gzharmonic`（ROS↔Gazebo 桥只有 amd64 构建），而板上的
+`ros-humble-ros-gz-*` 是配 **Fortress** 的、与本项目的 **Harmonic** ABI 不通
+⇒ 必须加 OSRF 源装 `gz-harmonic`，再**源码编译** `ros_gz` 与 `gz_ros2_control`
+（`GZ_VERSION=harmonic`）。上游自己也把 Humble + Harmonic 列为 "build from source"。
+
 **端到端**（需要 pipeline 正在运行）——这是唯一能回答「链路是否真的通」的脚本：
 
 ```bash
