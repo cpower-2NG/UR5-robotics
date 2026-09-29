@@ -16,6 +16,11 @@
   <depend>vision_msgs</depend>
   <depend>builtin_interfaces</depend>
 
+  <!-- 遥测（telemetry.py）。两者都在板子上现成（2026-09-29 实测），
+       所以补这两个 depend **不需要**在 Orin 上装任何东西。 -->
+  <depend>visualization_msgs</depend>
+  <depend>diagnostic_msgs</depend>
+
   <!-- moveit_msgs 现在是 planner_node.py 的**顶层硬导入**（GetPositionIK），
        不再是过去那种「导入失败就回落 mock 模式」的防御性导入，所以必须是
        depend：缺了它节点根本起不来。 -->

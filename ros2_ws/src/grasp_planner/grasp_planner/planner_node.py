@@ -92,6 +92,9 @@ from vision_msgs.msg import Detection3DArray
 
 from grasp_planner.gripper import make_gripper
 
+# 遥测（只读发布，不参与任何决策）。见 telemetry.py 的模块文档。
+from grasp_planner.telemetry import SLOT_SKIPPED, SLOT_USED, PlannerTelemetry
+
 JointAngles = List[float]
 
 #: goal status → 人话。用于日志（数字本身在现场毫无可读性）。
@@ -311,6 +314,17 @@ class GraspPlanner(Node):
             Detection3DArray, p["targets_topic"], self._targets_cb, 10
         )
 
+        # ---- 遥测：只读发布，**不参与任何决策**（见 telemetry.py）----
+        # 必须在这里建（而不是等第一次抓取）：RViz/rqt 在节点刚起时就该能看到
+        # 槽位图与初始状态，而不是干等到第一次放置。
+        self._telem = PlannerTelemetry(
+            self,
+            base_frame=self.base_frame,
+            place_slots=self.place_slots,
+            place_z=self.place_z,
+            snapshot=self._telemetry_snapshot,
+        )
+
         self.get_logger().info(
             f"GraspPlanner 就绪 | 夹爪后端={p['gripper_backend']} "
             f"({self._gripper.describe()})\n"
@@ -331,6 +345,38 @@ class GraspPlanner(Node):
         self.create_timer(1.0, self._idle_check)
         # 桌面碰撞体：move_group 起得晚，内部带周期重试。
         self._start_table_scene()
+
+    # ------------------------------------------------------------------
+    # 遥测快照
+    # ------------------------------------------------------------------
+    def _telemetry_snapshot(self) -> dict:
+        """给遥测的一份**只读**快照。
+
+        遥测每次发布都调它，所以这里的数字**永远和状态机同步** —— 不必在
+        十几处「记得更新一下计数」（那种写法一定会漏）。本函数**只读**，
+        不改任何状态。
+
+        ⚠️ 这里**不放** ``place_index`` 的占用含义：它在「放成功」和「跳过」
+        两种情况下都会自增，占用情况只有遥测自己分得清（见 telemetry.py）。
+        ``place_index`` 仍然报出去，当作「已消耗槽位数」看。
+        """
+        tgt = self._grasp_target
+        place = self._place_target
+        return {
+            # 只走位模式下槽位的「灰 = 已消费」不代表那里真有方块（见 telemetry.py）
+            "carry_objects": self.carry_objects,
+            "place_index": self._place_index,
+            "place_target": ("-" if place is None
+                             else f"{place[0]:.3f},{place[1]:.3f}"),
+            "target": ("-" if tgt is None
+                       else f"{tgt[0]:.3f},{tgt[1]:.3f},{tgt[2]:.3f}"),
+            "grasped": len(self._grasped_positions),
+            "attempts_since_place": self._attempts_since_place,
+            "max_attempts": self.max_attempts_without_place,
+            "holding": self._holding,
+            "recovering": self._recovering,
+            "busy": self._busy,
+        }
 
     # ------------------------------------------------------------------
     # 参数
@@ -708,6 +754,7 @@ class GraspPlanner(Node):
     def _start_initial_home(self):
         self._home_timer.cancel()
         self.get_logger().info("初始化：先张开夹爪，再回 HOME ...")
+        self._telem.set_state("INIT")
         self._gripper.open(done_cb=self._on_initial_open_done)
 
     def _on_initial_open_done(self, _status, _result):
@@ -1050,6 +1097,9 @@ class GraspPlanner(Node):
     def _reset_busy(self):
         if self._finished:
             return          # 收工后不要再喊「已就绪」
+        # 遥测：本函数在闲着时会被 10 Hz 的检测流每批调一次，所以 set_state
+        # 内部做变化检测，不会把这变成每秒几十条的水龙头（见 telemetry.py）。
+        self._telem.set_state("IDLE")
         # 丢掉过期缓存：本轮结束后要等**新的**检测，而不是拿旧坐标再抓一次
         self._pending_msg = None
         with self._busy_lock:
@@ -1093,8 +1143,14 @@ class GraspPlanner(Node):
             throttle_duration_sec=5.0,
         )
 
-    def _finish(self, reason: str):
+    def _finish(self, reason: str, ok: bool = True):
         """收工：打日志 + **停止接受新目标**。
+
+        ``ok`` 表示这是不是**正常收工**，只喂给遥测（决定诊断级别 OK/ERROR），
+        不影响任何行为。⚠️ 必须由调用方**显式**给出，不能靠匹配 ``reason``
+        的字符串猜 —— 两处「槽位已用尽」的严重性正好相反：``_select_and_approach``
+        那处是「该抓的都抓完了」，``_on_home_with_object_done`` 那处是
+        **夹爪里还夹着一个方块却没地方放**（见那里的注释），字符串一样。
 
         ⚠️ 这里**不能**调 ``_reset_busy()``：那会让节点继续接受检测，而槽位
         已经放满了 —— 于是同一批方块被反复抓起来又因为没地方放而放下，
@@ -1109,6 +1165,9 @@ class GraspPlanner(Node):
         with self._busy_lock:
             self._busy = False
         self._pending_msg = None
+        # 遥测：把**原因**也报出去。`reason` 只进日志的话，事后分析一个 bag
+        # 就只能靠翻 /rosout 文本猜「它为什么停了」—— 而那正是最该一眼看到的。
+        self._telem.note_finished(reason, ok=ok)
         self.get_logger().info("=" * 60)
         self.get_logger().info(f"收工：{reason}")
         self.get_logger().info(
@@ -1209,12 +1268,18 @@ class GraspPlanner(Node):
         if self._attempts_since_place > self.max_attempts_without_place:
             self._finish(
                 f"连续 {self._attempts_since_place - 1} 次尝试都没有产生新的成功"
-                f"放置（上限 {self.max_attempts_without_place}）—— 判定为卡住"
+                f"放置（上限 {self.max_attempts_without_place}）—— 判定为卡住",
+                ok=False,
             )
             return
 
         score, label, wx, wy, wz = best
         self._grasp_target = (wx, wy, wz)
+        # 遥测：把瞄准点挂到 RViz 上。**这一条的价值最高** —— 把「相机看到的
+        # 检测框」与「规划器实际用的 3D 点」叠在一起，投影错了、或目标被
+        # pick_zone 滤掉了，一眼就能看出来。IK 失败时**也保留**这个点：
+        # 那正是「为什么这次没抓成」的答案。
+        self._telem.set_target(wx, wy, wz)
         self.get_logger().info(
             f"→ 选中 [{label}] score={score:.2f} "
             f"{self.base_frame}=({wx:.3f}, {wy:.3f}, {wz:.3f})"
@@ -1235,6 +1300,7 @@ class GraspPlanner(Node):
         # -175°（那会变成 350° 的大回转）。
         self._approach_arm = list(arm)
 
+        self._telem.set_state("APPROACH")
         self._send_arm_trajectory(arm, self.move_duration,
                                   done_cb=self._on_approach_done)
 
@@ -1254,6 +1320,7 @@ class GraspPlanner(Node):
             self.get_logger().warn("抓取高度 IK 失败")
             self._open_and_reset()
             return
+        self._telem.set_state("DESCEND")
         self._send_arm_trajectory(arm, self.descend_duration,
                                   done_cb=self._on_descend_done)
 
@@ -1269,6 +1336,7 @@ class GraspPlanner(Node):
             self._lift_and_go()
             return
         self.get_logger().info("下降完成 —— 闭合夹爪")
+        self._telem.set_state("CLOSE")
         self._gripper.close(done_cb=self._on_close_done)
 
     def _on_close_done(self, _status, _result):
@@ -1303,9 +1371,11 @@ class GraspPlanner(Node):
                             seed=self._approach_arm, prev=self._approach_arm)
         if arm is None:
             self.get_logger().warn("抬起位姿 IK 失败，直接回 HOME")
+            self._telem.set_state("LIFT")
             self._send_arm_trajectory(self.home_joints, self.move_duration,
                                       done_cb=self._on_lift_done)
             return
+        self._telem.set_state("LIFT")
         self._send_arm_trajectory(arm, self.move_duration, done_cb=self._on_lift_done)
 
     def _on_lift_done(self, status, result):
@@ -1321,6 +1391,7 @@ class GraspPlanner(Node):
                 f"（累计 {len(self._grasped_positions)} 个）"
             )
         self.get_logger().info("返回 HOME ...")
+        self._telem.set_state("HOME_WITH_OBJECT")
         self._send_arm_trajectory(self.home_joints, self.move_duration,
                                   done_cb=self._on_home_with_object_done)
 
@@ -1355,7 +1426,9 @@ class GraspPlanner(Node):
                 # 它是可达的：下面每个解不出来的槽位都会 _place_index += 1 跳过，
                 # 跳着跳着就可能把槽位表耗尽。
                 self._finish(
-                    f"放置槽位已用尽（{len(self.place_slots)} 个）—— 没有地方可放了"
+                    f"放置槽位已用尽（{len(self.place_slots)} 个）—— 没有地方可放了",
+                    ok=False,   # ⚠️ 与 _select_and_approach 里同样文案的那处相反：
+                                # 这里是**方块已经在夹爪里**却没处放，不是正常收工。
                 )
                 return
             sx, sy = slot
@@ -1366,6 +1439,10 @@ class GraspPlanner(Node):
                 f"槽位[{self._place_index}] ({sx:.3f}, {sy:.3f}) 接近位姿解不出来，"
                 "跳过它"
             )
+            # 遥测：橙色标出来。**必须在这里标，不能靠 i < place_index 事后推** ——
+            # _place_index 在「放成功」和「跳过」两种情况下都会自增，事后推会把
+            # 跳过的槽位错报成已占用（见 telemetry.py）。
+            self._telem.mark_slot(self._place_index, SLOT_SKIPPED)
             self._place_index += 1      # 放弃这个槽位，继续试下一个
 
         self._place_target = (sx, sy)
@@ -1375,6 +1452,8 @@ class GraspPlanner(Node):
             f"已到 HOME —— 去放置位[{self._place_index}] "
             f"({sx:.3f}, {sy:.3f})"
         )
+        self._telem.set_target(sx, sy, self._place_descend_z)
+        self._telem.set_state("PLACE_APPROACH")
         self._send_arm_trajectory(arm, self.move_duration,
                                   done_cb=self._on_place_approach_done)
 
@@ -1398,6 +1477,7 @@ class GraspPlanner(Node):
         self.get_logger().info(
             f"放置位接近完成 —— 下降到 place_z={self.place_z:.3f}"
         )
+        self._telem.set_state("PLACE_DESCEND")
         self._send_arm_trajectory(arm, self.descend_duration,
                                   done_cb=self._on_place_descend_done)
 
@@ -1410,10 +1490,14 @@ class GraspPlanner(Node):
             self._on_place_released(None, None)
             return
         self.get_logger().info("已到放置高度 —— 张开夹爪放下")
+        self._telem.set_state("RELEASE")
         self._gripper.open(done_cb=self._on_place_released)
 
     def _on_place_released(self, _status, _result):
         """放下完成：消费槽位、清 ``_holding``、清看门狗，然后抬起并回 HOME。"""
+        # 遥测：这个槽位**真的用掉了**（绿色 → 灰色）。要在自增**之前**标，
+        # 因为自增之后 _place_index 指的是下一个槽位。
+        self._telem.mark_slot(self._place_index, SLOT_USED)
         self._place_index += 1
         self._holding = False
         self._attempts_since_place = 0
@@ -1439,12 +1523,14 @@ class GraspPlanner(Node):
             self._open_and_reset()
             return
         self.get_logger().info("返回 HOME ...")
+        self._telem.set_state("PLACE_RETREAT")
         self._send_arm_trajectory(self.home_joints, self.move_duration,
                                   done_cb=self._on_home_done)
 
     def _on_open_done(self, _status, _result):
         self._holding = False
         self.get_logger().info("返回 HOME ...")
+        self._telem.set_state("HOME")
         self._send_arm_trajectory(self.home_joints, self.move_duration,
                                   done_cb=self._on_home_done)
 
@@ -1471,9 +1557,12 @@ class GraspPlanner(Node):
                 "恢复流程（回 HOME → 张开夹爪）自身又失败了 —— 不再自动重试，"
                 "请人工确认机械臂状态。"
             )
-            self._finish("失败恢复流程自身失败")
+            self._finish("失败恢复流程自身失败", ok=False)
             return
         self._recovering = True
+        # 遥测：这一步很重要 —— 走失败恢复时臂在动，而「正在恢复」和「正常走
+        # 流程」在外部看是一样的。诊断级别也会因此升到 WARN（见 telemetry.py）。
+        self._telem.set_state("RECOVERING")
 
         if self._holding:
             self.get_logger().warn(
@@ -1487,7 +1576,7 @@ class GraspPlanner(Node):
                 self.get_logger().error(
                     "回 HOME 失败，夹爪保持原状不动 —— 停止本轮自动重试。"
                 )
-                self._finish("失败恢复时回 HOME 也失败")
+                self._finish("失败恢复时回 HOME 也失败", ok=False)
                 return
             self.get_logger().info("已回 HOME —— 张开夹爪")
             self._gripper.open(done_cb=self._on_open_done)
