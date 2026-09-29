@@ -4069,3 +4069,112 @@ Get-NetFirewallHyperVVMSetting -PolicyStore ActiveStore
 2. **空输出会伪装成「没有这个工具」**：第二十八轮 `systemctl is-active ufw`、
    第三十轮 `tegrastats` 缓冲，本轮 `nohup` 日志 —— **同一个族**：
    一次状态查询报告的往往是**它自己那个对象**的活性，而不是你关心的东西。
+
+---
+
+## 第三十二轮：把板上的画面搬回家 —— 以及一个「从来没有生效过」的 RViz 配置（2026-09-29）
+
+### 一、这一轮要解决什么
+
+第三十一轮把「可视化怎么办」问清楚了，你选了 **① bag 录制 + 本机回放**（和可选的 ③ 改 WSL 防火墙），
+Gazebo **降级为可选、先不做**。本轮就是把 ① 做出来并端到端验通。
+
+要落的东西：板端录制脚本、把原始图压成 JPEG 的中继（板上没装 `image_transport_plugins`，
+但 cv2 现成）、QoS 覆盖文件，以及把回放流程写进 `docs/待执行命令.md`（**甲-15**）。
+
+### 二、做出来的东西
+
+| 文件 | 作用 | 关键设计 |
+|---|---|---|
+| `scripts/board_bag_record.py` | 板端录制器，三档 profile | 自动按 `ros2 topic list -t` 认话题；录完打印体积、回传预估、rsync 与回放命令；**只录不起链路**（真机时链路是驱动带起来的，录制器只能挂上去） |
+| `scripts/image_jpeg_relay.py` | 原始 `Image` → `CompressedImage`(JPEG) | 用 cv2 自己编码（**板上没装 image_transport_plugins，零 sudo 零安装**）；输出名刻意取 `<话题>/compressed` 对齐 image_transport 约定 |
+| `scripts/bag_qos_overrides.yaml` | rosbag2 的 QoS 覆盖 | 治 `/tf_static` 与 `/robot_description` 的 latched 消息（见坑 ①） |
+
+三档实测：`plan` 6 秒 = **0.5 MB**；`perception` 20 秒 = **36.5 MB**；`full` ≈ 2.5 GB/30 秒（估）。
+
+### 三、端到端验通了什么（都是实测，不是推断）
+
+| 环节 | 实测 |
+|---|---|
+| 板上录制 | 20 秒 / 10 个话题**全部有消息**；`/tf_static` **3 条**、`/robot_description` **1 条** |
+| rsync 回本机 | 20.2 MB / **2.6 秒 = 8.1 MB/s**（与第三十一轮实测链路 7.4 MB/s 吻合） |
+| 本机读 bag | `rosbag2_py` 直接读文件（不经 DDS）→ `cv2.imdecode` 成功 |
+| JPEG 收益 | 原图 2.76 MB/帧 → **130 KB/帧，小 21 倍**，解出仍是 1280×720×3 |
+| bag 里的 TF 链 | 建 TF 缓冲后 `base_link → camera_color_optical_frame` = (0.485, 0.000, 1.000) ✅ |
+| RViz 回放 | 插件加载失败 **0**；四个显示全部订阅上（用 `get_subscriptions_info_by_topic` 查，不是看窗口） |
+| 板子收尾 | 0 残留进程、测试 bag 已删、`git status` 只剩本轮新文件 |
+
+> ⚠️ 那个 (0.485, 0, 1.000) 是 `board_chain_check.py` 的**占位外参**（相机在上方一米朝下看），
+> **不是标定结果**。本轮验的是「链路通、搬得动、看得见」，不是「数值对」。真外参要等手眼标定。
+
+### 四、本轮最大的发现：那个 RViz 配置**从来没有生效过**
+
+`ros2_ws/src/yolo_bringup/config/grasping.rviz` 通篇写着 `rviz2/TF`、`rviz2/Image`、
+`rviz2/Displays`…… RViz 的实际反应是把**每一个显示都丢掉**：
+
+```
+[ERROR] PluginlibFactory: The plugin for class 'rviz2/TF' failed to load.
+        Error: ... the class rviz2/TF ... does not exist.
+        Declared types are ... rviz_default_plugins/TF ...
+```
+
+`rviz2/X` 这个写法 **ROS 1（`rviz/X`）和 ROS 2 两边都不对**，看起来是一次
+`rviz/` → `rviz2/` 的全局替换留下的。**正确的是显示用 `rviz_default_plugins/*`、
+面板用 `rviz_common/*`**（两方面核实：`plugins_description.xml` 的声明，以及改完后
+实跑 `failed to load` 计数为 0）。
+
+也就是说：这个被 README 指着当「看结果的地方」的文件，打开只会得到**一个空白窗口**。
+
+同一轮里还修掉两个同族的问题：
+
+| 问题 | 证据 |
+|---|---|
+| `/target_3d_marker` 是个**死话题** | 全仓库 `grep` 没有任何地方发布它；真正在发的是 `projector_node.py:141` 的 `/target_3d`（`PoseStamped`）。那个 Marker 显示永远画不出东西 |
+| RobotModel 缺 `Description Source` | rviz2 会退回默认的 **File**（路径为空）⇒ 即使打开也画不出模型。要点名走 Topic，且 `/robot_description` 是 transient_local，Durability 必须是 Transient Local |
+
+> **`planner_node` 一个发布者都没有**（全文件无 `create_publisher`）—— 所以规划器的决策
+> （轨迹、分区）在 RViz 和 bag 里都**看不到**。这是已知的可观测性缺口，本轮只记录，未动。
+
+### 五、三个「不做实验就会写错」的坑
+
+**① latched 话题会被录成空话题（bag 里话题在、消息数 0）**
+`ros2 bag record` 默认按 VOLATILE 订阅，**接不到 transient_local 的锁存消息**。
+症状是回放时 **TF 树断根**：`base_link` 不存在、机器人模型不显示、相机外参丢失。
+修法就是那个 `bag_qos_overrides.yaml`。**验收判据是「bag info 里条数非 0」，不是「话题存在」。**
+
+**② 不用 `--clock` + `use_sim_time`，回放里的机械臂是僵住的**
+bag 的时间戳是录制当时的，RViz 当过期数据丢掉。实测 **252 条 `TF_OLD_DATA` → 0 条**。
+两处必须配对：`ros2 bag play --clock` 与 `rviz2 --ros-args -p use_sim_time:=true`。
+
+**③ RViz 的 `Transport Hint` 不可用 —— 我原本写了两条这样的显示，实测被忽略**
+实验设计是关键：**只**发布 `/probe_cmp/compressed`，显示写 `/probe_cmp` + `Transport Hint: compressed`
+⇒ RViz **仍然去订阅 `/probe_cmp`**（那里没有发布者）。对照组 `/probe_img`（原始话题**有**
+发布者）拿到 **2 个 rviz 订阅者**，证明 **RViz 本身完全正常**，是 hint 被忽略。
+⇒ 看 JPEG bag 改用开发机现成的 `image_transport republish compressed raw` 桥一下，
+RViz 配置照旧订原始话题名（实测桥后 `/camera/color/image_raw` 出现发布者 `image_republisher`）。
+
+### 六、两次「测试装置自己出错」，一次差点写进台账
+
+**1. 我一度以为「RViz 连 `Enabled: false` 都不认」——错，是我的 bag 播完了。**
+我设计了一个非对称实验（一个显示写 `Enabled: false`、另一个写 `Value: false`，
+看哪个话题没被订阅）。结果**三个话题一个订阅者都没有**，包括本该默认开启的那个。
+差点据此写下「RViz 在这个环境里不订阅任何话题」。
+真实原因：那个 bag 只播 **11.4 秒**，而探针在 **17 秒**才去查 —— **话题早已从 ROS 图上消失**，
+`get_subscriptions_info_by_topic` 自然返回空。**先怀疑测试装置**（[[verify-before-asserting]]）。
+
+**2. 差点把已经修好的 D50 当成活的缺陷报出去。**
+清场时 `ps` 看到板上的 `planner_node` 命令行里**带着 `grasp_planner.yaml`**，
+与我台账里 D50「真实入口不加载该 yaml」的结论**直接冲突**。
+查代码后确认：**D50 在本项目前几轮已经修好了**（`pipeline.launch.py:369-375` 有专门注释
+说明曾经只传 `gripper_backend`，现在补上了 yaml 入口，还多了 `table_scene_enabled`）。
+板子上那条命令行的观察，反而是**这个修复在真机入口下生效的运行期证据**。
+—— 台账是**过程记录**，里面的缺陷编号对应的是「当时的状态」，引用前要回代码核对。
+
+### 七、本轮没有做的事
+
+- **没有跑甲-14（Gazebo）** —— 按你的决定「降级为可选，先不做」，命令留在原地。
+- **没有改 WSL 防火墙**（甲-16）—— 那在 Windows 侧，要你跑；且它是**可选加固**，
+  甲-15 这条路完全不依赖它。
+- **没有推送**，`main` 仍在 `0ab13ec`。
+- **没有解决可观测性缺口**：`planner_node` 不发布任何东西，所以规划器的决策在
+  bag 与 RViz 里都看不见。这是下一步值得做的（成本不高：几条 `create_publisher`）。
