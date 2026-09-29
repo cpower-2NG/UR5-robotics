@@ -3611,8 +3611,28 @@ PASS：全部 cleanly、无 traceback。
   UDP 端口，ufw 默认拒绝入站）。
 
 建议写进了 `待执行命令.md` 的甲-1：**`sudo ufw disable`**（开发板 + 可信内网，
-攻击面本来就有 SSH 一层；回滚 `sudo ufw enable` 一条）。规则明细
-（`sudo ufw status verbose`）仍留给用户 —— 那只是「看」，**决定**才是要紧的。
+攻击面本来就有 SSH 一层；回滚 `sudo ufw enable` 一条）。**用户当天 19:27 就执行了**
+（`/etc/ufw/ufw.conf` → `ENABLED=no`，时间戳为证）。
+
+**次日（09-29）复核 + 一条会骗人的检查**：我做了决定性验证 —— 板上开一个只 accept、
+不发数据的裸 TCP 监听（50001），从另一台机器连，**连上了**（板端
+`ACCEPTED from ('<ip>', 44990)`），对照 22 端口同样可连 ⇒ 入站确实没被过滤，
+甲-1 关闭。**但复核过程暴露了一个陷阱**：`ufw disable` **不会**停掉 systemd 单元
+（`RemainAfterExit=yes`），所以防火墙关掉之后 `systemctl is-active ufw` **照样报
+`active`**、`is-enabled` 照样报 `enabled` —— 我这一轮最初就是拿它当判据的。判断
+「实际有没有在过滤」只能看 `grep ^ENABLED /etc/ufw/ufw.conf` 或
+`sudo ufw status verbose`。**同类的错在第二十八轮已经犯过一次**（`process has died
+... exit code -2` 被当成判据）：**状态查询工具报的是它自己那个对象的活性，不一定是
+你想要的那件事的状态。**
+
+**同日更重要的发现（真机联调级）**：把 UR 驱动的端口从板上头文件里查实之后，看清
+链路是**双向**的 —— 板子→控制箱走 30004 RTDE / 29999 Dashboard（出站），而
+**控制箱→板子走 50001–50004**（External Control 程序回连；`ur_driver.h:98-101`
+写明回连目标 IP 是按「到控制箱 RTDE 的路由」自动选的本机 IP）。`arm-cleanup-sudo.sh`
+的 A8 只放行 22/3389/5900（它自己那句提示只提了 DDS 的 7400:7500/udp），
+**所以 ufw 一开就挡死回连**，而症状会指向 URCap、不会指向防火墙。⇒ 两条纪律
+（联调前别重跑那个脚本；必须开 ufw 时补 50001–50004）已写进 `待执行命令.md` 甲-1，
+链路详解写进 `board/UR5接入方案.md` 新增的 §4.5。
 
 其余环境复核：`free -h` available **5.9 GiB**（压内存生效）；ollama / gdm 均
 inactive（不自启了）；`dialout` 已解决（甲-4 关闭）。

@@ -74,6 +74,10 @@
 
 先 A 后 B：A 验证链路，如果以后发现 RTDE 有周期性抖动再上 B。
 
+> ⚠️ **选 B 之前先看 §4.5 的「专用网卡到底买来干什么」**：B 的真实理由不是「A 连不上」
+> （A 能连上），而是**隔离**＋**板子只有一个有线口**（单口走独立网段会把 SSH 一起切断）。
+> §4.5 还写了链路上一共有哪四个 TCP 连接、为什么「能 ping 通」不够。
+
 ---
 
 ## 4. Jetson 侧要装什么
@@ -85,6 +89,104 @@ sudo apt install ros-humble-ur ros-humble-ur-msgs
 会带上 `ur-robot-driver`、`ur-calibration`、`ur-description` 等。
 如果规划放开发机，`ur-moveit-config` 和 `ros-humble-moveit` **不用装在 Jetson 上**，
 能省不少内存和磁盘；如果想让板子独立跑完整栈，就一起装。
+
+---
+
+## 4.5 控制链路详解：**四个 TCP 连接、两个方向**（2026-09-29 实测补）
+
+这一节是为了回答「能不能就用办公局域网」而写的 —— 要回答它，先得说清链路上
+**到底有哪些连接、谁连谁**。端口号取自板上已装的驱动头文件（实测，非记忆）：
+
+```bash
+grep -rn "PORT" /opt/ros/humble/include/ur_client_library/
+#   rtde/rtde_client.h:41              UR_RTDE_PORT = 30004
+#   ur/dashboard_client_implementation_x.h:63  DASHBOARD_SERVER_PORT = 29999
+#   ur/ur_driver.h:77,82,87,95         reverse 50001 / script_sender 50002
+#                                      / trajectory 50003 / script_command 50004
+```
+
+### 方向一：Jetson → 控制箱（板子主动连出去）
+
+| 端口 | 协议 | 干什么 |
+|---|---|---|
+| **30004** | TCP（**RTDE**） | 状态流：关节角、速度、TCP 位姿、IO。125 Hz 的「心跳」通道，驱动的生命线 |
+| **29999** | TCP（**Dashboard**） | 管理命令：`play` / `stop` / `brake release` / 加载程序 |
+| 30001 / 30002 | TCP | 老的 primary / secondary 接口，部分命令还在用 |
+
+### 方向二：控制箱 → Jetson（**机械臂反过来连板子**）⚠️
+
+这是最容易漏掉、也最容易在现场吃掉一下午的一半。驱动在 Jetson 上**开四个监听端口**，
+控制箱里那个 External Control 程序**主动连过来**：
+
+| 端口 | 名字 | 干什么 | 断了的后果 |
+|---|---|---|---|
+| **50001** | `reverse_port` | 125 Hz 收关节目标（`servoj` 流）；程序要发 keepalive | 没有 keepalive 就**停机** |
+| **50002** | `script_sender_port` | 驱动把 URScript 程序送进控制器 | 驱动头文件原话：**"If the robot cannot connect to this port, External Control will stop immediately."** |
+| 50003 | `trajectory_port` | 新版驱动的轨迹流 | 轨迹下发失败 |
+| 50004 | `script_command_port` | 脚本命令通道 | 同上 |
+
+板子要用哪个 IP 去接这个回连？驱动头文件写得很明确（`ur_driver.h:98-101`）：
+
+> `reverse_ip`：Port that will be opened by the driver ...
+> **"If not specified, the IP address of the interface that is used for connecting to
+> the robot's RTDE port will be used."**
+
+也就是说，**回连目标 IP 是按「到控制箱 30004 的路由」自动选出来的**。这条决定了
+组网要求：**能 ping 通不够，必须双向可达**。
+
+### 由此推出的两条结论
+
+**① 同网段（方案 A）为什么最稳**：两个方向都是 L2 直达，没有中间设备，
+路由「选哪个本地 IP」也没有歧义。
+
+**② 为什么不要指望路由器**：如果控制箱在**另一个网段**、只靠网关转发：
+- 方向一（30004）**可能**通 —— 只要路由器有路由；
+- 方向二（50001–50004）是**控制箱发起的新入站连接**，要穿透 NAT / 企业防火墙 ——
+  默认不放行。
+- 症状极具误导性：**RTDE 连上了、驱动也起来了、日志看着正常，然后 External Control
+  立刻停**。看起来像 URCap 装错了，其实是回连被挡。
+
+> ⚠️ 所以 `UR5接入方案.md` 那句「不要把 UR 放在和 Jetson 不同的网段去指望路由器
+> 帮你打通」不是保守，是这两条方向的直接推论。
+
+### 实测的防火墙陷阱（2026-09-29，值得单独记）
+
+板上的 `arm-cleanup-sudo.sh` A8 段会 `ufw default deny incoming`，**只放行
+22/3389/5900**（它自己那句提示只提了 DDS 的 7400:7500/udp，**没提驱动的 50001–50004**）。
+所以：**只要 ufw 处于启用状态，方向二就被挡死，真机联调一定失败**，而报错会指向
+URCap，不会指向防火墙。
+
+如果将来有人重新跑了那个脚本、或者出于合规要求必须开 ufw，**必须补这一条**：
+
+```bash
+sudo ufw allow from <控制箱IP> to any port 50001:50004 proto tcp   # 方向二：机械臂回连
+sudo ufw allow 30004/tcp                                            # 方向一：RTDE（出站默认放行，这条是保险）
+```
+
+**另一个会骗人的检查**：`ufw disable` **不会**把 systemd 单元停掉或禁用 ——
+单元是 `RemainAfterExit`，所以 `systemctl is-active ufw` 在**防火墙已经关掉之后
+仍然报 `active`**（实测：2026-09-28 19:27 `ufw disable` 之后，
+`/etc/ufw/ufw.conf` 是 `ENABLED=no`，而 `systemctl is-active ufw` 依旧回 `active`）。
+要判断**实际有没有在过滤**，只有两个可信来源：
+
+```bash
+grep ^ENABLED /etc/ufw/ufw.conf    # 不需要 sudo；no = 没在过滤
+sudo ufw status verbose            # 需要 sudo；权威
+```
+
+### 那「专用网卡」（方案 B）到底买来干什么
+
+**不是为了「让 UR 能连上」—— 方案 A 就能连上。** 真正的理由是下面两条：
+
+1. **隔离与可预测性**：机械臂流量不经过办公网交换机，不受 IT 改 VLAN / 端口策略 /
+   其它大流量影响。演示当天被网管动一下网，是真实风险。
+2. **（更实在的一条）板子只有一个有线口。** 实测 `ip -br addr`：只有 `eno1` 是 UP 的
+   以太网口（另有 `wlP1p1s0` 无线 DOWN、`can0`、`docker0`、`l4tbr0`）。
+   单口 + 想把机械臂放独立网段（`<ip>/24`）= **板子自己离开办公网**，
+   于是 **SSH 与开发链路一起断**，只能抱着键盘去插机械臂那根线。
+   **USB 网卡给的是第二个口**：办公网那口留着（SSH 不断），机械臂走新口。
+
+⇒ 一句话：**单网口时方案 A 是唯一选择，而且够用；要方案 B 的隔离，就得先有第二个口。**
 
 ---
 
@@ -229,6 +331,8 @@ arm_bringup/
 | 谁做伺服环 | UR 控制箱（Jetson 不承担硬实时） |
 | 谁跑 RViz/MoveIt | 开发机（WSL2），Jetson 上不开 |
 | UR 网络放哪 | 先跟 Jetson 同网段（方案 A），有抖动再上专用网卡 |
+| 链路要满足什么 | **双向可达**：板子→控制箱 30004/29999，控制箱→板子 **50001–50004**（回连，见 §4.5） |
+| 防火墙 | ufw 一开就挡死回连。`systemctl is-active ufw` **不能**用来判断（关了也报 active），看 `/etc/ufw/ufw.conf` |
 | 仿真和真机怎么统一 | 一个仓库两套 launch，速度限制共用 |
 | 编译在哪 | 源码同步到 Jetson 上编译（架构不同） |
 | DDS 怎么跨 WSL2 | 镜像网络模式，或 Fast DDS Discovery Server |
