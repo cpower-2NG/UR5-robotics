@@ -23,6 +23,27 @@
 #    RViz 仍然去订阅 `/probe_cmp`（那里没有发布者）。
 #    要看板子录回来的 JPEG，用开发机上的 `image_transport republish` 把它解回
 #    原始话题（命令见 `docs/待执行命令.md` 甲-15），本配置就照常能用。
+#
+# ⚠️ 第四个坑，性质和上面三条不同 —— 它**不报错**：**QoS 取值必须写字符串**。
+#    RViz 的 QoS 属性存的是**枚举的名字**，不是数字：
+#      `Durability Policy: Transient Local | Volatile | System Default`
+#      `Reliability Policy: Reliable | Best Effort | System Default`
+#      `History Policy: Keep Last | Keep All | System Default`
+#    （`Depth` 是整数属性，照常写数字。）本文件原先全写成了数字（`1`/`2`），
+#    RViz **读不懂就静默退回默认值**，一个警告都不给。实测对照：
+#      写 `Durability Policy: 1`              → 订阅出来是 VOLATILE（被忽略）
+#      写 `Durability Policy: Transient Local` → 订阅出来是 TRANSIENT_LOCAL ✓
+#    **为什么这个特别危险**：默认的 Reliability 恰好是 Reliable，而 RealSense 的
+#    彩色话题是 **BEST_EFFORT** 发的 —— 两边匹配不上，**订阅者收不到任何东西**。
+#    于是「相机显示在仿真里好好的，接上真机就是黑的」。
+#    （仿真里没暴露，是因为仿真侧的发布者恰好是 Reliable。）
+#
+#    两条连带结论：
+#      · 订阅**锁存**话题（`/robot_description`、下面两个遥测话题）的显示，
+#        必须写 `Durability Policy: Transient Local`，否则拿不到锁存的那条 ——
+#        显示一直空着，和「话题没在发」长得一模一样（`ros2 topic echo` 默认
+#        也是 Volatile，同样看不到，更容易误判）。
+#      · 订阅 RealSense 图像必须写 `Reliability Policy: Best Effort`。
 
 Panels:
   - Class: rviz_common/Displays
@@ -39,15 +60,16 @@ Visualization Manager:
       Value: true
 
     # RGB 图像
-    # ⚠️ Reliability Policy 2（Best Effort）两边都对：
-    #   · 实时：RealSense 就是 Best Effort 发的；
+    # ⚠️ `Best Effort` 两边都对：
+    #   · 实时：RealSense 就是 Best Effort 发的 —— **Reliable 的订阅者匹配不上它**
+    #     （不报错，只是永远收不到）；
     #   · 回放：`image_transport republish` 按可靠发，Best Effort 订阅者能匹配它。
     - Class: rviz_default_plugins/Image
       Name: RGB Camera
       Value: true
       Topic:
         Depth: 1
-        Reliability Policy: 2  # Best Effort
+        Reliability Policy: Best Effort
         Value: /camera/color/image_raw
 
     # YOLO 检测标注
@@ -56,17 +78,44 @@ Visualization Manager:
       Value: true
       Topic:
         Depth: 1
-        Reliability Policy: 2
+        Reliability Policy: Best Effort
         Value: /detections_image
 
-    # 3D 目标点
+    # 3D 目标点（projector_node 按可靠发）
     - Class: rviz_default_plugins/Pose
       Name: Target 3D
       Value: true
       Topic:
         Depth: 5
-        Reliability Policy: 1
+        Reliability Policy: Reliable
         Value: /target_3d
+
+    # ---- 规划器的遥测（见 grasp_planner/telemetry.py）----
+    # 「规划器**实际**瞄准的点」。与上面的 Target 3D 不是一回事：Target 3D 是
+    # 投影器给出的候选，而这里是规划器**真正拿去解 IK 的那个点** —— 两者对不上
+    # 就是「投影错了」或「目标被 pick_zone 滤掉了」，一眼可辨。
+    # ⚠️ Durability Policy **必须**是 `Transient Local`：这个和下面那个话题都是
+    #    锁存的（latched），而 RViz 的默认是 Volatile —— Volatile 的订阅者永远
+    #    拿不到锁存的那条，显示**一直空着**且不报错。
+    #    这条尤其要紧：`current_target` 一个抓取周期才发一次（几十秒）。
+    - Class: rviz_default_plugins/Pose
+      Name: Planner Target
+      Value: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Value: /grasp_planner/current_target
+
+    # 放置槽位：绿=空着 灰=规划器已消费 橙=IK 解不出而跳过
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Place Slots
+      Value: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        Value: /grasp_planner/place_slots
 
     # 机器人模型。
     # `/robot_description` 是 transient_local（latched），所以 Durability Policy
@@ -78,8 +127,8 @@ Visualization Manager:
       Description Source: Topic
       Description Topic:
         Depth: 5
-        Durability Policy: 1  # Transient Local
-        Reliability Policy: 1
+        Durability Policy: Transient Local  # 锁存，必须（写数字会被静默忽略）
+        Reliability Policy: Reliable
         Value: /robot_description
 
   Global Options:
