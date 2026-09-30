@@ -5338,3 +5338,72 @@ timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes -o HostName=<board-ip> jetso
 | `docs/RESTRUCTURE_PLAN.md` | 第三十八轮加更正横幅；本节（第三十九轮） |
 
 **未做（等甲-26 第五步的结果）**：未在任何位置写盘、未重刷、未 `fsck`、未切 bootloader slot。
+
+---
+
+## 第四十轮：A/B 假设被 `lsblk` 否掉 —— 以及一个更基本的疑问（2026-09-30）
+
+第三十九轮把「公钥被拒」归到 **Jetson A/B 回退到旧 rootfs**。用户跑完第五步的判据块，
+**这条假设直接死了**，而它换来的四条不一致指向另一个方向。
+
+### 一、我错在哪
+
+`lsblk` 显示 `nvme0n1` 上**只有一个根文件系统**：
+
+```
+nvme0n1p1  114.7G ext4  /     ← 唯一的根分区，且就挂在 /
+nvme0n1p2    128M   nvme0n1p5    128M
+nvme0n1p3    768K   nvme0n1p6    768K      ← 成对的只是 kernel / kernel-dtb
+nvme0n1p4   31.6M   nvme0n1p7   31.6M
+nvme0n1p10    64M vfat /boot/efi
+```
+
+`/etc/nv_boot_control.conf` 在（A/B 确实开着），但**冗余的只有 kernel 那几对小分区**；
+**没有第二个 rootfs 可以回退**，`root=PARTUUID=e04a3889-…` 指的就是 `nvme0n1p1`。
+我先前是从「`nv_boot_control.conf` 存在 + `nvbootctrl` 回了个槽号」推到「rootfs 也 A/B」的，
+**这一步是臆测，没有去数分区**。教训与 [Verify before asserting] 同一条。
+
+### 二、换来的四条不一致
+
+| # | 实测 | 为什么说不通 |
+|---|---|---|
+| 1 | `nmcli con show` 只剩 `SZTU` / `SZTU-student` / `Wired connection 1`，**`SZTU-usb` 消失** | 当天早上 `sudo nmcli con mod SZTU-usb …` 是**成功**的（profile 不存在会报错）；NM 不会因设备不在就删 profile |
+| 2 | `ls /sys/class/net/` 无任何 `wlx…`，`lsusb` 也无 USB 无线网卡 | 那张网卡连**接口**都不在了 |
+| 3 | `uptime -s` = `2026-09-23 14:56:30` ⇒ 连续运行 **7 天** | 板子当天被**拔电搬动**过，拔电必然清零 uptime |
+| 4 | `~/.bash_history` mtime `2026-09-23 21:56`；家目录自身 mtime `2026-09-23 16:13` | 9/23 晚到现在，家目录里除 `.codex`（当天 14:17）外**没动过**；而我们 9/27–29 在这块盘上部署过 |
+
+### 三、反向警告：这台机器的时钟不可信（**这条同时打掉我第三十九轮的一步推理**）
+
+`who -b` = `1970-01-04 06:47`，`journalctl --list-boots` 的 boot 0 从 `2026-07-29 21:41` 起，
+两者都与 `uptime -s` 的 9/23 打架 ⇒ **无 RTC 电池**（开机从 1970 起跳，联网后 NTP 拉正）。
+
+⇒ 第三十九轮里「`authorized_keys` mtime 是 9/23，**早于**私钥生成日 9/26，所以钥匙从没装过」
+这一步，**建立在一个不可靠的 mtime 上**。它可能仍然对，但**不再是证据**。
+我在甲-26 里把这条警告写在显眼处。
+
+### 四、现在还活着的两种读法
+
+| 读法 | 含义 |
+|---|---|
+| **甲** | 是我们的板子，但状态被人动过（板上有活跃的 `.codex`） |
+| **乙** | 是**另一块同款板子** —— Yahboom 克隆镜像会带**同样的 hostname 与同一套 SSH 主机密钥**，所以「主机密钥对得上」**区分不了**。我先前正是用主机密钥去否掉「另一块板子」的，**那是循环论证** |
+
+并明确写下**哪两条不能用来区分**：`~/yahboom_ws` / `~/ultralytics` 存在、`ros-humble` 292 个包 ——
+Yahboom 出厂镜像本来就带。
+
+### 五、本轮产出（甲-26 第九步）
+
+四条只读命令定生死：`/proc/uptime`（用算术确认真实 uptime）、
+`/var/log/dpkg.log*` 里的 `ros-humble-vision-msgs`（**9/28 那次安装在不在这块盘上**）、
+`~/.bash_history` 末尾、`~/yahboom_ws` 的 mtime 与 `find -newermt 2026-09-25`。
+外加两条**用眼睛定**的：板子上有没有插着 USB 无线网卡；网线插在哪、
+为什么 `eno1` 是 `carrier=0`。
+
+### 六、改动清单
+
+| 文件 | 改了什么 |
+|---|---|
+| `docs/待执行命令.md` | ① 分组表 F 行改写；甲-26 新增 **§八（A/B 否证 + 四条不一致 + 时钟警告）** 与 **§九（判定命令 + 判据）** |
+| `docs/RESTRUCTURE_PLAN.md` | 本节（第四十轮） |
+
+**仍未做**：未装钥匙、未改网络、未写盘、未重刷、未切 bootloader slot。
