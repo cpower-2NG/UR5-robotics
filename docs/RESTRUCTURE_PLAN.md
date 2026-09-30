@@ -7130,8 +7130,36 @@ load 0.46）、节点名冲突（固定名与每次唯一名**都是 6/6 通过*
 4. **「收不到帧」那个间歇**继续观察；真机联调时若复现，优先看 DDS 发现（§四.2）。
 5. 相机外参仍未标定 —— 第一个 demo 的感知链路要它，靶已备好（第五十六轮 §三）。
 
-### 六、本轮未做
+### 六、顺带复核：第十二轮那批已提交的自检**真的会过**
 
-未动臂、未碰串口、未碰控制箱。板子上**只往 `/tmp` 传脚本**，
+第五十七轮开始时我手里的交接摘要把 W1/W1b/W2/W4、D50–D57 全列成「待办」，
+**那是过期的**：`git log` 显示它们早已实现并提交
+（`b82eee0` W1/W1b/D51–D55、`45dd3a3`/`b8738bd` W2、`011a1f2` NullGripper、
+`07a4aec` AG-95 只读、W4 的 `auto_label_grid.py` 已是 tf2 + 单应双后端）。
+
+**但「提交了」不等于「会过」，所以实跑了一遍**（`scripts/test_*.py`，
+在**板子上**跑 —— 本机 WSL 没有 ROS 环境，直接跑会因 `No module named rclpy`
+假失败）：
+
+| 脚本 | 结果 |
+|---|---|
+| `test_ag95_units` `test_ag95_probe` `test_ag95_gripper` `test_label_projection` `test_model_resolution` `test_detector_device` | **PASS（6/6）** |
+| `test_real_launch` `test_perception_3d` `test_minimal` | **PASS（3/3）** |
+| `test_planner_telemetry` / `test_pipeline_e2e` | **按设计需要「pipeline 已在跑」**，单跑必失败（前者要真起 `planner_node`，后者文件头写着「需要 pipeline 已经在跑」）。**本轮未验**，不是回归 |
+
+⚠️ **一个陷阱值得记下来**：`test_ag95_probe` 在 WSL 里报 `FAIL 1`
+（`dump：FC3 读到 0x0202 = 637‰`），看上去像真缺陷，**其实不是** ——
+失败行紧跟的括号写着 `未换算：No module named 'action_msgs'`，
+也就是说它只是**没拿到 ROS 环境、换算不了千分位方向**。在板子上 source 完
+ROS 再跑就 PASS。同 `verify-before-asserting`：**先怀疑测量装置**。
+
+### 七、本轮未做
+
+未动臂、未碰串口、未碰控制箱。板子上**只往 `/tmp` 传脚本**
+（`/tmp/measure_board_scale.py`、`/tmp/ink3.py`、`/tmp/cb_diag.py`、
+`/tmp/disc_probe.py`、`/tmp/yolo_check/` 一份仓库副本），
 **未改板上仓库 `~/yolo_ros_original` 一个字节**。未推送，`main` 未动。
-本轮结束时**停掉了板上的相机 launch**（`/tmp/pl_test.launch.py`，PID 20416）。
+本轮结束时**停掉了板上的相机 launch 与遗留节点**
+（`pl_test.launch.py` 20416、`realsense2_camera_node` 20484、
+两个 `projector_node` 19031/20486 —— 后三个是 launch 父进程被 kill 后**成了孤儿**，
+所以补了一刀）。板子 `available` 回到 **6.5 GiB**。
