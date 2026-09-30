@@ -4987,3 +4987,87 @@ $ who                          → jetson :0  2026-09-30 12:31
 ### 七、状态
 
 `migrate/humble-orin` 上又添 3 个提交（本轮），`main` 仍在 `0ab13ec`，**未推送**。
+
+---
+
+## 第三十七轮：甲-16 的关口找到了（不是 Hyper-V 那一层），并给「搬板子」立条目
+
+用户报告「甲-16 开了」，并要求说明「下一步怎么连板子」以及「搬到机械臂那边会不会掉 IP、怎么解决」。
+按惯例**先量再信**，结果否掉了「甲-16 已生效」这个前提，并新立 **甲-25**。
+
+### 一、甲-16：实测**仍未通**，且路线 B 反噬了路线 A
+
+板子网线拔着、走无线 `<board-ip>`；开发机 `<ip>/23`（mirrored）。三次测量：
+
+| # | 测什么 | 结果 |
+|---|---|---|
+| 1 | 板子 → WSL，ICMP | `4 transmitted, 0 received, 100% packet loss` |
+| 2 | 板子 → WSL，TCP（WSL 内 `python3 -m http.server 8123 --bind 0.0.0.0`） | `HTTP 000`、`rc=28`（6 s 超时）；**WSL 侧日志为空** ⇒ 连接没到 |
+| 3 | 板子 → **Windows 主机本身**，TCP（Windows 监听 8124） | **通了**：`GOT_CONNECTION from <board-ip>:38136` |
+
+第 3 条把「路由 / 校园网 / 入站一律拒绝」这些解释全部排除 —— 包能进这台机器。
+那它是被什么放行的？实查 Windows Defender 防火墙的**程序**入站允许规则：
+
+```
+Windows PowerShell | En=True | Allow | Profile=Public | ...\powershell.exe
+python.exe         | En=True | Allow | Profile=Public | ...\codex-runtimes\...\python.exe
+```
+
+**PowerShell 自带 Public 档的入站允许规则**，所以第 3 条是**侥幸**（监听器正好是 PowerShell）。
+WSL 里那个监听器在 VM 内、不是 Windows 进程，**拿不到程序规则**；而
+`LocalPort ∈ {8123, 8124, 22, 7400–7500}` 的**端口规则一条都没有**。
+
+**路线 B 为什么反噬**：`firewall=false` 的语义是**Hyper-V 防火墙那一层整个不生效**
+⇒ 绑在 WSL VM 上的规则（含用户加的 `ROS2-FromOrin-In`）**全部变惰性**，而
+**Windows Defender 防火墙随即接手**。实查 `.wslconfig`：`firewall=false`，改于
+**2026-09-29 20:05**，WSL 启动于 **20:44** ⇒ **已生效**，不是「改了没重启」。
+以太网网卡的档位是 **`Public`**（`Get-NetConnectionProfile`），入站默认拒绝。
+
+| 层 | 现状 | 管用吗 |
+|---|---|---|
+| Hyper-V 防火墙 | `ROS2-FromOrin-In` 在，但**过滤器全空** | ❌ 惰性（`firewall=false`） |
+| Windows Defender 防火墙（以太网，Public） | 默认拒入站，无相关端口规则 | ✅ **这才是挡着的** |
+
+⇒ 新增**路线 C**：在 Windows Defender 防火墙上开一条
+`-Direction Inbound -Action Allow -Protocol Any -Profile Any -RemoteAddress <board-ip>,<host-ip>`
+（放开协议是因为 DDS 端口动态、列不全；**收紧来源**是「只让板子进来」，比 `firewall=false` 窄得多）。
+已写入 `待执行命令.md` 甲-16，并**把路线 A 降级为后手、把路线 B 标注为实测证否**。
+
+### 二、甲-25（新条目）：搬板子之前的三道保险
+
+**诱因是一个实查到的、会直接把人锁在门外的事实**：
+
+| # | 风险 | 证据 |
+|---|---|---|
+| 1 | **无线连接 `AUTOCONNECT=no`** —— 上电后不会自己连回来 | `nmcli -t -f NAME,AUTOCONNECT con show` ⇒ `SZTU-usb:…:no:802-11-wireless`。现在连着是历史激活的结果，**同一间屋子断电也可能再也回不来** |
+| 2 | IP 是 DHCP 给的，不保证同一个 | 租约 `7200 s`、服务器 `<ip>`、当前 `<board-ip>/22`、无线 MAC `<mac>` |
+| 3 | **插网线会让 `ssh jetson-wifi` 再次失效** | 有线默认路由 metric 100 赢无线 metric 600 —— 即甲-23 的成因，会原样复发 |
+
+三道保险：① `nmcli con mod SZTU-usb connection.autoconnect yes`（+ `-priority 10`）；
+② `nmcli con mod "Wired connection 1" ipv4.never-default yes`（掉风险 3 的根，
+机械臂那条线只需要同网段直达、**不需要默认路由**）；③ 按 **MAC** 找板子
+（`nmap -sn <ip>/22` + 匹配 MAC），而不是靠记住 IP。
+另记：板上 avahi **inactive**、校园网跨网段不转发 mDNS ⇒ `yahboom.local` **当锦上添花、不当保险**；
+以及**桌面先别关**（甲-24 是「跑 MoveIt/YOLO *之前*关回去」）—— 留作 HDMI 本地兜底。
+
+### 三、顺带修正：连接名字与设备对上了
+
+`SZTU-usb` 是**无线**连接（`802-11-wireless`，活动在 `wlx3c6a48573453`），
+不是名字暗示的 USB 网卡 —— 但正好印证了甲-23 的方案（USB 无线网卡走 `SZTU`）。
+板上还存着 `SZTU / SZTU-student / Yahboom / Yahboom2 / Yahboom3 / PDCN / idolm@ster`
+七套无线凭据（后六个 `AUTOCONNECT=yes`），换 SSID 时可直接用。
+
+### 四、改动清单
+
+| 文件 | 改了什么 |
+|---|---|
+| `docs/待执行命令.md` | ① 分组表加 **E** 行；「先 `ssh jetson`」改为**按网线插没插二选一**（当前用 `jetson-wifi`）；新增 **`## E. 搬板子之前 —— 甲-25`**；甲-16 加 2026-09-30 实测块 + **路线 C**，路线 A 降级、路线 B 标注证否 |
+| `docs/RESTRUCTURE_PLAN.md` | 本节（第三十七轮） |
+
+### 五、未验证 / 未做
+
+- **路线 C 还没测**（要管理员 PowerShell，得用户跑）。加完我来复测 8123。**结论留待实测**，
+  本节只断言「关口在 Windows Defender 防火墙」，**不断言加规则一定通**。
+- **甲-25 三条保险都没跑**（两条要 sudo）。
+- **板子现在仍是「一断电就可能失联」的状态** —— 这是当前最该先处理的一件事。
+- `main` 仍在 `0ab13ec`，**未推送**。
