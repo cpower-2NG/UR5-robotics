@@ -22,7 +22,7 @@
   看默认的 `block_best.pt` 在**当前目录**解析到哪里 —— D67 的现场体检。
 
 范围说明：这里只扫**四个节点源文件**，也就是 `bringup` 会启动的那些。现场工具
-（`scripts/ag95_probe.py` 要 `pymodbus`）不在其中，它由 `docs/待执行命令.md` 的
+（`scripts/ag95_probe.py` 要 `pymodbus`）不在其中，它由 `docs/待执行命令-留档.md` 的
 甲-5 单独覆盖 —— 那一步在部署次序里是第 5 步，晚于本脚本要回答的「链路能不能起来」。
 
 只读：不装包、不写文件、不碰串口、不启动任何节点。**不需要 sudo**。
@@ -59,7 +59,7 @@ NODE_FILES = [
 
 # 少数几个模块的「修法」不能用通用套路，写死在这里 —— 通用的 `pip3 install torch`
 # 在 Jetson(aarch64) 上是**错的建议**（PyPI 没有合适的 CUDA wheel，得用 NVIDIA 的）。
-# 这几条都是踩过的，见 docs/待执行命令.md 的 甲-5 与 README 的「真机部署」。
+# 这几条都是踩过的，见 docs/待执行命令-留档.md 的 甲-5 与 README 的「真机部署」。
 FIX_HINTS = {
     "torch": "板子上 torch 随 JetPack/NGC 提供（实测 2.5.0a0+nv24.08）—— "
              "**不要** pip3 install torch；先确认解释器对不对",
