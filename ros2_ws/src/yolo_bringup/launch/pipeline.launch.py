@@ -115,6 +115,29 @@ def _default_planner_params_file():
         return ''
 
 
+def _default_realsense_params_file():
+    """真机 RealSense 的参数文件路径；包没编出来时返回空串。
+
+    这个文件存在的**唯一**理由是 `serial_no` 的引号（理由见
+    generate_launch_description 里那段长注释）。丢了它**不会报错** ——
+    驱动会退回「枚举到的第一台」，插着两台相机时就是**随机**认一台。
+    所以这里必须出声，不能静默。
+    """
+    try:
+        return os.path.join(
+            get_package_share_directory('yolo_bringup'),
+            'config', 'realsense_camera.yaml',
+        )
+    except PackageNotFoundError:
+        print(
+            '[pipeline.launch.py] 警告: 找不到 yolo_bringup 包，无法钉死相机'
+            '序列号（config/realsense_camera.yaml）。插着两台 D435i 时，'
+            '驱动会**静默**取枚举到的第一台。',
+            file=sys.stderr,
+        )
+        return ''
+
+
 def generate_launch_description():
     # ---- 参数 ----
     model_arg = DeclareLaunchArgument(
@@ -138,25 +161,34 @@ def generate_launch_description():
         'camera_source', default_value='sim',
         description='sim | realsense | external — who provides /camera/* topics'
     )
-    # ── 相机认亲（2026-09-30 板端实测）────────────────────────────────────
-    # 本台机械手上挂了**两台** D435i：**腕部一台 + 俯视一台**，都插在同一块 Orin 上。
-    # 2026-09-30 拔插认亲结果：
-    #     俯视 = <topcam-asic-serial>        腕部 = <wristcam-asic-serial>
+    # ── 相机认亲：钉死是哪一台 D435i ─────────────────────────────────────
+    # ⚠️ 序列号**不在这个文件里传**，在 `config/realsense_camera.yaml` ——
+    #    只有那样才传得过去。这是一个**两侧判断相反**的坑，完整推导见那份
+    #    yaml 的文件头，这里只留结论：
     #
-    # ⚠️ 为什么必须显式传 serial_no：`realsense2_camera` 在**不传 serial_no**
-    #    时取**枚举到的第一台**，而枚举顺序**随插拔变化** ⇒ 今天起俯视、
-    #    明天可能起腕部，**而且不报错**。失效症状与 D50/D45 同类：**静默**
-    #    （检测器收不到帧 → 没目标 → 看起来像「检测器坏了」或「模型不行」）。
+    #      launch 用 PyYAML 写参数字典，PyYAML 认为 `<topcam-serial>` 是**普通
+    #      字符串**，于是**不加引号**地落盘；而节点侧 rcl 的 **C 版** YAML
+    #      解析器把没引号的全数字读成**数字**（全 0-7 → 八进制 int；含 8/9 →
+    #      double），节点报 `invalid type {double}` 并**退出**。
+    #      ⇒ launch 这条路对「纯数字串」是**结构性**走不通的。
     #
-    #    ⇒ 默认值直接钉成**俯视那台**：本仓库的下游（detector / projector /
-    #      手眼外参）当前都按**一台固定相机**写，而第一个真机 demo 用的是俯视。
-    #      换相机（例如上腕部）必须**同时**改这个号和相机外参，别只改一半。
-    #      只有一台相机插着时，传这个号也无害（就是那一台）。
-    camera_serial_arg = DeclareLaunchArgument(
-        'camera_serial', default_value='<topcam-asic-serial>',
-        description='RealSense serial_no. Pins WHICH D435i is used — this rig has '
-                    'two (top-down <topcam-asic-serial> / wrist <wristcam-asic-serial>) and the driver '
-                    'otherwise picks the first one it enumerates, silently.'
+    #    两条看着该管用、实测都救不了的路（D60 踩过，别再试）：
+    #      · `ParameterValue(..., value_type=str)` —— 落盘仍是无引号。
+    #      · 命令行 `camera_serial:="'014…'"` —— 引号被**原样保留**进值里，
+    #        驱动拿着带引号的串去找设备，报 NOT found。
+    #
+    #    本机两台 D435i（腕部 + 俯视）各报两个号，`serial_no` 认 **SDK 号**：
+    #        俯视  <topcam-serial> (ASIC <topcam-asic-serial>)
+    #        腕部  <wristcam-serial> (ASIC <wristcam-asic-serial>)
+    #    用 ASIC 号**不报错退出**，而是每 6 秒重试一次 ⇒ 「进程都在、永远没有
+    #    图像」；且驱动做**字符串精确比较、不支持正则**（实测 `.*22072963`
+    #    被当字面量）。详见那份 yaml 与 `docs/RESTRUCTURE_PLAN.md` 本轮记录。
+    realsense_params_default = _default_realsense_params_file()
+    realsense_params_arg = DeclareLaunchArgument(
+        'realsense_params_file', default_value=realsense_params_default,
+        description='真机 RealSense 参数文件（含**带引号**的 serial_no）。'
+                    '换相机改它，别用命令行传 serial_no —— 纯数字串在 launch '
+                    '里传不过去，理由见本文件注释与 config/realsense_camera.yaml'
     )
     # depth_topic 的默认值**随 camera_source 变**：选 realsense 就自动指向
     # 对齐后的话题。这不是锦上添花——若默认写死成 /camera/depth/image_raw，
@@ -342,12 +374,16 @@ def generate_launch_description():
         name='camera',
         output='screen',
         condition=use_realsense,
-        parameters=[{
-            'align_depth.enable': True,
-            # 钉死是哪一台 D435i —— 本机有两台，不传就是**碰运气**且不报错。
-            # 理由与两台相机的序列号见上面 camera_serial_arg。
-            'serial_no': LaunchConfiguration('camera_serial'),
-        }],
+        parameters=[
+            # ⚠️ 顺序有意义：**文件在前、覆盖项在后**。`serial_no` **只在文件里**
+            # （带引号才传得过去，理由见上面那段注释）—— 别把它加到下面这个
+            # dict 里，加了就是无引号 → 被读成 double → 节点退出。
+            # 包不在时用空 dict 占位（与 planner_params 同一种写法）。
+            LaunchConfiguration('realsense_params_file') if realsense_params_default else {},
+            {
+                'align_depth.enable': True,
+            },
+        ],
         # 把 `/camera/camera/...` 收回单层，理由与实测见文件头 REALSENSE_REMAPS。
         remappings=REALSENSE_REMAPS,
     )
@@ -431,7 +467,7 @@ def generate_launch_description():
         device_arg,
         target_frame_arg,
         camera_source_arg,
-        camera_serial_arg,
+        realsense_params_arg,
         depth_topic_arg,
         tf_required_arg,
         max_sync_dt_arg,
