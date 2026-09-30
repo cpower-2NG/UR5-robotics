@@ -5243,3 +5243,98 @@ jetson@<ip>: Permission denied (publickey,password).
 |---|---|
 | `docs/待执行命令.md` | ① 分组表加 **F** 行；新增 **`## F. … 甲-26`**（完整证据链 + `!` 诊断命令 + 两种结果的下一步） |
 | `docs/RESTRUCTURE_PLAN.md` | 本节（第三十八轮） |
+
+---
+
+## 第三十九轮：公钥被拒的真相 —— **不是文件系统坏，是根文件系统换了一个**（2026-09-30）
+
+接第三十八轮。用户在板子上跑了只读诊断，随后又跑了我给的第二组只读命令。
+本轮把第三十八轮的两条结论**都推翻了**，并且发现了比它们更要紧的一件事。
+
+### 一、第三十八轮的两条结论，逐条否掉
+
+| 第三十八轮的说法 | 本轮实测 | 判定 |
+|---|---|---|
+| 「这是另一块同款板子」（解释 B） | `hostname` = `yahboom`；开发机 `known_hosts` 里 **`<board-ip>` / `<ip>` / `<host-ip>` 三处**存的 ed25519 主机密钥**全是** `SHA256:CNq3uA+C/rNCy/K8PVW/enejeR48PryqoTvTG2eujJA`，与板子自报**逐位相同** | ❌ **否掉**，就是同一台机器 |
+| 「硬拔电 ⇒ `authorized_keys` 被截断 / 根分区只读」（解释 A） | `mount` ⇒ `/dev/nvme0n1p1 on / type ext4 (rw,relatime)`；`wc -l` ⇒ **2 行**、229 字节、mtime **`Sep 23 15:58`** | ❌ **否掉**，文件和分区都完好 |
+| （我方新提出的）`authorized_keys` 里有 `from=` 源地址限制 | `cut -c1-60` ⇒ 两行都是干净的 `ssh-ed25519 AAAA…` | ❌ **否掉** |
+
+顺带记：根分区 **94% 满**（112G / 100G 已用 / 6.7G 可用）。
+
+### 二、真正的证据链：钥匙对不上，而且「它以前明明能用」
+
+板上 `authorized_keys` 只有两把，`ssh-keygen -lf` 原文：
+
+| 指纹 | 注释 |
+|---|---|
+| `SHA256:K5Reqt8SKTINmM4poixh4g7b5nID+Lmg2zDLpka1Fkc` | `windows-codex-to-yahboom-jetson` |
+| `SHA256:/CX7v41YXdljg5BjQHV4dlfrp2QFnUNBVYKzMNUGIa8` | `windows-codex-to-yahboom-jetson-v2` |
+
+我们这一侧现在一把都对不上 —— 三处都查了：
+
+| 位置 | 指纹 |
+|---|---|
+| WSL `~/.ssh/board_ed25519`（**从 Windows 拷来的**，`cp` 见会话记录） | `SHA256:zubqjL1MgyKYuGzguR6+bcKWau8ssZSX0GxOhLlzHzY` |
+| Windows `C:\Users\<winuser>\.ssh\board_ed25519.pub` | **同上**（两者的**公钥文件内容逐字节相同**，副本是忠实的） |
+| Windows `id_ed25519_codex.pub` | `SHA256:Kh2EDgA+lnirEQodDAFsZa63fmE5MQmysOxcDhJGGN0` |
+
+**板子上那两把 `windows-codex-to-yahboom-jetson` / `-v2` 的私钥，Windows 与 WSL 两侧都已不存在**
+（Windows `.ssh` 里只剩 9 月 26 日那两把）⇒ 板子上留的是**更早一轮会话的旧钥匙**。
+
+### 三、矛盾点（本轮最关键的推理）
+
+同一条命令、同一把钥匙、**`BatchMode=yes`（结构上不可能回退密码）**，当天早上**成功**过。
+原文从会话记录里挖出来了：
+
+```bash
+timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes -o HostName=<board-ip> jetson \
+  'hostname; ip route | grep default'      # ⇒ yahboom（第 24 次尝试）
+```
+
+`Host jetson` 匹配 ⇒ 用的就是 `board_ed25519`（`zubqjL1M…`）。**它当时被接受了。**
+
+而板子**现在**的 `authorized_keys` mtime 停在 **`Sep 23 15:58`** ——
+**9 月 23 日的文件不可能包含 9 月 26 日才生成的钥匙**（`stat` 显示私钥生成于
+`2026-09-26 20:28`）。
+
+⇒ 唯一自洽的解释：**当天早上那份 `authorized_keys` 与现在这份不是同一个文件**，
+即 **板子现在启动的根文件系统 ≠ 当天早上的那一个**。
+
+**最贴合的机制是 Jetson 的 A/B 冗余启动**：用户确认过是**直接拔的电源**；
+硬断电 → 反复启动失败 → bootloader 按设计**回退到另一个 slot**，而那个 slot 上是
+**约 9 月 23 日的旧镜像**。于是三件事同时解释得通：钥匙是旧的（公钥被拒）、
+网络配置是旧的（见下）、而**主机名与主机密钥两个 slot 完全一样**（克隆镜像的典型特征），
+所以从外面看「当然是同一台机器」。
+**⚠️ 这条尚未坐实**，甲-26 第五步的命令就是去坐实它。
+
+### 四、顺带更正：**「保险一在实战场生效」不成立**
+
+| 项 | 第三十八轮的说法 | 本轮实测 |
+|---|---|---|
+| 生效的无线网卡 | **USB 网卡** `wlx3c6a48573453` | **板载** `wlP1p1s0`（MAC `<mac>`） |
+| 生效的连接 | `SZTU-usb`（**USB 卡**上的 profile —— 正是我改的那条） | **`SZTU`**（板载卡上的另一条 profile） |
+| USB 网卡还在吗 | 默认在 | `nmcli dev status` **没有它**；`lsusb` 只有两个 hub + 蓝牙电台（`0bda:c822`），**无任何 USB 无线网卡** |
+| 有线口 | 网线插着、`carrier=1`、租约 `<ip>/23` | **`eno1:unavailable`**（无载波） |
+
+⇒ **「板子自己连回校园网」是真的**（它确实回来了），
+**但「归功于保险一」这个结论下早了** —— 更可能是板载卡上本来就 `autoconnect` 的 `SZTU` 自己起来的。
+**我改的那条 `SZTU-usb` 至今没有被证明起过作用。** 这条更正已写回甲-25 与甲-26。
+
+### 五、本轮产出的命令（甲-26 第五步）
+
+只读，含 3 条 sudo 只读查询，一次拿齐七组判据：`/etc/nv_boot_control.conf` +
+`nvbootctrl -t rootfs is-supported / get-current-slot`、`/proc/cmdline` 与 `lsblk`
+（找第二个上百 G 的 ext4 分区）、`journalctl --list-boots`、
+`grep -rl` 我们的公钥（**在这块盘上到底有没有**）、家目录 mtime 年份、
+`nmcli` 里 `SZTU-usb` 还在不在 + `eno1` 的 operstate/carrier、
+以及 `~/yahboom_ws` / `~/ultralytics` / `ros-humble` 包数（**当天早上那份工作环境在不在这块盘上**）。
+另附第三步「把钥匙装回去」（用户已授权重建）与「两种结果的分支」。
+
+### 六、改动清单
+
+| 文件 | 改了什么 |
+|---|---|
+| `docs/待执行命令.md` | ① 分组表 **F 行**改写；连接块改写（短名过期，改用 `ssh jetson@<ip>`）；甲-25 执行进度加**更正**；**甲-26 整节重写**（否掉了两个旧假设 + 新证据链 + 七组只读判据 + 装钥匙 + 分支） |
+| `docs/RESTRUCTURE_PLAN.md` | 第三十八轮加更正横幅；本节（第三十九轮） |
+
+**未做（等甲-26 第五步的结果）**：未在任何位置写盘、未重刷、未 `fsck`、未切 bootloader slot。
