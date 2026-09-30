@@ -5071,3 +5071,36 @@ WSL 里那个监听器在 VM 内、不是 Windows 进程，**拿不到程序规�
 - **甲-25 三条保险都没跑**（两条要 sudo）。
 - **板子现在仍是「一断电就可能失联」的状态** —— 这是当前最该先处理的一件事。
 - `main` 仍在 `0ab13ec`，**未推送**。
+
+### 八、13:15 补记：**路线 C 跑完就通了** —— 但目标还差两关
+
+用户跑完路线 C（`New-NetFirewallRule … -Profile Any -RemoteAddress <board-ip>,<host-ip>`）后的复测：
+
+| 判据 | 之前 | 之后 |
+|---|---|---|
+| 板子 → WSL，TCP 8123 | `HTTP 000`、`rc=28` 超时 | **`HTTP 200`，`0.047 s`** |
+| 板子 → WSL，ICMP | `100% packet loss` | **`0% loss`，平均 2.9 ms** |
+| WSL 监听端日志 | 空 | `<board-ip> - - "GET / HTTP/1.1" 200` |
+
+规则实查无误（`En=True / Inbound / Allow / Profile=Any`，`RemoteAddress` 正是那两个）。
+**§一 的诊断成立**：关口确实在 Windows Defender 防火墙，不在 Hyper-V 那一层。
+**Windows 侧要用户跑的到此为止。**
+
+**但「在开发机上实时看板子的话题」还差两关**（都不需要用户操作）：
+
+- **关卡 2 —— DDS 发现靠组播，两台机器不在同一个子网。** 用 ROS 2 官方跨机判据实测：
+  WSL `ros2 multicast receive` **什么都没收到**，板子 `ros2 multicast send` 却报发送成功。
+  板子无线 `<board-ip>/22` vs 开发机 `<ip>/23` ⇒ 组播不跨网段路由。
+  修法是**改走单播**：两边设 `ROS_STATIC_PEERS` 互相指。`ROS_DOMAIN_ID` 两边都是未设（=0），已一致。
+- **关卡 3 —— WSL 的 `ros2` CLI 本身是坏的**（既有问题，非本次引入）：
+  `ros2 topic list` 输出**空**（连自己的 `/parameter_events` 都没有）、
+  `ros2 topic list -a` 报 `unrecognized arguments: -a`、`ros2 daemon status` **挂住**。
+  板子上同样命令正常。`ros2` 在本机 `/opt/ros/humble/bin/ros2`、`rclpy` 可 import、
+  `RMW_IMPLEMENTATION` 未设。⇒ **不是「ROS 没装好」，是 CLI/daemon 这一层。**
+
+⚠️ **两关的判定顺序不能反**：关卡 3 是 WSL **本地**就坏的，
+**必须先修好它才能判定关卡 2 到底通没通** —— 否则 DDS 即使通了，CLI 照样看不见东西。
+
+**用户顺手踩到的一个坑**（已写进 `待执行命令.md` 开头）：`jetson-wifi` / `jetson` 这两个短名
+**只是 WSL 侧 `~/.ssh/config` 的别名**，Windows 的 `ssh.exe` 读 `C:\Users\<winuser>\.ssh\config`，
+不认识它们 ⇒ 报 `Could not resolve hostname jetson-wifi`。在 PowerShell 里要写全地址。
