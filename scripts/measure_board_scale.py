@@ -44,25 +44,34 @@ class Cam(Node):
     def __init__(self, a):
         super().__init__('measure_board_scale')
         self.info = self.color = self.depth = None
+        # ⚠️ `_seen` 原先**没有初始化**，`_first` 也**从没被调用过** ——
+        # 也就是说这个「第一帧就报一声」的排查手段一直是死代码，
+        # 一旦真去调就会 AttributeError。而它要排查的那个现象是**活的**：
+        # 实测约 8 次里有 3 次收不到帧（原因未查明，见第五十七轮 §四）。
+        # 现在接上：全都没来 ⇒ 多半是 DDS 发现；只缺一路 ⇒ 那一路自己的问题。
+        self._seen = set()
         self.create_subscription(CameraInfo, a.info_topic, self._i, qos_profile_sensor_data)
         self.create_subscription(Image, a.color_topic, self._c, qos_profile_sensor_data)
         self.create_subscription(Image, a.depth_topic, self._d, qos_profile_sensor_data)
-
-    def _i(self, m):
-        self.info = m
-
-    def _c(self, m):
-        if self.color is None:
-            self.color = m
-
-    def _d(self, m):
-        self.depth = m
 
     def _first(self, name):
         """只在第一帧时打一行 —— 排查「一条都收不到」还是「只缺某一路」。"""
         if name not in self._seen:
             self._seen.add(name)
             print('  ← 收到第一帧 %s' % name, flush=True)
+
+    def _i(self, m):
+        self.info = m
+        self._first('camera_info')
+
+    def _c(self, m):
+        if self.color is None:
+            self.color = m
+        self._first('color')
+
+    def _d(self, m):
+        self.depth = m
+        self._first('depth')
 
 
 def rgb_to_bgr(msg):
