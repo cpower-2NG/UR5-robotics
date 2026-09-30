@@ -5104,3 +5104,33 @@ WSL 里那个监听器在 VM 内、不是 Windows 进程，**拿不到程序规�
 **用户顺手踩到的一个坑**（已写进 `待执行命令.md` 开头）：`jetson-wifi` / `jetson` 这两个短名
 **只是 WSL 侧 `~/.ssh/config` 的别名**，Windows 的 `ssh.exe` 读 `C:\Users\<winuser>\.ssh\config`，
 不认识它们 ⇒ 报 `Could not resolve hostname jetson-wifi`。在 PowerShell 里要写全地址。
+
+### 九、13:30 补记：关卡 3 的**症状我记错了**，关卡 2 的**网络层已排除**
+
+继续往下挖，两条更正、一条新结论：
+
+**更正 1 —— 关卡 3 不是「输出空」，是【挂住】。** 用 `timeout` 的退出码一量就分清了：
+`ros2 topic list` 默认走 daemon ⇒ **`rc=124`**（被 timeout 杀，所以看起来「什么都没有」）；
+加 `--no-daemon` ⇒ **正常**，列出 `/parameter_events`、`/rosout`。
+`ros2 daemon status` / `daemon stop` 也都挂住（`rc=143`）。`~/.ros/` 下**没有**残留
+`ros2cli_daemon_port` 文件、也没有残留 daemon 进程 ⇒ 不是「僵死的守护进程」，是**起不来**。
+另外我测的 `ros2 topic list -a` 报 `unrecognized arguments` **根本不是 bug** ——
+Humble 里这个选项叫 `--include-hidden-topics`，是我测错了。
+⇒ **绕过办法就是 `--no-daemon`，关卡 3 不必先修。**
+
+**更正 2 —— 关卡 2 卡在 DDS 发现，不在网络。** 逐层实测：
+板子 → WSL 的**纯 socket 单播 UDP**（不走 DDS）**收到了**（`udp-hello-from-board`，来自
+`<board-ip>:56885`）⇒ **传输层是好的**。不通的是发现：
+- 组播方向收不到（不同子网，预期之中）；
+- **两边都设 `ROS_STATIC_PEERS` 互相指、两个方向都试、加 `--spin-time 8`** —— **仍然发现不到**。
+
+最可能的原因：`ROS_STATIC_PEERS` 只带 IP，端口按「participant id = 0」推算
+（`7400 + 250*domain + 2*participantId`），而 participant 端口是动态分配的，推错就永远对不上。
+⇒ 下一步改用 **Discovery Server**（`ROS_DISCOVERY_SERVER`，固定端口，两边都连它），
+备选是两边都写 `FASTRTPS_DEFAULT_PROFILES_FILE` XML 把 `initialPeersList` 的端口写死。
+
+**新结论（定性，重要）**：**甲-16 是可选路线，不必为它挡路。**
+它买的是「*实时*看板子的话题」，而「看板子的画面/数据」**甲-15 已经做完 ✅**
+（录包 → rsync → 本地回放，走文件、不碰 DDS）。跨机 DDS 真正必需的场景是
+「从工作站下发指令给板子」，那是 W5 之后的事。
+⇒ **下一步该做的是甲-25（搬板子前的三道保险），不是继续挖 DDS。**
