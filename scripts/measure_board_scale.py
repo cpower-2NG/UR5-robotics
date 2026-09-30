@@ -37,7 +37,8 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from camera_geometry_survey import depth_to_meters, deproject, ransac_planes  # noqa: E402
+from camera_geometry_survey import (                                          # noqa: E402
+    _ENCODING_SCALE, depth_to_meters, deproject, ransac_planes)
 
 
 class Cam(Node):
@@ -91,6 +92,9 @@ def main():
     ap.add_argument('--cols', type=int, default=12, help='内角点列数（patternSize 第一个数）')
     ap.add_argument('--rows', type=int, default=7, help='内角点行数')
     ap.add_argument('--save-dir', default='/tmp/board_scale')
+    ap.add_argument('--depth-scale', type=float, default=-1.0,
+                    help='强制指定米/像素（如 0.000988）；-1 = 按编码的约定值。'
+                         '用来**施放**修正，不用来判定成因')
     args = ap.parse_args()
 
     rclpy.init()
@@ -110,6 +114,21 @@ def main():
     fx, fy, cx, cy = K[0], K[4], K[2], K[5]
     img = rgb_to_bgr(node.color)
     depth = depth_to_meters(node.depth)
+    # 深度尺度可以**强制覆盖**，与 `projector_node` 的 `depth_scale` 参数对齐。
+    # 为什么要给这个口子：实测这条链整体偏 ~1.2%（棋盘格靶已用**卡尺**
+    # 验证过是准的，见 calib/README.md），而 `depth_scale` 正是把那个偏差
+    # 修回去的**唯一旋钮**。默认 -1 = 按编码的约定值（16UC1 → 0.001）。
+    # ⚠️ 它不区分「深度尺度错」和「焦距错」—— 平面靶上这两者**数学上不可分**
+    # （实测：内参偏 1.2% 时重投影仍是 0.03 px，而解出的距离正好偏 1.2%）。
+    # 所以这里的定位是「**施放**修正」，不是「**判定**成因」。
+    if args.depth_scale > 0.0:
+        # 除掉**实际用到**的那个编码尺度再乘新的 —— 不能写死 0.001：
+        # 16UC1 是毫米，32FC1 已经是米，写死会把后者改错 1000 倍。
+        applied = _ENCODING_SCALE[node.depth.encoding]
+        print('深度尺度被参数覆盖为 %.6f m/px（编码 %s 的约定值是 %.6f，'
+              '换算系数 %.6f）' % (args.depth_scale, node.depth.encoding,
+                                   applied, args.depth_scale / applied))
+        depth = depth * (args.depth_scale / applied)
     print('内参 fx=%.1f fy=%.1f cx=%.1f cy=%.1f  %dx%d'
           % (fx, fy, cx, cy, img.shape[1], img.shape[0]))
 
@@ -184,6 +203,24 @@ def main():
           % (len(allsp), np.median(allsp) * 1e3, np.std(allsp) * 1e3,
              np.median(allsp) / nom))
     print('  （1.0000 = 这条链准；>1 = 偏大，即把东西量大了）')
+
+    # 反手给出**该用多少**：这条链把长度量成 r 倍，深度就该缩 1/r。
+    # 它是拿来喂 `projector_node` 的 `depth_scale`（或本脚本的 --depth-scale）
+    # 的**修正值**，前提是那个偏差真的出在深度尺度上。
+    # ⚠️ 平面靶**分不出**「深度尺度错」和「焦距错」—— 两者签名完全相同，
+    #    所以这个数只是「若成因为深度，则用这个值」，不是结论。
+    #    要判定成因，得有一条**独立**的米制真值（皮尺量相机高度即可）。
+    r = np.median(allsp) / nom
+    if abs(r - 1.0) > 0.002:
+        print('  ⇒ 若这个偏差出在**深度尺度**上，则应为 '
+              '**%.6f** m/px（现在用的 %.6f，即 0.001 × %.4f）'
+              % (0.001 / r, 0.001, 1.0 / r))
+        print('    拿它重跑一次（--depth-scale %.6f）应当回到 1.0000。'
+              % (0.001 / r))
+        print('    ⚠️ 但**别就此认定成因是深度** —— 焦距错 1.2%% 会给出'
+              '一模一样的签名')
+        print('       （实测：内参偏 1.2%% 时重投影仍 0.03 px，'
+              '而解出的距离正好偏 1.2%%）。')
 
     # ── 对照：只拟合一张台面，用平面方程求交（不含逐点深度噪声）──────
     pts, us, vs = deproject(depth, fx, fy, cx, cy, 0.15, 2.0)
