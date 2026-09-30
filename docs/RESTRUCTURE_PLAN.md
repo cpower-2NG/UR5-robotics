@@ -6357,3 +6357,106 @@ timeout 2 bash -c "echo > /dev/tcp/fe80::2d8:61ff:fe4b:9f4f%eno1/29999"
 2. **不手搓任何 RTDE 包**（`30004`），**不碰 `30001`/`30002`/`30003`**；
 3. 要验 RTDE → **让 `ur_robot_driver` 自己去连**（完整协商 + 错误处理，正是我不该绕过的那层）；
 4. 真机动作 / 控制器状态变更前，**当次**明确授权 + **急停就绪**。
+
+---
+
+## 第五十一轮：硬件就绪度只读盘点（2026-09-30）—— **两台相机 + 串口适配器出现了**
+
+**触发**：用户跑完 ① 1-1（关板载无线自动连接）、插回相机，要求
+**「只读的确认，各个串口是否合适，有没有速率、协议、驱动等问题」**。
+全程**只读**：没开任何 ROS 节点、没往任何设备写一个字节、**没碰控制箱**。
+
+### 三条新事实（都与既有台账不符，需更正）
+
+| # | 台账原来写的 | 实测 | 影响 |
+|---|---|---|---|
+| 1 | 「RS485 适配器 **无**（`lsusb` 无任何 USB-串口芯片）」 | **`0403:6001` FTDI FT232R USB UART 在**，`/dev/ttyUSB0`，`ftdi_sio` 已加载 | AG-95 的**物理链路可能已经具备** |
+| 2 | 「D435i **实物已插在板上**」（单数） | **两台** D435i：`<wristcam-asic-serial>`(2-1.1→video0-5) 与 `<topcam-asic-serial>`(2-1.3→video6-11) | 与「腕部 + 俯视」两台吻合；**但仓库只配了一台** |
+| 3 | 甲-6「MoveIt 已在」 | `moveit_ros_move_group` **2.5.10** 在；`ur_robot_driver` **2.14.0** / `ur_description` **2.13.0** / `ur_moveit_config` **2.14.0** / `realsense2_camera` **4.58.4** 全在 | 驱动侧齐 |
+
+### 一、网络（① 1-1 验收）✅
+
+```
+SZTU-usb     wlx3c6a48573453  yes  activated
+SZTU-student --               no   --
+TP-LINK_3B72 --               no   --
+default via <ip> dev wlx3c6a48573453 proto dhcp metric 600   ← 只剩一条
+eno1  UP  <ip>/24        ← 去控制箱
+wlP1p1s0  DOWN                     ← 板载无线已断
+```
+`ping <ur-controller-ip>` 0% 丢包、0.166–0.302 ms。**1-1 通过。**
+
+### 二、串口（AG-95 那条线）
+
+| 项 | 实测 | 判定 |
+|---|---|---|
+| 设备 | `/dev/ttyUSB0`，`0403:6001`，**FT232R USB UART**，序列号 **`AB0P6UEX`** | ✅ 在 |
+| 稳定路径 | `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0` | ✅ 有（别用 `/dev/ttyUSB0`，插拔会变号） |
+| 驱动 | `ftdi_sio` + `usbserial` 已加载 | ✅ |
+| 权限 | `root:dialout 660`；`jetson` ∈ `dialout`(20) | ✅ |
+| 能否打开 | **只读打开成功**（`O_RDONLY\|O_NONBLOCK\|O_NOCTTY`，未写一字节） | ✅ |
+| 当前 termios | **9600** 8N1，无校验，`CREAD`/`CLOCAL` 置位；**`IXON=True`** | ⚠️ 见下 |
+| 线上数据 | `FIONREAD` = **0**，静默 | ✅ 符合空闲总线 |
+| 占用 | `lsof` / `fuser` 均空 | ✅ |
+| 板载 UART | `/dev/ttyTHS1` `/dev/ttyTHS2` 均 `root:dialout 660`、**无人占用**；`nvgetty` **inactive** | ✅ 备用路可用 |
+
+**⛔ 唯一没解决的：分不出是 RS-485 还是 TTL 电平。**
+`0403:6001` + `FT232R USB UART` 这个描述符，**带 485 收发器的板子和纯 TTL 板子完全一样**，
+接口类也是 `ffffff`（厂商自定义），**软件侧拿不到任何判别信息**。
+AG-95 走的是 **RS-485**，所以这一条**必须肉眼看硬件**：
+板上有没有 `MAX485`/`SP485`/`SP3485`/`MAX13487` 之类的收发芯片，
+接线端子是 **A/B 两线**（485）还是 **TX/RX/GND**（TTL）。
+
+⚠️ 另记两个小项，都不是故障但会咬人：
+- **`IXON=True`**（软件流控开着）。Modbus RTU 是二进制帧，数据里出现 `0x11`/`0x13`
+  会被当成 XON/XOFF 吃掉。`pyserial` 默认 `xonxoff=False` **会清掉它**，
+  所以只要走 `pyserial`/`pymodbus` 就没事；**手写 termios 时别忘了清**。
+- 打开时是 **9600**，而仓库默认 **115200**（`grasp_planner.yaml:234`）——
+  波特率在 `open()` 时设定，不是问题，但**说明「当前值」没有参考意义**。
+
+**仓库期望值对得上**：`planner_node.py:525` `ag95_port: /dev/ttyUSB0`、
+`:526` / `grasp_planner.yaml:234` `ag95_baudrate: 115200` ⇒ **设备路径正好命中**。
+
+### 三、相机（两台）
+
+| 序列号 | USB 路径 | video 节点 | 验证过的格式 |
+|---|---|---|---|
+| **`<wristcam-asic-serial>`** | `2-1.1` | video0–5（+ media1/2） | video0 = `Z16` 深度 |
+| **`<topcam-asic-serial>`** | `2-1.3` | video6–11（+ media3/4） | video6 = `Z16` 深度 |
+
+- `lsusb` 两条 `8086:0b3a` ✅；`uvcvideo` 已加载 ✅
+- **`99-realsense-libusb.rules` 在**（`/etc/udev/rules.d/`，Sep 26 建）⇒ 深度流**不需要 root** ✅
+- `jetson` ∈ `video`(44) ✅；`/dev/video*` = `root:video 660` ✅
+- `v4l2-ctl --list-devices` 把两台分得清清楚楚 ✅
+- **无进程占用** ✅
+- `realsense2_camera` **4.58.4** ✅
+
+**🔴 本轮最要紧的发现：仓库代码只配了**一台**相机，而板上现在有**两台**。**
+`realsense2_camera` 在**不传 `serial_no`** 时取**枚举到的第一台**，
+而枚举顺序**随插拔变化** ⇒ **今天起的是俯视、明天可能起腕部，而且不报错**。
+配合 `pipeline.launch.py:65` 那句「`camera_namespace:=` 是改不掉的」，
+失效症状同样**静默**（检测器收不到帧 → 没目标 → 像检测器坏了）。
+⇒ **必须用 `serial_no` 把「俯视那台」钉死**（与 [[board-identity-rule]] 同一条纪律：
+**不认序列号就会认错东西**）。**前提是先知道哪台是哪台。**
+
+**✅ 核实后排除一条虚警**：`realsense2_description` **没装**，
+但**全仓库零处引用它**（`grep -rn realsense2_description` 无匹配）⇒ **不是阻塞**。
+同理全仓库**零处写死 `/dev/video*`** ⇒ 相机走 ROS 话题，不受节点号漂移影响。
+
+### 四、软件栈
+
+```
+python 3.10.12 · pyserial 3.5 · pymodbus 3.15.0
+socat 在；minicom / picocom / rs-enumerate-devices / realsense-viewer 没装
+磁盘 / 165G 可用
+```
+
+### 五、本轮**没有**做的事
+
+未开任何 ROS 节点 · 未向任何设备写入 · 未碰控制箱任何端口 · 未改板上任何配置。
+`/dev/ttyUSB0` 的 termios 是**只读查询**（`tcgetattr`），**没有 `tcsetattr`**。
+
+### 六、待用户确认（阻塞项）
+
+1. **FT232R 那块板子是 RS-485 还是 TTL** —— 软件分不出，必须眼看。
+2. **哪台 D435i 是俯视** —— 需要拔一台做一次认亲，或用户直接报。
