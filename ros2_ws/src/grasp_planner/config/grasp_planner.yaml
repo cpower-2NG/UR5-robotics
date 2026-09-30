@@ -230,7 +230,11 @@ grasp_planner:
     sim_gripper_close: 0.8
     sim_gripper_empty_threshold: 0.75
     sim_gripper_barely_moved: 0.02
-    ag95_port: /dev/ttyUSB0
+    # 用 by-id 而不是 /dev/ttyUSB0：ttyUSB* 的编号**随插拔重新分配**，同机上若
+    # 再插第二个 USB 串口设备就会**静默**开错口，症状是「夹爪没反应」——
+    # 与 D50/D60 同类。by-id 里的 `AB0P6UEX` 是这颗 **FT232R 的芯片序列号**，
+    # 不可克隆（2026-09-30 板端实测：重插后 ttyUSB 号变了，这条软链不变）。
+    ag95_port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0
     ag95_baudrate: 115200
     ag95_slave_id: 1
     ag95_force: 50
@@ -243,8 +247,11 @@ grasp_planner:
     # 翻成 false 的前提：夹爪已从机械臂上拆下、放工作台、急停在手边，
     # 且下面的 ag95_open_is_high 已现场实测确认。
     ag95_dry_run: true
-    # 千分位的方向：1000 = 全开（true）还是全闭（false）。**大寰手册没写**，
-    # 网上两种说法都有，不要猜 —— 手动把手指掰到全开、读一次 0x0202 即判决
-    # （读到 1000 ⇒ true）。这道门只有 dry_run=false 时才会影响真实动作，
-    # 但写错会让 open/close 完全反着来，所以留在这里显式写出来。
+    # 千分位的方向：1000 = 全开（true）还是全闭（false）。
+    # ✅ **2026-09-30 板端实测判决，不再是从手册推的**：
+    #    写 `0x0100 = 0x01`（单向初始化；方向寄存器 0x0301 实测 = 0）之后，
+    #    `0x0202` 由 0 走到 **1000**，肉眼确认**完全张开**、指示灯由红闪转**蓝常亮**。
+    #    ⇒ **1000 = 全开** ⇒ true。这条有**实物目视背书**。
+    #    （初始化前的 0x0202 读数是**无意义**的 —— 手册：未初始化时位置回读不作数。
+    #      所以别拿「初始化前读到 0」去反推方向。）
     ag95_open_is_high: true
