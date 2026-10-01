@@ -90,6 +90,25 @@ SIM_IK_GROUP = 'ur5_manipulator'
 REAL_IK_GROUP = 'ur_manipulator'
 SIM_TRAJECTORY_ACTION = '/joint_trajectory_controller/follow_joint_trajectory'
 REAL_TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_trajectory'
+# tool0 → 指尖的距离（m）。**和上面两项一样是后端属性**，理由完全一样：
+# 仿真用 Robotiq 2F-85（0.13 是从参考项目 `arm-grasping` 抄来的 2F-85 推导值，
+# 两处同一个常数），真机用 AG-95 —— **指尖长度不同**。
+#
+# 真机值 **0.174** 的来源：示教器上 4 点法标出的 `TCP_1` 的 z = **173.99 mm**
+#（x = 47.46、y = 6.8，rpy 全 0 —— 姿态为零所以三个数就是法兰系里的偏移，
+# 不用换算）。x ≈ 47.5 = 半行程，说明碰的是**指尖角**，即 z 正是法兰→指尖。
+# ⚠️ 它依赖「夹爪停在标定时那个开度（全开）」，**驱动一次夹爪这个值就失效**。
+#
+# 差 44 mm 的后果不是「差一点」，是**方向确定地往桌子里扎**：
+#   planner_node.py 把**法兰**放在 `wz + tool0_to_fingertip`（`:1288` 接近点、
+#   `:1317` 抓取点），好让指尖落到 `wz`。抓一个 40 mm 的方块（`wz` = 台面 + 20）：
+#     该是：法兰 0.020 + 0.174 = 0.194 → 指尖 **0.020**（方块中心）✅
+#     实际：法兰 0.020 + 0.130 = 0.150 → 指尖 **−0.024** ⇒ **台面以下 24 mm**。
+#   44 − 20 = 24。接近点同样整体低 44 mm。
+# ⚠️ 这个数**尚未经 Δ 验收**（`scripts/tcp_check.py`）：同一笔点换 ≥30° 的姿态
+#   再碰一次，Δ ≤ 1 mm 才算数。验收没过就要重标、这个值跟着改。
+SIM_TOOL0_TO_FINGERTIP = '0.13'
+REAL_TOOL0_TO_FINGERTIP = '0.174'
 
 
 def _default_planner_params_file():
@@ -307,6 +326,25 @@ def generate_launch_description():
                     'controller / 真机 scaled_joint_trajectory_controller'
                     '（尊重示教器速度滑条）。默认随 camera_source。'
     )
+    # tool0 → 指尖同样**随后端变**（见文件头 SIM_/REAL_TOOL0_TO_FINGERTIP）。
+    # 它必须在这里覆盖，不能只改 `grasp_planner.yaml`：那份 yaml 是**共用的**，
+    # 改它会把仿真一起改坏。
+    # 覆盖之所以有效：这一项落在 `planner_params` 的**第二个**元素（字典）里，
+    # launch_ros 把列表里每一项各写成一个 `--params-file`，**按顺序给节点**
+    # （`launch_ros/utilities/evaluate_parameters.py:155-165` 保序 →
+    # `launch_ros/actions/node.py:446` 每个字典一个临时文件）。
+    # 已实测：两份文件有同名键时**后一份赢**，且只在前一份里的键**照样保留** ——
+    # 所以这里只需写要覆盖的那几项，不必抄全 35 条。
+    tool0_to_fingertip_default = PythonExpression([
+        "'" + SIM_TOOL0_TO_FINGERTIP + "' if '",
+        LaunchConfiguration('camera_source'),
+        "' == 'sim' else '" + REAL_TOOL0_TO_FINGERTIP + "'",
+    ])
+    tool0_to_fingertip_arg = DeclareLaunchArgument(
+        'tool0_to_fingertip', default_value=tool0_to_fingertip_default,
+        description='tool0 到指尖的距离（m）。仿真 2F-85 0.13 / 真机 AG-95 0.174'
+                    '（由 TCP_1 的 z = 173.99 mm 实测）。默认随 camera_source。'
+    )
     # 只走位演示（第一个真机 demo）要用 carry_objects:=false，否则规划器会去
     # 闭合一个不存在的夹爪。它**必须**和后端一起给：none 后端 + true 会在
     # planner_node 启动时直接抛错（刻意如此，见 gripper.py 的 NullGripper）。
@@ -447,6 +485,7 @@ def generate_launch_description():
             # 必须覆盖，理由见文件头 SIM_/REAL_ 常量。
             'ik_group': LaunchConfiguration('ik_group'),
             'trajectory_action': LaunchConfiguration('trajectory_action'),
+            'tool0_to_fingertip': LaunchConfiguration('tool0_to_fingertip'),
             # 只走位演示：规划器不闭合夹爪，但仍走完「接近→下降→抬起→HOME→
             # 放置位→下降→抬起→HOME」的完整动作序列。
             'carry_objects': LaunchConfiguration('carry_objects'),
@@ -481,6 +520,7 @@ def generate_launch_description():
         gripper_backend_arg,
         ik_group_arg,
         trajectory_action_arg,
+        tool0_to_fingertip_arg,
         carry_objects_arg,
         skip_detector_arg,
         skip_planner_arg,

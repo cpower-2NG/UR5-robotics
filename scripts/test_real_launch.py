@@ -823,6 +823,61 @@ def main():
               "; ".join(mismatched) if mismatched else
               f"比了 {len(node_defaults) - len(INTENTIONAL & set(node_defaults))} 条")
 
+        print("\n--- W2-15 tool0_to_fingertip 必须**随后端变**（D44 的入口）---")
+        # 为什么值得单独钉：这个数错了**不会报任何错**，只会让指尖落在
+        # 比该到的地方低一截的地方 —— 44 mm 的差，对 40 mm 的方块就是
+        # 指尖扎进台面 24 mm。而它是**静默**的：IK 会解成功、轨迹会走完、
+        # 控制器会报 SUCCEEDED。唯一的征兆是「夹爪撞桌子」。
+        #
+        # 而且它**不能靠改 `grasp_planner.yaml` 来修**：那份 yaml 是仿真与
+        # 真机**共用**的（仿真用 Robotiq 2F-85 = 0.13，真机用 AG-95 = 0.174），
+        # 改它等于把仿真一起改坏。所以必须走 launch 侧的后端分支。
+        check("pipeline.launch.py 声明了 tool0_to_fingertip",
+              "tool0_to_fingertip" in p_names)
+        t_subs = _raw_default(pipeline, "tool0_to_fingertip")
+        sim_v = _resolve_default_in(t_subs, camera_source="sim")
+        real_v = _resolve_default_in(t_subs, camera_source="realsense")
+        check("仿真默认仍是 2F-85 的 0.13（动它就会把仿真弄坏）", sim_v == "0.13",
+              f"got {sim_v!r}")
+        check("真机默认是 AG-95 实测的 0.174（TCP_1 的 z = 173.99 mm）",
+              real_v == "0.174", f"got {real_v!r}")
+        # 这条是**意图**的断言：差的不是零头，是「指尖扎进台面」那个量级。
+        check("两者差 44 mm（正是 D44 说的那一截）",
+              abs(float(real_v) - float(sim_v) - 0.044) < 1e-9,
+              f"差 {abs(float(real_v) - float(sim_v)) * 1e3:.1f} mm")
+
+        # 关键：光声明没用，得**真的传进 grasp_planner 的参数字典**。
+        # `planner_params` 是 [yaml路径, {覆盖项}] 两项 —— 覆盖项落在第二项里
+        # 才盖得住 yaml（已实测：多份 --params-file 同名键**后一份赢**）。
+        gp = node_params(pipeline, "grasp_planner")
+        gp_pairs = {}
+        if gp:
+            for item in gp:
+                if isinstance(item, dict):
+                    gp_pairs.update({_resolve_default_in(k): _lc_name(v[0])
+                                     for k, v in item.items()})
+        check("它真的传进了 grasp_planner 的参数（否则只是个死旋钮）",
+              gp_pairs.get("tool0_to_fingertip") == "tool0_to_fingertip",
+              f"got {gp_pairs.get('tool0_to_fingertip')!r}; keys={sorted(gp_pairs)}")
+        # 兄弟项在图里也在（同一条覆盖路径），掉了说明列表结构被改过
+        check("同一条覆盖路径上的 ik_group / trajectory_action 也还在",
+              {"ik_group", "trajectory_action"} <= set(gp_pairs),
+              f"keys={sorted(gp_pairs)}")
+
+        # 共用 yaml **必须原样不动** —— 它是仿真那一侧的真相，真机靠覆盖。
+        _yaml = (PROJECT_ROOT / "ros2_ws" / "src" / "grasp_planner"
+                 / "config" / "grasp_planner.yaml")
+        _ysrc = _yaml.read_text(encoding="utf-8") if _yaml.is_file() else ""
+        check("共用的 grasp_planner.yaml 里仍是 0.13（真机走覆盖，不改共用件）",
+              "tool0_to_fingertip: 0.13" in _ysrc,
+              "找不到 `tool0_to_fingertip: 0.13`" if _ysrc else "yaml 不存在")
+
+        # 真机侧不许再出现第二处定义（D50/D64 那一类：谁生效取决于顺序）
+        _rsrc = _src("real.launch.py")
+        check("real.launch.py 不重复声明它（默认值已随 camera_source 解析）",
+              "tool0_to_fingertip" not in _rsrc,
+              "real.launch.py 里又写了一遍 —— 两处定义会有一处静默失效")
+
     print("\n--- W2-11 max_sync_dt 只能有一处定义（D50/D64 的同一类错）---")
     for mod, label in ((real, "real"), (bringup, "bringup")):
         if mod is None:
