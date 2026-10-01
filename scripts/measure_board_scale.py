@@ -37,6 +37,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from board_extrinsics import detect_chessboard                                # noqa: E402
 from camera_geometry_survey import (                                          # noqa: E402
     _ENCODING_SCALE, depth_to_meters, deproject, ransac_planes)
 
@@ -140,28 +141,25 @@ def main():
     # 按 (12, 7) 试会**一个角点都找不到**，而这不是靶的问题、也不是反光的问题
     # （第一版就是这么误判的，差点又去怪打印质量）。
     # 内角点数只是行列互换，量出来的边长集合完全一样，所以掉个个儿没有副作用。
-    found = None
-    for ps in ((args.cols, args.rows), (args.rows, args.cols)):
-        ok, corners = cv2.findChessboardCorners(
-            gray, ps,
-            flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
-        if ok:
-            found = ps
-            break
+    # ⚠️ 除了两种朝向，还要**逐级放大**：`findChessboardCorners` 在图案只占
+    #    画面一小块时会返回「末行复制上一行」的网格，88 个点里 8 个是假的，
+    #    而它照样返回 True。那份结果喂给这里的边长统计会**静默地**把
+    #    「靶一格多少像素」算歪 —— 见 `detect_chessboard` 的注释。
+    corners, found, scale = detect_chessboard(
+        gray, ((args.cols, args.rows), (args.rows, args.cols)))
     if found is None:
         os.makedirs(args.save_dir, exist_ok=True)
         p = os.path.join(args.save_dir, 'no_board.png')
         cv2.imwrite(p, img)
-        raise SystemExit('没找到内角点（试过 (%d,%d) 与 (%d,%d) 两种朝向）；原图存 %s'
-                         % (args.cols, args.rows, args.rows, args.cols, p))
+        raise SystemExit('没找到内角点（试过 (%d,%d) 与 (%d,%d) 两种朝向，放大到 3x）；'
+                         '原图存 %s' % (args.cols, args.rows, args.rows, args.cols, p))
     if found != (args.cols, args.rows):
         print('注意：靶在画面里转了 90°，按 patternSize=(%d, %d) 解出来的'
               % found)
     args.cols, args.rows = found
+    if scale > 1:
+        print('检测放大 %dx（1x 下会检出重复行）' % scale)
 
-    corners = cv2.cornerSubPix(
-        gray, corners, (11, 11), (-1, -1),
-        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01))
     C = corners.reshape(args.rows, args.cols, 2)
     print('找到内角点 %dx%d = %d 个' % (args.rows, args.cols, args.rows * args.cols))
 

@@ -249,6 +249,101 @@ def optical_to_link(R_bc, t_bc):
     return R, np.asarray(t_bc, float)
 
 
+# ───────────────────────── 找棋盘格（两条路共用） ──────────────────────────
+
+def adjacent_spacing_min_ratio(grid):
+    """相邻角点间距的最小值 / 中位数。用来抓「重复行」这种**沉默**的退化。
+
+    `findChessboardCorners` 在图案只占画面一小块（本仓库俯视相机实测：
+    整块 A4 靶只有 ~200×175 px）时会返回一个**末行复制上一行**的网格 ——
+    88 个点里有 8 个是假的，**函数照样返回 True**。
+    而它的表现恰好躲过「看中位数」这种质检：
+
+        1x 检测：中位 0.271 px（漂亮）  95 分位 6.394  最大 6.981
+        3x 检测：中位 0.171 px          95 分位 0.347  最大 0.480
+
+    同一个靶、同一帧图。所以判据必须看**最大值**，而这里这个比值是更早的
+    一道闸：重复行的间距≈0，比值会掉到 0.0x；正常检测在 0.7 以上。
+
+    ⚠️ **必须喂给 `cornerSubPix` 之后的结果。** 实测：`findChessboardCorners`
+    的**原始**输出里那一行还是分开的（比值 0.75，看着正常），是 `cornerSubPix`
+    把幻影行**收敛到真实行上**才塌成 0.00 的。拿未细化的角点来查会**假通过**。
+    """
+    g = np.asarray(grid, float)                       # (rows, cols, 2)
+    d = []
+    if g.shape[0] > 1:
+        d.append(np.linalg.norm(np.diff(g, axis=0), axis=2).ravel())
+    if g.shape[1] > 1:
+        d.append(np.linalg.norm(np.diff(g, axis=1), axis=2).ravel())
+    d = np.concatenate(d)
+    med = float(np.median(d))
+    return float(d.min() / med) if med > 0 else 0.0
+
+
+def _rough_roi(gray, ps_list, pad=0.35, min_pad=30):
+    """1x 粗定位靶在画面里的位置，给放大那一轮裁 ROI 用。定位不到就整幅。"""
+    import cv2
+
+    h, w = gray.shape[:2]
+    for ps in ps_list:
+        ok, c = cv2.findChessboardCorners(
+            gray, ps,
+            flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+        if ok:
+            c = c.reshape(-1, 2)
+            x0, y0 = c.min(0)
+            x1, y1 = c.max(0)
+            px = max(min_pad, pad * (x1 - x0))
+            py = max(min_pad, pad * (y1 - y0))
+            return (max(0, int(x0 - px)), max(0, int(y0 - py)),
+                    min(w, int(x1 + px)), min(h, int(y1 + py)))
+    return (0, 0, w, h)
+
+
+def detect_chessboard(gray, ps_list, scales=(1, 2, 3), min_ratio=0.45, verbose=True):
+    """逐级放大找棋盘格 → `(corners(原图像素, N,1,2), patternSize, scale)`。
+
+    **为什么要放大**：这不是精度洁癖，是正确性。同一个靶在 1x 下会被检出
+    重复行（见 `adjacent_spacing_min_ratio`），解出来的外参在远端差 11 mm。
+    放大 3x 后 88 点全部 ≤0.5 px。放大只在 ROI 上做，代价可以忽略。
+
+    :param ps_list: 要试的 `patternSize`，**两种朝向都该传** ——
+        `findChessboardCorners` 对非正方图案不是旋转不变的。
+    :param min_ratio: 相邻间距比低于它就判为退化，换更大倍数重试。
+    :return: 找不到时 `(None, None, None)`。
+    """
+    import cv2
+
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.001)
+    roi = None
+    for scale in scales:
+        if scale == 1:
+            ox, oy, sub = 0, 0, gray
+        else:
+            if roi is None:
+                roi = _rough_roi(gray, ps_list)
+            ox, oy, x1, y1 = roi
+            sub = cv2.resize(gray[oy:y1, ox:x1], None, fx=scale, fy=scale,
+                             interpolation=cv2.INTER_CUBIC)
+        for ps in ps_list:
+            ok, c = cv2.findChessboardCorners(
+                sub, ps,
+                flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+            if not ok:
+                continue
+            c = cv2.cornerSubPix(sub, c, (11, 11), (-1, -1), crit)
+            grid = c.reshape(ps[1], ps[0], 2)
+            ratio = adjacent_spacing_min_ratio(grid)
+            if ratio < min_ratio:
+                if verbose:
+                    print('  ⚠️ %dx 检出**重复行**（相邻间距比 %.2f < %.2f），'
+                          '放大重试 —— 这份结果别用' % (scale, ratio, min_ratio))
+                continue
+            pts = grid.reshape(-1, 2) / scale + np.array([ox, oy], float)
+            return pts.reshape(-1, 1, 2).astype(np.float32), ps, scale
+    return None, None, None
+
+
 # ────────────────────────────── 两个前端（要数据） ────────────────────────────
 
 def cmd_capture(args):
@@ -365,20 +460,13 @@ def cmd_pnp(args):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     # ⚠️ 两种朝向都试 —— 非正方图案的 findChessboardCorners **不是旋转不变的**，
     #    腕部/俯视相机都可能侧装，画面里的靶可能是横的也可能是竖的（实测踩过）。
-    found = None
-    for ps in ((args.cols - 1, args.rows - 1), (args.rows - 1, args.cols - 1)):
-        ok, corners = cv2.findChessboardCorners(
-            gray, ps, flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
-        if ok:
-            found = ps
-            break
+    #    `detect_chessboard` 还会**逐级放大**：小靶在 1x 下会检出重复行。
+    corners, found, scale = detect_chessboard(
+        gray, ((args.cols - 1, args.rows - 1), (args.rows - 1, args.cols - 1)))
     if found is None:
-        raise SystemExit('没找到内角点（试过 (%d,%d) 与 (%d,%d)）'
+        raise SystemExit('没找到内角点（试过 (%d,%d) 与 (%d,%d)，放大到 3x）'
                          % (args.cols - 1, args.rows - 1,
                             args.rows - 1, args.cols - 1))
-    corners = cv2.cornerSubPix(
-        gray, corners, (11, 11), (-1, -1),
-        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01))
 
     # 图案在画面里转了 90° 时，内角点的行列是互换的，物体点也要跟着换，
     # 否则会把靶的长短边对调 —— 外参会错得离谱但残差依旧好看（对称图案尤其）。
@@ -401,13 +489,24 @@ def cmd_pnp(args):
 
     proj, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
     err = np.linalg.norm(proj.reshape(-1, 2) - imgp, axis=1)
-    print('内角点 %d 个（patternSize=%s）' % (len(objp), found))
+    print('内角点 %d 个（patternSize=%s，检测放大 %dx）' % (len(objp), found, scale))
     print('重投影误差：中位 %.3f px，95 分位 %.3f px，最大 %.3f px'
           % (np.median(err), np.percentile(err, 95), err.max()))
-    print('⚠️ 这是**质检**：> 1 px 就别用，先查靶平不平、图糊不糊。')
+    # ⚠️ 判据看**最大值**，不看中位数。重复行那种退化中位数照样 0.27 px
+    #    （实测），只有最大值会露馅 —— 88 个点里坏 8 个，中位数根本不动。
+    if err.max() > 1.0:
+        print('❌ 最大 %.2f px > 1 px —— **别用这份外参**。先查靶平不平、图糊不糊、'
+              '有没有反光；再怀疑检测本身。' % err.max())
+    elif np.percentile(err, 95) > 1.0:
+        print('❌ 95 分位 %.2f px > 1 px —— 有一片点没对上，同样别用。'
+              % np.percentile(err, 95))
+    else:
+        print('✅ 全部内角点 ≤ %.2f px。' % err.max())
     doc = {'R': R_cb.tolist(), 't': t_cb.tolist(),
            'unit': 'm',
            'reproj_median_px': float(np.median(err)),
+           'reproj_max_px': float(err.max()),
+           'detect_scale': int(scale),
            'square_mm': args.square_mm, 'cols': c_eff, 'rows': r_eff}
     with open(args.out, 'w') as fh:
         json.dump(doc, fh, indent=2)

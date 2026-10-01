@@ -52,20 +52,10 @@ COL_OUT = (0, 0, 255)       # 外角：红
 COL_IN = (255, 0, 0)        # 内角：蓝
 
 
-def find_corners(gray, cols, rows):
-    """找内角点；**两种朝向都试**。
-
-    `findChessboardCorners` 对**非正方**图案**不是旋转不变的**，画面里的靶
-    转了 90° 就一个角点都找不到 —— 腕部/俯视相机都可能侧装，实测踩过。
-    内角点数只是行列互换，量出来的东西完全一样，所以掉个个儿没有副作用。
-    """
-    for ps in ((cols - 1, rows - 1), (rows - 1, cols - 1)):
-        ok, corners = cv2.findChessboardCorners(
-            gray, ps,
-            flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
-        if ok:
-            return ps, corners
-    return None, None
+# 与 `board_extrinsics.py` 用**同一个**检测器 —— 这两张图必须是同一个靶系的
+# 两种画法，检测差一个角点就白对。那边逐级放大 + 抓重复行，理由见它的注释。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from board_extrinsics import detect_chessboard        # noqa: E402
 
 
 def main():
@@ -87,16 +77,14 @@ def main():
         json.load(fh)                      # 只为确认它是个合法 json；内参用不上
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    ps, corners = find_corners(gray, args.cols, args.rows)
+    corners, ps, scale = detect_chessboard(
+        gray, ((args.cols - 1, args.rows - 1), (args.rows - 1, args.cols - 1)))
     if ps is None:
-        raise SystemExit('没找到内角点（试过 (%d,%d) 与 (%d,%d)）'
+        raise SystemExit('没找到内角点（试过 (%d,%d) 与 (%d,%d)，放大到 3x）'
                          % (args.cols - 1, args.rows - 1,
                             args.rows - 1, args.cols - 1))
-    corners = cv2.cornerSubPix(
-        gray, corners, (11, 11), (-1, -1),
-        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01))
     c_eff, r_eff = ps[0] + 1, ps[1] + 1    # 方格数
-    print('patternSize=%s ⇒ 方格 %d×%d' % (ps, c_eff, r_eff))
+    print('patternSize=%s ⇒ 方格 %d×%d（检测放大 %dx）' % (ps, c_eff, r_eff, scale))
 
     # 用**内角点**求「靶系(mm) → 像素」的单应。内角点 (i,j) 落在
     # ((j+1)·s, (i+1)·s)，所以单应的定义域是**靶系毫米**，原点就是我们要的 ①。
