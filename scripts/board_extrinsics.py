@@ -96,6 +96,21 @@ OPTICAL_TO_LINK = np.array([[0.0, 0.0, 1.0],
                             [0.0, -1.0, 0.0]])
 
 
+# ② 刚体配准残差的闸门（米）。超过它 `solve-touch` **不再往下走**。
+#
+# 为什么是个**硬闸门**而不是一句 ⚠️：② 的输入是**手抄的六个数字**，抄错一位
+# 就会解出一个「合法但错」的 base←靶 —— 残差会大（实测：把④抄成①的重复点，
+# 残差 **94 mm**），可它**照样写出 base_from_board.json 并且退出码 0**，
+# 后面 `compose` 照单全收，最后那台相机会被放到离基座几米外的地方，
+# 而**打印出来的"相机离基座 X m"看着就像一个正常数字**。
+# 现场是四条命令连着敲的，一句 ⚠️ 太容易从屏幕上滑过去。
+#
+# 3 mm 这个值有实测依据（合成复演，见 RESTRUCTURE_PLAN 第六十轮 §七）：
+# 示教器读数是 1 mm 分辨率，四个角即使在**零噪声**下也会有 ±0.29 mm 的取整，
+# 正常操作下残差落在 0.3~0.8 mm。3 mm ≈ 正常值的 4~10 倍，留足了余量。
+TOUCH_RMS_MAX_M = 3e-3
+
+
 # ────────────────────────────── 纯数学（可离线自检） ──────────────────────────
 
 def rigid_from_correspondences(P_src, P_dst):
@@ -533,18 +548,55 @@ def cmd_solve_touch(args):
         print('⚠️ %s 里没写 unit，按 --unit %s 处理（默认值，别靠这个）'
               % (args.points, unit))
     scale = 1e-3 if unit == 'mm' else 1.0
-    P_board = np.array(doc['R_board_pts'], float) * scale
-    P_base = np.array(doc['P_base_pts'], float) * scale
+    # 两组点各自解析 + 报出**是哪一行**填坏了。这一步不是洁癖：记录是人手抄的，
+    # 最常见的错就是**有一个点忘了改**（留着模板里的占位符，或复制了上一行）。
+    # 不拦的话 `np.array` 要么抛一句与坐标毫无关系的 `could not convert string
+    # to float: 'x'`，要么把 null 变成 NaN 一路传到 SVD —— 现场没人能从
+    # 「SVD did not converge」反推出「④那一行没填」。
+    def _pts(key):
+        rows = doc.get(key)
+        if not isinstance(rows, list):
+            raise SystemExit('%s 里缺 %r（或它不是个数组）' % (args.points, key))
+        out = []
+        for i, row in enumerate(rows):
+            try:
+                v = [float(x) for x in row]
+            except (TypeError, ValueError):
+                raise SystemExit(
+                    '%s 的 %s[%d] = %r 不是三个数字 —— **这一行没填**？'
+                    '\n  （模板里的占位符要换成示教器上读到的 Base 坐标，单位 %s）'
+                    % (args.points, key, i, row, unit))
+            if len(v) != 3:
+                raise SystemExit('%s 的 %s[%d] 有 %d 个数，应该是 3 个'
+                                 % (args.points, key, i, len(v)))
+            if not all(np.isfinite(v)):
+                raise SystemExit('%s 的 %s[%d] = %r 里含 nan/inf'
+                                 % (args.points, key, i, row))
+            out.append(v)
+        return np.array(out, float) * scale
+
+    P_board = _pts('R_board_pts')
+    P_base = _pts('P_base_pts')
     R_bb, t_bb, rms = rigid_from_correspondences(P_board, P_base)
     print('碰了 %d 个点（记录单位 %s），刚体配准残差 RMS = %.2f mm'
           % (len(P_board), unit, rms * 1e3))
-    if rms > 3e-3:
-        print('⚠️ 残差 > 3 mm —— **先别用**。按顺序查三样：')
+    out = {'R': R_bb.tolist(), 't': t_bb.tolist(), 'unit': 'm', 'rms_m': rms,
+           'n_points': int(len(P_board)), 'src_unit': unit}
+    if rms > TOUCH_RMS_MAX_M:
+        # 文件照写（要能回头看是哪几个点解歪的），但**退出码非 0** ——
+        # 这样 `solve-touch && compose` 这条链会**停在原地**，
+        # 不会拿着一个错的 base←靶继续往下合成。
+        with open(args.out, 'w') as fh:
+            json.dump(out, fh, indent=2)
+        print('❌ 残差 %.1f mm > %.0f mm —— **这份解不能用**，已写出的 %s 只当草稿看。'
+              % (rms * 1e3, TOUCH_RMS_MAX_M * 1e3, os.path.abspath(args.out)))
+        print('   按顺序查三样：')
         print('   ① 示教器上 TCP 标了吗（没标的话尖端偏移会原样灌进来）')
         print('   ② 碰的时候是不是顶住了同一个物理点（尖端有没有侧滑）')
         print('   ③ 靶在碰的过程中有没有被推动')
-    out = {'R': R_bb.tolist(), 't': t_bb.tolist(), 'unit': 'm', 'rms_m': rms,
-           'n_points': int(len(P_board)), 'src_unit': unit}
+        print('   ④ 六个数是不是抄串行了 —— 这是最常见的一种')
+        raise SystemExit(2)
+    print('✅ 残差在闸门内（%.0f mm）。' % (TOUCH_RMS_MAX_M * 1e3))
     with open(args.out, 'w') as fh:
         json.dump(out, fh, indent=2)
     print('→ %s' % os.path.abspath(args.out))
@@ -572,6 +624,20 @@ def cmd_compose(args):
         raise SystemExit('单位不一致，停下来：\n  ' + '\n  '.join(bad) +
                          '\n（现在这一版所有中间文件都统一用米；'
                          '`solve-touch` 加 --unit mm 可以把毫米记录转进来）')
+
+    # ② 的残差闸门在这里**再过一次**，不能只靠 `solve-touch` 那一道。
+    # 理由：那个残差是**手抄坐标**唯一的质检，而它一旦被忽略（旧版只打一句 ⚠️、
+    # 退出码仍是 0），合成出来的位姿照样「合法」，最后只是相机被放到几米外，
+    # 而打印行看着完全正常。闸门要放在**生成外参的这一步**才算真拦住。
+    # （`solve-touch` 直接跑会被自己的闸门挡住；但 base_from_board.json 也可能
+    #  是手改的、或是别的工具产出的 —— 所以这里按文件里的 rms_m 字段再判一次。）
+    rms_b = b.get('rms_m')
+    if rms_b is not None and float(rms_b) > TOUCH_RMS_MAX_M:
+        raise SystemExit(
+            '② 的刚体配准残差 %.1f mm > %.0f mm（%s），停下来：\n'
+            '  这份 base←靶 是歪的，合成出来的外参会把相机放到错的地方。\n'
+            '  重碰一遍那几个点，别拿它凑合。'
+            % (float(rms_b) * 1e3, TOUCH_RMS_MAX_M * 1e3, args.base_from_board))
 
     R_bc, t_bc = compose_base_from_camera(
         b['R'], b['t'], c['R'], c['t'])

@@ -305,6 +305,80 @@ def main():
         check('单位不一致时停下来（退出码非 0）', rc4 != 0, 'rc=%d' % rc4)
         check('且说清了是谁的单位不对', 'mm' in log4, log4.strip()[-200:])
 
+        # ── ② 的残差闸门：抄串行必须**停下来** ──────────────────────────
+        # ② 的输入是**手抄的六个数**，抄错一位会解出一个「合法但错」的
+        # base←靶。旧版只打一句 ⚠️、退出码仍是 0、文件照样写 —— 现场四条
+        # 命令连着敲，那一行太容易滑过去，而合成出来的位姿看着完全正常。
+        # 实测：把④抄成①的重复点，残差 94 mm。
+        dup = w('touch_dup.json',
+                {'R_board_pts': corners.tolist(),
+                 'P_base_pts': [P_base[0].tolist(), P_base[1].tolist(),
+                                P_base[2].tolist(), P_base[0].tolist()],
+                 'unit': 'm'})
+        rc5, log5 = run('solve-touch', '--points', dup,
+                        '--out', os.path.join(td, 'b_dup.json'))
+        check('抄串行（重复点）时 solve-touch 退出码非 0', rc5 != 0, 'rc=%d' % rc5)
+        # 就算那份坏文件流到了 compose，也必须被**第二道**闸门拦住 ——
+        # 闸门要放在**生成外参**的那一步才算真拦住。
+        rc6, log6 = run('compose', '--base-from-board',
+                        os.path.join(td, 'b_dup.json'),
+                        '--cam-from-board', cam,
+                        '--out', os.path.join(td, 'x2.json'))
+        check('坏 base←靶 流到 compose 仍被拦住', rc6 != 0, 'rc=%d' % rc6)
+
+        # 有一行没填 —— 报错要**指出是哪一行**。默认那两句
+        # （`could not convert string to float` / `SVD did not converge`）
+        # 没人能从中反推出「④那一行没填」。
+        hole = w('touch_hole.json',
+                 {'R_board_pts': corners.tolist(),
+                  'P_base_pts': [P_base[0].tolist(), P_base[1].tolist(),
+                                 P_base[2].tolist(), ['FILL', 'FILL', 'FILL']],
+                  'unit': 'm'})
+        rc7, log7 = run('solve-touch', '--points', hole,
+                        '--out', os.path.join(td, 'b_hole.json'))
+        check('有一行没填时退出码非 0', rc7 != 0, 'rc=%d' % rc7)
+        check('且指出是第几行（P_base_pts[3]）', 'P_base_pts[3]' in log7,
+              log7.strip()[-200:])
+
+    # ── 10. 现场输入模板与靶系定义**不许漂** ─────────────────────────────
+    # `docs/calib/points.template.json` 是给现场用的：靶系那四个角已经算好
+    # 填在里面，人只填 Base 坐标。它一旦与 `board_pattern_corners` 不一致，
+    # 后果正是这条路上**残差抓不到**的那种错 —— 四个点仍能配出一个刚体，
+    # 只是配到别的靶系上去了。所以把「模板 == 函数输出」钉在这里。
+    print('[10] points.template.json 与 board_pattern_corners 一致')
+    tpl_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'docs', 'calib', 'points.template.json')
+    if not os.path.exists(tpl_path):
+        # 这份自检**两边都跑**（本地 + 板子上 `/tmp/calib/`）。板子上那份是
+        # 从 `scripts/` 单独拷过去的，没有 `docs/` —— 那不是失败，跳过。
+        print('  SKIP  没有 %s（板子上只拷了 scripts/）' % tpl_path)
+    else:
+        with open(tpl_path) as fh:
+            tpl = json.load(fh)
+        want = board_pattern_corners(20.0, 9, 12)      # A4：9×12 格 / 20 mm
+        got = np.array(tpl['R_board_pts'], float)
+        check('R_board_pts == board_pattern_corners(20, 9, 12)',
+              np.array_equal(got, want),
+              '模板 %s' % got.tolist())
+        check('R_board_pts 是四个点（①②③④）', got.shape == (4, 3),
+              '形状 %s' % (got.shape,))
+        # 外角必须**不共线** —— 共线的话 Kabsch 的 rotation 是不定的，
+        # 而残差照样接近 0（这条路上残差抓不到的错又多一种）。
+        # ⚠️ 看的是**第二大**奇异值，不是最小的那个：这四个点本来就**共面**
+        # （靶系里 z 全是 0），所以最小奇异值**必然**是 0，拿它当判据是错的
+        # —— 这条断言第一版就写错了，是它自己 FAIL 出来的。
+        e = np.sort(np.linalg.eigvalsh(np.cov((want - want.mean(0)).T)))[::-1]
+        check('四个外角不共线（第二奇异值 > 10 mm）', np.sqrt(max(e[1], 0)) > 0.010,
+              '奇异值 %.1f / %.1f / %.1f mm'
+              % tuple(np.sqrt(np.maximum(e, 0)) * 1e3))
+        check('unit 是 mm（示教器读的就是 mm）', tpl.get('unit') == 'mm',
+              'unit=%r' % tpl.get('unit'))
+        # 占位符要**填不动**才安全：留着它必须让 ② 报错，而不是当 0 用
+        ph = tpl['P_base_pts']
+        check('P_base_pts 四行、每行三个（占位符形式）',
+              len(ph) == 4 and all(len(r) == 3 for r in ph),
+              '形状 %s' % ([len(r) for r in ph],))
+
     print()
     print('=' * 72)
     print('PASS %d   FAIL %d' % (N_PASS, N_FAIL))
