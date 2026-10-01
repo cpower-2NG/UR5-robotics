@@ -39,20 +39,29 @@
 
 用法
 ====
-    # ① 不动臂：拍一张靶在台面上的图，解 相机←靶
-    python3 scripts/board_extrinsics.py pnp --image top.png --info info.json \
-        --square-mm 20 --cols 9 --rows 12 --out cam_from_board.json
+    # ⓪ 不动臂：抓一帧 + 内参（机器转写，省得手抄内参抄错一位）
+    python3 scripts/board_extrinsics.py capture --out-dir /tmp/topcam
 
-    # ② 要动臂：碰四个角点（点动，本脚本**不指挥任何运动**）
-    #    碰法是「人手动慢速点动、每碰住一个就回车」，脚本只读 /joint_states
-    #    + 调 /compute_fk，绝不发轨迹。
-    python3 scripts/board_extrinsics.py touch --square-mm 20 --cols 9 --rows 12 \
-        --out base_from_board.json
+    # ① 不动臂：解 相机←靶
+    python3 scripts/board_extrinsics.py pnp --image /tmp/topcam/frame.png \
+        --info /tmp/topcam/info.json --square-mm 20 --cols 9 --rows 12
+
+    # 【中间的动臂环节**不在本脚本里**】碰点由人在示教器上点动完成，
+    # 每个点从示教器读出 base 系坐标，手写进 points.json。
+    # 为什么不做成子命令：那需要在臂上开一个会**指挥运动**的口子，
+    # 而这条路的全部价值恰恰在于「碰」的过程完全由人控制。
+
+    # ② 纯离线：从碰点记录解 base←靶（不碰 ROS、不碰臂）
+    python3 scripts/board_extrinsics.py solve-touch --points points.json
 
     # ③ 合成，打印可直接粘进 real.launch.py 的参数
     python3 scripts/board_extrinsics.py compose \
         --base-from-board base_from_board.json \
         --cam-from-board cam_from_board.json --out extrinsics.json
+
+⚠️ 还有一个**不属于本脚本、但少了它就白标**的步骤：碰点之前必须先看
+   `scripts/annotate_target_corners.py` 生成的编号图，确认「①(0,0) 是纸上
+   哪个角」。标反 180° 时两处残差**都照样漂亮** —— 理由见那个脚本的文档字符串。
 
 坐标系约定（**容易错，写清楚**）
 ================================
