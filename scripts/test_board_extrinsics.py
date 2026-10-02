@@ -15,7 +15,7 @@
 三样都只能靠断言发现，不能靠读代码或看结果「像不像」。所以这里的每一节
 都对应上面一条。
 
-七节：
+十二节（编号即 `main()` 里的 `[n]`）：
   1. **Kabsch 精确复原**：已知 (R,t) 造点，解出来必须逐位对上。
   2. **有噪声时不跑飞**：加 1 mm 高斯噪声，误差应仍是毫米级。
   3. **退化输入仍返回真旋转**：点共线时朴素 SVD 会给出 det = −1 的**镜像**，
@@ -28,6 +28,12 @@
      向前(z_opt) → x_link、向右(x_opt) → −y_link。
   7. **靶点几何**：内角点比外角点**各进去一整格**，数量 = (cols−1)(rows−1)。
   8. **PnP 往返**（有 cv2 才跑）：合成一组投影 → solvePnP → 比 (R,t)。
+  9. **CLI 端到端 + 单位契约**：`solve-touch` 的毫米/米、残差闸门、抄串行、
+     缺行 —— 每一种都必须让退出码非 0。
+ 10. **`points.template.json`** 与 `board_pattern_corners` 逐点一致。
+ 11. **检测 ROI 逐级放宽**：紧框检不出时自动放宽、最后退到整幅（含变异检查）。
+ 12. **④ 标注器接口**：`靶←相机` 的求逆、与 ① 逐点一致、忘了求逆会错、
+     台面方块该填的 z 符号，以及三道硬闸门。**这条路不动臂**，是采数据集用的。
 """
 
 import os
@@ -39,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from board_extrinsics import (                                    # noqa: E402
     OPTICAL_TO_LINK, rigid_from_correspondences, quat_to_matrix, matrix_to_quat,
     board_inner_corners, board_pattern_corners, compose_base_from_camera,
-    optical_to_link)
+    optical_to_link, board_from_camera_optical, cmd_labeler)
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -483,6 +489,152 @@ def main():
         finally:
             _B._rough_roi = real_roi
             _B._roi_variants = real_variants
+
+    # ── 12. ④ 标注器接口：靶←相机（**不动臂**那条出口）────────────────────
+    # ① 解的是 `相机←靶`，而 `auto_label_grid.py` 的 tf 后端要的是
+    # `靶←相机`（tf2 lookup_transform(target, camera) 的语义）—— **恰好是逆**。
+    # 喂错了**不报错**：逆矩阵照样是合法位姿，方块被标到画面里一个镜像位置，
+    # 框还在、大小也对。这一节钉四件事：
+    #   ① 求逆本身对（含「是 −Rᵀt 不是 −t」这一处）；
+    #   ② 标注器的 `to_camera` 与 ① 的 `R·p+t` **逐点相同**（两份独立意见）；
+    #   ③ 把 ① 直接喂进去（变异）**确实会错**，证明求逆承重；
+    #   ④ 台面方块该填的 z 符号 —— 靶系 z 指向不定，填反号是**静默**错误。
+    print('[12] labeler：靶←相机')
+    import contextlib
+    import io
+    import json as _json
+    import tempfile
+    import types
+
+    import auto_label_grid as L
+
+    # 真实那组数的量级：相机在靶上方 0.88 m、斜着朝下看。
+    # **用 look-at 造，不硬编码角度** —— 随手挑一组欧拉角很容易让靶点落到
+    # 相机背后，而 `project_pinhole` 会把背后的点**丢掉**（返回值少几个），
+    # 于是后面的比较就变成了拿长度不等的两个数组相减。实测踩过。
+    #
+    # 靶系 z 指**进台面**（findChessboardCorners 的右手定则：图像里 x 向右、
+    # y 向下 ⇒ z 指进画面）；相机在上方，所以光心 z 是负的，世界「上」是 −z。
+    t_bc_true = np.array([0.16, -0.58, -0.64])
+    z_opt = -t_bc_true / np.linalg.norm(t_bc_true)         # 光轴：光心→靶原点
+    x_opt = np.cross(np.array([0.0, 0.0, -1.0]), z_opt)     # 世界「上」× 光轴
+    x_opt /= np.linalg.norm(x_opt)
+    y_opt = np.cross(z_opt, x_opt)
+    R_bc_true = np.column_stack([x_opt, y_opt, z_opt])     # 列 = 相机各轴在靶系
+    R_cb_true = R_bc_true.T
+    t_cb_true = -R_cb_true @ t_bc_true
+    check('(前置) 造出来的位姿是真旋转、且原点在相机前方',
+          np.allclose(R_bc_true @ R_bc_true.T, np.eye(3), atol=1e-12)
+          and (R_cb_true @ np.zeros(3) + t_cb_true)[2] > 0,
+          'det=%.6f' % np.linalg.det(R_bc_true))
+
+    R_bc, t_bc = board_from_camera_optical(R_cb_true, t_cb_true)
+    check('求逆：R 回到原样', np.allclose(R_bc, R_bc_true, atol=1e-12),
+          '最大差 %.2e' % np.abs(R_bc - R_bc_true).max())
+    check('求逆：t 回到相机光心在靶系的坐标',
+          np.allclose(t_bc, t_bc_true, atol=1e-12),
+          '最大差 %.2e' % np.abs(t_bc - t_bc_true).max())
+    # 「−Rᵀt 写成 −t」这条变异的**唯一**症状就是光心跑到靶的另一侧，
+    # 而 R 还是对的 —— 所以单独钉一条。
+    check('求逆：**不是** −t（那会把光心放到靶另一侧）',
+          not np.allclose(t_bc, -t_cb_true, atol=1e-6),
+          '−t 恰好也对得上？那这条测试没测到东西')
+
+    info = {'fx': 917.62, 'fy': 916.43, 'cx': 649.55, 'cy': 344.91,
+            'width': 1280, 'height': 720}
+    doc = {'target_frame': 'board', 'camera_frame': 'camera_color_optical_frame',
+           'translation': t_bc.tolist(), 'rotation': matrix_to_quat(R_bc).tolist()}
+    proj = L.TfProjector(info, doc)
+
+    # 含离面高度的点：z≠0 那条路也要一起验（只验 z=0 的靶面点是测不到符号坑的）
+    pts = np.array([[0.00, 0.00, 0.0], [0.09, 0.12, 0.0],
+                    [0.18, 0.24, 0.0], [0.09, 0.12, -0.01425],
+                    [0.03, 0.30, -0.0285]])
+    via_labeler = np.array([proj.to_camera(p) for p in pts])
+    via_pnp = (R_cb_true @ pts.T).T + t_cb_true
+    check('标注器 to_camera ≡ ① 的 R·p+t（两份独立意见）',
+          np.allclose(via_labeler, via_pnp, atol=1e-12),
+          '最大差 %.2e m' % np.abs(via_labeler - via_pnp).max())
+
+    def _px(cam_pts):
+        uv, dropped = L.project_pinhole(list(cam_pts), info['fx'], info['fy'],
+                                        info['cx'], info['cy'])
+        return np.asarray(uv), dropped
+
+    uv_ok, drop_ok = _px(via_labeler)
+    check('正常路径全部点都在相机前方', drop_ok == 0, 'dropped=%d' % drop_ok)
+
+    # 变异：**把 ① 的产物直接当 target←camera 喂进去**（忘了求逆）。
+    wrong = {'target_frame': 'board', 'camera_frame': 'camera_color_optical_frame',
+             'translation': t_cb_true.tolist(),
+             'rotation': matrix_to_quat(R_cb_true).tolist()}
+    wproj = L.TfProjector(info, wrong)
+    cam_wrong = np.array([wproj.to_camera(p) for p in pts])
+    # ⚠️ 判据取在**相机系（米）**，不取像素差。像素差依赖这组具体几何：
+    #    这组位姿下喂错方向的点**全部落到相机背后**（project_pinhole 会把它们
+    #    丢掉，返回空数组），换个角度就可能变成「镜面成像、框照样出得来」。
+    #    米制差与几何无关，且同样证明这一步承重。
+    d_m = float(np.abs(cam_wrong - via_pnp).max())
+    check('变异：忘了求逆 → 相机系差 > 0.1 m（证明这一步承重）', d_m > 0.1,
+          '只差 %.4f m —— 那这条测试没测到东西' % d_m)
+    check('变异方向在这组几何下是**响的**（点全落到相机背后，会被丢掉）',
+          _px(cam_wrong)[1] > 0 or np.abs(_px(cam_wrong)[0]).max() > 50.0,
+          '居然投出了几乎一样的像素 —— 那它就是个静默错误')
+
+    # z 符号：台面在靶系里是哪一侧。**填反号是静默的** —— 框照样出得来。
+    cx, cy = info['cx'], info['cy']
+    base = np.array([0.09, 0.12, 0.0])
+    uv_base, _ = _px([proj.to_camera(base)])
+    r_base = float(np.hypot(uv_base[0][0] - cx, uv_base[0][1] - cy))
+
+    def _r_of(z):
+        uv, _ = _px([proj.to_camera(np.array([0.09, 0.12, z]))])
+        return float(np.hypot(uv[0][0] - cx, uv[0][1] - cy))
+
+    h = 0.0285
+    sign = 1.0 if t_bc[2] > 0 else -1.0        # ← 与 cmd_labeler 里那条规则逐字一致
+    z_rule = sign * h / 2
+    check('打印机给出的 z 符号规则 = 物理上正确的那一侧（抬高 → 离主点更远）',
+          _r_of(z_rule) > r_base + 0.5,
+          'z=%+.5f 时 r=%.2f，底面 r=%.2f' % (z_rule, _r_of(z_rule), r_base))
+    check('变异：z 填反号 → 反而缩向主点（这就是「指进台面」那个坑）',
+          _r_of(-z_rule) < r_base,
+          'z=%+.5f 时 r=%.2f，底面 r=%.2f' % (-z_rule, _r_of(-z_rule), r_base))
+
+    # 三道硬闸门。**每一道都要真的响** —— 否则文件写出去、数据集就歪了。
+    def _run_labeler(pnp_doc, **kw):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, 'pnp.json')
+        with open(p, 'w') as fh:
+            _json.dump(pnp_doc, fh)
+        a = types.SimpleNamespace(pnp=p, out=os.path.join(d, 'o.json'),
+                                  target_frame='board', image=None, info=None,
+                                  square_mm=None, cols=None, rows=None,
+                                  block_mm=28.5)
+        for k, v in kw.items():
+            setattr(a, k, v)
+        # 静音：`cmd_labeler` 正常时会把整段「下一步」打印出来，四条闸门
+        # 各来一遍会把这一节的输出淹掉，看不出哪几条在测什么。
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_labeler(a)
+            return None
+        except SystemExit as e:
+            return str(e)
+
+    good = {'R': R_cb_true.tolist(), 't': t_cb_true.tolist(), 'unit': 'm'}
+    check('闸门 0：合法输入放行', _run_labeler(good) is None,
+          '被挡了：%s' % _run_labeler(good))
+    msg = _run_labeler(dict(good, unit='mm'))
+    check('闸门 1：单位不是 m → 停', msg is not None and '单位' in msg, str(msg))
+    msg = _run_labeler(dict(good, R=(R_cb_true * 1.01).tolist()))
+    check('闸门 2：R 不正交（手改/转存）→ 停',
+          msg is not None and '不正交' in msg, str(msg))
+    # 距离出界：t_cb 取成「相机离靶原点 5 cm」。这条拦住的是
+    # --square-mm / --cols / --rows 填错 —— 那些错误解出来的位姿**照样合法**。
+    msg = _run_labeler(dict(good, t=(R_cb_true @ np.array([0.0, 0.0, 0.05])).tolist()))
+    check('闸门 3：相机离靶 0.05 m（尺度错）→ 停',
+          msg is not None and '说得通' in msg, str(msg))
 
     print()
     print('=' * 72)

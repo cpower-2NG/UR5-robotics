@@ -84,7 +84,8 @@
 输入文件格式
 ------------
 blocks.json        : [{"x":0.44,"y":0.24,"z":0.02,"size":0.04}, ...]
-                     坐标在 ``--frame`` 指定的坐标系里（tf 后端=base_link；
+                     坐标所在的系由 ``--extrinsics`` 里的 ``target_frame`` 命名
+                     （**没有** ``--frame`` 开关 —— tf 后端=base_link；
                      homography 后端=标定板所在的台面坐标系，z 忽略）。
 camera_info.json   : {"fx":554.4,"fy":554.4,"cx":320,"cy":240,
                       "width":640,"height":480}

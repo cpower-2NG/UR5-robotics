@@ -59,6 +59,20 @@
         --base-from-board base_from_board.json \
         --cam-from-board cam_from_board.json --out extrinsics.json
 
+    # ④ 【只要 ①，不动臂】给数据集标注用的 靶←相机
+    #    ② 碰点只服务于「真机运行要 base_link←相机」；**标注不需要它** ——
+    #    靶平放在台面上，靶←相机就已经是台面←相机。见下面「两条出口」。
+    python3 scripts/board_extrinsics.py labeler \
+        --pnp cam_from_board.json --image frame.png --info info.json
+
+⚠️ **两条出口，别搞混**
+─────────────────────
+    ③ `compose`  要 ①②，出 `base_link ← camera_link`  → 真机运行（TF / launch）
+    ④ `labeler`  只要 ①，出 `靶 ← 相机光学系`           → 数据集自动标注
+
+④ 存在的意义是把「先标定还是先采数据集」这个顺序耦合拆掉：真机运动（②）
+是高风险动作，而采数据集与它**没有任何依赖关系**。
+
 ⚠️ 还有一个**不属于本脚本、但少了它就白标**的步骤：碰点之前必须先看
    `scripts/annotate_target_corners.py` 生成的编号图，确认「①(0,0) 是纸上
    哪个角」。标反 180° 时两处残差**都照样漂亮** —— 理由见那个脚本的文档字符串。
@@ -476,7 +490,17 @@ def cmd_capture(args):
         d = np.array(node.info.d, float).ravel()
         frame = node.info.header.frame_id
         with open(info_path, 'w') as fh:
+            # ⚠️ 这里**同时**写两种形状，别删任何一种：
+            #   · `K`/`D`（ROS `CameraInfo` 原样）—— ① `pnp` 要的，它走
+            #     `solvePnP`，畸变要一起进去；
+            #   · `fx/fy/cx/cy`（拍平）—— `auto_label_grid.py` 的投影器要的，
+            #     它是**纯针孔**模型，没有畸变项。
+            # 两种形状以前分属两个文件，跑标注时会以 `KeyError: 'fx'` 的形式
+            # 炸出来（实测）。一个文件把两者都带上，就不用再手工转一次 ——
+            # 而手工转正是**抄错内参**最容易发生的地方，这个脚本存在的理由。
             json.dump({'K': k.tolist(), 'D': d.tolist(),
+                       'fx': float(k[0, 0]), 'fy': float(k[1, 1]),
+                       'cx': float(k[0, 2]), 'cy': float(k[1, 2]),
                        'width': int(node.info.width),
                        'height': int(node.info.height),
                        'frame_id': frame,
@@ -713,6 +737,208 @@ def cmd_compose(args):
     print('→ %s' % os.path.abspath(args.out))
 
 
+# ── ④ 标注器接口（**不动臂**）────────────────────────────────────────────
+#
+# **为什么单列一步**：① 解出来的是 `相机 ← 靶`（p_cam = R·p_board + t），
+# 而 `auto_label_grid.py` 的 tf 后端要的是 tf2 `lookup_transform(target, camera)`
+# 的语义 ——「把 camera_frame 里的点变到 target_frame」，也就是 `靶 ← 相机`，
+# **恰好是逆**。这一步就是求逆 + 转四元数 + 自检。
+#
+# 为什么不能让人手推：逆矩阵**照样是一个合法位姿**，喂错了**不报错** ——
+# 方块会被标到画面里一个镜像的位置，框还在、大小也对，只有把框画到原图上
+# 才发现全错。这与 `compose` 里那句「合成顺序写反了也还是正交矩阵」同源。
+#
+# 🔴 这条路**一次都不用动臂**：靶平放在台面上，`靶 ← 相机` 就已经是
+# 「台面 ← 相机」。所以**采数据集不必等 ② 碰点** —— ② 只在要
+# `base_link ← 相机`（真机运行路径）时才需要。
+#
+# 这比 W4 里说的「标定板单应（H + H_top）」还少一步：手上有的是**完整位姿**，
+# 方块顶面的视差是精确投影出来的，不需要 `H_top` 那种「把靶垫高一个方块高、
+# 再标一次」的近似档。
+
+LABELER_TARGET_FRAME = 'board'
+
+# 相机到靶原点的距离闸门（米）。靶放在台面上、相机在它上方，这个数就是
+# 「相机离台面多高」，合理范围很宽；出了这个范围一定是单位/检测出了问题，
+# 而不是「装得偏」。
+LABELER_DIST_RANGE_M = (0.15, 5.0)
+
+
+def board_from_camera_optical(R_cb, t_cb):
+    """`相机 ← 靶` 求逆 → `(R_bc, t_bc)`，即 `靶 ← 相机`。
+
+    只做代数，**不换坐标系**：`pnp` 的相机系就是 OpenCV 光学系，标注器的
+    `TfProjector` 要的也是光学系，中间没有 `camera_link` 那一跳。
+
+    返回值里 `t_bc` **就是**相机光心在靶系里的坐标（取 p_cam = 0 即得），
+    也就是标注器 `describe()` 打印的那个数 —— 现场第一眼核对的就它。
+    """
+    R_cb = np.asarray(R_cb, float).reshape(3, 3)
+    t_cb = np.asarray(t_cb, float).reshape(3)
+    R_bc = R_cb.T
+    # ⚠️ 是 −Rᵀ·t，**不是** −t。写成 −t 时 R 仍然正确、t 的量级也仍然像个
+    #    正常数，但相机光心会跑到靶的另一侧 —— 每个方块都被标到镜像位置上。
+    t_bc = -R_bc @ t_cb
+    return R_bc, t_bc
+
+
+def cmd_labeler(args):
+    """④ ① 的产物 → `auto_label_grid.py --backend tf` 的 `extrinsics.json`。
+
+    **不碰 ROS、不碰臂。** `--image`/`--info` 是可选的独立自检：它把靶上的
+    物体点**用标注器自己的那套数学**投回像素，与 `findChessboardCorners`
+    实测的角点比 —— 走的是 `TfProjector.to_camera` + 针孔，**不是** solvePnP，
+    所以对得上才算两份独立意见一致。
+    """
+    with open(args.pnp) as fh:
+        c = json.load(fh)
+    if c.get('unit', 'm') != 'm':
+        raise SystemExit('① 的产物单位是 %r，不是 m（%s）' % (c['unit'], args.pnp))
+    for key in ('R', 't'):
+        if key not in c:
+            raise SystemExit('① 的产物里没有 %r：%s' % (key, args.pnp))
+
+    R_bc, t_bc = board_from_camera_optical(c['R'], c['t'])
+    q = matrix_to_quat(R_bc)
+
+    # 自检 ①：R 必须是**真旋转**。solvePnP 给的一定是，但这份 json 也可能
+    # 是手改的、或别的工具转存的 —— 而一个略微不正交的 R 投出来只是
+    # 「有点歪」，不会报错，也不会被下面那道往返抓住（往返只用 R 自己）。
+    orth = float(np.abs(R_bc @ R_bc.T - np.eye(3)).max())
+    if orth > 1e-6:
+        raise SystemExit('R 不正交（max|R·Rᵀ − I| = %.2e），这份 pnp 文件不可信'
+                         % orth)
+
+    # 自检 ②：往返回原位。求逆写错时这一关会响。
+    back_R = R_bc @ np.asarray(c['R'], float).reshape(3, 3)
+    back_t = R_bc @ np.asarray(c['t'], float).reshape(3) + t_bc
+    if not np.allclose(back_R, np.eye(3), atol=1e-9) or \
+            not np.allclose(back_t, 0.0, atol=1e-9):
+        raise SystemExit('求逆往返没回到原位（ΔR=%.2e Δt=%.2e）—— 停下'
+                         % (np.abs(back_R - np.eye(3)).max(),
+                            np.abs(back_t).max()))
+
+    # 自检 ③：几何上说得通。这一关拦的是「--square-mm / --cols / --rows 填错」
+    # 那类错误 —— 它们解出来的位姿**照样合法**，只是尺度或朝向不对。
+    dist = float(np.linalg.norm(t_bc))
+    lo, hi = LABELER_DIST_RANGE_M
+    if not (lo < dist < hi):
+        raise SystemExit(
+            '相机离靶原点 %.3f m，超出 %.2f~%.1f m 这个物理上说得通的范围。\n'
+            '  ⇒ 先查 ① 的 --square-mm 与 --cols/--rows 是不是与实际靶一致。'
+            % (dist, lo, hi))
+
+    doc = {'target_frame': args.target_frame,
+           'camera_frame': c.get('frame_id', 'camera_color_optical_frame'),
+           'translation': t_bc.tolist(),
+           'rotation': q.tolist(),
+           'unit': 'm',
+           'from': os.path.abspath(args.pnp),
+           # 溯源：这两个数决定了这份外参的**尺度**，事后要能对上
+           'square_mm': c.get('square_mm'), 'cols': c.get('cols'),
+           'rows': c.get('rows'),
+           'reproj_max_px': c.get('reproj_max_px')}
+
+    # 自检 ④（可选，但强烈建议）：与检测角点做**独立往返**。
+    if args.image:
+        if not args.info:
+            raise SystemExit('--image 要和 --info 一起给（自检要用内参）')
+        doc['reproj_max_px_labeler'] = _labeler_roundtrip(c, args, doc)
+
+    with open(args.out, 'w') as fh:
+        json.dump(doc, fh, indent=2)
+
+    print('靶 ← 相机光学系（target_frame=%s）' % args.target_frame)
+    print('  相机光心在靶系 = [%.4f %.4f %.4f] m   ⇒ 离靶原点 %.3f m'
+          % (t_bc[0], t_bc[1], t_bc[2], dist))
+    print('  q (x y z w)    = [%.5f %.5f %.5f %.5f]' % tuple(q))
+
+    # ⚠️ 靶系的 z **指向哪边是不定的**，取决于 findChessboardCorners 给出的
+    #    行列朝向（右手定则：图像里 x 向右、y 向下 ⇒ z 指进画面）。靶平放在
+    #    台面上、相机在上方时，靶系 z 通常**指进台面**，于是「摆在台面上的
+    #    方块」在靶系里是**负 z**。填成正的会把方块投到台面**下面**去，
+    #    画面里框照样出得来（只是位置偏一个视差量），不对图看不出来。
+    #    所以这里直接把该填的数算出来，不让人推。
+    sign = 1.0 if t_bc[2] > 0 else -1.0
+    z_blk = sign * args.block_mm / 2000.0
+    print('  靶系 z 指向**%s**（相机在 z = %+.3f）'
+          % ('靶面外（朝相机）' if sign > 0 else '靶面内（朝台面）', t_bc[2]))
+    print('  ⇒ 台面上 %g mm 高的方块，中心 z 填 **%+.5f** m'
+          % (args.block_mm, z_blk))
+    print('     示例：{"x": 0.06, "y": -0.10, "z": %+.5f, "size": %g}'
+          % (z_blk, args.block_mm / 1000.0))
+    print()
+    print('下一步（仍然不动臂）：')
+    print('  python3 scripts/auto_label_grid.py --backend tf \\')
+    print('      --images <图目录> --out <标签目录> \\')
+    print('      --blocks <方块在 %s 系里的坐标.json> --camera-info %s \\'
+          % (args.target_frame, args.info or '<info.json>'))
+    print('      --extrinsics %s' % args.out)
+    print('  （方块坐标所在的系由外参文件里的 target_frame 命名，没有单独的 --frame）')
+    print('→ %s' % os.path.abspath(args.out))
+
+
+def _labeler_roundtrip(c, args, doc):
+    """把靶上的物体点**经标注器自己的数学**投回像素，与实测角点比。
+
+    返回最大误差（px），并直接打印。> 1 px 就 ``SystemExit`` ——
+    与 ① 同一条判据（看**最大值**，不看中位数）。
+    """
+    import cv2
+
+    import auto_label_grid as L          # 同目录，`scripts/` 在 sys.path 上
+
+    img = cv2.imread(args.image)
+    if img is None:
+        raise SystemExit('读不到图：%s' % args.image)
+    with open(args.info) as fh:
+        info = json.load(fh)
+    K = np.array(info['K'], float).reshape(3, 3)
+    if np.abs(np.array(info.get('D', [0.0]), float)).max() > 1e-9:
+        # 标注器的针孔模型**没有畸变项**。① 用了 D，标注器不用 —— 两者就不
+        # 再互逆了。本机彩色流实测 D 全 0，所以现在不发作；但换个 config
+        # 打开畸变就会**静默地**把标签搞歪，所以在这里响一声。
+        print('  ⚠️ camera_info 的 D 非零（%s），而标注器是纯针孔模型。'
+              % np.array(info['D']).tolist())
+        print('     两者不再严格互逆；先去畸变再采图，或把 D 关掉。')
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    corners, found, _ = detect_chessboard(
+        gray, ((args.cols - 1, args.rows - 1), (args.rows - 1, args.cols - 1)))
+    if found is None:
+        raise SystemExit('自检：本图检不出角点（① 那份是对着哪张图解出来的？）')
+    c_eff, r_eff = found[0] + 1, found[1] + 1
+    # ⚠️ 这一条不是防呆，是防「两次检测取了不同朝向」：非正方图案的
+    #    findChessboardCorners 不是旋转不变的，两次跑理论上可能给出
+    #    (c,r) 与 (r,c) 两种解，物体点跟着换，最后误差看着还挺小。
+    if (c_eff, r_eff) != (c.get('cols'), c.get('rows')):
+        raise SystemExit('自检用的朝向 (%d,%d) 与 ① 记录的 (%s,%s) 不一致，停下'
+                         % (c_eff, r_eff, c.get('cols'), c.get('rows')))
+
+    objp = board_inner_corners(c['square_mm'] / 1000.0, c_eff, r_eff)
+    imgp = corners.reshape(-1, 2).astype(float)
+
+    flat = {'fx': K[0, 0], 'fy': K[1, 1], 'cx': K[0, 2], 'cy': K[1, 2],
+            'width': int(info.get('width', img.shape[1])),
+            'height': int(info.get('height', img.shape[0]))}
+    proj = L.TfProjector(flat, doc)
+    pts_cam = [proj.to_camera(p) for p in objp]
+    uv, dropped = L.project_pinhole(pts_cam, flat['fx'], flat['fy'],
+                                    flat['cx'], flat['cy'])
+    if dropped:
+        raise SystemExit('自检：有 %d 个靶点落在了相机背后 —— 这份外参方向反了'
+                         % dropped)
+    err = np.linalg.norm(np.asarray(uv) - imgp, axis=1)
+    print('自检（标注器数学，独立于 solvePnP）：中位 %.3f px，最大 %.3f px'
+          % (np.median(err), err.max()))
+    if err.max() > 1.0:
+        raise SystemExit('❌ 自检最大 %.2f px > 1 px —— 这份外参别用来标注。\n'
+                         '  最可能：① 解的是另一张图 / 靶被挪过 / 求逆那步写反。'
+                         % err.max())
+    print('✅ 标注器数学与 solvePnP 对得上（≤ %.2f px）' % err.max())
+    return float(err.max())
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='俯视相机外参（B 路：用臂点一下）',
@@ -750,7 +976,43 @@ def main():
     p3.add_argument('--out', default='extrinsics.json')
     p3.set_defaults(func=cmd_compose)
 
+    # ④ 与 ①②③ 是**两条独立的出口**：③ 要 ② 的碰点，产出给真机运行路径用的
+    # base_link←camera_link；④ **只要 ①**，产出给数据集标注用的 靶←相机。
+    # 采数据集因此不必等臂动。
+    p4 = sub.add_parser('labeler', help='④ ① → 标注器外参（不动臂，不用 ②）')
+    p4.add_argument('--pnp', required=True, help='① 产出的 cam_from_board.json')
+    p4.add_argument('--out', default='labeler_extrinsics.json')
+    p4.add_argument('--target-frame', default=LABELER_TARGET_FRAME,
+                    help='写进 json 的 target_frame 名字；方块坐标就在这个系里')
+    p4.add_argument('--image', help='可选：独立往返自检用的原图（与 ① 同一张）')
+    p4.add_argument('--info', help='可选：自检用的内参（--image 必需）')
+    p4.add_argument('--square-mm', type=float, default=None,
+                    help='仅自检检测用；默认跟 ① 记录的一致')
+    p4.add_argument('--cols', type=int, default=None, help='同上（方格数）')
+    p4.add_argument('--rows', type=int, default=None, help='同上（方格数）')
+    p4.add_argument('--block-mm', type=float, default=28.5,
+                    help='方块边长，只用来算「台面上的方块该填多少 z」')
+    p4.set_defaults(func=cmd_labeler)
+
     a = ap.parse_args()
+
+    # ④ 的 --square-mm/--cols/--rows 默认取 ① 记录里的值：
+    # **同一张靶，两组数分两处填，是抄错的重灾区**。
+    if a.cmd == 'labeler':
+        with open(a.pnp) as fh:
+            _c = json.load(fh)
+        for k in ('square_mm', 'cols', 'rows'):
+            if getattr(a, k) is None:
+                setattr(a, k, _c.get(k))
+            elif _c.get(k) is not None and getattr(a, k) != _c[k]:
+                raise SystemExit('--%s %s 与 ① 记录里的 %s 不一致；'
+                                 '同一张靶不该有两个值'
+                                 % (k.replace('_', '-'), getattr(a, k), _c[k]))
+        for k in ('square_mm', 'cols', 'rows'):
+            if getattr(a, k) is None:
+                raise SystemExit('① 的产物里没有 %s，请用 --%s 显式给出'
+                                 % (k, k.replace('_', '-')))
+
     a.func(a)
 
 
