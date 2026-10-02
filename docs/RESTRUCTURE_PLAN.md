@@ -8865,23 +8865,41 @@ W5 第 4b 步（D49 的现场闸门）。
   **会把整个 launch 带崩**（move_group 已起来也被 SIGINT 掉），而报错行只讲相机
   —— 看起来像 MoveIt 坏了。⇒ `--no-pipeline`。
 
-### 八、附带查实：**板子的代码树与本地 HEAD 逐字节一致**
+### 八、⚠️ **改正**：板子的代码树**不是**当前的（我先前抽查两个文件就下了结论）
 
-顺手核对了板子（`jetson-wifi`，模组序列号 **<board-serial>**，本次在
-`<board-ip>`）的仓库状态，因为要准备第 0 步。结果比预想的干净：
+> **这一节原来写的是「板子的代码树与本地 HEAD 逐字节一致」—— 那句话是错的。**
+> 它成立于我抽的那两个文件（`planner_node.py`、`telemetry.py`），我拿它们当成了
+> 整棵树。做第 0 步前把 `ros2_ws/src` **整个树**对了一遍哈希，真实情况是：
 
-| 项 | 板子 | 本地 HEAD |
+板子（`jetson-wifi`，模组序列号 **<board-serial>**，本次在 `<board-ip>`）
+是 `4f5e781`（**2026-09-29 13:02**）的检出，只**手工拷过个别文件**。全树 46 个
+文件对下来：
+
+| | 文件 | 差异 |
 |---|---|---|
-| `planner_node.py` 的 blob | `741cac2` | `741cac2`（B 之前） |
-| `telemetry.py` 的 blob | `885be03` | `885be03` |
+| **过期 6 个** | `grasp_planner/config/grasp_planner.yaml` | 缺 `guard_path_samples`（B） |
+| | `grasp_planner/grasp_planner/planner_node.py` | blob `741cac2`，**比本地少 B** |
+| | `grasp_planner/grasp_planner/gripper.py` | 只差一段 docstring |
+| | `grasp_planner/launch/planner.launch.py` | 只差 docstring |
+| | `yolo_bringup/launch/real.launch.py` | 只差 docstring |
+| | `yolo_bringup/launch/pipeline.launch.py` | **缺三样实质东西**（见下） |
+| **整个缺失 1 个** | `yolo_bringup/config/realsense_camera.yaml` | **相机序列号钉死文件不在板上** |
 
-**逐字节相同。** 板子的 `git` **元数据**落后（停在 `4f5e781`，2026-09-29 13:02，
-是 HEAD 的祖先；中间 **127 个提交**，绝大多数是 `docs/` 的台账轮次，
-没有同步到板子），但**代码内容是通过拷文件同步的**，所以是当前的 ——
-板子上那 3 个「已修改」+ 6 个「未跟踪」正是本地已提交的内容。
+`pipeline.launch.py` 缺的三样是**实质的**，不是文档：
 
-⇒ **第 0 步可以直接跑**，不需要先把 B 同步上板（护栏不影响 `/joint_states`、
-`/compute_ik`、TF 树）。⚠️ 板子的仓库副本**不要覆盖**。
+1. `realsense_params_file` —— **相机认亲**（`serial_no` 的引号只能靠这份 yaml，
+   理由见该文件头）。没有它，驱动退回「枚举到的第一台」，**插着两台 D435i 时
+   静默认错一台**。
+2. `tool0_to_fingertip` 的真机覆盖 **0.172**（板上会沿用仿真的 `0.13`）。
+3. `place_release_lift` 的真机覆盖 **0.0156**（板上会沿用仿真的 `0.01`
+   ⇒ 放置时**多下压 5.6 mm**，方向是朝桌面）。
+
+⇒ 这三条都落在「**真机几何必须按现场实测覆盖**」那件事上，而且全是**静默**的。
+**结论改成：第 0 步不能直接跑，得先把板子同步到当前代码**（已在下面「补记」里做了，
+含全树哈希复核 + `colcon build`）。
+
+⚠️ 板子的仓库副本**不要整体覆盖**（它是另一份 git 检出）；做法是**逐文件**比对、
+只拷差异文件，并把被替换的原文件备份到板上的 `/tmp/board_backup_<日期>/`。
 
 #### ⚠️ 但这意味着：**板子上装的还是「会打死 move_group」的那个探针**
 
@@ -8917,3 +8935,207 @@ W5 第 4b 步（D49 的现场闸门）。
   `moveit::Exception` + `exit code -6` 的整段栈、`EXIT=0` 配「一个位姿都没解出来」），
   不是推想。
 - 板子的 blob 比对是**哈希**，不是「看起来一样」。
+
+## 第六十二轮补记：板端第 0 步（a）—— 顺带查出**板子的代码树是过期的**，和**第五处假绿**（2026-10-02 深夜）
+
+本轮（B + 假绿）写完就上了板子做第 0 步。一上手就发现两件事，都不是原计划的。
+**这一节是补记，不是新的一轮** —— 它属于同一晚、同一件事。
+
+### 一、先说改正：§八 那句「逐字节一致」是**错的**
+
+我在 §八 里写「板子的代码树与本地 HEAD 逐字节一致」—— 那句话只成立于我抽的
+**两个文件**，我拿它们当成了整棵树。做第 0 步前把 `ros2_ws/src` **全树 46 个
+文件**对了一遍哈希，真实情况是：板子是 `4f5e781`（**2026-09-29 13:02**）的检出
+再加**个别文件的手工拷贝**，**6 个文件过期、1 个整个缺失**。
+
+细节见改正后的 §八。这里只留一句教训 —— 它和本轮的主题是同一条：
+
+> **抽查两个文件就宣布「整棵树一致」，和「预检没测到却报绿」是同一类错。**
+> 判据必须覆盖**整个**被断言的范围，否则那个结论的强度就不是你以为的那个。
+
+### 二、同步（备份 → 全树哈希 → 逐文件拷 → `colcon build` → 复核）
+
+| 步 | 做法 | 结果 |
+|---|---|---|
+| 1 | 把 6 个差异文件按原路径备份到板上 `/tmp/board_backup_20261002/` | md5 留档 |
+| 2 | 逐文件 `scp`（**不整体覆盖**仓库；它是另一份 git 检出） | 7 个文件（含缺失的那一个） |
+| 3 | `colcon build --symlink-install --packages-select grasp_planner yolo_bringup` | **2 包 5.6 s，RC=0** |
+| 4 | `build/` 与 `src/` 哈希复核 | `pipeline.launch.py` = `1dd834d`、`grasp_planner.yaml` = `e4df192`、`realsense_camera.yaml` = `33a8f97`，**与本地逐位一致** |
+
+⚠️ 一个容易踩的前提：板子是 `--symlink-install`，但 `install/` 指向的是
+**`build/`**（不是 `src/`）—— 所以**改了 `src` 必须重编**，光拷文件不生效。
+`grasp_planner` 的 Python 模块走 `egg-link` 直连 `src`，但 launch/config
+走的是 `build/` 的拷贝。
+
+### 三、第 0 步（a）：**板端 MoveIt-only 链路全绿**
+
+零运动风险：`start_ur_driver:=false` + `start_pipeline:=false`
+⇒ **没有驱动、没有 controller_manager，物理上没有任何东西可动**。
+新增 `scripts/real_chain_check.py`（只读；只调 `/compute_ik`、`/compute_fk`）。
+
+```
+① 服务
+  ✓ /compute_ik 在（等了 3s）        ✓ /compute_fk 在（等了 0s）
+② /joint_states  ✓ 6 个臂关节（HOME）
+③ TF 树（base_link → tool0 逐跳，7 跳全通）
+  ✓ base_link      → shoulder_link   t=(+0.0000,+0.0000,+0.0892)
+  ✓ upper_arm_link → forearm_link    t=(-0.4250,+0.0000,+0.0000)
+  ✓ forearm_link   → wrist_1_link    t=(-0.3922,+0.0000,+0.1091)
+  ✓ wrist_1_link   → wrist_2_link    t=(+0.0000,-0.0946,-0.0000)
+  ✓ wrist_3_link   → tool0           t=(+0.0000,+0.0000,+0.0000)
+④ /compute_ik + /compute_fk（真调一次）
+  IK error_code = 1 (SUCCESS)   目标 tool0 = (0.45, 0.00, 0.05) 朝下
+  FK error_code = 1   tool0 回到 (+0.4500, +0.0000, +0.0500)   ← 与请求**逐位一致**
+      forearm_link (+0.1584,-0.0396,+0.4815)   wrist_1_link (+0.3582,+0.0230,+0.1323)
+EXIT=0
+```
+
+那 7 跳的平移量与 UR5 的 DH 对得上（`d1=0.0892`、`a2=0.4250`、`a3=0.3922`、
+`d4=0.1091`、`d5=0.0946`、`d6=0.0823`）—— 顺带证实了「UR5 **没有** `elbow_link`，
+肘关节的子树根是 `forearm_link`」这条链是对的。
+
+### 四、真机几何**还没覆盖** —— 板端量出来的 D49 量级
+
+同一个探针在板上跑（`--ik-group ur_manipulator`，30 个候选）：
+
+```
+IK 解不出来的候选：6 / 30（NO_IK_SOLUTION，全在 x=0.90 区域边界）
+各连杆在所有候选里的最低高度：
+  wrist_1_link  -0.138   （离护栏下限 -0.370 还有 +0.232 m）
+  forearm_link  +0.152
+```
+
+⚠️ **这个 +0.232 的余量是假的安全感**：它的护栏下限 `-0.370` 来自
+`table_plane_z = -0.39`，而那是**仿真**的台面高度（臂坐在 0.80 m 立柱上）。
+板端实读的参数确认了这一点：
+
+```
+/grasp_planner 参数（同步后在板子上实读）
+  ik_group            ur_manipulator            ✅ 真机值（pipeline 覆盖生效）
+  trajectory_action   /scaled_joint_trajectory_controller/...  ✅
+  tool0_to_fingertip  0.172     ✅ 真机 AG-95（新覆盖生效）
+  place_release_lift  0.0156    ✅
+  guard_path_samples  8         ✅ B 在板上是活的
+  table_plane_z       -0.39     ⚠️ **还是仿真的**
+  table_scene_enabled False     ⚠️ 桌子不在规划场景里
+```
+
+**把台面放回真机的位置（z ≈ 0），那 30 个候选里 `wrist_1_link` 最低到
+−0.138 m —— 比台面低 13.8 cm。** 这不是推想，是板上 FK 量出来的数。
+
+⇒ 这就是 D49 在真机上的**真实量级**，也说明「按现场实测覆盖几何参数」这件事
+**还没做**（`pick_zone` 的 z 也是 `[-0.45,-0.30]`，同样是仿真口径）。
+这是 W5 的前置项，**不是**本轮能替做的 —— 但它现在是**有数**的了。
+
+### 五、⭐ 第五处假绿：**我自己这一轮新写的工具里**
+
+`test_guard_path.py` **全跑 A/B/C/D** 时，D 段打印的是：
+
+```
+===== D. 真 UR5 模型上的整段检查 =====
+  ~ 跳过：30 条候选里没找到「两端高、中间低」的路径 —— 不是失败，只是这一组姿态没触发。
+✓ 全部通过
+```
+
+看起来是「没触发，跳过，通过」。而**同一个 D 段单跑**（`--only D`）却是：
+
+```
+  找到一条真的会俯冲的路径：elbow_joint+1.8
+    起点最低连杆 z=0.514  终点 z=0.132  中段最低 z=0.122（在 88% 处）
+  ✓ ★ D3 整段检查拦下了这条真路径   ✓ ★ D4 guard_path_samples=0 → 放行
+```
+
+**同一个自检，D 段的强度取决于它是被全跑还是被单跑。**
+
+根因：**A 段为了造合成几何，把 `node.guard_links` 改成了 `["forearm_link"]`
+（单连杆）并且没有还原**。D 段开头读的就是这个属性，于是在单连杆几何上找不到
+「两端高、中间低」→ 走进「跳过」分支 → 照样打勾。
+另外 A 段的 A6 还把 `node.get_logger().warn` 换成了往列表里塞的 lambda，**也没还原**。
+
+**修法**（两层）：
+
+1. A 段把改过的共享属性**快照 + `finally` 还原**（含那个 logger 的 `warn`）。
+   —— 中途抛异常也还原，否则一次失败会顺着污染把后面几段一起带歪。
+2. D 段加一条**前置断言**：它量到的 `guard_links` 必须等于 `main()` 在
+   任何一段跑之前抓的**原装值**，不等就**判失败**，而不是去打那个勾。
+   —— 这一条是兜底：即使将来又有人往 A 段里加东西忘了还原，也只会**响亮地红**。
+
+**变异测试**（板上实跑）：把第 1 层的还原改成 `pass`，D 段立刻变成
+
+```
+  ✗ D 前置：护栏量的是原装的 guard_links
+      拿到 ['forearm_link']，原装 ['forearm_link', 'wrist_1_link'] —— 状态被前面的段污染了，本段不测
+EXIT=1
+```
+
+⇒ **从「静默跳过 + 报绿」变成「响亮地红」。** 修完再全跑一次，D 段正常找到那条
+路径，数字与开发机**逐位一致**（0.514 / 0.132 / 0.122 @88%，82 次 FK / 1.37 s）。
+
+> 这一条值得单独记一笔：**它是本轮做的那件事（查假绿）在做那件事的工具里又发作了一次。**
+> 五处假绿的共同形状还是那一句 ——「**没测到**」和「**测到了、是好的**」长得一模一样。
+
+### 六、D71（新）：`pipeline.launch.py` **直跑** = `ag95` + `carry_objects:=true`
+
+板端实测（`ros2 launch yolo_bringup pipeline.launch.py camera_source:=realsense`）：
+
+```
+  gripper_backend   ag95        ← PythonExpression：'sim' if camera_source=='sim' else 'ag95'
+  carry_objects     True        ← pipeline.launch.py 的默认值就是 'true'
+```
+
+而 `real.launch.py` 会把这两个都覆盖成 `none` / `false`（第一个真机 demo 的口径）。
+所以：
+
+| 入口 | `gripper_backend` | `carry_objects` | 真机会让夹爪动吗 |
+|---|---|---|---|
+| `bringup camera_source:=realsense` → `real.launch.py` | `none` | `false` | **不会** ✅ |
+| **`bringup camera_source:=external`** → **直连 `pipeline.launch.py`** | **`ag95`** | **`true`** | **会** ⚠️ |
+| 直接 `ros2 launch yolo_bringup pipeline.launch.py camera_source:=realsense` | **`ag95`** | **`true`** | **会** ⚠️ |
+
+⚠️ **今天没出事，靠的是 `ag95_dry_run` 那一层。** 日志原文：
+
+```
+[WARN] AG-95 **DRY-RUN**（只读）：不会写任何寄存器，open/close 只在日志里说明「本应写什么」
+[INFO] 初始化：先张开夹爪，再回 HOME ...
+[INFO] AG-95 DRY-RUN 本应写：力 50 N → 0x0101；开口 95.0 mm → 1000 ‰ → 0x0103（未写，手指不动）
+```
+
+⇒ **`carry_objects:=true` 就是「规划器到时会真的去闭合夹爪」**，而 `ag95` 后端
+接的是**装在臂上的真夹爪** —— 按纪律「夹爪装臂上时写寄存器 = 真机动作」。
+所以 D71 的严重性**不在今天**，而在于：**丙-1 把 `ag95_dry_run` 翻成 `false`
+的那一刻起，这两条入口就变成「一跑就动夹爪」，而且没有任何东西拦**。
+安全的组合（`none` + `false`）只写在**一个**入口里，别的入口不继承 ——
+与 D50/D64 同一族的病。
+
+**这一条本轮不改代码**（第一优先级是第 0 步），只记进台账与纪律。
+
+### 七、顺带查实的两件（都进纪律）
+
+1. **相机认亲在板上是**好的：日志里
+   `Device with serial number <topcam-serial> was found.` —— 俯视那台，用 SDK 号。
+   ⚠️ 但同一份日志里也有 `The requested device with serial number <topcam-serial>
+   is NOT found. Will Try again.` **反复出现**，因为**板上另有一台 19 小时前留下的
+   俯视相机孤儿节点**占着同一台设备（PPID=1、跑在**域 0**、30 Hz）。
+   ⇒ **跑真机 pipeline 之前必须先清掉它**，否则两台节点抢同一台相机、图像反复断。
+   （本次没能清：它不是本会话起的进程，权限系统拦下了，见下面「没做的」。）
+2. **`--no-pipeline` 的口径**：本轮按新加的纪律执行 —— 它只用来验「MoveIt 链路
+   本身通不通」，没拿它做护栏判读。
+
+### 八、本轮补记的验证
+
+- 板子全树 46 个文件的 md5 比对是**逐文件**做的，不是抽样。
+- 同步后 `build/` 与本地 `src/` 的哈希**逐位一致**。
+- 第 0 步（a）的每一个 ✓ 都有**原始输出**（服务等待秒数、7 跳 TF 平移量、
+  IK 的 `error_code=1`、FK 把 tool0 打回请求点）。
+- 第五处假绿有**两种跑法的对照原文**，并做了**变异测试**证明修法真的把
+  「静默跳过」变成「响亮地红」。
+- D71 有板端**实读的参数值**和**日志原文**，不是推想。
+
+### 九、本轮补记**没做**的（留给下一段或需要你定）
+
+- **第 0 步（b）**：驱动那一半要在**控制箱**那一侧，属高风险操作，
+  命令已写进 `docs/待执行命令.md`。
+- **板子上那台孤儿相机节点**：不是本会话起的，权限系统不允许我杀它。
+  它的命令行与恢复方式已记进 `docs/待执行命令.md`。
+- **现场几何覆盖**（`table_plane_z`、`pick_zone`/`place_zone` 的 z）：
+  要先量现场工作台，属 W5。
