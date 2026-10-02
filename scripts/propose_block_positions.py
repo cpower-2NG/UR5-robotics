@@ -275,7 +275,10 @@ def main(argv=None):
     ap.add_argument('--out', default='blocks.json')
     ap.add_argument('--draw', default=None, help='复核图输出路径')
     ap.add_argument('--block-mm', type=float, default=28.5)
-    ap.add_argument('--sat-min', type=int, default=110)
+    ap.add_argument('--sat-min', type=int, nargs='+', default=[110, 50],
+                    help='可给多个：**并集**取候选。不同阈值抓到不同的方块 —— '
+                         '实测高饱和的橙/黄在 110 稳，米色的 S≈108 要 100 以下，'
+                         '阴影里的紫方块 S≈66 更低。并集之后由倒角/尺寸闸门统一筛。')
     ap.add_argument('--val-min', type=int, default=80)
     ap.add_argument('--area-min', type=int, default=450)
     ap.add_argument('--area-max', type=int, default=6500)
@@ -316,11 +319,27 @@ def main(argv=None):
           % (np.round(proj.t, 4).tolist(), zc))
 
     dt = chamfer_field(img)
-    cands = candidates(img, a.sat_min, a.val_min, a.area_min, a.area_max,
-                       a.aspect_lo, a.aspect_hi)
-    print('\n候选连通域 %d 个（饱和度 >%d、亮度 >%d、面积 %d~%d、长宽比 %.2f~%.2f）'
-          % (len(cands), a.sat_min, a.val_min, a.area_min, a.area_max,
+
+    # 多个饱和度阈值取**并集**。为什么不是挑一个最好的：方块的颜色跨度比
+    # 台面杂物大得多（实测同一台上 S 从 27 到 217），任何一个全局阈值都会
+    # 漏掉一端。低阈值会带来多余的候选和**粘连**，但那些由后面的倒角/尺寸
+    # 闸门和最后那道非极大抑制统一收掉 —— 让每一层干它擅长的事。
+    cands, seen, per = [], [], []
+    for s in a.sat_min:
+        got = candidates(img, s, a.val_min, a.area_min, a.area_max,
+                         a.aspect_lo, a.aspect_hi)
+        per.append((s, len(got)))
+        for c in got:
+            cx, cy = (c[0] + c[2]) / 2.0, (c[1] + c[3]) / 2.0
+            if any((cx - k[0]) ** 2 + (cy - k[1]) ** 2 < 6.0 ** 2 for k in seen):
+                continue
+            seen.append((cx, cy))
+            cands.append(c)
+    print('\n候选连通域 %d 个（亮度 >%d、面积 %d~%d、长宽比 %.2f~%.2f）'
+          % (len(cands), a.val_min, a.area_min, a.area_max,
              a.aspect_lo, a.aspect_hi))
+    print('  饱和度并集：%s（去重前）'
+          % '  '.join('>%d: %d 个' % (s, n) for s, n in per))
 
     kept, dropped = [], []
     for (u0, v0, u1, v1, area) in cands:

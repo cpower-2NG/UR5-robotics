@@ -14,6 +14,10 @@ install/
 log/
 *.pyc
 
+# 临时产物工作区：`make_click_labeler.py` 生成的单文件点选页面落在这里
+# （内嵌一整帧顶视画面，1.6 MB 量级，一条命令就能重生成，没有入库的理由）。
+.scratch/
+
 # P0: 附件隔离解压区（不入库，见 docs/ATTACHMENT_MANIFEST.md）
 docs/reference/
 
