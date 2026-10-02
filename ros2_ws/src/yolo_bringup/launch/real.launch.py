@@ -30,9 +30,13 @@
 ⚠️ 第一个真机 demo **不含抓取**，所以本文件的默认值就是那个组合：
 `gripper_backend:=none` + `carry_objects:=false`（只走位）。
 要真夹取，AG-95 的**代码侧已经就绪**（`ag95` 后端的读/写/到位轮询都在
-`grasp_planner/gripper.py`，写路径由 `ag95_dry_run` 卡着，默认只读）——
-挡着的**只有硬件**：板上还没有 USB-RS485 适配器，`_connect()` 打不开串口。
-硬件到位后按 `docs/待执行命令-留档.md` 的 **丙-1**（判决方向 → 离臂试写 → 上臂）逐步走。
+`grasp_planner/gripper.py`，写路径由 `ag95_dry_run` 卡着，默认只读）。
+**硬件也已在位**（2026-10-02 复查：FT232R `0403:6001` 在 `/dev/ttyUSB0`，
+推荐的稳定路径是 `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0`；
+`jetson` 已在 `dialout`；`pymodbus` 3.15.0 已装）——
+挡着的是**纪律**：写寄存器（初始化 / 开合）在夹爪装臂上时**等于真机动作**，
+只允许在「**夹爪拆下臂、放工作台、急停在手边**」时写。
+按 `docs/待执行命令-留档.md` 的 **丙-1**（判决方向 → 离臂试写 → 上臂）逐步走。
 """
 
 import os

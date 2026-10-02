@@ -830,7 +830,7 @@ def main():
         # 控制器会报 SUCCEEDED。唯一的征兆是「夹爪撞桌子」。
         #
         # 而且它**不能靠改 `grasp_planner.yaml` 来修**：那份 yaml 是仿真与
-        # 真机**共用**的（仿真用 Robotiq 2F-85 = 0.13，真机用 AG-95 = 0.174），
+        # 真机**共用**的（仿真用 Robotiq 2F-85 = 0.13，真机用 AG-95 = 0.172），
         # 改它等于把仿真一起改坏。所以必须走 launch 侧的后端分支。
         check("pipeline.launch.py 声明了 tool0_to_fingertip",
               "tool0_to_fingertip" in p_names)
@@ -839,12 +839,21 @@ def main():
         real_v = _resolve_default_in(t_subs, camera_source="realsense")
         check("仿真默认仍是 2F-85 的 0.13（动它就会把仿真弄坏）", sim_v == "0.13",
               f"got {sim_v!r}")
-        check("真机默认是 AG-95 实测的 0.174（TCP_1 的 z = 173.99 mm）",
-              real_v == "0.174", f"got {real_v!r}")
+        # 真机值的来历（2026-10-02 定案）：
+        #   大寰官方 184.6（张开）/ 200.2（闭合）的基准面**就是 tool0**
+        #   （184.6 的起止线画在 Ø67 法兰板**底面**上，那正是 UR 螺栓贴合面）；
+        #   现场那块 4 mm **就是这块法兰板**，不再叠加。
+        #   ⇒ tool0_to_fingertip = 200.2 − 28.5（真机方块高）= 171.7 ≈ 0.172
+        # 早先的 0.174 / 0.176 都是手工读数（TCP_1 的 173.99、卷尺），已全部降级。
+        check("真机默认是 AG-95 的 0.172（官方 200.2 − 方块 28.5）",
+              real_v == "0.172", f"got {real_v!r}")
         # 这条是**意图**的断言：差的不是零头，是「指尖扎进台面」那个量级。
-        check("两者差 44 mm（正是 D44 说的那一截）",
-              abs(float(real_v) - float(sim_v) - 0.044) < 1e-9,
-              f"差 {abs(float(real_v) - float(sim_v)) * 1e3:.1f} mm")
+        # ⚠️ 别再把这里钉成一个精确值 —— 真机方块高换一次，这个差就跟着变。
+        # 要钉的是「两个后端真的差了几十毫米」，那才是 D44 说的那一截。
+        _delta = abs(float(real_v) - float(sim_v))
+        check("两者差 ≥ 30 mm（正是 D44 说的那一截，不是零头）",
+              _delta >= 0.030,
+              f"差 {_delta * 1e3:.1f} mm")
 
         # 关键：光声明没用，得**真的传进 grasp_planner 的参数字典**。
         # `planner_params` 是 [yaml路径, {覆盖项}] 两项 —— 覆盖项落在第二项里
