@@ -24,6 +24,13 @@ docs/reference/
 # demo_pipeline.py 的独立数据集输出（几何与 block_dataset/ 不同，见 D30）
 block_dataset_demo/
 
+# YOLO 训练产物：`train_yolo_block.py --name X` 会在这里堆检查点、日志、
+# 混淆矩阵、以及每轮的 batch 预览图，几百 MB 且**每次训练都不一样**。
+# 真正要留下的是它最后复制到仓库根的 block_best.pt。
+# （原先没有这条，训练一次 git status 里就多出一整棵 runs/ —— 和上面 build/ 那
+#  条同一个道理：构建产物一律不入库。）
+runs/
+
 # YOLO 权重：属**构建产物**而非源码，默认不入库（历史里已有一批被删但仍在
 # history 中的 .pt blob，见 RESTRUCTURE_PLAN 的 Q7，不再往上加）。
 # 需要随仓库分发时用 `git add -f` 显式覆盖。

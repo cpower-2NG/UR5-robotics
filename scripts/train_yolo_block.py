@@ -2,26 +2,33 @@
 """
 YOLOv8 方块检测训练脚本
 =======================
-微调 YOLOv8n 检测 Gazebo 中的立方体方块。
+微调 YOLOv8n 检测**真机**俯视相机里的方块。
 
 用法:
-    python3 scripts/train_yolo_block.py
+    python3 scripts/train_yolo_block.py [--epochs N] [--batch N] [--imgsz N]
 
-前提:
-    1. 已采集并标注好数据集
-    2. 数据集结构:
-       block_dataset/
-       ├── data.yaml
-       ├── train/
-       │   ├── images/   ← 采集的 jpg
-       │   └── labels/   ← 标注的 txt (labelImg 生成)
-       └── val/
-           ├── images/   ← 从 train 复制 20%
-           └── labels/   ← 对应标注
+先装配数据集（本脚本**不做切分**，见下）::
 
-训练参数:
+    python3 scripts/build_dataset.py --out block_dataset \\
+        --val r02,r06a2 --jpeg-quality 92
+
+数据集结构（block_dataset/）::
+
+    ├── data.yaml
+    ├── train/{images,labels}   ← 156 帧 / 3345 框，5 个排布
+    ├── val/{images,labels}     ←  54 帧 / 1350 框，2 个排布
+    └── dataset_manifest.json   ← 哪一帧来自哪个排布、来自哪个源文件
+
+⚠️ **切分由 `build_dataset.py` 按「排布」做，本脚本不再切。**
+原版这里有个 `split_val()`，随机抽 20% 的**帧**当验证集 —— 对这份数据是假的：
+同一个排布下拍的几十帧**布局完全相同**，模型只要背下那 25 个坐标就能在 val 上
+刷满分。val 于是衡量的只是「记住没有」，不是「换个摆法还认不认」，而部署时方块
+是**当场摆的**。所以那段代码已删除，`check_dataset()` 反过来**断言** train 与
+val 的排布不重叠 —— 谁要是手工把同一排布的两帧分别放进两边，这里会拦下来。
+
+训练参数（默认）:
     model:   yolov8n_coco.pt (COCO 预训练权重，微调)
-    epochs:  100
+    epochs:  100, patience 20
     imgsz:   640
     device:  cuda:0 (自动回退 cpu)
 
@@ -29,10 +36,9 @@ YOLOv8 方块检测训练脚本
       （yolo_detector 的默认 model 参数就指向它）
 """
 
-import os
+import argparse
 import sys
 import shutil
-import random
 from pathlib import Path
 
 # ---- 路径 ----
@@ -51,57 +57,64 @@ VAL_LBL = DATASET_DIR / "val" / "labels"
 DATA_YAML = DATASET_DIR / "data.yaml"
 
 
-def split_val(val_ratio=0.2):
-    """从 train 中随机抽取 val_ratio 比例作为验证集。"""
-    images = sorted(TRAIN_IMG.glob("*.jpg")) + sorted(TRAIN_IMG.glob("*.png"))
-    if not images:
-        print("[ERROR] train/images/ 中没有图像，请先采集数据。")
-        sys.exit(1)
-
-    if len(images) < 5:
-        print(f"[INFO] 仅 {len(images)} 张，不足以拆分验证集，全部用于训练。")
-        return
-
-    # 清空 val
-    for f in VAL_IMG.glob("*"):
-        f.unlink()
-    for f in VAL_LBL.glob("*"):
-        f.unlink()
-
-    random.seed(42)
-    val_count = max(1, int(len(images) * val_ratio))
-    val_images = random.sample(images, val_count)
-
-    for img_path in val_images:
-        shutil.move(str(img_path), str(VAL_IMG / img_path.name))
-        label_path = TRAIN_LBL / (img_path.stem + ".txt")
-        if label_path.exists():
-            shutil.move(str(label_path), str(VAL_LBL / label_path.name))
-
-    print(f"数据拆分: train={len(list(TRAIN_IMG.glob('*.jpg')))} 张, "
-          f"val={len(val_images)} 张")
+def images_in(d):
+    return sorted(list(d.glob("*.jpg")) + list(d.glob("*.png"))
+                  + list(d.glob("*.jpeg")))
 
 
-def check_labels():
-    """检查标注文件是否就绪。"""
-    images = list(TRAIN_IMG.glob("*.jpg")) + list(TRAIN_IMG.glob("*.png"))
-    labeled = 0
-    for img in images:
-        lbl = TRAIN_LBL / (img.stem + ".txt")
-        if lbl.exists():
-            labeled += 1
-    print(f"标注进度: {labeled}/{len(images)} 张已标注")
-    if labeled == 0:
-        print("[WARN] 尚未标注任何图像，请先运行 labelImg 标注。")
-        print("       安装: pip install labelImg")
-        print(f"       打开: labelImg {TRAIN_IMG}")
-        return False
-    if labeled < len(images) * 0.5:
-        print("[WARN] 标注不足 50%，建议标注更多后再训练。")
-    return True
+def arrangement_of(path):
+    """输出文件名形如 ``r06a2__img_0013.jpg`` —— 前缀就是排布名。"""
+    return path.name.split("__")[0]
 
 
-def train():
+def check_dataset():
+    """训练前的体检。**切分不在这里做**，只检查它已经是对的。
+
+    三件事：图与标签一一对应、两边都非空、**train 与 val 的排布不重叠**。
+    最后一条是这份数据集唯一不能出错的地方 —— 重叠了 val 指标就不可信，
+    而且它不会报错，只会让数字好看。
+    """
+    ok = True
+    arrs = {}
+    for split, idir, ldir in (("train", TRAIN_IMG, TRAIN_LBL),
+                              ("val", VAL_IMG, VAL_LBL)):
+        imgs = images_in(idir)
+        if not imgs:
+            print(f"[ERROR] {idir}/ 里没有图像 —— 先跑 scripts/build_dataset.py 装配。")
+            return False
+        missing = [p.name for p in imgs if not (ldir / (p.stem + ".txt")).exists()]
+        if missing:
+            print(f"[ERROR] {split}: {len(missing)} 张图没有标签，例如 {missing[:3]}")
+            ok = False
+        arrs[split] = sorted({arrangement_of(p) for p in imgs})
+        print(f"  {split:5s} {len(imgs):3d} 帧  排布 {', '.join(arrs[split])}")
+
+    both = set(arrs["train"]) & set(arrs["val"])
+    if both:
+        print(f"[ERROR] 这些排布同时出现在 train 和 val：{sorted(both)}")
+        print("        val 指标会虚高 —— 模型只要背下这些布局就能拿满分。")
+        print("        请重跑 scripts/build_dataset.py 重新按排布切分。")
+        ok = False
+
+    man = DATASET_DIR / "dataset_manifest.json"
+    if man.exists():
+        import json
+        m = json.load(open(man))
+        print(f"  清单（**构建时**的记录）：train {m['split']['train']['boxes']} 框 / "
+              f"val {m['split']['val']['boxes']} 框")
+        # 清单是装配那一刻的快照。跟现况对一下 —— 对不上说明有人手工动过目录，
+        # 那时清单里的出处追溯就不可信了，比数字本身更值得警惕。
+        for split, idir in (("train", TRAIN_IMG), ("val", VAL_IMG)):
+            now, was = len(images_in(idir)), m["split"][split]["frames"]
+            if now != was:
+                print(f"  [WARN] {split} 实际 {now} 帧，清单记的是 {was} 帧 "
+                      f"—— 目录被手工改过，清单里的出处不再可信。")
+    else:
+        print("  [WARN] 没有 dataset_manifest.json —— 无法追溯每帧的出处。")
+    return ok
+
+
+def train(epochs, batch, imgsz, device_arg, name):
     """训练 YOLOv8n。"""
     try:
         from ultralytics import YOLO
@@ -109,14 +122,16 @@ def train():
         print("[ERROR] 请安装 ultralytics: pip install ultralytics")
         sys.exit(1)
 
-    device = "cuda:0"
-    try:
-        import torch
-        if not torch.cuda.is_available():
+    device = device_arg
+    if device is None:
+        device = "cuda:0"
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                device = "cpu"
+                print("[INFO] CUDA 不可用，使用 CPU 训练（会慢很多）。")
+        except ImportError:
             device = "cpu"
-            print("[INFO] CUDA 不可用，使用 CPU 训练（会慢很多）。")
-    except ImportError:
-        device = "cpu"
 
     if not BASE_WEIGHTS.is_file():
         print(f"[ERROR] 找不到微调起点权重: {BASE_WEIGHTS}")
@@ -125,20 +140,21 @@ def train():
         sys.exit(1)
 
     print(f"\n加载预训练模型 {BASE_WEIGHTS.name}，设备: {device}")
+    print(f"epochs={epochs} batch={batch} imgsz={imgsz}")
     model = YOLO(str(BASE_WEIGHTS))
 
-    print(f"开始训练...")
+    print("开始训练...")
     results = model.train(
         data=str(DATA_YAML),
-        epochs=100,
-        imgsz=640,
-        batch=16,
+        epochs=epochs,
+        imgsz=imgsz,
+        batch=batch,
         device=device,
         patience=20,          # 20 个 epoch 无提升则早停
         save=True,
         save_period=10,       # 每 10 epoch 保存一次
         project=str(PROJECT_ROOT / "runs"),
-        name="block_detect",
+        name=name,
         exist_ok=True,
         pretrained=True,
         optimizer="auto",
@@ -146,7 +162,7 @@ def train():
     )
 
     # 复制最佳模型到项目根目录（yolo_detector 的默认 model 参数就指向它）
-    best_src = PROJECT_ROOT / "runs" / "block_detect" / "weights" / "best.pt"
+    best_src = PROJECT_ROOT / "runs" / name / "weights" / "best.pt"
     best_dst = PROJECT_ROOT / "block_best.pt"
     if best_src.exists():
         shutil.copy(str(best_src), str(best_dst))
@@ -162,15 +178,22 @@ def train():
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser("训练 YOLOv8n 方块检测")
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--batch", type=int, default=16,
+                    help="8 GB 的 Orin 上建议 8 —— 显存与 CPU 共享同一个内存池")
+    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--device", default=None, help="cuda:0 / cpu（默认自动）")
+    ap.add_argument("--name", default="block_detect", help="runs/ 下的子目录名")
+    a = ap.parse_args()
+
     print("=" * 60)
     print("  YOLOv8 方块检测训练")
     print("=" * 60)
 
-    if not check_labels():
-        print("\n请先完成标注后再运行训练。")
-        sys.exit(0)
+    print("\n体检数据集（切分已由 build_dataset.py 按排布固化）...")
+    if not check_dataset():
+        print("\n❌ 数据集不合格，拒绝训练。")
+        sys.exit(1)
 
-    print("\n拆分为 train/val ...")
-    split_val()
-
-    train()
+    train(a.epochs, a.batch, a.imgsz, a.device, a.name)
