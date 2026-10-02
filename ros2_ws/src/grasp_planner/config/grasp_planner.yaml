@@ -197,6 +197,11 @@ grasp_planner:
     guard_links: [forearm_link, wrist_1_link]
     table_plane_z: -0.39        # 台面在 base_frame 里的高度（真机 ≈ 0）
     guard_margin: 0.02          # 余量（m）
+    # 整段护栏（B）：上面几条只查**路点本身**，而臂是连续走过去的 ——
+    # 两端都在台面之上，中间照样可以俯冲下去。发轨迹前把「当前位置→目标」
+    # 的关节空间线段均匀采样这么多段，逐点查一遍。
+    #   0 或负数 = 关掉整段检查，退回「只查终点」。
+    guard_path_samples: 8
     max_joint_jump: 1.0         # 同一段内相邻路点的最大关节跳变（rad，L∞）
 
     # ---- 姿态安全：把桌子放进 MoveIt 规划场景 ----

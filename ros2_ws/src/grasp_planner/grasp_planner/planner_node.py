@@ -223,6 +223,7 @@ class GraspPlanner(Node):
         self.guard_links = list(p["guard_links"])
         self.table_plane_z: float = float(p["table_plane_z"])
         self.guard_margin: float = float(p["guard_margin"])
+        self.guard_path_samples: int = int(p["guard_path_samples"])
         self.max_joint_jump: float = float(p["max_joint_jump"])
         self.table_scene_enabled: bool = bool(p["table_scene_enabled"])
         self.table_box_size = [float(v) for v in p["table_box_size"]]
@@ -556,6 +557,12 @@ class GraspPlanner(Node):
         # 台面在 base_frame 里的高度。真机（臂装在工作台上）≈ 0；仿真 ≈ -0.39。
         d("table_plane_z", -0.39)
         d("guard_margin", 0.02)         # 护栏余量（m）
+        # 「整段护栏」的采样点数（B）。上面的判据只查**路点本身**，而臂是
+        # **连续**走过去的 —— 两端都在台面之上，中间照样可以俯冲下去。
+        # 发轨迹前把 当前位置→目标 的关节空间线段均匀采样，逐点查一遍。
+        #   0 或负数 = 关掉整段检查，退回「只查终点」（B 之前的行为）。
+        # 代价：每次机械臂动作多 (N+1)×len(guard_links) 次 /compute_fk 调用。
+        d("guard_path_samples", 8)
         # 同一段内相邻路点的最大关节跳变（rad，L∞）。超过就认为解到了另一个
         # 分支 —— 见 _consistent_with。
         d("max_joint_jump", 1.0)
@@ -808,15 +815,7 @@ class GraspPlanner(Node):
         traj.header.stamp = Time(sec=0, nanosec=0)
 
         point = JointTrajectoryPoint()
-        # 把每个目标角「展开」到离当前位置最近的等价角，保证 JTC 走短路。
-        # 这是防 360° 回转的**第二道**防线：第一道是 IK 侧的归一化，
-        # 但两次调用之间机械臂可能已经转过大半圈，所以这里再按当前位置校正一次。
-        unwrapped = [float(v) for v in positions]
-        for i, name in enumerate(joint_names):
-            if name in self._current_joints:
-                curr = self._current_joints[name]
-                diff = unwrapped[i] - curr
-                unwrapped[i] = curr + math.atan2(math.sin(diff), math.cos(diff))
+        unwrapped = self._unwrap_to_nearest(joint_names, positions)
         point.positions = unwrapped
         point.velocities = [0.0] * len(positions)
         point.time_from_start = Duration(
@@ -858,8 +857,89 @@ class GraspPlanner(Node):
 
         self._traj_client.send_goal_async(goal).add_done_callback(_on_goal_response)
 
+    def _unwrap_to_nearest(self, joint_names: List[str],
+                           positions: List[float]) -> List[float]:
+        """把每个目标角「展开」到离当前位置最近的等价角，保证 JTC 走短路。
+
+        这是防 360° 回转的**第二道**防线：第一道是 IK 侧的归一化，
+        但两次调用之间机械臂可能已经转过大半圈，所以这里再按当前位置校正一次。
+
+        它同时定义了**机械臂实际会走的那条路**：JTC 拿到的是展开后的值，
+        所以整段护栏（:meth:`_path_ok`）必须用同一份值去采样，否则护栏量的
+        和控制器走的不是同一条线。
+        """
+        out = [float(v) for v in positions]
+        for i, name in enumerate(joint_names):
+            if name in self._current_joints:
+                curr = self._current_joints[name]
+                diff = out[i] - curr
+                out[i] = curr + math.atan2(math.sin(diff), math.cos(diff))
+        return out
+
+    def _path_ok(self, target: JointAngles) -> bool:
+        """整段护栏（B）：**当前位置 → 目标**这整条路都要在台面之上（D49）。
+
+        为什么单查端点不够
+        ------------------
+        :meth:`_posture_ok` 只判一个位姿。而臂是从当前位姿**连续**走到目标的：
+        两端都在台面之上，中间照样可以俯冲下去再抬起来 —— 尤其在大幅度换
+        分支的动作里（比如从抓取区摆到放置区）。这一条把中间的采样点也查一遍。
+
+        为什么这是「近似」而不是「精确」
+        --------------------------------
+        它假设控制器沿**关节空间直线**插值。JTC 单点轨迹的实际插值是一条
+        两端速度为零的单调曲线（既不过冲、也不越出两端），关节空间的**路径**
+        与这条直线几乎重合，但严格来说不相等。所以本检查是**保守近似**，
+        由 ``guard_margin``（默认 2 cm）吸收这点偏差。采样点数由
+        ``guard_path_samples`` 控制；设 0 或负数即退回「只查终点」。
+
+        FK 查不通时**拒绝** —— 与 :meth:`_posture_ok` 同一条 fail-closed 纪律。
+        """
+        if not self.elbow_guard_enabled:
+            return True
+        if self.guard_path_samples <= 0:
+            return self._posture_ok(target)
+
+        start = [self._current_joints.get(n) for n in self.arm_joints]
+        if any(v is None for v in start):
+            # 还没收到 /joint_states 时拿不到起点。退回端点检查（这比原来更严，
+            # 因为原来连端点都不在这里查），并出声 —— 不静默降级。
+            self.get_logger().warn(
+                "整段护栏拿不到当前关节角（/joint_states 还没来？）——"
+                "这条轨迹只查终点，中间段没有保护。"
+            )
+            return self._posture_ok(target)
+
+        end = self._unwrap_to_nearest(self.arm_joints, target)
+        n = self.guard_path_samples
+        for i in range(n + 1):
+            t = i / n
+            sample = [s + (e - s) * t for s, e in zip(start, end)]
+            if not self._posture_ok(sample):
+                self.get_logger().error(
+                    f"整段护栏拦下：当前位置→目标的关节空间线段在 "
+                    f"{t * 100:.0f}% 处不过（两端本身是过的）—— 这条轨迹不发。"
+                )
+                return False
+        return True
+
     def _send_arm_trajectory(self, arm: JointAngles, duration: float,
                              done_cb: Optional[Callable] = None):
+        """机械臂轨迹的唯一出口 —— 也是**整段护栏**的挂点。
+
+        护栏放在这里而不是每个调用点，是因为这是所有机械臂动作的必经之路：
+        抓取段、放置段、回 HOME 都从这儿走，漏掉一个调用点就是一个洞。
+
+        ⚠️ ``_send_trajectory`` 被仿真夹爪后端复用（只发一个关节），所以护栏
+        挂在 ``_send_arm_trajectory`` 上、**不能**下移到 ``_send_trajectory``：
+        夹爪那一个关节不在 ``guard_links`` 里，硬查会让夹爪一动不动。
+        """
+        if not self._path_ok(arm):
+            # 与「轨迹目标被拒绝」走同一条失败路径（见 _send_trajectory 里
+            # not handle.accepted 那一支），调用方不需要知道护栏的存在。
+            if done_cb:
+                done_cb(None, None)
+            return
         self._send_trajectory(self.arm_joints, arm, duration, done_cb)
 
     # ------------------------------------------------------------------
