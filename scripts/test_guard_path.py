@@ -66,10 +66,40 @@ E_MID = 1.0             # 合成抛物线的顶点，就在线段正中间
 FLOOR = 0.20            # 台面+余量：端点 0.25 在它之上，中点 0.00 在它之下
 
 
+# A 段为了造合成几何会改这些**共享的**节点属性。跑完必须逐个还原 —— 否则后面
+# 的段会在被污染的状态上量，而且**是静默的**。
+#
+# 实测（2026-10-02，板端）：全跑 A/B/C/D 时，D 段拿到的是 A 留下的
+# `guard_links = ["forearm_link"]`（单连杆），于是找不到「两端高、中间低」的
+# 路径，打印「~ 跳过」然后**照样打「✓ 全部通过」**；而 `--only D` 能找到那条
+# 路径并真的拦下它（两边的数字与开发机逐位一致）。
+# ⇒ 同一个自检，**D 段的强度取决于它是被全跑还是被单跑**，而全跑那个绿是假的。
+# 这正是本轮在查的那类病：**「没测到」和「测到了、是好的」长得一模一样。**
+_MUTATED_BY_A = (
+    "_call_fk", "guard_links", "table_plane_z", "guard_margin",
+    "elbow_guard_enabled", "arm_joints", "_current_joints",
+    "guard_path_samples",
+)
+
+
 def part_a(node):
     print("\n===== A. 整段采样：中段俯冲能不能被拦下 =====")
     before = len(_failures)
 
+    saved_attrs = {a: getattr(node, a) for a in _MUTATED_BY_A}
+    saved_warn = node.get_logger().warn
+    try:
+        _part_a_body(node)
+    finally:
+        # 中途抛异常也照样还原 —— 否则一次失败会顺着状态污染把后面的段带歪，
+        # 把真正的失败信息埋掉。
+        for a, v in saved_attrs.items():
+            setattr(node, a, v)
+        node.get_logger().warn = saved_warn
+    return len(_failures) == before
+
+
+def _part_a_body(node):
     if True:                                     # 只为保持原来的缩进层次
         # 合成几何：z(elbow) = (elbow - E_MID)² —— 非线性，所以沿关节空间
         # 直线插值时高度是抛物线。取线段端点 elbow = 0.5 / 1.5。
@@ -176,8 +206,6 @@ def part_a(node):
         check(node._path_ok(wrap),
               "A8 目标写成 +2π 的等价角 → 按原地不动判（不做一圈大回转）")
 
-    return len(_failures) == before
-
 
 # ----------------------------------------------------------------------
 # D. 接真 FK：在真 UR5 模型上，整段检查真的会开火吗
@@ -195,7 +223,7 @@ def part_a(node):
 #
 # 需要 /compute_fk 在。它不在就**跳过**（不算失败）—— 这个自检在没起 MoveIt
 # 的机器上照样要能跑。
-def part_d(node, fk):
+def part_d(node, fk, pristine_guard_links):
     print("\n===== D. 真 UR5 模型上的整段检查（要 /compute_fk，没有就跳过）=====")
     before = len(_failures)
 
@@ -207,6 +235,16 @@ def part_d(node, fk):
     # ⚠️ A 段把 _call_fk 打了桩，这里必须换回来 —— 否则本段量的是合成几何，
     # 却顶着「真 UR5 模型」的标题，是一个**看起来很硬、其实什么都没验**的绿。
     node._call_fk = fk
+
+    # ★ 先钉死「量的是哪几个连杆」。A 段会改 `guard_links`，若它没还原干净，
+    #   本段就会在**单连杆**几何上找不到俯冲路径 → 「跳过」→ 「全部通过」。
+    #   这是一个**沉默的**假绿，所以这里宁可直接判失败，也不去打那个勾。
+    #   （正常路径下 part_a 的 finally 已经还原，这一条是兜底断言。）
+    if sorted(node.guard_links) != sorted(pristine_guard_links):
+        check(False, "D 前置：护栏量的是原装的 guard_links",
+              f"拿到 {node.guard_links}，原装 {pristine_guard_links} ——"
+              f" 状态被前面的段污染了，本段不测（否则会静默跳过并报绿）")
+        return False
 
     links = list(node.guard_links)
     arm = list(node.arm_joints)
@@ -395,6 +433,8 @@ def main():
                      "-p", "carry_objects:=false"])
     node = GraspPlanner()
     real_fk = node._call_fk          # A 段会打桩，D 段要用回真的
+    # D 段拿它当「原装值」，用来断言前面的段没把状态漏过来（见 part_d 的说明）
+    pristine_guard_links = list(node.guard_links)
 
     # ⚠️ 必须**转**这个节点。`_call_fk` 是「投出去 → 用 threading.Event().wait()
     # 阻塞等 future」的写法，它自己**不转执行器**，靠的是**别处**在 spin
@@ -413,7 +453,7 @@ def main():
         if args.only in (None, "C"):
             ok = part_c() and ok
         if args.only in (None, "D"):
-            ok = part_d(node, real_fk) and ok
+            ok = part_d(node, real_fk, pristine_guard_links) and ok
     finally:
         # rclpy 的 SIGINT/SIGTERM 处理器会自己调 shutdown，所以这里必须挡一道
         # （与仓内其它节点同一个写法）：否则信号一到，收尾反而抛 RCLError，
