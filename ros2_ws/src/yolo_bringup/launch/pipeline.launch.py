@@ -12,6 +12,16 @@ Launch 文件: 启动感知+抓取流水线 (不含 Gazebo)
   # 相机由别人提供（外部驱动/已有 rosbag），本文件只起上层节点
   ros2 launch yolo_bringup pipeline.launch.py camera_source:=external
 
+⚠️ 非仿真的两个入口默认是「**只走位**」：`gripper_backend:=none` +
+`carry_objects:=false`（第一个真机 demo 的定义就是不抓取）。要真夹取必须
+**显式**给 —— 而且是三件一起给，少一件都不是你以为的那个意思：
+
+    gripper_backend:=ag95 carry_objects:=true    # 再另配 ag95_dry_run:=false
+                                                # （yaml 里的全局闸，见 gripper.py）
+
+理由见下面 `gripper_backend` / `carry_objects` 两处声明上的长注释（D71）：
+这两个默认值原先叠起来是「一跑就动夹爪」，而当时唯一拦着的是一层全局开关。
+
 相机来源用**单个枚举**而不是 use_sim/use_realsense 两个布尔量：
 两个布尔量存在「都为真」这种无意义且必须额外校验的状态，枚举没有。
 对上层节点 yolo_detector / perception_3d / grasp_planner 而言**话题名一致**，
@@ -345,23 +355,39 @@ def generate_launch_description():
     )
     # 夹爪后端的默认值**随 camera_source 变**，理由同 depth_topic：
     #   sim        → 夹爪就是 JTC 的第 7 个关节（Robotiq 2F-85），发轨迹即可
-    #   realsense/ → 夹爪是**独立的 Modbus 设备**（大寰 AG-95），不在 JTC 里。
-    #   external
-    # 真机上若仍默认 sim，规划器会去命令一个**真机不存在的关节**
-    # robotiq_85_left_knuckle_joint——JTC 收下这条轨迹却不动任何东西，
-    # 于是「夹爪没反应」而不报错。故真机默认 ag95（它**会大声报错**：后端一构造就去
-    # 开串口，板上没适配器时抛 RuntimeError，见 grasp_planner/gripper.py）——
-    # 这里取的是「响亮失败」，不是「能跑」。⚠️ 只起上层节点时（external）记得传
-    # gripper_backend:=none，否则规划器启动即死。
+    #   realsense/ → **none**：不驱动夹爪，配合下面的 carry_objects:=false
+    #   external      走「只走位」。真机上要真夹取，**显式**给三件套：
+    #                 gripper_backend:=ag95 carry_objects:=true
+    #                 （且 ag95_dry_run:=false 是另一道独立的闸，见 gripper.py）
+    #
+    # ⚠️ 这一条改过（第六十二轮补记的 D71），原先是 `else 'ag95'`，理由写的是
+    # 「ag95 会**大声报错** —— 后端一构造就去开串口，板上没适配器时抛
+    # RuntimeError」。那个理由**已经失效**：2026-10-01 查实板上 USB-RS485
+    # 适配器在位（`0403:6001` → `/dev/ttyUSB0`）、且 **pymodbus 3.15.0 已装**
+    # ⇒ ag95 现在**构造得起来**，不再响亮失败，它只是安静地连上真夹爪。
+    #
+    # 而 `planner_node` 在**只走位模式（carry_objects:=false）下仍然会调用
+    # `gripper.open()`** —— 那是初始化那一步（`_start_initial_home`），
+    # 由 test_real_launch.py 的可达性分析钉着：「open() 恰有两处可达
+    #（初始化 + 失败恢复）」。于是「ag95 + dry_run:=false」时，
+    # **节点一启动就写寄存器** = 装在臂上的真夹爪会动，
+    # 与外部驱动（camera_source:=external 的立命之本就是「别碰机械臂」）
+    # 完全矛盾。
+    #
+    # ⇒ 默认改成 none：非仿真入口的默认组合 = **只走位**，与 real.launch.py
+    # 的选择、与「第一个真机 demo 不抓取」的决策一致。真夹取改为显式申请。
+    # none + carry_objects:=true 会在启动时**大声抛错**（NullGripper，见
+    # gripper.py），所以这两个默认值是成对自洽的，不会滑出「静默地以为在夹」。
     gripper_backend_default = PythonExpression([
         "'sim' if '", LaunchConfiguration('camera_source'),
-        "' == 'sim' else 'ag95'",
+        "' == 'sim' else 'none'",
     ])
     gripper_backend_arg = DeclareLaunchArgument(
         'gripper_backend', default_value=gripper_backend_default,
         description='sim | ag95 | none — 夹爪后端。sim = JTC 第 7 关节；'
-                    'ag95 = 独立 Modbus 设备（真机）；none = 不驱动夹爪，'
-                    '只配 carry_objects:=false。默认随 camera_source。'
+                    'ag95 = 独立 Modbus 设备（真机，**会动**，要显式给）；'
+                    'none = 不驱动夹爪，须配 carry_objects:=false（默认）。'
+                    '默认随 camera_source：只有 sim 是 sim，其余都是 none。'
     )
     # IK 组名与轨迹 action 的默认值同样**随 camera_source 变**，理由与
     # gripper_backend / depth_topic 一致：这两项在真机与仿真上是**不同的名字**，
@@ -421,13 +447,30 @@ def generate_launch_description():
                     '「闭合 − 张开」的指尖落差。仿真 2F-85 0.01 / 真机 AG-95'
                     '0.0156（未验收）。默认随 camera_source。'
     )
-    # 只走位演示（第一个真机 demo）要用 carry_objects:=false，否则规划器会去
-    # 闭合一个不存在的夹爪。它**必须**和后端一起给：none 后端 + true 会在
-    # planner_node 启动时直接抛错（刻意如此，见 gripper.py 的 NullGripper）。
+    # carry_objects 的默认值**也随 camera_source 变**（同 D71 那一改）：
+    #   sim  → true  ：仿真的完整演示本来就要搬运
+    #   其余 → false ：**只走位**。第一个真机 demo 的定义就是「不抓取」
+    #                  （决策 7），而且 non-sim 的后端默认已经是 none。
+    #
+    # ⚠️ 原先这里写死 'true'，理由是「只走位演示自己传 false 就行」。在
+    # `camera_source:=external` 与直接调本文件的入口上，那句话不成立：
+    # 顶层不传就拿到 true，而 true 的含义是**规划器到时会真的去闭合夹爪**。
+    # 它与 `gripper_backend` 原先那个 `ag95` 默认叠在一起 = 「一跑就动夹爪」，
+    # 而当时唯一拦着的是 `ag95_dry_run:=true` 那一层 —— 一层**全局**开关，
+    # 丙-1 的离臂试写要把它翻成 false，翻了之后**所有入口**一起失去这层。
+    # 安全的东西不能只写在**一个**入口里（real.launch.py），别的入口不继承。
+    #
+    # 两个默认值必须成对：none 后端 + true 会在 planner_node 启动时**直接抛错**
+    # （刻意如此，见 gripper.py 的 NullGripper）—— 响亮，不会静默。
+    carry_objects_default = PythonExpression([
+        "'true' if '", LaunchConfiguration('camera_source'),
+        "' == 'sim' else 'false'",
+    ])
     carry_objects_arg = DeclareLaunchArgument(
-        'carry_objects', default_value='true',
+        'carry_objects', default_value=carry_objects_default,
         description='false = 只走位、不夹持（第一个真机 demo）。'
-                    '须与 gripper_backend:=none 成对使用。'
+                    '须与 gripper_backend 成对：none↔false、ag95↔true。'
+                    '默认随 camera_source：只有 sim 是 true。'
     )
     # 感知单测 / 真机分阶段验收需要**只起感知、不起抓取**。
     # 这与 gripper_backend 的默认值是两个正交的问题：前者是「本轮验不验抓取」，

@@ -753,6 +753,32 @@ def main():
         check("丢弃检测时给出**累计**批数（限流日志里要能分辨「偶尔」与「一直」）",
               "_sync_drops += 1" in node_src and "累计 {self._sync_drops} 批" in node_src)
 
+        # ------------------------------ 非仿真入口的默认组合必须是「只走位」（D71）
+        #
+        # 这两个默认值原先叠起来是「一跑就动夹爪」：gripper_backend 非 sim 给
+        # ag95（当时它会**大声报错**，因为板上没适配器 —— 那个前提 2026-10-01
+        # 失效了：适配器在位、pymodbus 3.15.0 已装），carry_objects 写死 true。
+        # 而 planner_node 在**只走位模式下仍会调用 `gripper.open()`**（初始化那一步，
+        # 由本文件的可达性分析钉着），所以 ag95 + dry_run:=false 时**节点一启动
+        # 就写寄存器** = 臂上的真夹爪会动，与 camera_source:=external「别碰机械臂」
+        # 的立命之本矛盾。唯一拦着的 `ag95_dry_run` 是**全局**开关，丙-1 要翻它。
+        print("\n--- W2-17 非仿真入口默认「只走位」（D71：默认值也不能让夹爪动）---")
+        gb = _raw_default(pipeline, "gripper_backend")
+        co = _raw_default(pipeline, "carry_objects")
+        # 成对表：backend ↔ carry 必须是自洽的那一对，否则启动就抛错（NullGripper）
+        PAIR = {"sim": "true", "ag95": "true", "none": "false"}
+        for src, want_backend in (("sim", "sim"), ("realsense", "none"),
+                                  ("external", "none")):
+            got_b = _resolve_default_in(gb, camera_source=src)
+            got_c = _resolve_default_in(co, camera_source=src)
+            check(f"camera_source:={src} 的默认夹爪后端 = {want_backend}",
+                  got_b == want_backend, f"got {got_b!r}")
+            check(f"camera_source:={src} 的默认 carry_objects = {PAIR[want_backend]}"
+                  f"（与后端成对）", got_c == PAIR[want_backend], f"got {got_c!r}")
+            check(f"camera_source:={src} 的默认组合**不会让夹爪动**"
+                  f"（要真夹取必须显式给 ag95 + true）",
+                  got_b != "ag95", f"gripper_backend 默认成了 {got_b!r}")
+
         # ------------------------------------------------ 参数面完整性（整条规则）
         print("\n--- W2-12 唯一入口的参数面完整性：传给节点的每一个参数都有声明 ---")
         # 这条规则是 D50 家族的一般化：**未声明的参数会被 launch 接受**并塞进
