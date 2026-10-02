@@ -51,6 +51,19 @@ from board_extrinsics import quat_to_matrix                        # noqa: E402
 import auto_label_grid as L                                        # noqa: E402
 
 
+# 交付方式是**本地文件**（本会话发不了 artifact），所以默认输出一份**完整的
+# 独立文档**：没有 `<meta charset>` 的本地 HTML，浏览器会按系统区域猜编码，
+# 中文界面在中文 Windows 上极可能被当成 GBK 解成乱码 —— 而且它"看起来还能用"，
+# 只是字全糊了，属于最难发现的一类。`--bare` 才输出裸片段（供 artifact 用，
+# 平台会自己套骨架）。
+SKEL_HEAD = (
+    '<!doctype html>\n<html lang="zh-CN">\n<head>\n'
+    '<meta charset="utf-8">\n'
+    '<meta name="viewport" content="width=device-width, initial-scale=1, '
+    'viewport-fit=cover">\n')
+SKEL_MID = '</head>\n<body>\n'
+SKEL_TAIL = '</body>\n</html>\n'
+
 TEMPLATE = r"""<title>顶视方块点选</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -252,6 +265,7 @@ TEMPLATE = r"""<title>顶视方块点选</title>
   }
 </style>
 
+<!--BODY-->
 <div class="shell">
   <header>
     <h1>顶视方块点选</h1>
@@ -620,6 +634,8 @@ def main(argv=None):
     ap.add_argument('--image', required=True, help='顶视画面 PNG')
     ap.add_argument('--size-mm', type=float, default=28.5, help='方块边长默认值')
     ap.add_argument('--out', required=True, help='输出 HTML 路径')
+    ap.add_argument('--bare', action='store_true',
+                    help='只输出片段，不套独立文档骨架（供 artifact 发布用）')
     a = ap.parse_args(argv)
 
     info = json.load(open(a.info))
@@ -685,12 +701,16 @@ def main(argv=None):
         't': [float(x) for x in t],
         'img': 'data:image/png;base64,' + b64,
     }
-    html = TEMPLATE.replace('__CFG__', json.dumps(cfg))
+    head, body = TEMPLATE.split('<!--BODY-->')
+    html = head + body if a.bare else SKEL_HEAD + head + SKEL_MID + body + SKEL_TAIL
+    html = html.replace('__CFG__', json.dumps(cfg))
 
     with open(a.out, 'w') as f:
         f.write(html)
 
-    print('写出 %s（%.2f MB）' % (a.out, os.path.getsize(a.out) / 1e6))
+    print('写出 %s（%.2f MB，%s）'
+          % (a.out, os.path.getsize(a.out) / 1e6,
+             '裸片段' if a.bare else '独立文档'))
     print('  画面 %d×%d  边长默认 %.1f mm  点选平面 z=%.5f（顶面）'
           % (cfg['W'], cfg['H'], a.size_mm, z_click))
     print('  自检：探针顶面 (%.3f, %.3f, z=%.5f) → 投影 → 反投 (%.3f, %.3f)，'

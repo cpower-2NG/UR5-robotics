@@ -10248,9 +10248,18 @@ d = proj.R.T @ d_cam        # ← 错
 | 2 | 页面 JS **从生成出来的 HTML 里抽源码**交给 node 跑，逐像素比对 | 四个像素一致 **< 1e-6 m** |
 | 3 | 变异 A：页面 `planeZ` 改成中心平面 | 第 [3] 节**变红**（0.0288 m）；还原后 exit=0 |
 | 4 | 变异 B：生成器 `plane_z` 改成中心平面 | **12.10 mm → exit 2** |
-| 5 | `scripts/test_make_click_labeler.py` | **10 PASS / 0 FAIL** |
+| 5 | `scripts/test_make_click_labeler.py` | **16 PASS / 0 FAIL** |
 | 6 | `scripts/test_propose_block_positions.py`（并集改动后） | **8 PASS / 0 FAIL** |
 | 7 | 其余 20 个 `test_*.py` | 非零退出的 8 个**与 HEAD 逐一比对完全一致**，不是本轮改坏的 |
+| 8 | 变异 C：去掉输出文档的 `charset` 声明 | 第 [1] 节**变红**；还原后 exit=0 |
+
+**第 8 条是「交付方式变了、没人提醒」那类缺陷。** 页面最初照 artifact 的规矩写
+（**不带** `<!doctype>` / `<head>` / `charset`，平台会自己套骨架），可本轮实际
+**发不了 artifact**，只能当本地文件交付 —— 而没有 `charset` 的本地 HTML，
+浏览器按系统区域猜编码，中文 Windows 上极可能把整个中文界面解成乱码，
+**页面还"看起来能用"，只是字全糊了**。现在默认输出**独立文档**，
+`--bare` 才给 artifact 用。这条纯粹是"确认产物到底长什么样"查出来的，
+没有任何测试或报错会提醒。
 
 **第 4 条要单独说，因为它抓到的是我自己写的假绿灯。** 生成器原来的那段自检
 拿 `plane_z()` 去**造**探针、又拿 `plane_z()` 去**反投** —— 被测的和造数据的是
@@ -10265,7 +10274,8 @@ d = proj.R.T @ d_cam        # ← 错
 
 - **页面发不成 artifact**：本会话用 `ANTHROPIC_AUTH_TOKEN`，与 claude.ai 登录冲突，
   `Artifact` 一律拒绝。所以落在 `.scratch/click_labeler.html`（已入 `.gitignore`），
-  本地浏览器打开即可；要托管版则需要 `/login` 换成 claude.ai 账号。
+  本地浏览器打开即可；要托管版则需要 `/login` 换成 claude.ai 账号 ——
+  那时用 `--bare` 重新生成一份即可（默认那份带骨架，会和外层骨架打架）。
 - **点选平面按单一边长**：页面上的「边长」默认 28.5 mm，混尺寸时逐次改。
 - **人工点选是每一轮摆场的固定成本**，不是一次性投入。换来的是毫米级精度。
 - 提案器从此**降级为粗筛**：它的产出是「给复核图的建议」，不再是「给 labeler 的

@@ -111,6 +111,25 @@ def main():
         check('__CFG__ 占位符已全部替换', '__CFG__' not in html)
         check('画面以 data URI 内嵌', 'data:image/png;base64,' in html)
 
+        # 交付方式是**本地文件**，所以必须自带 charset —— 否则中文界面的编码
+        # 交给系统区域去猜，中文 Windows 上会被当成 GBK 解成乱码，而且页面
+        # "看起来还能用"，只是字全糊了。这个坑本轮真踩到过一次。
+        check('默认输出是独立文档（有 doctype）',
+              html.lstrip().lower().startswith('<!doctype html>'))
+        check('声明了 charset=utf-8', 'charset="utf-8"' in html)
+        check('head 里有标题', '<title>' in html[:8192])
+        check('body 标签闭合齐', html.rstrip().endswith('</html>'))
+
+        p_bare = os.path.join(d, 'bare.html')
+        M.main(['--info', p_info, '--extrinsics', p_extr, '--image', p_img,
+                '--size-mm', '28.5', '--out', p_bare, '--bare'])
+        bare = open(p_bare).read()
+        check('--bare 不带骨架（供 artifact 用）',
+              '<!doctype' not in bare.lower() and '<html' not in bare.lower()
+              and '<body' not in bare.lower())
+        check('--bare 仍然内嵌画面与 CFG',
+              'data:image/png;base64,' in bare and '__CFG__' not in bare)
+
         # ------------------------------------------- [2] 变异：平面选错
         print('\n[2] 变异：点选平面必须是顶面（z_top），不是中心平面（zc）')
         proj = L.TfProjector(info, extr)
