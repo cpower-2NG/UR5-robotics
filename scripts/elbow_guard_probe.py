@@ -35,7 +35,8 @@
     python3 scripts/elbow_guard_probe.py
     python3 scripts/elbow_guard_probe.py --node /grasp_planner --grid 4
 
-退出码：0 = 全部连杆都在护栏之上（可以动）；1 = 有连杆低于护栏（**不要动**）。
+退出码：0 = 全部连杆都在护栏之上（可以动）；1 = 有连杆低于护栏（**不要动**）；
+2 = **一个位姿都没解出来**（环境不满足，结论无从谈起 —— 先查 ik_group / /compute_ik）。
 只调 /compute_ik 与 /compute_fk，**绝不发轨迹**。
 """
 
@@ -47,7 +48,8 @@ import rclpy
 from rclpy.node import Node
 from rcl_interfaces.srv import GetParameters
 from sensor_msgs.msg import JointState
-from moveit_msgs.srv import GetPositionFK, GetPositionIK
+from moveit_msgs.srv import GetPositionFK, GetPositionIK, GetPlanningScene
+from moveit_msgs.msg import PlanningSceneComponents
 
 # 与 planner_node.grasp_planner 默认值一致的兜底（节点读不到参数时才用）
 FALLBACK = {
@@ -135,26 +137,64 @@ def val(rs, i, default):
 
 
 class Probe(Node):
-    def __init__(self, target_node):
+    def __init__(self, target_node, ik_group=None):
         super().__init__("elbow_guard_probe")
         self.target = target_node
+        # 覆盖规划组名。**没有 /grasp_planner 可读参数时必须给**：兜底默认是仿真
+        # 的 ur5_manipulator，而真机链路的组名是 ur_manipulator（ur_moveit_config
+        # 硬编码 name:=ur），用错会得到 44/44 的 INVALID_GROUP_NAME（实测，2026-10-02）。
+        self.ik_group_override = ik_group
         self.pget = self.create_client(GetParameters, f"{target_node}/get_parameters")
         self.ik = self.create_client(GetPositionIK, "/compute_ik")
         self.fk = self.create_client(GetPositionFK, "/compute_fk")
+        self.scene = self.create_client(GetPlanningScene, "/get_planning_scene")
+        self._model_joints = None      # 只查一次；None = 还没查，set() = 查不到
+        self._warned_gripper = False   # 「模型里没这个关节」只提示一次
+
+    # ---- 模型里到底有哪些关节 ----
+    def model_joint_names(self):
+        """问 move_group 要**它自己模型里**的关节名集合（失败返回空集）。
+
+        ⚠️ 这不是锦上添花，是一条**血换来的**护栏。IK 请求里的 robot_state 若
+        带了模型不认识的关节名，move_group **不是**忽略它，而是抛
+        `moveit::Exception`：「Variable 'robotiq_85_left_knuckle_joint' is not
+        known to model 'ur'」，没人接 ⇒ `std::terminate` ⇒ **SIGABRT 整个进程
+        死掉**（实测，2026-10-02）。之后所有 IK 调用都变成「服务未应答」，
+        而本脚本原来会把「一个位姿都没解出来」报成**退出码 0 = 通过**。
+
+        所以：**宁可不给夹爪值，也不给错的名字**。查不到就返回空集，
+        调用方据此**不注入**夹爪关节。
+        """
+        if self._model_joints is not None:
+            return self._model_joints
+        self._model_joints = set()
+        if not self.scene.wait_for_service(timeout_sec=5.0):
+            print("⚠️ /get_planning_scene 不在 —— 无法确认模型关节名，"
+                  "本次**不给 IK 请求注入夹爪关节**（注入错名字会让 move_group 崩）。")
+            return self._model_joints
+        req = GetPlanningScene.Request()
+        req.components.components = PlanningSceneComponents.ROBOT_STATE
+        fut = self.scene.call_async(req)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)
+        if not fut.done() or fut.result() is None:
+            print("⚠️ /get_planning_scene 没回话 —— 同上，不注入夹爪关节。")
+            return self._model_joints
+        self._model_joints = set(fut.result().scene.robot_state.joint_state.name)
+        return self._model_joints
 
     # ---- 读运行中节点的参数 ----
     def read_params(self):
         if not self.pget.wait_for_service(timeout_sec=5.0):
             print(f"⚠️ {self.target} 的 get_parameters 不可用 —— 用兜底默认值。\n"
                   "   （节点没起？本脚本量的就不是它将要走的位姿了。）")
-            return dict(FALLBACK)
+            return self._apply_override(dict(FALLBACK))
         req = GetParameters.Request()
         req.names = PARAM_NAMES
         fut = self.pget.call_async(req)
         rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)
         if not fut.done() or fut.result() is None:
             print("⚠️ 读参数超时 —— 用兜底默认值。")
-            return dict(FALLBACK)
+            return self._apply_override(dict(FALLBACK))
         rs = fut.result()
         p = {}
         for i, name in enumerate(PARAM_NAMES):
@@ -163,6 +203,16 @@ class Probe(Node):
             if v in ([], 0, 0.0, "") and FALLBACK[name] not in ([], 0, 0.0, ""):
                 v = FALLBACK[name]
             p[name] = v
+        return self._apply_override(p)
+
+    def _apply_override(self, p):
+        """把命令行覆盖叠到参数上（目前只有规划组名）。
+
+        两条取参数的路径（真的读到 / 用兜底）**都要**过这里，否则
+        「读了参数但组名读错」这条路会绕过覆盖。
+        """
+        if self.ik_group_override:
+            p["ik_group"] = self.ik_group_override
         return p
 
     # ---- IK / FK ----
@@ -194,9 +244,19 @@ class Probe(Node):
         #    「can only append array (not "list") to array」。
         names = list(p["arm_joint_names"])
         pos = [float(v) for v in seed]
+        # ⚠️ 只在**确认模型认识这个关节**之后才追加它。否则 move_group 会抛
+        # `moveit::Exception` 并**整个进程 SIGABRT**（见 model_joint_names 的
+        # docstring）—— 一个探测工具把被测服务打死，还报成「通过」。
         if p["gripper_backend"] == "sim" and grip is not None:
-            names.append(p["sim_gripper_joint"])
-            pos.append(float(grip))
+            if p["sim_gripper_joint"] in self.model_joint_names():
+                names.append(p["sim_gripper_joint"])
+                pos.append(float(grip))
+            else:
+                if not self._warned_gripper:
+                    print(f"ℹ️ 模型里没有 {p['sim_gripper_joint']}"
+                          f"（这是**仿真**的夹爪关节，真机 URDF 里不存在）——"
+                          f"本次按「只给 6 个臂关节」解，和 planner_node 的做法一致。")
+                    self._warned_gripper = True
         js = JointState()
         js.name = names
         js.position = pos
@@ -281,10 +341,15 @@ def main():
     ap.add_argument("--stress", action="store_true",
                     help="额外采样 pick_zone 的 z 上下界（区域边界，不是真位姿；"
                          "会解不出来一批，属预期）")
+    ap.add_argument("--ik-group", default=None,
+                    help="覆盖规划组名。**没有 /grasp_planner 可读参数时必须给** —— "
+                         "兜底默认是仿真的 ur5_manipulator，而真机链路（"
+                         "ur_moveit_config 硬编码 name:=ur）的组名是 ur_manipulator，"
+                         "用错会得到 44/44 的 INVALID_GROUP_NAME（实测）。")
     args = ap.parse_args()
 
     rclpy.init()
-    pr = Probe(args.node)
+    pr = Probe(args.node, ik_group=args.ik_group)
     try:
         if not pr.ik.wait_for_service(timeout_sec=10.0):
             print("!! /compute_ik 不可用 —— move_group 起了吗？")
@@ -392,7 +457,21 @@ def main():
         print("\n提醒：本脚本只证明「肘/大臂解在桌面之上」，它**不**替代")
         print("      · 桌面进 MoveIt 规划场景（W1b 第 2 项）")
         print("      · 单步低速 + 急停就绪的第一次真机动作")
-        return 1 if rejected else 0
+
+        # 退出码。⚠️ 原来这里是 `return 1 if rejected else 0`，于是
+        # **一个位姿都没解出来**（lo 是 NaN、rejected 空）时报的是 **0 = 通过** ——
+        # 「什么都没量到」被报成「全部都在护栏之上」。本脚本是 W5 第 4b 步的闸门，
+        # 而 moveit_only_check.py 又按退出码决定整个预检的成败，所以这个假绿会把
+        # 4b 直接放过去（实测踩到：--no-pipeline 下 44/44 INVALID_GROUP_NAME + EXIT=0）。
+        if rejected:
+            return 1
+        if math.isnan(lo):
+            return 2
+        # HOME 位低于护栏同样是一条「不要上电」的结论（护栏会在初始化拦死自己），
+        # 原来只打印 ⛔、不影响退出码。
+        if not math.isnan(home_lo) and home_lo < floor:
+            return 1
+        return 0
     finally:
         pr.destroy_node()
         rclpy.shutdown()

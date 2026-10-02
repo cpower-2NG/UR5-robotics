@@ -30,6 +30,16 @@
 ----
     python3 scripts/moveit_only_check.py
     python3 scripts/moveit_only_check.py --grid 6
+    python3 scripts/moveit_only_check.py --no-pipeline    # 见下
+
+`--no-pipeline`：不 include `pipeline.launch.py`。**开发机上没有
+`ros-humble-realsense2-camera` 时必需** —— `camera_source:=realsense` 会去拉那个包，
+拉不到就**把整个 launch 带崩**（`move_group` 已经起来了也会被 SIGINT 掉，而报错行
+只讲相机，看起来像 MoveIt 坏了）。板子上装了相机包，**默认不加这个开关**。
+
+⚠️ 加了它就没有 `/grasp_planner` 了，`elbow_guard_probe.py` 会退回它自己的
+   兜底默认值并**打警告**。所以这个开关只用于「验 MoveIt 链路本身通不通」，
+   **不要**用它去主持护栏口径的判读（护栏要读运行中节点的参数才算数）。
 
 退出码：0 = 探针通过（所有候选连杆在护栏之上）；1 = 探针报告有候选低于护栏；
 2 = 环境不满足（残留进程 / 缺包 / 服务起不来）。
@@ -65,8 +75,52 @@ def leftovers():
     return out
 
 
-def sh(cmd, **kw):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+def sh(cmd, timeout=15, **kw):
+    """跑一条命令，**带超时**。
+
+    ⚠️ 这个超时不是装饰：`ros2` 的 CLI 在某些环境里（WSL2 实测）会**永远挂住**
+    —— `ros2 service list` 既不返回也不报错。没有超时的话，本脚本会卡在
+    `wait_for_services` 之外的那些调用上，连 `finally` 的收尾都跑不到。
+    """
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        print(f"  ! `{cmd}` {timeout}s 没返回（环境问题？当没就绪处理）")
+        return subprocess.CompletedProcess(cmd, returncode=124, stdout="",
+                                           stderr="timeout")
+
+
+def wait_for_services(needed, timeout=180.0):
+    """等一组服务出现在 ROS 图里，返回 (是否齐了, 用时秒)。
+
+    **不走 `ros2` CLI，直接问 rclpy 的图发现。** 原因是实测出来的：
+    `ros2 service list` 在 WSL2 上**永远挂住**（既不返回也不报错）。原来第 4 步
+    每轮 `sleep 5` 再跑一次 CLI、超时 15 s ⇒ **一轮 20 s**，跑满 36 轮要
+    **12 分钟**才吐出一句「/compute_ik 没起来」—— 而那是**假结论**：同一时刻
+    move_group 已经在打 `You can start planning now!`。挂住和「服务真的不在」
+    是两件事，用 CLI 分不开，用 rclpy 就分得开，而且板子上行为一致。
+    """
+    import rclpy
+    from rclpy.node import Node
+
+    own = not rclpy.ok()
+    if own:
+        rclpy.init()
+    node = Node("moveit_only_check_ready")
+    t0 = time.monotonic()
+    try:
+        while time.monotonic() - t0 < timeout:
+            rclpy.spin_once(node, timeout_sec=0.2)
+            names = {n for n, _ in node.get_service_names_and_types()}
+            if all(s in names for s in needed):
+                return True, time.monotonic() - t0
+            time.sleep(0.3)
+        return False, time.monotonic() - t0
+    finally:
+        node.destroy_node()
+        if own and rclpy.ok():
+            rclpy.shutdown()
 
 
 def main():
@@ -75,6 +129,9 @@ def main():
                     help="肘探针的采样密度（传给 elbow_guard_probe.py）")
     ap.add_argument("--ur-type", default="ur5")
     ap.add_argument("--log", default="/tmp/moveit_only_check.log")
+    ap.add_argument("--no-pipeline", action="store_true",
+                    help="不 include pipeline.launch.py（开发机没装 "
+                         "realsense2_camera 时必须；见模块 docstring）")
     args = ap.parse_args()
 
     if not os.environ.get("ROS_DISTRO"):
@@ -108,7 +165,8 @@ def main():
         spawn("launch",
               "ros2 launch yolo_bringup real.launch.py "
               "start_ur_driver:=false publish_camera_tf:=false "
-              "tf_required:=false gripper_backend:=none carry_objects:=false",
+              "tf_required:=false gripper_backend:=none carry_objects:=false"
+              + (" start_pipeline:=false" if args.no_pipeline else ""),
               args.log)
 
         # 2) robot_state_publisher（未标定 URDF；⚠️ 只用于预检，见模块 docstring）
@@ -128,25 +186,34 @@ def main():
                                "fake_joint_states.py")
         spawn("fake_js", f"python3 {fake_js}", "/tmp/moveit_only_check_js.log")
 
-        # 4) 等 /compute_ik
-        ready = False
-        for i in range(36):
-            time.sleep(5)
-            if sh("ros2 service list").stdout.find("/compute_ik") >= 0:
-                ready = True
-                print(f"/compute_ik 就绪（约 {(i + 1) * 5} 秒）")
-                break
+        # 4) 等 /compute_ik（rclpy 图发现，不走 CLI —— 见 wait_for_services）
+        ready, waited = wait_for_services(["/compute_ik"], timeout=180.0)
         if not ready:
-            print("120 秒内 /compute_ik 没起来 —— 日志：", args.log)
+            print(f"{waited:.0f} 秒内 /compute_ik 没起来 —— 日志：", args.log)
             return 2
+        print(f"/compute_ik 就绪（约 {waited:.0f} 秒）")
 
         # 5) 肘高探针（只读）
-        probe = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "elbow_guard_probe.py")
-        rc = subprocess.call(
-            [sys.executable, probe, "--node", "/grasp_planner",
-             "--grid", str(args.grid)])
-        return rc
+        #    ⚠️ `--no-pipeline` 下**必须**显式给规划组名：没有 /grasp_planner 可读
+        #    参数，探针会退回它自己的兜底默认 `ur5_manipulator`，而这条链路的
+        #    move_group 是 ur_moveit_config 起的（组名 `ur_manipulator`）—— 用错
+        #    的结果是 **44/44 INVALID_GROUP_NAME**，看起来像「全部不可达」（实测，
+        #    2026-10-02）。不加开关时探针读运行中节点的参数，那是权威来源。
+        here = os.path.dirname(os.path.abspath(__file__))
+        probe_cmd = [sys.executable, os.path.join(here, "elbow_guard_probe.py"),
+                     "--node", "/grasp_planner", "--grid", str(args.grid)]
+        if args.no_pipeline:
+            probe_cmd += ["--ik-group", "ur_manipulator"]
+        rc = subprocess.call(probe_cmd)
+
+        # 6) 整段护栏接到真 FK 上验一遍（B）
+        #    上一步量的是**路点**，这一步量的是**路点之间**：在真 UR5 的 URDF 上
+        #    找一条「两端都在台面上、中段却俯冲下去」的真实路径，再看护栏拦不拦。
+        #    只调 /compute_fk，**不发轨迹**；而且本脚本没有驱动、没有
+        #    controller_manager，结构上不可能动。
+        rc2 = subprocess.call(
+            [sys.executable, os.path.join(here, "test_guard_path.py"), "--only", "D"])
+        return rc or rc2
     finally:
         for name, p in reversed(procs):
             try:
