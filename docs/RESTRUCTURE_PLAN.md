@@ -10698,3 +10698,92 @@ mtime 只是**链接自身**的创建时间。
 - **没有**改板子工作树、**没有** `reset`、**没有**删未跟踪文件、**没有**碰 `main`。
 - 未动 `~/yahboom_ws`、`~/ultralytics` 等目录。
 - 未通过 SSH 触发任何机械臂运动。
+
+---
+
+## 第七十六轮：**板子同步做完了** —— 编译通过、自检全绿、感知链路端到端跑通（2026-10-02 夜）
+
+### 一 用户授权与执行
+
+第七十五轮把结论摆出来后，用户选了「**整体推进到本地 HEAD**」。
+第一次尝试被权限闸门拦下（理由是「丢弃板子工作树」），**我没有绕**，
+把证据摆全后由用户明确授权，再执行。
+
+执行顺序（每一步都可回滚）：
+
+1. 备份：`~/yolo_repo_backup_20261002.tar.gz`（174 MB，工作树全量）
+2. 存档：`~/board_dirty_20261002.patch`（1548 行）
+3. `git bundle create ^4f5e781 migrate/humble-orin`（50 MB）→ scp → `git fetch`
+4. 移走 12 个未跟踪文件（**内容与本地 HEAD 逐字节相同**，`reset` 会还原）
+5. `git reset --hard FETCH_HEAD`
+
+### 二 结果
+
+| 项目 | 结果 |
+|---|---|
+| 板子 HEAD | `8ac7c06`（= 本地） |
+| 跟踪文件数 | 本地 **1183** / 板子 **1183** |
+| 全树哈希复验 | 内容不同 **0**、只在板子 **0** |
+| 板子工作树 | **干净**（`git status --porcelain` 输出 0 行） |
+| `colcon build --symlink-install` | 5 个包全 `Finished`，退出码 **0**，6.73 s |
+
+> 「只在本地 3180 个」全部是 `.scratch/`（我的工作暂存目录）+ 少量图片，
+> **被 git 跟踪的文件一个不缺**。
+
+### 三 板端自检：25 个 `scripts/test_*.py`
+
+**必须 source 过 ROS 再跑**，否则 `test_guard_path.py` / `test_pipeline_e2e.py`
+会因 `ModuleNotFoundError: No module named 'rclpy'` 假红（第一次就是这么红的）。
+
+source 之后：**23 个直接通过**，余下两个的处置见下。
+
+### 四 查出并修掉一条陈旧断言（真缺陷）
+
+`test_real_launch.py` 断言真机 `tool0_to_fingertip == "0.172"`，
+而 `pipeline.launch.py:147` 早就是 `REAL_TOOL0_TO_FINGERTIP = '0.1757'`
+（204.2 定案）—— 提交 `8ba23c2` **改了常量却漏了这条断言**，板上必红。
+
+- 改断言 + 把来历注释换成 204.2 定案那套（+4 mm 外挂件 ⇒ 188.6 / 204.2）；
+- **变异验证**：把 `REAL_TOOL0_TO_FINGERTIP` 临时改回 `'0.172'`，
+  测试**确实退出码 1 且指名该项**，随后还原 —— 证明这条断言真的在咬，不是永真。
+- 提交 `8ac7c06`。
+
+### 五 另一个红：`test_pipeline_e2e.py` 是「前置没满足」
+
+它要求 pipeline **已在运行**；我裸跑时收到 0 条，于是报 FAILED（退出码 1）。
+按文档前置补上之后：
+
+```
+ros2 launch yolo_bringup pipeline.launch.py camera_source:=external skip_planner:=true
+python3 scripts/test_pipeline_e2e.py
+```
+
+⭐ **退出码 0，全项 PASS** —— `/detections + /camera/depth + TF → /target_3d + /targets_3d`
+整条**感知链路在板上真跑通了**（含 `class_id` / `score` 透传、
+`bbox.center` 与 `results[0].pose` 一致、两个话题坐标一致）。
+
+> ⚠️ **加了 `skip_planner:=true`**：本仓库的规划器一收到 `/targets_3d` 就会去
+> `/compute_ik` 并往轨迹 action 发目标。今天没有控制器在跑（UR 未接），
+> 但把规划器摘掉是**零运动风险**的做法，这类验证以后照此办理。
+>
+> 📌 退出码语义可以更好：前置没满足时报 **1**（失败）而不是 **2**（环境不满足），
+> 会把「没起 pipeline」误读成「链路坏了」。**记在案，本轮不改。**
+
+### 六 顺带澄清一个看着像问题的现象
+
+跑起来后 `ros2 node list` 里出现 `/camera/camera` —— 那是**孤儿 realsense 节点**
+（PIDs 4713/4715，`--params-file /tmp/calib/realsense_camera.yaml -p align_depth.enable:=true`），
+**不是我启动的**（`/tmp/pipe.log` 里没有任何 realsense 启动行）。我全程只读、没杀它。
+
+同时核对了一条**已经修好**的坑：`depth_topic` 的默认值随 `camera_source` 变
+—— 选 `realsense` 会自动指向**对齐后**的话题，只有 `external`/`sim` 才落到
+`/camera/depth/image_raw`。所以「未对齐深度配彩色内参」那个视差偏差（D2）
+在真机路径上**不会发生**，不是缺陷。
+
+### 七 台面账
+
+- 本轮对板子做过的**写**操作：备份文件、patch 存档、`/tmp` 下的 bundle、
+  `git fetch` + `reset --hard`（**用户明确授权**）、`colcon build`（**先前已授权**）、
+  一次临时变异并**立即还原**。
+- **没有**通过 SSH 触发任何机械臂运动；**没有**碰 `main`；**没有**推送。
+- 未动 `~/yahboom_ws`、`~/ultralytics` 等目录。
