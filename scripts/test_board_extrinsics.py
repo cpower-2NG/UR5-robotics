@@ -379,6 +379,111 @@ def main():
               len(ph) == 4 and all(len(r) == 3 for r in ph),
               '形状 %s' % ([len(r) for r in ph],))
 
+    # ── 11. 检测的 ROI 必须**逐级放宽、最后退到整幅** ────────────────────
+    # 2026-10-02 实测踩到的坑，且**不报错**：同一张靶、同一个位置（外接矩形
+    # 逐像素相同），只因为画面里别的东西变了（机械臂吊进来、投在纸上的影子），
+    # `_rough_roi` 的紧框（pad=0.35）下 2x/3x **双双检不出**，放宽到 0.90
+    # 或整幅立刻检出。症状是「靶明明在画面中央，脚本却说找不到角点」。
+    #
+    # 这一节钉三件事：① 变体的顺序与覆盖（结构）；② 紧框全废时**整幅兜底
+    # 仍能端到端检出**（功能）；③ 拿掉兜底那一步就会红（变异）——
+    # 前两条只证明「现在能跑」，第三条才证明**兜底是承重的**。
+    print('[11] 检测 ROI 逐级放宽 + 整幅兜底')
+    try:
+        import cv2
+    except ImportError:
+        print('  SKIP  没有 cv2')
+    else:
+        import board_extrinsics as _B
+
+        # 造一张合成靶图：内角点 8×11 ⇒ 方格 9×12。
+        # ⚠️ 每格 **12 px** 是**试出来的**，不是随手填的：方格大到 14 px 时
+        #    1x 就能干净检出（ratio=1.00），整节就**一档都不会走到**，
+        #    下面三条会「全绿地什么都没测」。12 px 时 1x 的 ratio = 0.00
+        #    （重复行），与真机上那张 150×143 px 的靶同档。
+        #    画布也要够大，否则两个 pad 裁出来的框会**退化成同一个**
+        #    （实测：紧框与 0.90 都等于整幅，去重后就只剩一档）。
+        sq, cols, rows, W, H, ox, oy = 12, 9, 12, 1280, 900, 600, 380
+        img = np.full((H, W, 3), 235, np.uint8)
+        for r in range(rows):
+            for c in range(cols):
+                if (r + c) % 2:
+                    img[oy + r * sq:oy + (r + 1) * sq,
+                        ox + c * sq:ox + (c + 1) * sq] = 25
+        img = cv2.GaussianBlur(img, (3, 3), 0)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        PS = [(cols - 1, rows - 1)]
+
+        # (前置) 这张合成图必须**在 1x 下就检出重复行** —— 否则整节什么
+        #        都没走到，会全绿地骗人（上面那条注释说的就是这个坑）。
+        ok1, c1 = cv2.findChessboardCorners(
+            gray, PS[0],
+            flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.001)
+        r1 = _B.adjacent_spacing_min_ratio(
+            cv2.cornerSubPix(gray, c1, (11, 11), (-1, -1), crit)
+            .reshape(PS[0][1], PS[0][0], 2)) if ok1 else 0.0
+        check('(前置) 合成图 1x 判为退化（否则本节测了个空）', r1 < 0.45,
+              'ratio=%.2f' % r1)
+
+        # ① 结构：第一档是 1x 全幅；每个放大档**最后一档**是整幅
+        vs = list(_B._roi_variants(gray, PS, (1, 2, 3), (0.35, 0.90)))
+        scales_seen = sorted({v[0] for v in vs})
+        check('_roi_variants 覆盖 1/2/3 三档', scales_seen == [1, 2, 3],
+              '实际 %s' % scales_seen)
+        check('第一档是 1x 全幅', vs[0][0] == 1 and vs[0][4] == '1x 全幅',
+              vs[0][4])
+        for sc in (2, 3):
+            tags = [v[4] for v in vs if v[0] == sc]
+            check('%dx 最后一档是整幅兜底' % sc, tags[-1] == '%dx 全幅' % sc,
+                  '实际 %s' % tags)
+            check('%dx 每个 pad 各一档 + 整幅' % sc, len(tags) == 3,
+                  '实际 %s' % tags)
+
+        # ② 功能：把 `_rough_roi` 打成**永远返回不含靶的小框**（模拟「紧框
+        #    与宽框都不行」），端到端仍必须检出 —— 救它的是整幅兜底。
+        ok_box = _B._rough_roi(gray, PS)
+        bad_box = (0, 0, 40, 40)
+        check('(前置) 造出来的坏框确实不含靶', bad_box != ok_box, str(ok_box))
+        real_roi = _B._rough_roi
+        tried = []
+        real_variants = _B._roi_variants
+
+        def spy(g, ps, scales, pads):
+            for v in real_variants(g, ps, scales, pads):
+                tried.append(v[4])
+                yield v
+
+        try:
+            _B._rough_roi = lambda *a, **k: bad_box
+            _B._roi_variants = spy
+            got, found, sc = _B.detect_chessboard(gray, PS, verbose=False)
+            n_want = (cols - 1) * (rows - 1)
+            check('紧框全废时仍检出 %d 点' % n_want,
+                  got is not None and len(got) == n_want,
+                  'got=%s' % (None if got is None else len(got)))
+            check('而且**确实走到了**整幅那一档',
+                  any(t.endswith('全幅') for t in tried[1:]),
+                  '试过 %s' % tried)
+
+            # ③ 变异：把兜底那一档抽掉，同一个坏框下**必须检不出**。
+            #    这一条才是「兜底是承重的」的证据 —— 少了它，上面那条
+            #    也可能只是碰巧。
+            def no_fallback(g, ps, scales, pads):
+                for v in real_variants(g, ps, scales, pads):
+                    if v[4].endswith('全幅') and v[0] != 1:
+                        continue
+                    yield v
+
+            _B._roi_variants = no_fallback
+            got2, _, _ = _B.detect_chessboard(gray, PS, verbose=False)
+            check('变异：抽掉整幅兜底后**检不出**（证明兜底承重）',
+                  got2 is None, '居然还是检出了 %d 点'
+                  % (0 if got2 is None else len(got2)))
+        finally:
+            _B._rough_roi = real_roi
+            _B._roi_variants = real_variants
+
     print()
     print('=' * 72)
     print('PASS %d   FAIL %d' % (N_PASS, N_FAIL))

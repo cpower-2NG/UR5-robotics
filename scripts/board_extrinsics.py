@@ -315,31 +315,66 @@ def _rough_roi(gray, ps_list, pad=0.35, min_pad=30):
     return (0, 0, w, h)
 
 
-def detect_chessboard(gray, ps_list, scales=(1, 2, 3), min_ratio=0.45, verbose=True):
+def _roi_variants(gray, ps_list, scales, roi_pads):
+    """产出放大档要试的 `(scale, sub, ox, oy, tag)`，**由紧到松，整幅兜底**。
+
+    1x 一律用整幅（它同时充当「有没有重复行」那一判的输入，必须与旧行为一致）。
+    放大档先按 `roi_pads` 里的边距逐个裁，**最后一定再补一档整幅**。
+
+    ⚠️ **为什么必须有这一档兜底**（2026-10-02 实测，一条真踩到的坑）：
+    `_rough_roi` 的 `pad=0.35` 只把外接矩形外扩三分之一。同一张靶、同一个位置，
+    只因为画面里**别的东西变了**（机械臂吊进来、投在纸上的影子），紧框下
+    2x/3x **双双检不出**，而放宽到 0.9 或整幅立刻检出。紧框失败**不报错**，
+    症状是「靶明明在画面中央，脚本却说找不到角点」——
+    正是这一类里最难查的。`_rough_roi` 本身也缓存，别每个 scale 重算。
+    """
+    import cv2
+
+    h, w = gray.shape[:2]
+    yield 1, gray, 0, 0, '1x 全幅'
+    cache = {}
+    for scale in scales:
+        if scale == 1:
+            continue
+        boxes = []
+        for pad in roi_pads:
+            if pad not in cache:
+                cache[pad] = _rough_roi(gray, ps_list, pad=pad, min_pad=30)
+            boxes.append(cache[pad])
+        boxes.append((0, 0, w, h))          # ⭐ 整幅兜底，永远排最后
+        seen = set()
+        for ox, oy, x1, y1 in boxes:
+            if (ox, oy, x1, y1) in seen or x1 <= ox or y1 <= oy:
+                continue
+            seen.add((ox, oy, x1, y1))
+            sub = cv2.resize(gray[oy:y1, ox:x1], None, fx=scale, fy=scale,
+                             interpolation=cv2.INTER_CUBIC)
+            yield (scale, sub, ox, oy,
+                   '%dx %s' % (scale, '全幅' if (ox, oy, x1, y1) == (0, 0, w, h)
+                               else 'roi(%d,%d,%d,%d)' % (ox, oy, x1, y1)))
+
+
+def detect_chessboard(gray, ps_list, scales=(1, 2, 3), min_ratio=0.45, verbose=True,
+                      roi_pads=(0.35, 0.90)):
     """逐级放大找棋盘格 → `(corners(原图像素, N,1,2), patternSize, scale)`。
 
     **为什么要放大**：这不是精度洁癖，是正确性。同一个靶在 1x 下会被检出
     重复行（见 `adjacent_spacing_min_ratio`），解出来的外参在远端差 11 mm。
     放大 3x 后 88 点全部 ≤0.5 px。放大只在 ROI 上做，代价可以忽略。
 
+    **为什么要放宽 ROI**：见 `_roi_variants` ——「紧框检不出、松框检得出」
+    是实测踩过的，且**不报错**。失败后自动放宽，最后退到整幅。
+
     :param ps_list: 要试的 `patternSize`，**两种朝向都该传** ——
         `findChessboardCorners` 对非正方图案不是旋转不变的。
     :param min_ratio: 相邻间距比低于它就判为退化，换更大倍数重试。
+    :param roi_pads: 放大档的 ROI 边距，**由紧到松**；整幅永远最后兜底。
     :return: 找不到时 `(None, None, None)`。
     """
     import cv2
 
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.001)
-    roi = None
-    for scale in scales:
-        if scale == 1:
-            ox, oy, sub = 0, 0, gray
-        else:
-            if roi is None:
-                roi = _rough_roi(gray, ps_list)
-            ox, oy, x1, y1 = roi
-            sub = cv2.resize(gray[oy:y1, ox:x1], None, fx=scale, fy=scale,
-                             interpolation=cv2.INTER_CUBIC)
+    for scale, sub, ox, oy, tag in _roi_variants(gray, ps_list, scales, roi_pads):
         for ps in ps_list:
             ok, c = cv2.findChessboardCorners(
                 sub, ps,
@@ -351,10 +386,13 @@ def detect_chessboard(gray, ps_list, scales=(1, 2, 3), min_ratio=0.45, verbose=T
             ratio = adjacent_spacing_min_ratio(grid)
             if ratio < min_ratio:
                 if verbose:
-                    print('  ⚠️ %dx 检出**重复行**（相邻间距比 %.2f < %.2f），'
-                          '放大重试 —— 这份结果别用' % (scale, ratio, min_ratio))
+                    print('  ⚠️ %s 检出**重复行**（相邻间距比 %.2f < %.2f），'
+                          '放宽重试 —— 这份结果别用' % (tag, ratio, min_ratio))
                 continue
             pts = grid.reshape(-1, 2) / scale + np.array([ox, oy], float)
+            if verbose and tag != '1x 全幅':
+                print('  ✓ %s 检出 %d 个内角点（间距比 %.2f）'
+                      % (tag, len(pts), ratio))
             return pts.reshape(-1, 1, 2).astype(np.float32), ps, scale
     return None, None, None
 
