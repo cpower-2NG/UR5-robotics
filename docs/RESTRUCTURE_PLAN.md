@@ -9107,7 +9107,8 @@ EXIT=1
 安全的组合（`none` + `false`）只写在**一个**入口里，别的入口不继承 ——
 与 D50/D64 同一族的病。
 
-**这一条本轮不改代码**（第一优先级是第 0 步），只记进台账与纪律。
+**这一条当晚就修了**（改成「默认只走位」）—— 修法与验证见下面 **§十**；
+纪律那一条仍然要留（它管的是「显式给了三件套」之后的事）。
 
 ### 七、顺带查实的两件（都进纪律）
 
@@ -9139,3 +9140,79 @@ EXIT=1
   它的命令行与恢复方式已记进 `docs/待执行命令.md`。
 - **现场几何覆盖**（`table_plane_z`、`pick_zone`/`place_zone` 的 z）：
   要先量现场工作台，属 W5。
+
+### 十、D71 当晚就修了（承 §六）
+
+§六 里写「本轮不改代码」，写完复查了一遍代码，**改了** —— 因为它比原先判断的更直接。
+两个默认值一起动，只动**默认值**（显式覆盖照旧生效）：
+
+| 参数 | 改前 | 改后 |
+|---|---|---|
+| `gripper_backend` | `'sim' if sim else 'ag95'` | `'sim' if sim else **'none'**` |
+| `carry_objects` | 写死 `'true'` | `'true' if sim else **'false'**` |
+
+⇒ 非仿真入口的默认组合 = **只走位**，与 `real.launch.py` 的选择、与「第一个
+真机 demo 不抓取」（决策 7）一致。真夹取改为显式申请，且要**三件一起给**：
+`gripper_backend:=ag95 carry_objects:=true`，再加 `ag95_dry_run:=false`。
+
+**为什么原先那个 `ag95` 默认现在才出问题**（这是修它的主要理由）：原注释给的
+依据是「ag95 会**大声报错** —— 后端一构造就去开串口，板上没适配器时抛
+`RuntimeError`」。**那个前提 2026-10-01 失效了**，当晚在板上实查：
+
+```
+$ ssh jetson-wifi 'python3 -c "import pymodbus; print(pymodbus.__version__)"'
+3.15.0
+$ ls -l /dev/ttyUSB0 ; lsusb | grep 0403
+crw-rw---- 1 root dialout 188, 0 Oct  1 17:11 /dev/ttyUSB0
+Bus 001 Device 004: ID 0403:6001 Future Technology Devices International, Ltd FT232
+```
+
+⇒ 适配器在位、`pymodbus` 已装 ⇒ `ag95` **构造得起来**，不再响亮失败，
+它只是安静地连上真夹爪。
+
+**而且不止 `carry_objects`**（这一条是复查时才看清的）：`planner_node` 在
+**只走位模式下仍然会调用 `gripper.open()`** —— 那是初始化那一步
+`_start_initial_home`，`test_real_launch.py` 的可达性分析钉着它：
+「`open()` 恰有两处可达：初始化 + 失败恢复」。所以
+`ag95` + `dry_run:=false` 时**节点一启动就写寄存器**，
+**与 `carry_objects` 无关** —— 光改 `carry_objects` 是不够的。
+
+**成对性**保住了：`none` + `carry_objects:=true` 会在启动时**大声抛错**
+（`NullGripper`，`gripper.py`），所以这两个默认值不会滑出「静默地以为在夹」。
+
+**新增自检** `test_real_launch.py` 的 **W2-17**：三个 `camera_source` 各自的
+默认后端与 `carry_objects`、两者**成对**、以及「默认组合不会让夹爪动」。
+
+```
+--- W2-17 非仿真入口默认「只走位」（D71：默认值也不能让夹爪动）---
+  [PASS] camera_source:=sim       的默认夹爪后端 = sim    got 'sim'
+  [PASS] camera_source:=sim       的默认 carry_objects = true（与后端成对）
+  [PASS] camera_source:=realsense 的默认夹爪后端 = none   got 'none'
+  [PASS] camera_source:=realsense 的默认 carry_objects = false（与后端成对）
+  [PASS] camera_source:=external  的默认夹爪后端 = none   got 'none'
+  [PASS] camera_source:=external  的默认 carry_objects = false（与后端成对）
+  …（每个 camera_source 另有一条「默认组合不会让夹爪动」）
+```
+
+**变异测试**（开发机实跑）：把两个默认值改回原样 ⇒ **6 条 FAIL、整个自检
+`EXIT=1`**（`realsense` / `external` 两列的后端变回 `ag95`、`carry_objects`
+变回 `true`）；还原 ⇒ `EXIT=0`。
+**板端**同一份自检也跑过：`EXIT=0`。同步与构建：
+
+```
+scp pipeline.launch.py test_real_launch.py → 板子
+colcon build --symlink-install --packages-select yolo_bringup   RC=0（2.56 s）
+md5sum  build/yolo_bringup/launch/pipeline.launch.py
+        src/yolo_bringup/launch/pipeline.launch.py
+        （本地）
+  → 三者同为 e7fec53f2c948bff0facaf8d54102f02
+```
+
+**顺带跑了相邻的六个自检**，全绿（都 `EXIT=0`）：`test_planner_telemetry`、
+`test_ag95_units`（全部通过）、`test_ag95_gripper`（PASS 51 / FAIL 0）、
+`test_board_extrinsics`（PASS 55）、`test_perception_3d`、`test_label_projection`。
+
+⚠️ **这条改动改的是「默认值」，不是「能力」**：显式
+`camera_source:=realsense gripper_backend:=ag95 carry_objects:=true` 仍然
+照旧。它拦的是「**没打算夹，却因为默认值而夹了**」那一类。
+
