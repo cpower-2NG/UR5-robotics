@@ -8642,3 +8642,278 @@ UR+ `185 opened, 200 closed`）—— 被质疑的**不是任何一个官方数�
 - 「Ø67 板半径 33.5 < 85 mm」这一步是**算术**，不是推断。
 - §8 的「定案」被降级这件事**已落到三个文件 + 一条 memory**，不是只写在对话里。
 
+
+## 第六十二轮：整段护栏（B）—— **两端都在台面上，中间照样能俯冲下去**；顺带查出**四处假绿**（2026-10-02 深夜）
+
+用户上一轮定的：「**B。第 0 步做完，可以来第一步。**」
+本轮做 B：把肘高护栏从「只查路点」扩到「查**整段**」。
+
+### 一、缺口是真的，不是理论 —— 在真 UR5 模型上找到了日常反例
+
+D49 那道护栏（`_posture_ok`）只判**一个位姿**。而机械臂是从当前位姿**连续**
+走到目标的：两端都在台面之上，**中间照样可以俯冲下去再抬起来**。
+
+在真 UR5 的 URDF 上实测找到这样一条**日常**路径 —— 从 HOME 出发，
+`elbow_joint + 1.8`：
+
+| | 最低的 guard_link z |
+|---|---|
+| 起点 | 0.514 |
+| 终点 | 0.132 |
+| **中段最低** | **0.122（在 88% 处）** |
+
+中段比**两端都低**，而且是**严格内点**。台面只要设在两者之间（实测用
+`zmin + 5 mm = 0.127`），只查端点的护栏就**放它过去**。这不是构造出来的
+病态例子，是 HOME 附近一个普通动作。
+
+### 二、护栏挂在**唯一出口**上
+
+`_send_arm_trajectory` 是全部机械臂动作的必经之路 —— 抓取段、放置段、回 HOME
+全从这儿走，**13 处调用点**。护栏挂在这里，漏一个调用点就是一个洞。
+
+**不能**下移到 `_send_trajectory`：那个方法被**仿真夹爪后端复用**
+（`planner_node.py:310` 把 `self._send_trajectory` 当回调传进夹爪），而夹爪那
+一个关节**不在 `guard_links` 里** —— 硬查会让夹爪一动不动。这条用 AST 测试钉住。
+
+独立复核（`grep`）：`_send_trajectory` 的调用者只有两处 —— `:943`（在
+`_send_arm_trajectory` 内部，已过护栏）和 `:310`（传给夹爪后端的**回调引用**）。
+没有别的地方绕过。
+
+### 三、护栏采样的是**控制器真会走的那条线**
+
+`_unwrap_to_nearest` 从 `_send_trajectory` 里**原样抽出来**，`_path_ok` 调它算终点。
+理由：JTC 拿到的是**展开后**（离当前位置最近的等价角）的值；护栏若拿未展开的值
+采样，量的和走的就不是同一条线，最坏差一整圈。抽出来之后两边共用同一份 `+2π`
+防御（A8 测的就是这个）。
+
+### 四、它是**保守近似**，这一点写进了 docstring 而不是藏起来
+
+它假设控制器沿关节空间**直线**插值。JTC 单点轨迹的实际插值是一条两端速度为零
+的单调曲线 —— 关节空间的**路径**与这条直线几乎重合，但严格来说不相等。
+所以这是**保守近似**，偏差由 `guard_margin`（默认 2 cm，比任何合理插值偏差都大）
+吸收。`guard_path_samples` 设 0 或负数即退回「只查终点」（B 之前的行为）。
+
+### 五、证据：四段 + 一次变异
+
+| 段 | 内容 | 结果 |
+|---|---|---|
+| **A** | 合成非线性 FK `z(elbow) = (elbow − 1.0)²`，台面 0.20 | 8 个断言全绿 |
+| **B** | AST：`_send_arm_trajectory` 调 `_path_ok`；`_send_trajectory` **不**调；没有第三方直接调 `_send_trajectory` | 全绿 |
+| **C** | `guard_path_samples` 同时出现在 `planner_node.py` 与 `grasp_planner.yaml` | 全绿 |
+| **D** | 真 UR5 模型 + 真 `/compute_fk` | 6 个断言全绿 |
+
+A 段里两条是决定性的：
+
+- **A1** 中段俯冲被拦。附带断言 `calls["n"] >= 2`，证明护栏**真的在跑采样循环**、
+  是在 `t = 1/8` 这个**中间采样点**上拦的，不是在起点上就判掉；
+- **A4 ★** 同一个俯冲，`guard_path_samples=0` → **放行**；
+- **A2** 平路径放行，且断言**跑满全程**（`calls["n"] == 9`，不是提前返回）；
+- **A6** 拿不到 `/joint_states` → 退回端点检查**并打警告**（不静默降级）；
+- **A7** FK 查不通 → **拒绝**（与 `_posture_ok` 同一条 fail-closed 纪律）；
+- **A8** `+2π` 等价角视为无操作。
+
+D 段（`/tmp/mocC.out`、`/tmp/mocD.out` 原文）：
+
+```
+  找到一条真的会俯冲的路径：elbow_joint+1.8
+    起点最低连杆 z=0.514  终点 z=0.132  中段最低 z=0.122（在 88% 处）
+  ✓ D0 护栏走的是真 FK（与独立量出的高度逐位一致，没留着 A 段的桩）
+  ✓ D1 起点单独查是通过的（台面设在缝里）
+  ✓ D2 终点单独查是通过的
+  ✓ ★ D3 整段检查拦下了这条真路径（端点都过、中段不过）
+  ✓ ★ D4 同一条路径，guard_path_samples=0 → 放行（再一次把功劳唯一归给整段采样）
+```
+
+**变异测试**：把 `for i in range(n + 1)` 改成 `for i in [0, n]`（等价于只查两端），
+**A1 与 A2 同时转红**；改回即绿。⇒ 绿是采样本身挣来的，不是别的错误路径碰巧挡下的。
+
+**D0 是为堵一个具体的坑加的**：A 段会把 `node._call_fk` 换成桩，D 段若不换回来，
+就会**拿桩去宣称在测真 UR5 模型**。D0 拿护栏量出的高度与独立量出的高度逐位比对，
+两者不一致就红。
+
+### 六、代价实测（所以不做批量化优化）
+
+```
+  整段检查的代价：41 点 × 2 连杆 = 82 次 /compute_fk 用了 1.37s（≈34 ms/点）
+  ；默认 8 点（9 个采样）约 0.30s/次机械臂动作
+```
+
+即每次 FK ≈ **17 ms**。默认 8 点（9 个采样 × 2 连杆 = 18 次调用）≈ **0.30 s**，
+对比一次 `move_duration` 是 **2.0 s** —— 半个数量级以下。**不值得做批量化。**
+
+### 七、⭐ 本轮真正花时间的部分：四处「假绿」
+
+这一轮的主要教训不是护栏，是**预检工具本身会报假绿**。四处，全是实测踩到的。
+其中第 (3) 条最重 —— 那是**一个探测工具把被测服务打死了**，而第 (4) 条
+把这次打死报成了「通过」。
+
+#### (1) `ros2 service list` 在 WSL 上永远挂住 ⇒ 就绪循环 12 分钟假阴性
+
+`moveit_only_check.py` 第 4 步原来是「`sleep 5` + 跑一次 `ros2 service list`」，
+**36 轮**。而 WSL2 上这条命令**既不返回也不报错**，于是每轮要等满 15 s 超时
+⇒ **一轮 20 s、跑满 12 分钟**，最后吐出一句「/compute_ik 没起来」—— 而那是
+**假结论**：同一时刻 move_group 已经在打 `You can start planning now!`。
+
+**修法**：改用 **rclpy 的图发现**（`wait_for_services()`，直接问
+`node.get_service_names_and_types()`），不碰 CLI。实测：
+
+```
+/compute_ik 就绪（约 1 秒）
+```
+
+**12 分钟 → 1 秒**，而且板子和开发机行为一致。
+
+#### (2) `--no-pipeline` 下探针用错**规划组名** ⇒ 44/44 `INVALID_GROUP_NAME`
+
+没有 `/grasp_planner` 可读参数时，`elbow_guard_probe.py` 退回它自己的兜底默认
+`ik_group = ur5_manipulator`（仿真值）。而这条链路的 move_group 是
+`ur_moveit_config` 起的 —— 组名 **`ur_manipulator`**（SRDF 派生名，两侧不同）。
+
+结果：
+
+```
+IK 解不出来的候选：44 / 44
+     · INVALID_GROUP_NAME: 44 个
+```
+
+**修法**：给探针加 `--ik-group` 覆盖；`moveit_only_check.py` 在 `--no-pipeline`
+下显式传 `ur_manipulator`。不加开关时探针仍**读运行中节点的参数**（那是权威来源）。
+
+#### (3) ★★ 探针往 IK 请求里塞了一个**模型不认识的关节** ⇒ **move_group 整个 SIGABRT**
+
+这条最重，因为它是**一个探测工具把被测服务打死了**。
+
+没有 `/grasp_planner` 可读参数时，探针退回兜底 `gripper_backend: sim`，
+于是 `solve_ik` 会往请求的 robot state 里追加 `sim_gripper_joint`
+= `robotiq_85_left_knuckle_joint`。那是**仿真模型**的关节，真机 URDF（模型名
+`ur`）里根本没有它。
+
+**MoveIt 不忽略未知关节名** —— 它抛异常，而且没人接：
+
+```
+[move_group-1] [ERROR] [moveit_exceptions.exceptions]:
+    Variable 'robotiq_85_left_knuckle_joint' is not known to model 'ur'
+[move_group-1] terminate called after throwing an instance of 'moveit::Exception'
+[move_group-1]   what():  Variable 'robotiq_85_left_knuckle_joint' is not known to model 'ur'
+[move_group-1] Aborted (Signal sent by tkill() 1186524 1000)
+[ERROR] [move_group-1]: process has died [pid 1186524, exit code -6, ...]
+```
+
+`exit code -6` = SIGABRT。**之后 44 次 IK 调用全部变成 15 s 超时**
+（15 × 44 ≈ 11 分钟），因为服务已经不存在了。
+
+⚠️ **这个偏离是探针自己注释里写明的、刻意的**：
+
+> `planner_node` 只放 6 个臂关节，夹爪由 MoveIt 从**当前状态**补齐。
+> 本探针改为**显式**给夹爪值 —— 这样「张开」与「闭合」两种情形都能测
+
+意图是好的（`place_release_lift` 那一坑正是「只有闭合时才发作」），但**多给的
+那个名字必须先在模型里存在**。
+
+**修法**：新增 `model_joint_names()` —— 向 move_group 的 `/get_planning_scene`
+（`ROBOT_STATE` 分量）要**它自己模型里**的关节名集合，**确认存在才注入**；
+查不到集合就**不注入**并出声。原则：**宁可不给夹爪值，也不给错的名字。**
+
+✅ 顺带核实：`planner_node.py` **没有**这个问题 —— 它的 IK 请求一律
+`list(self.arm_joints)`（`:1072`、`:1117`），从不注入夹爪关节。**危险的是探针，
+不是规划器。**
+
+#### (4) ★ 探针在「**一个位姿都没解出来**」时返回 **0 = 通过**
+
+这条最要命。修 (2) 之前那一次跑，探针打印的是：
+
+```
+结论：
+  ⚠️ 一个位姿都没解出来 —— 先查 ik_group 与 /compute_ik。
+```
+
+而**整个脚本的退出码是 0**。原因是最后一行：
+
+```python
+return 1 if rejected else 0     # ← 一个都没解出来 ⇒ rejected 空 ⇒ 返回 0
+```
+
+探针自己的 docstring 写的是「**0 = 全部连杆都在护栏之上（可以动）**」——
+**实现违反了它自己写下的契约**。而它下游是两层串联的闸门：
+`moveit_only_check.py` 用 `return rc or rc2` 决定整个预检成败，这份预检又是
+W5 第 4b 步（D49 的现场闸门）。**「什么都没量到」被一路报成「可以动」。**
+
+**修法**：退出码拆成三档并存进 docstring ——
+`0 = 全在护栏之上`、`1 = 有低于护栏的`（含 **HOME 位低于护栏**，原来只打印 ⛔、
+不影响退出码）、**`2 = 一个位姿都没解出来`**（环境不满足，结论无从谈起）。
+
+**★ (3) 和 (4) 是配套的**，这也是它们合起来最危险的地方：
+**(3) 让整次预检彻底失败（move_group 都死了），(4) 把这次彻底失败报成「通过」。**
+单看任何一条都还能发现，合起来就是**一个全程无声的假绿** —— 而它下游是
+W5 第 4b 步（D49 的现场闸门）。
+
+> 这四条是同一类病：**「没测到」和「测到了、是好的」长得一模一样。**
+> 本仓库 `scripts/test_*.py` 的约定（0 通过 / 2 环境不满足）本来就是为了分开它们，
+> 这两个老脚本没跟上。
+
+#### （附）两条纯测试台架的坑，记下来免得再踩
+
+- **`_call_fk` 需要外部 spinner**：它 `call_async` 之后在
+  `threading.Event().wait()` 里阻塞，**自己不转 executor**。测试里没起
+  `SingleThreadedExecutor` 时，每一条 FK 都报「FK 请求超时（5s）」（实测 14 条）。
+  这是**测试台架**的问题，不是 MoveIt 的。
+- **退出码 134（SIGABRT）**：executor 线程活得比节点长。要按
+  `ex.shutdown()` → `spin_thread.join(timeout=5)` → `ex.remove_node(node)` →
+  `node.destroy_node()` → `if rclpy.ok(): rclpy.shutdown()` 的顺序收尾。
+  这个顺序本仓库 `test_real_launch.py` 已经在用。
+- 开发机没装 `ros-humble-realsense2-camera` 时，`camera_source:=realsense`
+  **会把整个 launch 带崩**（move_group 已起来也被 SIGINT 掉），而报错行只讲相机
+  —— 看起来像 MoveIt 坏了。⇒ `--no-pipeline`。
+
+### 八、附带查实：**板子的代码树与本地 HEAD 逐字节一致**
+
+顺手核对了板子（`jetson-wifi`，模组序列号 **<board-serial>**，本次在
+`<board-ip>`）的仓库状态，因为要准备第 0 步。结果比预想的干净：
+
+| 项 | 板子 | 本地 HEAD |
+|---|---|---|
+| `planner_node.py` 的 blob | `741cac2` | `741cac2`（B 之前） |
+| `telemetry.py` 的 blob | `885be03` | `885be03` |
+
+**逐字节相同。** 板子的 `git` **元数据**落后（停在 `4f5e781`，2026-09-29 13:02，
+是 HEAD 的祖先；中间 **127 个提交**，绝大多数是 `docs/` 的台账轮次，
+没有同步到板子），但**代码内容是通过拷文件同步的**，所以是当前的 ——
+板子上那 3 个「已修改」+ 6 个「未跟踪」正是本地已提交的内容。
+
+⇒ **第 0 步可以直接跑**，不需要先把 B 同步上板（护栏不影响 `/joint_states`、
+`/compute_ik`、TF 树）。⚠️ 板子的仓库副本**不要覆盖**。
+
+#### ⚠️ 但这意味着：**板子上装的还是「会打死 move_group」的那个探针**
+
+板子的 `scripts/elbow_guard_probe.py` 是旧版（没有 `model_joint_names()`），
+所以上面第 (3) 条在板上是**活的**。触发条件要说清楚，因为它不显然：
+
+| 板上的情形 | 探针读到的 `gripper_backend` | 会不会打死 move_group |
+|---|---|---|
+| 全车入口（`bringup`，含 `pipeline`）在跑 | `none`（真机由 launch 覆盖） | **不会** —— 不注入夹爪关节 |
+| **没起规划器 / 用 `--no-pipeline`** | 兜底 `sim` | **会** |
+
+⇒ **现场纪律**：探针**必须在 `/grasp_planner` 已经起来之后**才跑；
+`--no-pipeline` 只用来验「MoveIt 链路本身通不通」，**不能**拿它跑护栏口径的判读
+（这一点 `moveit_only_check.py` 的 docstring 早就写了，现在多了一条硬理由）。
+三个工具的修复**要在第 4b 步之前同步上板**。
+
+### 九、落到文件
+
+| 文件 | 改成 |
+|---|---|
+| `planner_node.py` | 新增 `guard_path_samples` 参数、抽出 `_unwrap_to_nearest`、新增 `_path_ok`、护栏挂到 `_send_arm_trajectory` |
+| `config/grasp_planner.yaml` | `guard_path_samples: 8` |
+| `scripts/test_guard_path.py` | **新增**（~400 行）A/B/C/D 四段自检，`--only` 可分段跑 |
+| `scripts/moveit_only_check.py` | 第 6 步接上 `test_guard_path.py --only D`；`sh()` 加超时；`--no-pipeline`；就绪检查改 rclpy；传 `--ik-group` |
+| `scripts/elbow_guard_probe.py` | 加 `--ik-group` 覆盖；新增 `model_joint_names()`（**确认模型认识才注入夹爪关节**，修「探针打死 move_group」）；**退出码加第 3 档**（修假绿） |
+
+### 十、本轮验证
+
+- 四段自检（A/B/C/D）**全部实跑**，A 段另做**变异测试**，D 段另有 **D0** 堵桩。
+- `guard_path_samples=0` 的**放行对照**在 A4 与 D4 **各做一次**。
+- 代价是**实测**（82 次调用 / 1.37 s），不是估算。
+- 四处假绿/崩溃**都有触发它的原文**（12 分钟挂起、44/44 INVALID_GROUP_NAME、
+  `moveit::Exception` + `exit code -6` 的整段栈、`EXIT=0` 配「一个位姿都没解出来」），
+  不是推想。
+- 板子的 blob 比对是**哈希**，不是「看起来一样」。
