@@ -212,9 +212,9 @@ yolo_ros/
 
 ## 自检与验收
 
-七个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`
-与 `test_real_launch.py` 连真夹爪、真串口都不需要 —— 前两个用一个手写的 Modbus 从站
-接在 pty 上验）：
+八个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+`test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
+前三个用一个手写的 Modbus 从站接在 pty 上验）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -237,6 +237,9 @@ python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
                                          #   没有 pymodbus 时 → 26 PASS / 6 SKIP
 python3 scripts/test_ag95_gripper.py     # AG-95 驱动（读 / dry-run 闸门 / 写）：51 项断言
                                          #   没有 pymodbus 时 → **退出码 2**（见下）
+python3 scripts/test_ag95_init_close.py  # AG-95 初始化/合拢脚本：13 项断言
+                                         #   重点只有一条：**不给 --go 时从站一次写都没收到**
+                                         #   没有 pymodbus 时 → 1 PASS / 10 SKIP、退出码 0
 ```
 
 > 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
@@ -247,6 +250,9 @@ python3 scripts/test_ag95_gripper.py     # AG-95 驱动（读 / dry-run 闸门 /
 > - `test_ag95_gripper.py`：每一项都走 pymodbus 的串口客户端，**没有可降级的部分**，
 >   所以缺了直接**退出码 2**（按 `test_real_launch.py` / `test_model_resolution.py`
 >   的先例）。它**不假装跑了一部分**。
+> - `test_ag95_init_close.py`：只有第 1 段（扫源码）能离线跑，其余要 pymodbus，
+>   缺了报 `1 PASS / 10 SKIP` 且**退出码 0** —— 同样**不能当「验过了」**。
+>   而它唯一的实质断言（「预演不写寄存器」）恰好就落在 SKIP 的那一段里。
 > - 全跑的办法都一样：`pip3 install "pymodbus>=3.6"`。
 
 **Ctrl-C 收工验收**（**在板子上跑**，不是 WSL）——「正常收工」这件事只有真被 Ctrl-C
