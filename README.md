@@ -212,9 +212,9 @@ yolo_ros/
 
 ## 自检与验收
 
-八个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+九个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
-前三个用一个手写的 Modbus 从站接在 pty 上验）：
+前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py` 只要 numpy）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -240,6 +240,9 @@ python3 scripts/test_ag95_gripper.py     # AG-95 驱动（读 / dry-run 闸门 /
 python3 scripts/test_ag95_init_close.py  # AG-95 初始化/合拢脚本：13 项断言
                                          #   重点只有一条：**不给 --go 时从站一次写都没收到**
                                          #   没有 pymodbus 时 → 1 PASS / 10 SKIP、退出码 0
+python3 scripts/test_ur5_fk_check.py     # UR5 正运动学 + 「示教器 Base 是不是机器人 base」
+                                         #   的判决工具：18 项断言（含 3 个变异测试）
+                                         #   只要 numpy，不需要 ROS / 真机 / 示教器
 ```
 
 > 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
