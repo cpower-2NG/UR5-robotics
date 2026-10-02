@@ -193,23 +193,42 @@ def self_test(verbose=True):
     return ok
 
 
-def _nums(s, n, what):
+def _nums(s, what):
     try:
-        vals = [float(v) for v in s.replace(" ", "").split(",")]
+        return [float(v) for v in s.replace(" ", "").split(",")]
     except ValueError as exc:
         raise ValueError(f"{what} 解析失败（{exc}）")
-    if len(vals) != n:
-        raise ValueError(f"{what} 维度不对：{len(vals)}，要 {n}")
-    return vals
 
 
 class Sample:
-    """一次抄表：关节角 + 示教器位姿 + 当时激活的 TCP。"""
+    """一次抄表：关节角 + 示教器位姿 + 当时激活的 TCP。
+
+    **位姿可以只给 `x,y,z` 三个数，但前提是 `TCP = (0,0,0)`** ——
+    那时示教器报的就是法兰本身，`R·TCP` 那一项恒为零，姿态根本不参与计算。
+    给了非零 TCP 却只抄三个数，就是**默认 rx=ry=rz=0**（几乎肯定不对），
+    所以这里**直接拒绝**，不猜。
+    """
 
     def __init__(self, q_deg, pose, tcp):
-        self.q = np.radians(_nums(q_deg, 6, "关节角"))
-        self.pose = _nums(pose, 6, "位姿")
-        self.tcp = _nums(tcp, 3, "TCP")
+        q = _nums(q_deg, "关节角")
+        if len(q) != 6:
+            raise ValueError(f"关节角维度不对：{len(q)}，要 6")
+        self.q = np.radians(q)
+
+        self.tcp = _nums(tcp, "TCP")
+        if len(self.tcp) != 3:
+            raise ValueError(f"TCP 维度不对：{len(self.tcp)}，要 3")
+
+        vals = _nums(pose, "位姿")
+        if len(vals) == 6:
+            self.pose = vals
+        elif len(vals) == 3 and not any(self.tcp):
+            self.pose = vals + [0.0, 0.0, 0.0]      # TCP=0 时姿态不参与，补零即可
+        else:
+            raise ValueError(
+                f"位姿给了 {len(vals)} 个数 —— 只给 x,y,z 的前提是 TCP = (0,0,0)；"
+                f"TCP 非零时必须给全 6 个（x,y,z,rx,ry,rz），"
+                f"否则 rx/ry/rz 会被当成 0，算出来的法兰位置是错的")
         self.M_link = urdf_fk(self.q)
         # base_link → base：绕 z 转 π（见 ur_macro.xacro 的注释）
         self.M_base = T(rotz(PI), np.zeros(3)) @ self.M_link
@@ -250,7 +269,9 @@ class Sample:
         d, n = self.d, float(np.linalg.norm(self.d))
         print(f"  d（base 系）            = ({d[0]*1000:+9.3f}, {d[1]*1000:+9.3f}, "
               f"{d[2]*1000:+9.3f}) mm   |d| = {n*1000:.3f} mm")
-        print(f"  工具轴 r33（base_link 系）= {self.r33:+.4f}\n")
+        # r33 由**关节角**算出（不是从填的位姿里读的），所以只抄 3 个数时它照样有效；
+        # base 与 base_link 只差绕 z 的 π，z 分量不变，两个系里同值。
+        print(f"  工具轴 r33（由关节角算）  = {self.r33:+.4f}\n")
         return n
 
 

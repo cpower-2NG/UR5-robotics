@@ -143,6 +143,15 @@ def main():
     code, _ = run('a,b,c,d,e,f', poseA + ',' + rvA)
     check('关节角不是数字 ⇒ 退出码 2', code == 2, 'code=%d' % code)
 
+    # 位姿只给 x,y,z 的前提是 TCP=0（那时 `R·TCP` 恒零，姿态根本不参与）
+    p3 = ','.join(poseA.split(',')[:3])
+    code, out = run(JQ, p3)
+    check('TCP=0 + 只给 x,y,z ⇒ 与给全 6 个数**同判**（不是碰巧，rvA 非零）',
+          code == 0 and 'A 成立' in out, 'code=%d' % code)
+    code, _ = run(JQ, p3, '0,0,200.2')
+    check('TCP 非零 + 只给 x,y,z ⇒ 拒绝、退出码 2（不许把 rx/ry/rz 当 0）',
+          code == 2, 'code=%d' % code)
+
     code, out = run('%s' % ','.join('%g' % v for v in Q), poseA + ',' + rvA,
                     joints2='%s' % ','.join('%g' % v for v in Q), pose2=poseA + ',' + rvA)
     check('第二组抄了**同一个姿态** ⇒ 被拦下、退出码 3（差=0 不是证据）',

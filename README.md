@@ -241,7 +241,7 @@ python3 scripts/test_ag95_init_close.py  # AG-95 初始化/合拢脚本：13 项
                                          #   重点只有一条：**不给 --go 时从站一次写都没收到**
                                          #   没有 pymodbus 时 → 1 PASS / 10 SKIP、退出码 0
 python3 scripts/test_ur5_fk_check.py     # UR5 正运动学 + 「示教器 Base 是不是机器人 base」
-                                         #   的判决工具：18 项断言（含 3 个变异测试）
+                                         #   的判决工具：20 项断言（含 3 个变异测试）
                                          #   只要 numpy，不需要 ROS / 真机 / 示教器
 ```
 
