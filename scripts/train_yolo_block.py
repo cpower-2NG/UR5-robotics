@@ -114,7 +114,7 @@ def check_dataset():
     return ok
 
 
-def train(epochs, batch, imgsz, device_arg, name):
+def train(epochs, batch, imgsz, device_arg, name, workers):
     """训练 YOLOv8n。"""
     try:
         from ultralytics import YOLO
@@ -149,6 +149,7 @@ def train(epochs, batch, imgsz, device_arg, name):
         epochs=epochs,
         imgsz=imgsz,
         batch=batch,
+        workers=workers,
         device=device,
         patience=20,          # 20 个 epoch 无提升则早停
         save=True,
@@ -183,6 +184,9 @@ if __name__ == "__main__":
     ap.add_argument("--batch", type=int, default=16,
                     help="8 GB 的 Orin 上建议 8 —— 显存与 CPU 共享同一个内存池")
     ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--workers", type=int, default=8,
+                    help="dataloader 进程数（默认 8；8 GB 的 Orin 上给 4，"
+                         "每个 worker 都持有一份数据集缓存的引用）")
     ap.add_argument("--device", default=None, help="cuda:0 / cpu（默认自动）")
     ap.add_argument("--name", default="block_detect", help="runs/ 下的子目录名")
     a = ap.parse_args()
@@ -196,4 +200,4 @@ if __name__ == "__main__":
         print("\n❌ 数据集不合格，拒绝训练。")
         sys.exit(1)
 
-    train(a.epochs, a.batch, a.imgsz, a.device, a.name)
+    train(a.epochs, a.batch, a.imgsz, a.device, a.name, a.workers)
