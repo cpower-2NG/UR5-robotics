@@ -10596,3 +10596,105 @@ rms_touch_m: 0.00112         reproj_px: 0.183
 - 我这一侧全程只**只读订阅**相机话题（孤儿节点 PIDs 4713/4715 未杀、参数未改）；
 - 臂已回 HOME，靶纸与相机支架未动（漂移检查退出码 0 为证）；
 - `main` 未动，没有推送。
+
+---
+
+## 第七十五轮：**板上那 878 行「未提交改动」查清了** —— 没有一行是本地没有的（2026-10-02 夜）
+
+### 一 起因
+
+准备同步板子仓库前，按记忆里的规矩：**同步前对全树哈希，别抽查**。
+上一次用 `comm` 比过一次，因为非 ASCII 路径的排序受 locale 影响而失败，
+当时印出来的数字（829/425）是**不可信的**，这一轮重做。
+
+### 二 方法
+
+两边各生成一份「sha256 前 16 位 → 相对路径」清单（Python 遍历，排除
+`.git` / `build` / `install` / `log` / `__pycache__`），本地 **4534** 个文件、
+板子 **962** 个，再按**路径字段**排序后 `join`。
+
+### 三 结果（全树，不抽查）
+
+| 类别 | 数量 |
+|---|---|
+| 两边都有、内容相同 | 595 |
+| 两边都有、内容不同 | **15** |
+| 只在本地 | 3924 |
+| 只在板子 | 352 |
+
+**只在板子的 352 个里没有一个是代码。** 拆开看：**321 个**是旧的
+`block_dataset/`（仿真集），**与本地 `block_dataset_sim/` 逐字节相同**
+—— 本地只是把它改了名（对比 321 个文件的 sha256 清单，`diff` 为空）；
+另外 27 个 `docs/images/`、3 个教材文档、1 个目录项。
+
+### 四 那 878 行到底是什么
+
+板子 HEAD = `4f5e781`，是本地 HEAD 的**祖先**；工作树比它自己的 HEAD 多
+878 行 / 11 个文件，另有 **12 个未跟踪新文件**。逐条核验 blob 出处：
+
+| 文件 | 板子那份 = |
+|---|---|
+| `real.launch.py`、`planner_node.py`、`gripper.py`、`planner.launch.py`、`package.xml`、`grasping.rviz`、`elbow_guard_probe.py`、`moveit_only_check.py`、`test_real_launch.py` | **与本地 HEAD 逐字节相同**（9 个） |
+| `pipeline.launch.py` | 提交 `f7c7096` 的状态（`8ba23c2` 把它改成了 HEAD 那版） |
+| `grasp_planner.yaml` | 提交 `0555f9a` 的状态（同上） |
+| 其余 13 个（README、`.gitignore`、数据 / 文档 / 脚本） | 各自某个**祖先提交**的状态 |
+
+12 个未跟踪文件（`telemetry.py`、`real_chain_check.py`、`test_guard_path.py`、
+`realsense_camera.yaml` …）**逐字节等于本地 HEAD**。
+
+⇒ **板子上没有任何本地没有的内容。** 它是一份「手工部分同步到 ~`f7c7096`
+前后、但 HEAD 仍停在更早的 `4f5e781`」的检出。它那 878 行不是板子独有的工作，
+而是**已经进了本地历史的改动被拷了过去、却没有提交**。
+
+板子仓库另外两条：**没有 remote、没有 stash**，只有 `main` 与
+`migrate/humble-orin` 两个分支。
+
+### 五 一处自我订正
+
+我第一版脚本用 `git log --all --find-object=<blob> | head -1` 判出处，取了日志里的
+**后一条**，把 `pipeline.launch.py` / `grasp_planner.yaml` 标成 `8ba23c2`。
+实际 `--find-object` 会把**引入**和**移除**该 blob 的提交**都**列出来 ——
+正确的是 `f7c7096` / `0555f9a`（引入方）。**结论不变**（两者都是 HEAD 的祖先，
+且 HEAD 的版本是它们之后被 `8ba23c2` 改出来的），但出处记错会误导，已订正。
+
+### 六 顺带查到的：`install/` 看着过期，其实不是
+
+`ros2_ws/install/` 的时间戳是 **2026-09-28**，而源码是 **10-02**，看着像过期 4 天。
+**实测不是**：`install/yolo_bringup/share/yolo_bringup/launch/real.launch.py`、
+同目录 `pipeline.launch.py`、`install/grasp_planner/share/grasp_planner/config/grasp_planner.yaml`
+**全是指向源码的符号链接**，md5 与源码一致。所以 launch / yaml 的改动本来就即时生效，
+mtime 只是**链接自身**的创建时间。
+
+> 这条与记忆里「改完必须 colcon build」并不冲突：**launch / yaml / python 模块是活的**，
+> 但 `setup.py` 的 entry_points、`package.xml` 那一类要重新 build 才会更新。
+
+### 七 这一轮已经做的（都不需要动板子工作树）
+
+| 动作 | 结果 |
+|---|---|
+| `colcon build --symlink-install` | 5 个包全 `Finished`，退出码 **0**，6.88 s |
+| 编译前资源 | 可用内存 **5.6 GiB**，`ollama` **未运行** |
+| `ros2 launch yolo_bringup real.launch.py --show-args` | 板上**解析通过**，参数全部列出 |
+
+`--show-args` 只做解析、不执行任何节点，所以这一步**没有**碰到 UR 驱动。
+
+### 八 没做，等用户决定
+
+把板子仓库推进到本地 HEAD（`git fetch <bundle>` + `git reset --hard`）
+**被权限闸门拦下**，理由正当：它是「丢弃板子工作树」的操作，授权该由用户给。
+我**没有绕**（没有改用别的工具、没有拆成小步）。
+
+已经备好的东西：
+
+- `~/yolo_repo_backup_20261002.tar.gz`（174 MB，板子工作树全量；
+  不含 `.git`/`build`/`install`/`log`）
+- `~/board_dirty_20261002.patch`（1548 行，那份 878 行改动的存档）
+- 本地 `/tmp/inc.bundle`（50 MB，`git bundle verify` 通过，只要求板子上已有的 `4f5e781`）
+
+### 九 安全
+
+- 全程对板子**只读**（`git status` / `diff` / `ls-files` / `hash-object` / `log` /
+  `branch` / `stash list` / `reflog`），外加**一次已授权的 `colcon build`**。
+- **没有**改板子工作树、**没有** `reset`、**没有**删未跟踪文件、**没有**碰 `main`。
+- 未动 `~/yahboom_ws`、`~/ultralytics` 等目录。
+- 未通过 SSH 触发任何机械臂运动。
