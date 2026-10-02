@@ -112,28 +112,53 @@ REAL_TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_traje
 # 是最先撞到桌面的那条（`place_release_lift` 整段注释都在讲这件事）。
 #
 # ── 真机 AG-95 的取值（2026-10-02）──────────────────────────────────
-# 用户查大寰官方图纸：**张开 179.64 mm / 闭合 195.21 mm**（法兰→指尖最低点）。
-# 两个数各喂上面一个公式，方块高按 40 mm：
-#     tool0_to_fingertip = 195.21 − 40     = **155.21 mm ≈ 0.155**
-#     place_release_lift = 195.21 − 179.64 = **15.57 mm = 0.0156**
-# ⚠️ 前提三条，任一条不成立就得重算：
-#   ① 图纸的起点是**夹爪自己的安装面**。UR 法兰与它之间若夹了转接板，
-#      要把**转接板厚度加到 195.21 上**；
-#   ② 指尖是**图纸上那一版**（AG-95 的指尖可更换）；
-#   ③ 方块高是**现场实测值**（这里假定 40 mm，与仿真一致）。
+# 用户读的图纸（DOBOT《AG-95 Gripper User Guide》V1.0 图 1.3）给：
+#     **张开 179.64 mm / 闭合 195.21 mm**
+# 🔴 **但这两个数不能直接用 —— 基准面差两块板。**
+#   该图上 179.64 是从**夹爪自身法兰板的顶面**量的（179.64 = 51.71 + 127.93，
+#   子代理在 PDF 里按矢量坐标复核过）；而 UR 的 `tool0` 在**贴合面**上。
+#   两者之间隔着：
+#         ① AG-95 自己的法兰板   **5 mm**（大寰 2024 官方图：184.6 与 179.64
+#            之差恰为 4.96，而同图标着法兰板厚 "5"；184.6 从**贴合面**量起）
+#         ② 现场那块转接板       **≈ 4 mm**（用户 2026-10-02 实测口述）
+#   ⇒ **tool0 → 指尖 = 图纸值 + 5 + 4**
+#   独立佐证：UR+ 市场页写 `Height (from wrist to fingertip):
+#   **200 mm (fully closed) / 185 mm (fully opened)**` —— 与「179.64+5=184.64」
+#   和「195.21+5=200.21」各差 0.4 / 0.2 mm（那是**不含现场那块 4 mm 转接板**的口径）。
+#   两条互不相干的来源都指向同一个 +5。
+#
+#   于是（**方块高按真机实测 28.5 mm**，用户 2026-10-02：视觉标定 28~29 mm）：
+#       tool0 → 指尖 张开 = 179.64 + 5 + 4 = **188.6 mm**
+#       tool0 → 指尖 闭合 = 195.21 + 5 + 4 = **204.2 mm**
+#       tool0_to_fingertip = 204.2 − 28.5 = **175.7 mm ≈ 0.176**
+#       place_release_lift = 204.2 − 188.6 = **15.6 mm = 0.0156**
+#
+# ⚠️ 前提三条，任一条不成立就要重算：
+#   ① 那 4 mm 是**UR 法兰与 AG-95 贴合面之间**的独立转接板。若用户量到的其实是
+#      **AG-95 自己的法兰板**（标称 5 mm，量成 4 mm），就**不要再加** —— 那样
+#      两个数变成 184.6 / 200.2，参数 0.172；
+#   ② 指尖是**图纸上那一版**（标准 J1 宽指，用户已确认）；
+#   ③ 方块高按**现场实测**（28.5 mm；换方块要重算 —— 这个参数**含方块高**）。
 #
 # ── 与示教器那几轮读数的关系（`docs/待执行命令.md` §丙-2）──────────
 # 那些读数（甲 173.99 / 乙 194.55 / 卷尺 190~195）都是「**法兰→某个尖**」，
 # **不是这个参数** —— 还要再减方块高才能填进来。先前把两者当同一个量直接
-# 相减、得出的「差 44 mm ⇒ 往桌子里扎」是**错的**：真实的差只有十几毫米，
-# 而且方向相反 —— 0.174 偏**大** ⇒ 张开的指尖只插进方块约 6 mm ⇒ **抓空**，
-# 不是撞桌。（0.13 才是偏小那条，它会让指尖入台 ~10 mm。）
+# 相减、得出的「差 44 mm ⇒ 往桌子里扎」是**错的**（那里还误用了仿真的 40 mm
+# 方块高）。按现在的口径重算：0.174 与 0.176 只差 2 mm，**原来那个值基本是对的**。
 #
 # ⚠️ 以上**均未现场验收**。量准的办法见 `docs/PROBE_LENGTH.md`（零 TCP 碰台面），
 #   它直接给「法兰→指尖」；**量的时候务必记下当次的夹爪开度**（张开/闭合差 15.6 mm，
 #   不记就白量）。
 SIM_TOOL0_TO_FINGERTIP = '0.13'
-REAL_TOOL0_TO_FINGERTIP = '0.155'
+REAL_TOOL0_TO_FINGERTIP = '0.176'
+# 放置下降时额外留的高度（m）= 「闭合 − 张开」的指尖落差。**同样是后端属性**：
+# 平爪**闭合**时指尖会往下走一截，所以放置那一段（爪是闭合的）比抓取那一段
+# （爪是张开的）更容易压到桌面 —— `planner_node.py` 的 `place_release_lift`
+# 整段注释都在讲这件事。仿真：2F-85 闭合 0.170 − 张开 0.160 = 0.010，正是那个 0.01。
+# 真机：AG-95 = 204.2 − 188.6 = **0.0156**。
+# ⚠️ 两个值都**尚未现场验收**，且都随夹爪开合行程变。
+SIM_PLACE_RELEASE_LIFT = '0.01'
+REAL_PLACE_RELEASE_LIFT = '0.0156'
 
 
 def _default_planner_params_file():
@@ -367,10 +392,24 @@ def generate_launch_description():
     ])
     tool0_to_fingertip_arg = DeclareLaunchArgument(
         'tool0_to_fingertip', default_value=tool0_to_fingertip_default,
-        description='tool0 到**抓取点**的距离（m），= 闭合时法兰→指尖 − 方块高。'
-                    '仿真 2F-85 0.13（= 0.170 − 0.040）/ 真机 AG-95 0.155'
-                    '（= 图纸 195.21 − 40，未验收）。默认随 camera_source，'
-                    '⚠️ 方块高度变了要重算，详见文件头。'
+        description='tool0 到**抓取点**的距离（m），= 闭合时 tool0→指尖 − 方块高。'
+                    '仿真 2F-85 0.13（= 0.170 − 0.040）/ 真机 AG-95 0.176'
+                    '（= 0.2042 − 0.0285，未验收）。默认随 camera_source，'
+                    '⚠️ **含方块高**，方块换了要重算，详见文件头。'
+    )
+    # 放置余量同样**随后端变**（见文件头 SIM_/REAL_PLACE_RELEASE_LIFT）：
+    # 仿真的 0.01 是 2F-85 的闭合/张开落差，AG-95 是 0.0156。若沿用仿真的 0.01，
+    # 真机放置时会多下压 5.6 mm（朝桌面方向），是不该有的偏差。
+    place_release_lift_default = PythonExpression([
+        "'" + SIM_PLACE_RELEASE_LIFT + "' if '",
+        LaunchConfiguration('camera_source'),
+        "' == 'sim' else '" + REAL_PLACE_RELEASE_LIFT + "'",
+    ])
+    place_release_lift_arg = DeclareLaunchArgument(
+        'place_release_lift', default_value=place_release_lift_default,
+        description='放置下降时在方块理论落点之上额外留的高度（m）= 夹爪'
+                    '「闭合 − 张开」的指尖落差。仿真 2F-85 0.01 / 真机 AG-95'
+                    '0.0156（未验收）。默认随 camera_source。'
     )
     # 只走位演示（第一个真机 demo）要用 carry_objects:=false，否则规划器会去
     # 闭合一个不存在的夹爪。它**必须**和后端一起给：none 后端 + true 会在
@@ -513,6 +552,7 @@ def generate_launch_description():
             'ik_group': LaunchConfiguration('ik_group'),
             'trajectory_action': LaunchConfiguration('trajectory_action'),
             'tool0_to_fingertip': LaunchConfiguration('tool0_to_fingertip'),
+            'place_release_lift': LaunchConfiguration('place_release_lift'),
             # 只走位演示：规划器不闭合夹爪，但仍走完「接近→下降→抬起→HOME→
             # 放置位→下降→抬起→HOME」的完整动作序列。
             'carry_objects': LaunchConfiguration('carry_objects'),
@@ -548,6 +588,7 @@ def generate_launch_description():
         ik_group_arg,
         trajectory_action_arg,
         tool0_to_fingertip_arg,
+        place_release_lift_arg,
         carry_objects_arg,
         skip_detector_arg,
         skip_planner_arg,
