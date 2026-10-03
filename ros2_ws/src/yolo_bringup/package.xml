@@ -19,6 +19,13 @@
        所以在板上只编子集、不装仿真资产的场景仍可正常用真机分支。 -->
   <exec_depend>arm_grasp_sim</exec_depend>
 
+  <!-- real.launch.py 把 description_package 钉到本仓库自己的描述覆盖包上
+       （见该文件里 DESCRIPTION_PACKAGE 那段注释）。仿真路径（sim.launch.py /
+       arm_grasp_sim）用不到它，所以是 exec_depend 而不是 depend。
+       ⚠️ 它不在，真机启动会在 `FindPackageShare` 那一步直接失败 —— 这是刻意的：
+       退回到官方 ur_description 会静默用标称运动学，比启动失败难查得多。 -->
+  <exec_depend>yolo_ur_description</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
 

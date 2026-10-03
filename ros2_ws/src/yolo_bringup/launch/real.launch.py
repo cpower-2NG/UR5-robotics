@@ -79,6 +79,30 @@ _NO_DEFAULT = ""
 # 现已在 grasp_planner.yaml 里改成 2.0 s（D55）。
 INITIAL_JOINT_CONTROLLER = "scaled_joint_trajectory_controller"
 
+# ⚠️ 描述包：本仓库自己的那一份，不是官方的 ur_description
+# =====================================================
+# 官方 `ur_description` 的 `config/ur5/default_kinematics.yaml` 是**标称** UR5 DH，
+# 而这台机器人带**出厂标定**。用官方那份的后果（都是实测，不是估计）：
+#   · 驱动启动打 ERROR：「The calibration parameters of the connected robot
+#     don't match the ones from the given kinematics config file.」
+#     （它照样继续跑，所以很容易被忽略）
+#   · `tool0` 位置偏差 均值 1.62 mm / p95 2.96 mm / **最坏 3.59 mm**，
+#     姿态最坏 0.39°（3000 组随机关节角下的 FK 对比，
+#     证据 docs/calib/ur5_calibration_delta.json）
+#
+# **这份常量必须同时喂给 _driver 和 _moveit，且两处必须是同一个值。**
+# 驱动和 move_group 各拿一份 robot_description：
+#   · 两边都用标称 → IK 按标称解、真机按标称的逆解去动，末端偏 δ；
+#   · 只把驱动换成标定 → TF 准了，但 IK 还是按标称解，末端**照样**偏 δ；
+#   · 只有两份**都**换成标定，IK 与 TF 才是同一套几何，δ 才真的消掉。
+# 所以「只修驱动侧」是白修的 —— 这不是过度设计，是这件事成立的前提。
+#
+# 上游那两个 launch 都声明了 `description_package` 参数，且在各自文件里
+# 分别决定 xacro 的全部输入路径（driver: ur_control.launch.py:97,100,103,119,529；
+# moveit: ur_moveit.launch.py:71,74,77,80,87），所以一个参数就能把两边同时钉住。
+# 细节与「怎么重新抓标定」见 ros2_ws/src/yolo_ur_description/README.md。
+DESCRIPTION_PACKAGE = "yolo_ur_description"
+
 
 def _package_launch(pkg: str, filename: str, *, why: str) -> str:
     """取另一个包的 launch 文件绝对路径；包不在就抛出**可操作**的报错。
@@ -172,6 +196,18 @@ def _driver(context):
             launch_arguments={
                 "ur_type": LaunchConfiguration("ur_type"),
                 "robot_ip": LaunchConfiguration("robot_ip"),
+                # ★ 描述包换成我们自己的（见 yolo_ur_description/README.md）。
+                #   官方默认是 ur_description，它那份 default_kinematics.yaml 是
+                #   **标称** UR5 DH，而这台机器人带出厂标定 —— 两者 hash 不等，
+                #   驱动启动会打一条 ERROR，且 tool0 位置偏差实测
+                #   均值 1.62 mm / 最坏 3.59 mm（3000 组随机关节角，
+                #   证据 docs/calib/ur5_calibration_delta.json）。
+                #   这里传 description_package 而不是 kinematics_params_file：
+                #   后者的默认值就是 <description_package>/config/<ur_type>/
+                #   default_kinematics.yaml（ur_control.launch.py:529-537），
+                #   传前者一个参数就够，而且**天然与下面 _moveit 传的是同一个值** ——
+                #   两份 description 不可能再分叉。
+                "description_package": DESCRIPTION_PACKAGE,
                 # 官方默认就是 true，显式传是为了让「本文件要不要 RViz」
                 # 一眼可见：Orin 上 7.4 GiB 内存，RViz 白占（也少一个能
                 # 显示机器人状态的窗口，但真机看的是示教器和实物）。
@@ -210,6 +246,14 @@ def _moveit(context):
             PythonLaunchDescriptionSource(path),
             launch_arguments={
                 "ur_type": LaunchConfiguration("ur_type"),
+                # ★ 必须与 _driver 传**同一个值**，理由同上：ur_moveit.launch.py 的
+                #   description_package 在 :71,74,77,80,87 五处决定 xacro 路径
+                #   （config/<ur_type>/ 那四份 yaml + urdf/<description_file>）。
+                #   官方这个 launch **没有** kinematics 参数，只有
+                #   description_package 这一个旋钮 —— 所以这里就是唯一入口。
+                #   （SRDF / kinematics.yaml / rviz 都来自 moveit_config_package，
+                #    不受影响。）
+                "description_package": DESCRIPTION_PACKAGE,
                 # ⚠️ 两个默认都是 true（`:394` 与 `:397`），在这里都关掉：
                 #   launch_rviz  —— Orin 上白占内存；
                 #   launch_servo —— **一个能直接指挥机器人的节点**（moveit_servo）。

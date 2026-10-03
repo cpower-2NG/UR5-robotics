@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>yolo_ur_description</name>
+  <version>0.1.0</version>
+  <description>
+    UR 机器人描述的**覆盖包**：只把运动学标定换成这台 UR5 的出厂标定，
+    其余文件（xacro 与 config 下除 default_kinematics.yaml 以外的全部内容）
+    在构建时从已安装的 ur_description 镜像过来。
+  </description>
+  <maintainer email="user@example.com">user</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- 构建期就要读它的 share/ 目录（镜像 xacro 与 config），故是 depend 不是 exec_depend。 -->
+  <depend>ur_description</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
