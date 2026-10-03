@@ -294,6 +294,33 @@ def row_limits_outer(cells, xs, ys):
     return row_limits(cells, list(reversed(xs)), ys)
 
 
+def node_guard_note(worst_z, table_z, node_table_z, guard_margin):
+    """最坏那格相对**节点参数那份**护栏的判词；两份台面一样就返回 `None`。
+
+    单拎出来是因为第一版把**两件独立的事说成了一件事**：
+    「节点护栏会放行它」与「它在台面以下」—— 前者由 `worst_z >= 节点下限`
+    支持，**后者当时没有任何东西检查过**。实测扫到一片全安全区域时，最低连杆
+    在 +0.2868（台面**之上**），而那句话照样印出「已在台面以下 -0.2868 m」：
+    负数、且与事实相反。一条字符串就是这样骗人的 —— 它报告的是**自己那句话**，
+    不是它以为在描述的物理事实。
+    """
+    if node_table_z is None or node_table_z == table_z:
+        return None
+    old_floor = node_table_z + guard_margin
+    if worst_z < old_floor:
+        return f"    ⇒ 这一格连节点参数那份护栏（下限 {old_floor:+.4f}）也会拦下。"
+    head = (f"    ⇒ **按节点参数那份护栏判（table_plane_z={node_table_z:+.2f}"
+            f" ⇒ 下限 {old_floor:+.4f}）会放行它**：这条连杆 {worst_z:+.4f}，"
+            f"而真机台面在 {table_z:+.4f}")
+    if worst_z < table_z:
+        return head + f" ⇒ 它已在**台面以下 {table_z - worst_z:.4f} m**。"
+    return head + (f" ⇒ 它在台面**之上** {worst_z - table_z:.4f} m。"
+                   f"这一格本身**不危险** —— 它只说明「节点这份护栏的下限"
+                   f"比真机台面还低、对真机几何已经没有意义」，"
+                   f"不能当作「这里撞桌」的证据。")
+
+
+
 def _fmt_x(v):
     return "—" if v is None else f"{v:.2f}"
 
@@ -621,17 +648,10 @@ def main():
                   f"「{LEVEL_LABEL[k]}」，离下限 {floor:+.4f} 还有"
                   f" {worst_z - floor:+.4f} m")
             print(f"    （该格各连杆：{which}）")
-            if p["table_plane_z"] is not None and p["table_plane_z"] != args.table_z:
-                old_floor = p["table_plane_z"] + p["guard_margin"]
-                if worst_z >= old_floor:
-                    print(f"    ⇒ **按节点参数那份护栏判（table_plane_z="
-                          f"{p['table_plane_z']:+.2f} ⇒ 下限 {old_floor:+.4f}）"
-                          f"会放行它**：这条连杆 {worst_z:+.4f}，而真机台面在 "
-                          f"{args.table_z:+.4f} ⇒ 它已在**台面以下"
-                          f" {args.table_z - worst_z:.4f} m**。")
-                else:
-                    print(f"    ⇒ 这一格连节点参数那份护栏（下限 {old_floor:+.4f}）"
-                          f"也会拦下。")
+            note = node_guard_note(worst_z, args.table_z,
+                                     p["table_plane_z"], p["guard_margin"])
+            if note:
+                print(note)
 
         usable = [(x, y) for (x, y), s in cells.items() if s in (SAFE, NEAR)]
         if usable:

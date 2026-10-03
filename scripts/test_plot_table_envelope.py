@@ -29,7 +29,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from plot_table_envelope import (                                 # noqa: E402
     CJK_CANDIDATES, MISSING, SYM_COLOR, SYM_LABEL_EN, SYM_LABEL_ZH, SYM_ORDER,
-    codes, edges, parse_slot, parse_zone, pick_font)
+    codes, edges, parse_slot, parse_zone, pick_font, validate, worst_point)
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -147,6 +147,67 @@ check("不能往返的 x 也能取到数据（不是 MISSING）", g3[0][0] == "X
 check("取不到时是 MISSING 而**不是** SAFE（宁可画成 ? 也不许当成安全）",
       codes({"xs": [0.1], "ys": [0.0], "cells": {}, "per_level": {"k": {}}},
             "worst")[2][0][0] == MISSING)
+
+
+# ----------------------------------------------------------------------
+# D3. validate：**契约**校验。这一段是踩出来的，不是想出来的
+# ----------------------------------------------------------------------
+# 实测：第一版 draw() 按两元组解包 `worst_at`，而包线写的是
+# **三元组** `[x, y, 层级名]` —— 在板上跑起来报 `too many values to unpack`，
+# 报的话跟「哪个键、哪一侧错」毫无关系。这 44 条自检当时**一条都没红**，
+# 因为它们只覆盖不画图的那一半。validate 就是为了让这类错**在入口就说清楚**。
+print("\n--- D3. validate（JSON 契约）---")
+
+# 这份样本**照抄包线脚本真写出来的键名与形状**（含 worst_at 的第三项）。
+GOOD = {
+    "xs": [0.15, 0.20], "ys": [-0.10, 0.00],
+    "cells": {"0.2000,0.1000": "X"}, "per_level": {"grasp_descend": {}},
+    "levels": {"grasp_descend": 0.2042}, "table_z": 0.0, "floor": 0.02,
+    "guard_margin": 0.02, "worst_link_z": -0.0944,
+    "worst_at": [0.20, 0.10000000000000009, "grasp_descend"],
+}
+check("照抄真实形状的样本要通过", validate(GOOD) == [], f"got {validate(GOOD)!r}")
+check("★ 三元组 worst_at 不再被当成两元组（这就是当时炸掉的那条）",
+      validate(GOOD) == [])
+check("两元组 worst_at 也接受（旧 JSON）",
+      validate({**GOOD, "worst_at": [0.2, 0.1]}) == [])
+check("worst_at = null 接受（没有坏格）",
+      validate({**GOOD, "worst_at": None}) == [])
+check("四元组 worst_at ⇒ 报出来（不是留给 unpack 去炸）",
+      len(validate({**GOOD, "worst_at": [0.2, 0.1, "grasp", 7]})) == 1)
+check("worst_at 前两项不是数字 ⇒ 报出来",
+      len(validate({**GOOD, "worst_at": ["a", "b"]})) == 1)
+check("有 worst_at 但没有 worst_link_z ⇒ 报出来",
+      len(validate({k: v for k, v in GOOD.items() if k != "worst_link_z"})) == 1)
+check("缺 table_z ⇒ 报出来", any("table_z" in b for b in
+                                validate({k: v for k, v in GOOD.items()
+                                          if k != "table_z"})))
+check("xs 是空列表 ⇒ 报出来（画不出空网格）",
+      any("xs" in b for b in validate({**GOOD, "xs": []})))
+check("per_level 不是对象 ⇒ 报出来",
+      any("per_level" in b for b in validate({**GOOD, "per_level": []})))
+check("顶层不是对象 ⇒ 一句话报掉，不抛异常", validate([1, 2]) == ["顶层不是对象"])
+check("**一次把所有问题都说出来**（不是修一个才发现下一个）",
+      len(validate({})) >= 6, f"got {len(validate({}))}")
+check("合法的空 cells 不报（那只是这一层没数据，不是 JSON 坏）",
+      validate({**GOOD, "cells": {}}) == [])
+
+# worst_point：**当初炸掉的就是这一处**。以前它在 draw() 里，纯函数自检够不着，
+# 所以 44 条全绿也照样漏。提出来之后这条契约才有断言。
+print("\n--- D4. worst_point（当初 `too many values to unpack` 的那一处）---")
+wx, wy, wl = worst_point(GOOD)
+# ⚠️ 别写成 `== (0.2, 0.1, ...)` —— 真实 JSON 里的 y 是
+# `0.10000000000000009`（浮点累加噪声），精确相等会假红。这正是包线要按
+# `%.4f` 写键的那个同一个来源。
+check("三元组解出 x/y/层级名（不是抛异常）",
+      abs(wx - 0.2) < 1e-9 and abs(wy - 0.1) < 1e-9 and wl == "grasp_descend",
+      f"got {(wx, wy, wl)!r}")
+check("两元组也解得出，层级名是 None",
+      worst_point({**GOOD, "worst_at": [0.2, 0.1]}) == (0.2, 0.1, None))
+check("没有 worst_at ⇒ None（不是抛异常）", worst_point({}) is None)
+check("worst_at = null ⇒ None", worst_point({**GOOD, "worst_at": None}) is None)
+check("x/y 是 float（不是原样透传的字符串或 numpy 之类）",
+      all(isinstance(v, float) for v in worst_point(GOOD)[:2]))
 
 
 # ----------------------------------------------------------------------

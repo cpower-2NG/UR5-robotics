@@ -139,6 +139,61 @@ def codes(data, which):
     return xs, ys, grid
 
 
+def validate(data):
+    """检查这份 JSON 是不是包线脚本写的、`draw()` 要的那些键在不在、形状对不对。
+
+    返回**问题清单**（空列表 = 通过），不是抛异常 —— 调用方要一次把所有问题
+    都打出来，而不是修一个才发现下一个。
+
+    为什么要有这一道：JSON 由**另一个脚本**写，两边靠约定配对。形状一旦对不上，
+    不校验的话错误会出现在 `draw()` 深处（可能是 unpack、可能是 KeyError、
+    也可能是**静默画错**），报出来的话跟「哪个键错了」没关系。
+    实测踩到过：`worst_at` 是三元组 `[x, y, 层级名]`，作图那半按两元组解包。
+    """
+    bad = []
+    if not isinstance(data, dict):
+        return ["顶层不是对象"]
+    for k in ("xs", "ys"):
+        v = data.get(k)
+        if not isinstance(v, list) or not v:
+            bad.append(f"{k} 要是非空列表，实际 {type(v).__name__}")
+        elif not all(isinstance(x, (int, float)) for x in v):
+            bad.append(f"{k} 里有非数字")
+    for k in ("cells", "per_level", "levels"):
+        if not isinstance(data.get(k), dict):
+            bad.append(f"{k} 要是对象，实际 {type(data.get(k)).__name__}")
+    for k in ("table_z", "floor", "guard_margin"):
+        if not isinstance(data.get(k), (int, float)):
+            bad.append(f"{k} 要是数字，实际 {type(data.get(k)).__name__}")
+    # `worst_at`：允许 None（没有坏格），否则必须是 2 或 3 元组。
+    # 3 元组的第三项是**层级名** —— 别按两元组解包（实测就是这么炸的）。
+    wa = data.get("worst_at")
+    if wa is not None:
+        if not isinstance(wa, (list, tuple)) or len(wa) not in (2, 3):
+            bad.append(f"worst_at 要是 null 或 [x, y] / [x, y, 层级名]，实际 {wa!r}")
+        elif not all(isinstance(v, (int, float)) for v in wa[:2]):
+            bad.append(f"worst_at 的前两个要是数字，实际 {wa!r}")
+        elif not isinstance(data.get("worst_link_z"), (int, float)):
+            bad.append("有 worst_at 就必须有数字 worst_link_z")
+    return bad
+
+
+def worst_point(data):
+    """`data["worst_at"]` → `(x, y, 层级名)`；没有就 `None`。
+
+    单拎出来是因为**这里正是踩过的那一处**：包线写的是**三元组**
+    `[x, y, 层级名]`，而第一版作图直接 `wx, wy = data["worst_at"]`，
+    在板上跑起来报 `too many values to unpack`。
+    放在 `draw()` 里就没法被自检覆盖（那半边要 matplotlib），
+    提成纯函数之后，这条契约就有断言钉着了。
+    层级名允许缺（只有两元组的旧 JSON）⇒ 返回 `None`。
+    """
+    wa = data.get("worst_at")
+    if not wa:
+        return None
+    return float(wa[0]), float(wa[1]), (wa[2] if len(wa) > 2 else None)
+
+
 def pick_font(available_names):
     """在**已经拿到的字体名集合**里挑一个 CJK 字体，没有就 None。
 
@@ -255,16 +310,21 @@ def draw(data, which, zones, slots, out, title, dpi):
                              markeredgewidth=2.0, color="#7a3ba8",
                              label=("放置槽位（--slot）" if font else "place slots (--slot)"))
 
-    if data.get("worst_at"):
-        wx, wy = data["worst_at"]
+    wp = worst_point(data)          # 解包规则见那个函数（三元组，踩过坑）
+    if wp:
+        wx, wy, wlvl = wp
+        # 层级名有用：同一格在「抓取下降」与「放置接近」上是两个不同的位姿。
+        wname = (LEVEL_ZH if font else LEVEL_EN).get(wlvl, wlvl) if wlvl else None
         ax.plot([wx], [wy], marker="o", markersize=9, markerfacecolor="none",
                 markeredgecolor="#8a1c1c", markeredgewidth=2.0, zorder=7)
-        ax.annotate(
-            (f"全场最低连杆 {data['worst_link_z']:+.4f} m\n"
-             f"（下限 {data['floor']:+.4f}）" if font else
-             f"lowest link {data['worst_link_z']:+.4f} m\n(floor {data['floor']:+.4f})"),
-            xy=(wx, wy), xytext=(wx + 0.06, wy - 0.12), fontsize=9, color="#8a1c1c",
-            zorder=7, arrowprops=dict(arrowstyle="->", color="#8a1c1c", lw=1.2))
+        txt = (f"全场最低连杆 {data['worst_link_z']:+.4f} m\n"
+               f"（下限 {data['floor']:+.4f}）" if font else
+               f"lowest link {data['worst_link_z']:+.4f} m\n(floor {data['floor']:+.4f})")
+        if wname:
+            txt += f"\n@{wname}" if font else f"\n@{wname}"
+        ax.annotate(txt, xy=(wx, wy), xytext=(wx + 0.06, wy - 0.12), fontsize=9,
+                    color="#8a1c1c", zorder=7,
+                    arrowprops=dict(arrowstyle="->", color="#8a1c1c", lw=1.2))
 
     ax.set_aspect("equal")
     ax.set_xlabel("x（base_frame，m，正前方）" if font else "x (base_frame, m)")
@@ -343,6 +403,17 @@ def main():
         return 2
     except json.JSONDecodeError as e:
         print(f"!! {args.json} 不是合法 JSON：{e}")
+        return 2
+
+    # 契约校验放在**最前面**：这份 JSON 由另一个脚本写，形状对不上是迟早的事。
+    # 没有这一道时，形状错要等到 draw() 深处才炸（实测踩到过：`worst_at` 是
+    # 三元组 `[x, y, 层级名]`，而作图那半按两元组解包，报的是
+    # `too many values to unpack`，看不出是哪个键、哪一侧错）。
+    bad = validate(data)
+    if bad:
+        print(f"!! {args.json} 不像包线脚本写的 JSON：")
+        for b in bad:
+            print(f"     · {b}")
         return 2
 
     which = args.map

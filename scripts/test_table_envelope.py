@@ -33,8 +33,8 @@ try:
     from table_safety_envelope import (                          # noqa: E402
         BLOCKED, LEVEL_KEYS, NEAR, NOIK, PROJECT_ROOT, REAL_BLOCK_HEIGHT, SAFE,
         SOLVABLE_OTHER, axis, cell_key, classify_one, combine, json_axis,
-        launch_const, num, render_map, row_limits, row_limits_outer, worst,
-        z_levels)
+        launch_const, node_guard_note, num, render_map, row_limits,
+        row_limits_outer, worst, z_levels)
 except ImportError as e:              # 没 source ROS 时 rclpy 拉不到
     print(f"环境不满足（{e}）—— 先 source /opt/ros/humble/setup.bash")
     sys.exit(2)
@@ -314,6 +314,60 @@ for key in ("pick_zone", "place_slots", "place_z", "table_plane_z", "table_min_z
           f"'{key}'" not in _block,
           "它被 launch 覆盖了 ⇒ planner_params_file 里改它静默无效")
 
+
+# ----------------------------------------------------------------------
+# I. node_guard_note：**「护栏放行」与「在台面以下」是两件事**
+# ----------------------------------------------------------------------
+# ⚠️ 这一段是**实测踩出来的**，不是想出来的。第八十五轮加的那句判词，第一版写成
+# 「节点护栏会放行它 ⇒ 所以它已在台面以下」。前半句有 `worst_z >= old_floor`
+# 支持，**后半句当时没有任何东西检查过** —— 在板上扫一片本来就全安全的区域
+# （x=0.5、最低连杆 +0.2868，台面之上）时，它照样印出
+# 「它已在台面以下 -0.2868 m」：负数，且与事实相反。
+# 一条字符串报告的是**它自己那句话**，不是它以为在描述的物理事实。
+print("\n--- I. node_guard_note：放行 ≠ 在台面以下 ---")
+
+K = dict(node_table_z=-0.39, guard_margin=0.02)      # 节点那份 ⇒ 下限 -0.3700
+
+# ① 真正的危险格：连杆在台面**之下**，而节点护栏放行（-0.0944 >= -0.37）
+n = node_guard_note(-0.0944, 0.0, **K)
+check("真危险格：说了「会放行它」", n and "会放行" in n, f"got {n!r}")
+check("★ 真危险格：**才**说「台面以下」，且是正数 0.0944（不是负的）",
+      n and "台面以下 0.0944 m" in n, f"got {n!r}")
+
+# ② 本次踩到的那一格：连杆在台面**之上**，节点护栏也放行
+n2 = node_guard_note(0.2868, 0.0, **K)
+check("★ 台面之上的格子：**不许**说「台面以下」（这就是当初印错的那句）",
+      n2 and "台面以下" not in n2, f"got {n2!r}")
+check("★ 台面之上的格子：要明说它**不危险**，别让人读成撞桌",
+      n2 and "不危险" in n2 and "台面**之上** 0.2868 m" in n2, f"got {n2!r}")
+check("台面之上的格子：仍然如实报告「节点护栏会放行」",
+      n2 and "会放行" in n2, f"got {n2!r}")
+
+# ③ 节点护栏自己就拦得下 ⇒ 另一种说法
+n3 = node_guard_note(-0.50, 0.0, **K)
+check("连杆低于节点下限 ⇒ 说「也会拦下」，不说放行",
+      n3 and "也会拦下" in n3 and "放行" not in n3, f"got {n3!r}")
+
+# ④ 两份台面一样 ⇒ 无可说（不印一段自我比较的废话）
+check("节点台面 = 本次台面 ⇒ None（两份一样就没什么可比的）",
+      node_guard_note(-0.5, 0.0, 0.0, 0.02) is None)
+check("节点没读到 table_plane_z ⇒ None（不拿 None 参与比较）",
+      node_guard_note(-0.5, 0.0, None, 0.02) is None)
+check("边界：正好等于下限 ⇒ **放行**（判据是 >=，与护栏同口径）",
+      "会放行" in (node_guard_note(-0.37, 0.0, **K) or ""))
+
+# ⑤ 三条判词互斥：任何输入只落一种说法
+says = [node_guard_note(z, 0.0, **K) for z in (-0.9, -0.5, -0.37, -0.0944, 0.0, 0.5)]
+check("每一条都非空（节点台面不同 ⇒ 总有话说）", all(says))
+# z = -0.9 / -0.5 低于节点下限 ⇒ 「也会拦下」，与台面高低无关，不说「台面以下」
+# z = -0.37 / -0.0944 放行且低于台面 ⇒ 说「台面以下」（这两格才是真危险）
+# z = 0.0 / +0.5 放行但在台面之上 ⇒ 说「台面之上、不危险」
+check("说「台面以下」的正好是那两格真的低于台面的（-0.37 与 -0.0944）",
+      [i for i, s in enumerate(says) if "台面以下" in s] == [2, 3],
+      f"got {[i for i, s in enumerate(says) if '台面以下' in s]}")
+check("说「也会拦下」的正好是那两格低于节点下限的（-0.9 与 -0.5）",
+      [i for i, s in enumerate(says) if "也会拦下" in s] == [0, 1],
+      f"got {[i for i, s in enumerate(says) if '也会拦下' in s]}")
 
 print("\n通过 %d，失败 %d" % (N_PASS, N_FAIL))
 if FAILS:
