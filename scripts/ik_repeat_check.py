@@ -134,81 +134,94 @@ def main():
     from table_safety_envelope import (                       # noqa: E402
         LEVEL_KEYS, REAL_BLOCK_HEIGHT, launch_const, num, z_levels)
 
-    pr = Probe(args.node, ik_group=args.ik_group)
-    if not pr.ik.wait_for_service(timeout_sec=10.0):
-        print("!! /compute_ik 不可用 —— move_group 起了吗？")
-        return 2
-    p = pr.read_params()
-
-    if args.seed:
-        seed = [float(v) for v in args.seed.split(",")]
-    else:
-        seed = list(p["ik_seed"])
-
-    if args.z is not None:
-        targets = [("（命令行 --z）", float(args.z))]
-        grips = {0: None}
-    else:
-        bh = args.block_height if args.block_height is not None else REAL_BLOCK_HEIGHT
-        ttf = num(launch_const("REAL_TOOL0_TO_FINGERTIP"),
-                  "pipeline.launch.py 的 REAL_TOOL0_TO_FINGERTIP")
-        prl = num(launch_const("REAL_PLACE_RELEASE_LIFT"),
-                  "pipeline.launch.py 的 REAL_PLACE_RELEASE_LIFT")
-        if ttf is None or prl is None:
-            print("!! 读不到 pipeline.launch.py 里的真机几何常数 —— "
-                  "拒绝用自己的一份副本顶上（那正是「两套几何」的来源）")
+    # ⚠️ init 必须在 Probe **之前**：Probe.__init__ 起 rclpy 节点，没 init 直接
+    # NotInitializedException —— 第一次板上真跑就崩在这。纯函数那一半有自检，
+    # 取数这一半没有（本文件 docstring 里「真正的『解会不会变』不在这里测」
+    # 说的正是这一半）。样式照抄 table_safety_envelope.main()。
+    rclpy.init()
+    pr = None
+    try:
+        # Probe 放进 try 里：它自己抛异常时 finally 里的 `pr.destroy_node()`
+        # 会 NameError，把真正的错盖成一句看不懂的 —— 崩溃信息要指向病根。
+        pr = Probe(args.node, ik_group=args.ik_group)
+        if not pr.ik.wait_for_service(timeout_sec=10.0):
+            print("!! /compute_ik 不可用 —— move_group 起了吗？")
             return 2
-        zs = z_levels(args.table_z, bh, ttf, prl, p["approach_clearance"])
-        targets = list(zip(LEVEL_KEYS, zs))
-        # 与包线同口径：抓取那两层是**张开**的爪子，放置那两层是**闭合**的。
-        # 「闭合」那一支正是 `place_release_lift` 那个只在手里有东西时才发作的坑。
-        grips = {i: (p["sim_gripper_open"] if k.startswith("grasp")
-                     else p["sim_gripper_close"])
-                 for i, (k, _) in enumerate(targets)}
+        p = pr.read_params()
 
-    print("=" * 74)
-    print("IK 可复现性检查（只读：只调 /compute_ik，不发轨迹、不写寄存器）")
-    print("=" * 74)
-    print(f"  规划组 {p['ik_group']} / 末端 {p['ik_link']} / 系 {p['base_frame']}")
-    print(f"  种子   {[round(v, 3) for v in seed]}"
-          f"{'（命令行 --seed）' if args.seed else '（← 节点参数 ik_seed，包线用的就是它）'}")
-    print(f"  位姿   x={args.x:.3f}  y={args.y:.3f}")
-    print(f"  每个高度问 {args.n} 次")
+        if args.seed:
+            seed = [float(v) for v in args.seed.split(",")]
+        else:
+            seed = list(p["ik_seed"])
 
-    bad = 0
-    for i, (label, z) in enumerate(targets):
-        print(f"\n--- {label}  tool0 z = {z:+.4f} ---")
-        sols = []
-        reasons = {}
-        for _ in range(args.n):
-            arm, why = pr.solve_ik(p, args.x, args.y, z, seed, grips.get(i))
-            sols.append(None if arm is None else tuple(float(v) for v in arm))
-            if why:
-                reasons[why] = reasons.get(why, 0) + 1
-        br = tally(sols)
-        real = [k for k, _ in br if k is not None]
-        print(f"  不同的解：{len(real)} 个" + (f"；解不出 {sum(v for k, v in br if k is None)} 次"
-                                              if any(k is None for k, _ in br) else ""))
-        for k, n in br:
-            if k is None:
-                print(f"    × {n:>3} 次  解不出")
-                continue
-            d = spread(k, seed)
-            print(f"    × {n:>3} 次  与种子最大关节差 {d:.4f} rad"
-                  f"   {[round(a, 3) for a in k]}")
-        if reasons:
-            print("  （失败原因：" + "、".join(f"{k}×{v}" for k, v in reasons.items()) + "）")
-        v = verdict(br, seed)
-        print("  " + v.replace("\n", "\n  "))
-        if len(real) > 1:
-            bad += 1
+        if args.z is not None:
+            targets = [("（命令行 --z）", float(args.z))]
+            grips = {0: None}
+        else:
+            bh = args.block_height if args.block_height is not None else REAL_BLOCK_HEIGHT
+            ttf = num(launch_const("REAL_TOOL0_TO_FINGERTIP"),
+                      "pipeline.launch.py 的 REAL_TOOL0_TO_FINGERTIP")
+            prl = num(launch_const("REAL_PLACE_RELEASE_LIFT"),
+                      "pipeline.launch.py 的 REAL_PLACE_RELEASE_LIFT")
+            if ttf is None or prl is None:
+                print("!! 读不到 pipeline.launch.py 里的真机几何常数 —— "
+                      "拒绝用自己的一份副本顶上（那正是「两套几何」的来源）")
+                return 2
+            zs = z_levels(args.table_z, bh, ttf, prl, p["approach_clearance"])
+            targets = list(zip(LEVEL_KEYS, zs))
+            # 与包线同口径：抓取那两层是**张开**的爪子，放置那两层是**闭合**的。
+            # 「闭合」那一支正是 `place_release_lift` 那个只在手里有东西时才发作的坑。
+            grips = {i: (p["sim_gripper_open"] if k.startswith("grasp")
+                         else p["sim_gripper_close"])
+                     for i, (k, _) in enumerate(targets)}
 
-    print("\n" + "=" * 74)
-    if bad:
-        print(f"结论：{bad} / {len(targets)} 个位姿**不可复现**。")
-    else:
-        print(f"结论：{len(targets)} 个位姿全部**可复现**（每个只回来一个解）。")
-    return 1 if bad else 0
+        print("=" * 74)
+        print("IK 可复现性检查（只读：只调 /compute_ik，不发轨迹、不写寄存器）")
+        print("=" * 74)
+        print(f"  规划组 {p['ik_group']} / 末端 {p['ik_link']} / 系 {p['base_frame']}")
+        print(f"  种子   {[round(v, 3) for v in seed]}"
+              f"{'（命令行 --seed）' if args.seed else '（← 节点参数 ik_seed，包线用的就是它）'}")
+        print(f"  位姿   x={args.x:.3f}  y={args.y:.3f}")
+        print(f"  每个高度问 {args.n} 次")
+
+        bad = 0
+        for i, (label, z) in enumerate(targets):
+            print(f"\n--- {label}  tool0 z = {z:+.4f} ---")
+            sols = []
+            reasons = {}
+            for _ in range(args.n):
+                arm, why = pr.solve_ik(p, args.x, args.y, z, seed, grips.get(i))
+                sols.append(None if arm is None else tuple(float(v) for v in arm))
+                if why:
+                    reasons[why] = reasons.get(why, 0) + 1
+            br = tally(sols)
+            real = [k for k, _ in br if k is not None]
+            print(f"  不同的解：{len(real)} 个" + (f"；解不出 {sum(v for k, v in br if k is None)} 次"
+                                                  if any(k is None for k, _ in br) else ""))
+            for k, n in br:
+                if k is None:
+                    print(f"    × {n:>3} 次  解不出")
+                    continue
+                d = spread(k, seed)
+                print(f"    × {n:>3} 次  与种子最大关节差 {d:.4f} rad"
+                      f"   {[round(a, 3) for a in k]}")
+            if reasons:
+                print("  （失败原因：" + "、".join(f"{k}×{v}" for k, v in reasons.items()) + "）")
+            v = verdict(br, seed)
+            print("  " + v.replace("\n", "\n  "))
+            if len(real) > 1:
+                bad += 1
+
+        print("\n" + "=" * 74)
+        if bad:
+            print(f"结论：{bad} / {len(targets)} 个位姿**不可复现**。")
+        else:
+            print(f"结论：{len(targets)} 个位姿全部**可复现**（每个只回来一个解）。")
+        return 1 if bad else 0
+    finally:
+        if pr is not None:
+            pr.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
