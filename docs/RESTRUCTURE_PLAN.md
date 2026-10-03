@@ -10787,3 +10787,53 @@ python3 scripts/test_pipeline_e2e.py
   一次临时变异并**立即还原**。
 - **没有**通过 SSH 触发任何机械臂运动；**没有**碰 `main`；**没有**推送。
 - 未动 `~/yahboom_ws`、`~/ultralytics` 等目录。
+
+---
+
+## 第七十七轮：给板子配上 `origin` —— 走**已经通的那个方向**（2026-10-03）
+
+### 一 为什么不直连
+
+用户要求给板子配 `origin`。最直觉的做法是 `ssh://开发机/...`，**但它不成立**：
+
+| 障碍 | 实测 |
+|---|---|
+| WSL 上的 `sshd` | **没在跑** |
+| 板上有没有反向可用的密钥 | 没有（`~/.ssh` 里只有 `board_ed25519` / `yahboom_ed25519` 两把**客户端**私钥） |
+| 开发机地址稳不稳 | WSL2 在 NAT 后面，`eth0 = <ip>/23` 是校园网 **DHCP**，重启就变 |
+| 板子能不能回来 | 板子能 **ping** 通 `<ip>`（2.8 ms），但那是**镜像网络下开发机应的答**；**TCP 入站没有验证过**，而验证它需要把端口 bind 到 `0.0.0.0` 暴露到局域网 —— 这一步被权限闸门拦下，**我没有绕** |
+
+就算全都配通，结果也是「**开发机不开着、板子就拉不动**」——那不叫 origin。
+
+### 二 改成走已经通的方向
+
+能通的方向只有一个：**开发机 → 板子**（`ssh jetson-wifi`）。
+于是把裸仓库放在**板子上**，板子的 `origin` 指向**本机路径**：
+
+| 位置 | 是什么 |
+|---|---|
+| 板子 `~/git/yolo_ros_original.git` | 裸仓库（镜像） |
+| 板子 `~/yolo_ros_original` 的 `origin` | `/home/<user>/git/yolo_ros_original.git` —— 本机路径 |
+| 开发机的 `board` remote | `jetson-wifi:/home/<user>/git/yolo_ros_original.git` |
+
+优点：不依赖网络、不依赖开发机在线、地址不会变；用的还是那条已经用了很久的 SSH 通路。
+
+### 三 往返验证（不是「空推」）
+
+「Everything up-to-date」**证明不了通路**——两边本来就在同一个提交上。
+所以临时推一个 ref 走全程：
+
+1. 开发机 `git push board migrate/humble-orin:refs/heads/tmp-origin-test` → `* [new branch]`
+2. 板子 `git fetch origin` → `* [new branch] tmp-origin-test -> origin/tmp-origin-test`，
+   `rev-parse` = `03c0f57`，提交标题读出来也对
+3. 清理：开发机 `git push board :refs/heads/tmp-origin-test`，板子 `git fetch --prune origin`
+   → 只剩 `origin/migrate/humble-orin`
+
+随后用**新通路本身**同步了本文档这次提交：开发机 `push` → 板子 `fetch` + `reset --hard`
+→ 板子 HEAD `bb25e89`、工作树 **0 条改动**。
+
+### 四 台面账
+
+- 板子盘上还有 **166 GB**，裸仓库约 200 MB。
+- `main` 两边都没动；没有推送任何外部远端。
+- 板子上新增：`~/git/yolo_ros_original.git` 及其 `.git` 配置里的一条 `origin`。
