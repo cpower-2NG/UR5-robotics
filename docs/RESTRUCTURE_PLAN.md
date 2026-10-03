@@ -11996,3 +11996,208 @@ $ python3 scripts/test_plot_table_envelope.py   → 通过 44，失败 0
   这一点第八十三轮已验）；**现场换了 zones 之后要按丙-6 重跑**。
 - **包线不含相机视野** ⇒ `pick_zone` 的最终形状要「几何边界 ∩ 视野」，
   后者等现场标定完俯视/腕部相机外参才画得出来。
+
+---
+
+## 第八十五轮（续）：把「无臂栈」补齐，并修掉它暴露的**三处「话说了没查过的事」**（2026-10-03）
+
+第八十四轮交付了包线，第八十五轮的**全扫**交付了它自己的两个静默缺陷。
+这一节记的是**跑全扫的过程中又掉出来的三个** —— 三个的形态是同一个：
+
+> **一句话/一个状态报告的是它自己的主语，不是你以为的那件事。**
+
+| # | 说出来的话 | 它实际的主语 | 后果 |
+|---|---|---|---|
+| 1 | `/compute_ik` 回 `FRAME_TRANSFORM_FAILURE` | 「请求帧的 TF 查不到」 | 被读成「这条位姿够不到」——**几何问题** |
+| 2 | 「它已在**台面以下 -0.2868 m**」 | 节点那份护栏的下限 | 负数、且**与事实相反**（那一格在台面之上） |
+| 3 | `data["worst_at"]` 解包 | 包线写的是**三元组** | `ValueError: too many values to unpack` |
+
+三处的修法也都是同一味药：**把那段话抽成一个纯函数，给它一条会红得起来的断言**。
+
+### 一、缺陷一：`start_ur_driver:=false` **连同 `robot_state_publisher` 一起省掉了**
+
+这不是「少起一个节点」，是一条**症状长得像几何问题**的链路故障。
+
+`real.launch.py` 的 `_driver()` 在 `start_ur_driver:=false` 时**直接 `return []`**，
+而 RSP 是 `ur_control.launch.py` 顺带起的 —— 于是：
+
+```
+· IK FRAME_TRANSFORM_FAILURE: 16
+  ↳ 请求帧的 TF 查不到：多半少了 robot_state_publisher（真机上由驱动顺带起）
+    —— 不是几何问题。
+```
+
+后果的量级：全扫 **1428 次 IK 请求**（357 格 × 4 个高度），**6 秒跑完，一个都没解出来**。
+那张表若不加判断，会被读成「**桌面全都不可用**」——与事实正好相反。
+
+`/compute_ik` **照常被发现、照常被调用**（`move_group` 在，服务就注册了），
+所以「服务在不在」这条常用判据**这次一点用都没有**。
+
+新增 `scripts/no_arm_stack.py`（约 270 行）把缺口补上，起三件：
+
+| # | 进程 | 为什么 |
+|---|---|---|
+| 1 | `real.launch.py start_ur_driver:=false …` | MoveIt（`/compute_ik` `/compute_fk`）+ 感知 + 规划器（包线要读它的参数） |
+| 2 | `robot_state_publisher` | **缺的就是它**。描述包与 `real.launch.py` 同源 |
+| 3 | `fake_joint_states.py` | 定频 HOME 关节角。**假的是关节角，不是几何** |
+
+它**自己没有一行能动的代码** —— 依据就是那条 `start_ur_driver:=false`（没有驱动
+⇒ 没有 `controller_manager` ⇒ 没有轨迹 action）。这条依据被**单拎成一个函数**钉住：
+
+```python
+def launch_command(entry):
+    return (f"ros2 launch yolo_bringup {entry} "
+            "start_ur_driver:=false publish_camera_tf:=false "
+            "tf_required:=false gripper_backend:=none carry_objects:=false")
+```
+
+`rsp_command()` 同样单拎（少它 = `FRAME_TRANSFORM_FAILURE`）。
+`--check` 只看可用性不起东西，`--stop` 按**进程组**清场（`ros2 launch` 的子节点
+不按组杀会漏）。`wait_for_ik` 走 **rclpy 图发现**、**不走 `ros2` CLI** ——
+CLI 在板上会挂住，而「挂住」与「真的没有」用 CLI 分不开（第八十三轮同一条理由）。
+
+### 二、缺陷二：我上一节那段判词，**说了一件它没查过的事**
+
+第八十五轮 §四 里我写的那两句：
+
+```
+⇒ **按节点参数那份护栏判（table_plane_z=-0.39 ⇒ 下限 -0.3700）会放行它**：
+  这条连杆 -0.0944，而真机台面在 +0.0000 ⇒ 它已在**台面以下 0.0944 m**。
+```
+
+它在那个例子上是**对的**（-0.0944 确实低于 0）。但**代码里它不是这么写的** ——
+代码是拿 `worst_z` 直接去和 `table_z` 比，而**没有检查过 `worst_z` 到底在台面上还是下**。
+于是当全扫扫到**整片安全区**、最低连杆在 `+0.2868`（台面**之上**）时，它照样印出：
+
+```
+它已在**台面以下 -0.2868 m**。
+```
+
+**负数，且与事实相反。** 修法是把「护栏放行它」与「它在台面以下」**拆成两件事**，
+抽成 `node_guard_note(worst_z, table_z, node_table_z, guard_margin)`：
+
+```python
+if worst_z < node_table_z + guard_margin:
+    return f"    ⇒ 这一格连节点参数那份护栏（下限 {old_floor:+.4f}）也会拦下。"
+head = (f"    ⇒ **按节点参数那份护栏判（table_plane_z={node_table_z:+.2f}"
+        f" ⇒ 下限 {old_floor:+.4f}）会放行它**：这条连杆 {worst_z:+.4f}，"
+        f"而真机台面在 {table_z:+.4f}")
+if worst_z < table_z:
+    return head + f" ⇒ 它已在**台面以下 {table_z - worst_z:.4f} m**。"
+return head + (f" ⇒ 它在台面**之上** {worst_z - table_z:.4f} m。"
+               f"这一格本身**不危险** —— 它只说明「节点这份护栏的下限"
+               f"比真机台面还低、对真机几何已经没有意义」，"
+               f"不能当作「这里撞桌」的证据。")
+```
+
+注意它把**「不危险」也明说出来** —— 因为这段话真正的用处不是「报危险」，
+而是「**告诉你节点那份护栏已经不代表真机几何了**」。台面之上的那格
+恰恰是**最该被看见**的那种：它说明护栏在这片区域**已经不设防**。
+
+自检新增一节 **I**（12 条），其中两条是**直接钉那次印错的**：
+
+```
+★ 真危险格：**才**说「台面以下」，且是正数 0.0944（不是负的）
+★ 台面之上的格子：**不许**说「台面以下」（这就是当初印错的那句）
+★ 台面之上的格子：要明说它**不危险**
+```
+
+还有一条**穷举全谱**的，比逐个例子更能钉住语义：
+
+```python
+says = [node_guard_note(z, 0.0, **K) for z in (-0.9, -0.5, -0.37, -0.0944, 0.0, 0.5)]
+check("说「台面以下」的正好是那两格真的低于台面的（-0.37 与 -0.0944）",
+      [i for i, s in enumerate(says) if "台面以下" in s] == [2, 3], ...)
+check("说「也会拦下」的正好是那两格低于节点下限的（-0.9 与 -0.5）",
+      [i for i, s in enumerate(says) if "也会拦下" in s] == [0, 1], ...)
+```
+
+> **写这几条时我又错了两处，是**测试**对了、我错了**：我原以为
+> `node_guard_note(-0.5, 0.0, -0.39, 0.02)` 不该有判词 —— 其实两份台面不同就**总有话要说**；
+> 又把 `z = -0.37` 当成「不比台面低」—— 它比台面低 **0.37 m**。
+> 期望值改成 `[2, 3]` 与空判词用另一组参数。**这两次红都是我的期望写错了，不是代码。**
+
+### 三、缺陷三：作图的把**三元组**当两元组解包，在板上才炸
+
+`plot_table_envelope.py` 在板上渲染时报：
+
+```
+ValueError: too many values to unpack (expected 2)
+  at   wx, wy = data["worst_at"]
+```
+
+包线写的是 **`[x, y, 层级名]`**（第八十五轮 §二刚改过，正是为了能标出「最坏在哪一层」）。
+而它那 **44 条**自检**一条都没拦住** —— 因为那 44 条**全在不用 matplotlib 的那半边**，
+`draw()` 里一行都没被覆盖到。
+
+修法不是「改个下标」，是**把解包规则抽出来**：
+
+```python
+def worst_point(data):
+    """`data["worst_at"]` → `(x, y, 层级名)`；没有就 `None`。
+    单拎出来是因为**这里正是踩过的那一处**……"""
+    wa = data.get("worst_at")
+    if not wa:
+        return None
+    return float(wa[0]), float(wa[1]), (wa[2] if len(wa) > 2 else None)
+```
+
+外加一个 `validate(data)`，在 `main()` **最前面**跑，返回**一串**问题
+（不是修一个才发现下一个）。自检新增 **D3**（13 条，样本 `GOOD` 直接把真实 JSON 的
+键名与形状抄下来，含 `"worst_at": [0.20, 0.10000000000000009, "grasp_descend"]`）
+与 **D4**（5 条）。
+
+**这里有一件必须记下来的事**：我先试过「直接把变异打回两元组解包」，
+结果 **测试没杀它**（`变异 draw 回到两元组解包 → 通过 57，失败 0`）。
+我没有把这条盖过去 —— 它正是**抽出 `worst_point()` 的理由**；
+抽完之后同一条变异**被杀掉**，并如实报出原来那句 `too many values to unpack`。
+
+D4 里还有一条期望**刻意写成带容差的**，理由写在注释里：
+
+```python
+# ⚠️ 别写成 `== (0.2, 0.1, ...)` —— 真实 JSON 里的 y 是
+# `0.10000000000000009`（浮点累加噪声），精确相等会假红。
+```
+
+### 四、顺带三处「说准」
+
+- **`--check` 把自己那份栈报成「残留」。** 它是**另一个进程**，无从知道这些是
+  「上一份栈还在跑」还是「没人管的残留」—— 两者处置**相反**（前者别动、后者要清）。
+  改成只报事实：「另有 N 个进程在跑（本脚本无从判断是上一份栈还是残留；要清就 `--stop`）」。
+- **`⚠️` 每次渲染都报一条 `UserWarning`。** `⚠️` = U+26A0 + 变体选择符 U+FE0F，
+  而 Noto CJK **没有 U+FE0F 的字形**：
+  `Glyph 65039 (\N{VARIATION SELECTOR-16}) missing from font(s) Noto Sans CJK JP`。
+  一条**常亮**的警告会训练人忽略警告 —— 真缺字形时就看不出来了。
+  改成单独的 U+26A0（有字形，效果一样）；改完再渲染，那条 warning 没了。
+- **字体数我先前是编的。** 文档里写「板上有 89 个 CJK 字体」——**实测不是**：
+
+  ```
+  板上（Orin）fontManager.ttflist 共 166 个字体，CJK 相关的**只有 5 个**：
+  Noto Sans CJK JP / Noto Serif CJK JP / AR PL UKai CN / AR PL UMing CN / Droid Sans Fallback
+  ```
+
+  这台板上**没有简体面**，所以挑中的是 **JP** 那份。Han 字形绝大部分共用，
+  图上那几个字**逐字核过**是对的（少数汉字 SC/JP 之间有字形差异，如「直」「骨」，
+  本图没用到）。候选表里 `Noto Sans CJK SC` **本来就排第一**，只是这台机器没装。
+  运行时的提示语也跟着改成「板上 5 个 CJK 相关字体，本机 WSL 一个都没有」。
+
+### 五、测试
+
+```
+$ python3 scripts/test_table_envelope.py        → 通过 80，失败 0
+$ python3 scripts/test_plot_table_envelope.py   → 通过 62，失败 0
+$ python3 scripts/test_no_arm_stack.py          → 通过 16，失败 0，跳过 2   （WSL：没装 yolo_bringup）
+                                                → 通过 18，失败 0，跳过 0   （板上）
+```
+
+`test_no_arm_stack.py` 引入了第三种状态 **SKIP**：它 D 节的「描述包读得出内容」
+走 `ros2 pkg prefix yolo_bringup`，而那个包**只在板上 colcon build 出来**。
+解不出来就**跳过** —— 判失败会让人以为代码坏了，判通过就是假绿。
+
+### 六、安全
+
+全过程**没有起过驱动、没有发过轨迹、没有写过任何寄存器、没有查过 Dashboard**：
+每一次 launch 都带 `start_ur_driver:=false`，`robot_ip` 无人使用。
+板子的 `scripts/` 树**不被任何 ROS 包安装**（四个 `setup.py` 里只有 `console_scripts`
+条目，实测），所以这些改动**不需要 colcon build**。
+两边的 `git rev-parse HEAD^{tree}` 逐次对齐。
