@@ -173,7 +173,12 @@ def main():
         print("可用：/compute_ik 与 /compute_fk 都在" if ok else
               "不可用：至少少一个服务 —— 先跑不带 --check 的本脚本把它起起来")
         if stale:
-            print(f"⚠️ 另有 {len(stale)} 个残留进程（不是本脚本起的）：")
+            # ⚠️ 措辞要准：`--check` 是**另一个进程**，它无从知道这些是
+            # 「上一份栈还在跑」还是「没人管的残留」——两者的处置完全相反
+            # （前者别动，后者要清）。写成「不是本脚本起的残留」就是在说一件
+            # 它没查过的事。只报事实，让读的人自己判。
+            print(f"另有 {len(stale)} 个进程在跑（本脚本无从判断是上一份栈还是残留；"
+                  f"要清就 `--stop`）：")
             for s in stale[:5]:
                 print("  " + s)
         return 0 if ok else 2

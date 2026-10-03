@@ -17,7 +17,15 @@
 ⚠️ 中文字体：matplotlib 默认字体**没有中文**，缺字体时字会变成方框（而且不报错）。
    脚本会自己找一份 CJK 字体；**一份都找不到就整体退回英文文案并打印告警** ——
    宁可换语言，也不给一张满是「豆腐块」的图。
-   板上（Orin）实测有 89 个 CJK 字体、matplotlib 3.10.8。
+   板上（Orin）实测（2026-10-03）：`fontManager.ttflist` 里 166 个字体，
+   **其中 CJK 相关的只有 5 个** —— `Noto Sans CJK JP` / `Noto Serif CJK JP` /
+   `AR PL UKai CN` / `AR PL UMing CN` / `Droid Sans Fallback`。
+   ⇒ 这台板上**没有 Simplified-Chinese 面**，于是挑中的是 **JP** 那份；
+   Han 字形绝大部分共用，图上这几个字逐字核过是对的（少数汉字在 SC/JP 之间
+   有字形差异，如「直」「骨」，本图没用到）。若哪天要严格用简体面，
+   把 `Noto Sans CJK SC` 排在最前即可 —— 它已经在候选表里排第一了，
+   只是这台机器上没装。
+   （先前这里写的是「89 个 CJK 字体」，那个数是错的，已按实测改正。）
 
 跑法：
     # 本机或板上都行，JSON 是包线那次跑出来的
@@ -274,7 +282,7 @@ def draw(data, which, zones, slots, out, title, dpi):
         plt.rcParams["axes.unicode_minus"] = False
     else:
         print("!! 没找到中文字体 —— 这张图改用英文文案。"
-              "（板上 89 个 CJK 字体，本机 WSL 一个都没有）")
+              "（板上 5 个 CJK 相关字体，本机 WSL 一个都没有）")
         bad = [n for n, _ in zones if any(ord(c) > 127 for c in n)]
         if bad:
             # 图里自己的文案能换英文，**区名是命令行给的**，换不了 —— 只能提醒
@@ -360,7 +368,11 @@ def draw(data, which, zones, slots, out, title, dpi):
                 f"（base_frame）\n")
         if retry:
             foot += f"`s` 来自重试种子 {[round(v, 3) for v in retry]}\n"
-        foot += ("⚠️ 判据只看连杆原点高度（不含连杆/夹爪本体的半径）；"
+        # 这里**不用** `⚠️`：那个 emoji 后面跟的变体选择符 U+FE0F
+        # 在 Noto CJK 里没有字形，每次渲染都报一条 UserWarning。
+        # 一条**常亮**的警告会训练人忽略警告 —— 真缺字形时就看不出来了。
+        # 单独的 U+26A0 有字形，效果一样。
+        foot += ("⚠ 判据只看连杆原点高度（不含连杆/夹爪本体的半径）；"
                  "也不含相机视野 —— 看得见 ≠ 够得到")
     else:
         foot = (f"grid {len(xs)}x{len(ys)}, pitch ~{pitch:.3f} m; "
