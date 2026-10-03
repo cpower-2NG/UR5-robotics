@@ -23,6 +23,11 @@
 import os
 import sys
 
+# ⚠️ 必须在 import 被测模块**之前**设：`.pyc` 的失效判据是 (mtime, size)，
+# 一次**等长**的改动落在**同一秒**里就会被当成「没变」而继续用旧字节码 ——
+# 第八十四轮做变异测试时真的撞上（详见 `test_plot_table_envelope.py` 里同一段）。
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from table_safety_envelope import (                          # noqa: E402
