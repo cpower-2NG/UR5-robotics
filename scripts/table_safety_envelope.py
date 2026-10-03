@@ -476,10 +476,13 @@ def main():
 
         print("\n" + "=" * 78)
         if args.map == "worst":
-            print(f"图：**四个高度取最坏**（{len(keys)} 层合成）")
+            print(f"图：**所有高度取最坏**（{len(keys)} 个高度合成）")
             shown = cells
         else:
-            print(f"图：只有「{LEVEL_LABEL[args.map]}」这一层（{levels[args.map]:+.4f}）")
+            note = ("——⚠️ 这一层**不**含 --retry-seed 的结果（重试只进 worst 那张图）"
+                    if retry_seed is not None else "")
+            print(f"图：只有「{LEVEL_LABEL[args.map]}」这一层"
+                  f"（{levels[args.map]:+.4f}）{note}")
             shown = per_level[args.map]
         print(render_map(shown, xs, ys))
 
