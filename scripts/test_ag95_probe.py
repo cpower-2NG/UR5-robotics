@@ -110,7 +110,8 @@ class _RtuSlave:
 
     def __init__(self, master_fd: int, regs: dict, slave_id: int = 1, *,
                  target_reg: int = None, actual_reg: int = None,
-                 step: int = 250):
+                 step: int = 250, init_cmd_reg: int = None,
+                 init_status_reg: int = None):
         self.fd = master_fd
         self.regs = dict(regs)
         self.slave_id = slave_id
@@ -119,6 +120,11 @@ class _RtuSlave:
         self.target_reg = target_reg
         self.actual_reg = actual_reg
         self.step = step
+        # 可选的**初始化模拟**：写 `init_cmd_reg` 时把 `init_status_reg` 由 0 置 1
+        # （真机就是这样：0x0100 是命令、0x0200 是状态）。只从 0 置 1 ——
+        # 状态已经是 2（进行中）时不覆盖，好让「卡在进行中」也能被测。
+        self.init_cmd_reg = init_cmd_reg
+        self.init_status_reg = init_status_reg
         self._stop = threading.Event()
         flags = fcntl.fcntl(self.fd, fcntl.F_GETFL)
         fcntl.fcntl(self.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
@@ -185,6 +191,9 @@ class _RtuSlave:
             value = (req[4] << 8) | req[5]
             self.regs[addr] = value
             self.writes.append((addr, value))
+            if (self.init_cmd_reg is not None and addr == self.init_cmd_reg
+                    and self.regs.get(self.init_status_reg, 0) == 0):
+                self.regs[self.init_status_reg] = 1
             os.write(self.fd, req)
             return
 

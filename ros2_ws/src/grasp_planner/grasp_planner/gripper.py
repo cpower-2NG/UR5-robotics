@@ -133,7 +133,15 @@ AG95_POLL_INTERVAL_S = 0.1
 #: 但接线、从站号、缩放都要在实物上确认（`scripts/ag95_probe.py` 就是为此写的）。
 #: 名字与取值刻意与探针里的 `REG_*` 保持一致 —— 两份若漂移，
 #: `scripts/test_ag95_gripper.py` 有一条断言会 FAIL。
-AG95_REG_INIT_STATE = 0x0100    # 初始化状态/命令：**写它会动**（本驱动不写它）
+AG95_REG_INIT_STATE = 0x0100    # 初始化**命令**：**写它会动**（本驱动不写它）
+#: ⚠️ `0x0100` 是**只写**命令寄存器，读它判状态**从来没生效过**（读回恒 0，
+#: 初始化前后一样）。真正的初始化状态在下面这个：
+#:   **0 = 未初始化 / 2 = 正在初始化 / 1 = 已完成**
+#: 2026-10-03 实测：写 `0x0100=0x01` 后 1.3 s 读到 **2**（手指还在走），
+#: 随后落到 **1**；而未初始化时是 0。三个值都见过，不是推的。
+AG95_REG_INIT_STATUS = 0x0200   # 初始化状态（**只读**，判据用它）
+AG95_INIT_READY = 1             # 只有等于它才算「可以发位置指令」
+AG95_INIT_IN_PROGRESS = 2       # 初始化正在做 —— **也不能发位置指令**
 AG95_REG_FORCE = 0x0101         # 力（45~160 N）
 AG95_REG_TARGET_POS = 0x0103    # 目标位置（千分位）：**写它会动**
 AG95_REG_ACTUAL_POS = 0x0202    # 实时位置（千分位）：**只读，不动**
@@ -502,6 +510,19 @@ class Ag95Gripper(GripperBackend):
             return False, str(rr)
         return True, f"0x{address:04X} ← {value}"
 
+    def _read_init_status(self) -> Optional[int]:
+        """读 AG-95 **初始化状态**（`0x0200`，只读）。
+
+        返回 ``0`` 未初始化 / ``2`` 正在初始化 / ``1`` 已完成；
+        读不到返回 ``None``（串口问题，**不是**「未初始化」—— 两者要分开）。
+        """
+        ok, raw = self._read_raw(AG95_REG_INIT_STATUS)
+        if not ok:
+            self._node.get_logger().warn(
+                f"AG-95 读初始化状态失败（0x{AG95_REG_INIT_STATUS:04X}）：{raw}")
+            return None
+        return int(raw)
+
     def _read_position(self) -> Optional[float]:
         """读 AG-95 实时位置（`0x0202`，只读，不会产生任何动作）。
 
@@ -541,6 +562,26 @@ class Ag95Gripper(GripperBackend):
             return
 
         before = self._read_raw(AG95_REG_ACTUAL_POS)
+        # ⚠️ **闸门：未初始化时绝不发位置指令。** 未初始化时 `0x0202` 恒 0，
+        #    于是 `close()` 写目标 0 → 回读 0「与目标相符」→ 报成功，而手指
+        #    一步没动、**一条日志都没有**（「静默假成功」）。所以这里响亮地拒绝。
+        #    （`0x0200` 判据见 `AG95_REG_INIT_STATUS` 的注释。）
+        #    ⚠️ 位置：**必须在 dry-run 早返回之后** —— dry-run 的契约是
+        #    「从站一个寄存器都没收到（写没有、读也没有）」，而本闸门要**读**
+        #    0x0200。放在前面会把那条契约破坏掉（第一版就是这么把 19 条打红的）。
+        status = self._read_init_status()
+        if status is None:
+            raise RuntimeError(
+                "读不到 AG-95 的初始化状态（0x0200）—— 串口问题，拒绝发位置指令")
+        if status != AG95_INIT_READY:
+            what = {0: "未初始化", AG95_INIT_IN_PROGRESS: "正在初始化"}.get(
+                status, f"未知状态 {status}")
+            raise RuntimeError(
+                f"AG-95 {what}（0x0200={status}）—— **拒绝写位置**："
+                f"未初始化时位置回读恒 0，写下去会「报成功但手指不动」，"
+                f"没有任何日志能指出这一点。先跑 "
+                f"`python3 scripts/ag95_init_close.py --go` 初始化")
+
         ok, msg = self._write_raw(AG95_REG_FORCE, int(self._force))
         if not ok:
             raise RuntimeError(f"AG-95 写力失败：{msg}")

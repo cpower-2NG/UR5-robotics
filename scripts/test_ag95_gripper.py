@@ -137,9 +137,18 @@ BANNER = "真实写入已启用"
 
 
 def default_regs(actual=637):
-    """637‰ 让两种方向的解释**不相等**（60.5 / 34.5 mm），方向才看得见。"""
+    """637‰ 让两种方向的解释**不相等**（60.5 / 34.5 mm），方向才看得见。
+
+    ⚠️ `AG95_REG_INIT_STATUS`（**0x0200**）给 1 = 已初始化 —— 驱动现在**发位置
+    指令前会查它**（未初始化时静默假成功，见 gripper.py 里的闸门注释）。
+    不给这个键，从站会对该地址回「非法地址」⇒ 驱动判「读不到状态」⇒ 所有写
+    路径全被拒（第一版就是这么把 21 条打红的）。闸门本身另有专门的用例。
+    `AG95_REG_INIT_STATE`（0x0100）保留原样：它只是「读回恒 0 的那个只写命令寄存器」，
+    留着正好证明**判据不该用它**。
+    """
     return {g.AG95_REG_ACTUAL_POS: actual,
             g.AG95_REG_INIT_STATE: 1,
+            g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY,
             g.AG95_REG_TARGET_POS: actual,
             g.AG95_REG_FORCE: 50}
 
@@ -374,7 +383,7 @@ def main():
     print("\n--- 5. **dry-run 闸门：一个寄存器都不碰**（本脚本的核心）---")
     for method in ("open", "close"):
         with rig(dry_run=True,
-                 regs={g.AG95_REG_ACTUAL_POS: 1000,
+                 regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY, g.AG95_REG_ACTUAL_POS: 1000,
                        g.AG95_REG_TARGET_POS: 1000,
                        g.AG95_REG_FORCE: 50,
                        g.AG95_REG_INIT_STATE: 1}) as (gr, slave, node, box):
@@ -396,9 +405,69 @@ def main():
                   node.log.text("info")[:200])
 
     # ------------------------------------------------------------------
+    # 2026-10-03 实测：`0x0200` = 0 未初始化 / 2 正在初始化 / 1 已完成。
+    # 下面是**闸门挡的那个场景** —— 加了防护就必须测它，否则等于没加。
+    print("\n--- 5b. **未初始化闸门**：0x0200 != 1 时绝不写位置 ---")
+    for val, why in ((0, "未初始化"), (2, "正在初始化")):
+        with rig(dry_run=False, open_is_high=True,
+                 regs={g.AG95_REG_INIT_STATUS: val, g.AG95_REG_ACTUAL_POS: 0,
+                       g.AG95_REG_TARGET_POS: 0, g.AG95_REG_FORCE: 50}) as \
+                (gr, slave, node, box):
+            gr.close(done_cb=cb(box))
+            got = wait_done(box)
+            check(f"★ 0x0200={val}（{why}）⇒ close() **失败**（不静默假成功）",
+                  got is not None and got[0] != OK, f"回调 {got}")
+            check(f"★ 0x0200={val} ⇒ 从站**一个力/位置都没收到**",
+                  slave.writes == [], f"写={slave.writes}")
+            check(f"  —— 但**读过** 0x0200（闸门真的查了）",
+                  # ⚠️ `seen` 的元素是 **(功能码, 地址)**，不是 (地址, 功能码)
+                  #    —— 我第一版按后者解，两条断言假红。
+                  any(addr == g.AG95_REG_INIT_STATUS for _, addr in slave.seen),
+                  f"读={slave.seen}")
+            check(f"★ 0x0200={val} 的报错文案说得清是**哪一步**、怎么修",
+                  "拒绝写位置" in node.log.text("error")
+                  and "ag95_init_close" in node.log.text("error"),
+                  node.log.text("error")[:200] or "（没有 error）")
+
+    # 只读命令寄存器（0x0100）读到什么**都不算数** —— 它是只写的，读回恒 0。
+    with rig(dry_run=False, open_is_high=True,
+             regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY,
+                   g.AG95_REG_INIT_STATE: 0,      # ← 故意给 0
+                   g.AG95_REG_ACTUAL_POS: 0, g.AG95_REG_TARGET_POS: 0,
+                   g.AG95_REG_FORCE: 50}) as (gr, slave, node, box):
+        gr.close(done_cb=cb(box))
+        got = wait_done(box)
+        check("★ 判据用的是 0x0200：0x0100 读回 0 **不影响**放行（它本来就是恒 0）",
+              got is not None and got[0] == OK, f"回调 {got}")
+
+    # 读不到状态（从站不回这个地址）⇒ 必须**拒绝**，不能当成「已初始化」。
+    with rig(dry_run=False, open_is_high=True,
+             regs={g.AG95_REG_ACTUAL_POS: 0, g.AG95_REG_TARGET_POS: 0,
+                   g.AG95_REG_FORCE: 50}) as (gr, slave, node, box):
+        gr.close(done_cb=cb(box))
+        got = wait_done(box)
+        check("★ 读不到 0x0200（非法地址）⇒ 也拒绝（不当成已初始化）",
+              got is not None and got[0] != OK, f"回调 {got}")
+        check("  报错说的是**串口/链路**，不是「未初始化」",
+              "读不到" in node.log.text("error"), node.log.text("error")[:160])
+
+    # dry-run 的契约优先：未初始化时 dry-run 仍然**一个寄存器都不碰**。
+    with rig(dry_run=True, open_is_high=True,
+             regs={g.AG95_REG_INIT_STATUS: 0, g.AG95_REG_ACTUAL_POS: 0,
+                   g.AG95_REG_TARGET_POS: 0, g.AG95_REG_FORCE: 50}) as \
+            (gr, slave, node, box):
+        gr.close(done_cb=cb(box))
+        got = wait_done(box)
+        check("★ dry-run + 未初始化：仍**零流量**（闸门不能破坏 dry-run 契约）",
+              slave.writes == [] and slave.seen == [],
+              f"写={slave.writes} 读={slave.seen}")
+        check("  且 dry-run 不因「没初始化」而报错（预演就是什么都不做）",
+              got is not None and got[0] == OK, f"回调 {got}")
+
+    # ------------------------------------------------------------------
     print("\n--- 6. 写路径（dry_run=false）：顺序、值、到位、异步 ---")
     with rig(dry_run=False, open_is_high=True,
-             regs={g.AG95_REG_ACTUAL_POS: 1000, g.AG95_REG_TARGET_POS: 1000,
+             regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY, g.AG95_REG_ACTUAL_POS: 1000, g.AG95_REG_TARGET_POS: 1000,
                    g.AG95_REG_FORCE: 50, g.AG95_REG_INIT_STATE: 1},
              slave_kw={"target_reg": g.AG95_REG_TARGET_POS,
                        "actual_reg": g.AG95_REG_ACTUAL_POS, "step": 250}
@@ -437,7 +506,7 @@ def main():
               f"{node.log.errors(exclude=(BANNER,))}")
 
     with rig(dry_run=False, open_is_high=False,
-             regs={g.AG95_REG_ACTUAL_POS: 0, g.AG95_REG_TARGET_POS: 0,
+             regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY, g.AG95_REG_ACTUAL_POS: 0, g.AG95_REG_TARGET_POS: 0,
                    g.AG95_REG_FORCE: 50, g.AG95_REG_INIT_STATE: 1},
              slave_kw={"target_reg": g.AG95_REG_TARGET_POS,
                        "actual_reg": g.AG95_REG_ACTUAL_POS, "step": 250}
@@ -473,7 +542,7 @@ def main():
         # 这一段本来要等满 3 s 超时才看得到结论，临时缩短（函数在调用时读全局）
         g.AG95_MOVE_TIMEOUT_S = 0.4
         with rig(dry_run=False, open_is_high=True,
-                 regs={g.AG95_REG_ACTUAL_POS: 500, g.AG95_REG_TARGET_POS: 500,
+                 regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY, g.AG95_REG_ACTUAL_POS: 500, g.AG95_REG_TARGET_POS: 500,
                        g.AG95_REG_FORCE: 50, g.AG95_REG_INIT_STATE: 1},
                  slave_cls=InvertedSlave,
                  slave_kw={"target_reg": g.AG95_REG_TARGET_POS,

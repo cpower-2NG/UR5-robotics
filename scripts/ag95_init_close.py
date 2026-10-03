@@ -60,6 +60,9 @@ REG_TARGET = 0x0103     # 目标位置（千分）
 REG_STATE = 0x0200      # 疑似初始化状态（未判决，仅打印）
 REG_GRASP = 0x0201      # 疑似到位状态（未判决，仅打印）
 REG_ACTUAL = 0x0202     # 实时位置（千分）
+REG_INIT_STATUS = 0x0200  # 初始化状态（**只读**）：0 未初始化 / 2 进行中 / 1 已完成
+INIT_READY = 1
+INIT_TIMEOUT = 25.0    # 等 0x0200 变 1 的最长秒数（--init-timeout 可覆盖）
 
 FORCE_N = 50            # 与 grasp_planner.yaml 的 ag95_force 一致
 TARGET_PERMILLE = 0     # 0 = 全闭（ag95_open_is_high: true）
@@ -98,6 +101,25 @@ class Gripper:
             if pos is not None:
                 last = pos
             if same >= 3:
+                return last, time.time() - t0
+            time.sleep(0.4)
+        return last, time.time() - t0
+
+    def wait_init_done(self, timeout=None):
+        """等 **`0x0200` 变成 1**（初始化真正做完）。
+
+        ⚠️ 2026-10-03 实测：**初始化是一次全行程自检，手指张开**又**合拢**都走**
+        （用户现场目击），耗时比原来以为的长。当时用 `settle()`（等 `0x0202`
+        停稳）判「完成」，而初始化**前半程** `0x0202` 一直是 0 —— 连读三次
+        相同就误判成「完成」，于是报「没走到 1000」。真正的完成信号是
+        `0x0200` 由 **2（进行中）** 变成 **1（已完成）**。
+        返回 ``(状态, 用时)``；超时返回最后一次读到的值。
+        """
+        timeout = INIT_TIMEOUT if timeout is None else timeout
+        t0, last = time.time(), None
+        while time.time() - t0 < timeout:
+            last = self.read(REG_INIT_STATUS)
+            if last == INIT_READY:
                 return last, time.time() - t0
             time.sleep(0.4)
         return last, time.time() - t0
@@ -147,12 +169,20 @@ def show(title, snap):
 
 
 def main(argv=None):
+    # ⚠️ `global` 必须在**函数最开头**：`INIT_TIMEOUT` 已经在下一条
+    #    argparse 的 default 里被引用过，声明晚了就是 SyntaxError。
+    global INIT_TIMEOUT
     ap = argparse.ArgumentParser(description="AG-95 初始化（可选合拢）")
+    ap.add_argument("--init-timeout", type=float, default=INIT_TIMEOUT,
+                    help="等 0x0200 变 1 的最长秒数（初始化是一次全行程"
+                         "自检，实测 >1.3 s）")
     ap.add_argument("--go", action="store_true",
                     help="真的写寄存器。不给就是只读预演。")
     ap.add_argument("--close", action="store_true",
                     help="初始化之后再合拢到 0 mm（会给 --go 才能生效）")
     args = ap.parse_args(argv)
+    # `wait_init_done` 读的是模块级常量，这里按命令行覆盖一次（测试用小的值）。
+    INIT_TIMEOUT = args.init_timeout
 
     g = Gripper.open_port()
     if g is None:
@@ -174,10 +204,17 @@ def main(argv=None):
         if not g.write(REG_INIT, 0x01):
             print("❌ 初始化写失败")
             return 2
-        pos, dt = g.settle()
-        print(f"   完成（{dt:.1f}s）：0x0202 = {pos}  ← 1000 才是完全张开\n")
+        st, dt = g.wait_init_done()
+        pos = g.read(REG_ACTUAL)
+        print(f"   初始化{'完成' if st == INIT_READY else '**没等到完成**'}"
+              f"（{dt:.1f}s）：0x0200 = {st}，0x0202 = {pos}  ← 1000 才是完全张开\n")
+        if st != INIT_READY:
+            print(f"⚠️ 0x0200 = {st}（1 才是已完成；2 = 还在做）—— 多等一会儿再看，"
+                  f"别急着下结论")
+            return 2
         if pos != 1000:
-            print(f"⚠️ 没走到 1000（读到 {pos}）—— 先别继续，查一下")
+            print(f"⚠️ 初始化完成了，但 0x0202 读到 {pos}（不是 1000）—— "
+                  f"手指可能被东西挡住，查一下")
 
         # ---- ② 合拢 ----
         if not args.close:

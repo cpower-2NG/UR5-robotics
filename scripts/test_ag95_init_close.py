@@ -60,7 +60,8 @@ def run_script(argv):
     return rc, buf.getvalue()
 
 
-def with_slave(regs, *, actual_reg=None, target_reg=None, step=1000):
+def with_slave(regs, *, actual_reg=None, target_reg=None, step=1000,
+               init_sim=True):
     """起一个 pty + 手写从站，把被测脚本的 PORT 指过去。
 
     用 ``with`` 语句进出；退出时**先停从站线程再关 pty**（顺序反了会有僵尸从站
@@ -71,7 +72,12 @@ def with_slave(regs, *, actual_reg=None, target_reg=None, step=1000):
             self.pair = SLAVE_MOD._PtyPair()
             self.slave = SLAVE_MOD._RtuSlave(
                 self.pair.master_fd, regs, slave_id=1,
-                actual_reg=actual_reg, target_reg=target_reg, step=step).start()
+                actual_reg=actual_reg, target_reg=target_reg, step=step,
+                # 真机行为：写 0x0100（命令）⇒ 0x0200（状态）由 0 变 1。
+                # 不模拟它，脚本就会一直等不到「初始化完成」（我第一版就是
+                # 只加等待器、没让假从站跟着变，两条用例假红）。
+                init_cmd_reg=0x0100 if init_sim else None,
+                init_status_reg=0x0200 if init_sim else None).start()
             self._old_port = SCRIPT.PORT
             SCRIPT.PORT = self.pair.port
             return self.slave
@@ -132,7 +138,7 @@ def main() -> int:
         regs = {0x0100: 0, 0x0200: 0, 0x0201: 0, 0x0202: 1000,
                 0x0101: 50, 0x0103: 1000}
         with with_slave(regs) as slave:
-            rc, out = run_script(["--go"])
+            rc, out = run_script(["--go", "--init-timeout", "1.5"])
             check("--go：只写了初始化寄存器",
                   slave.writes == [(0x0100, 1)], f"写了 {slave.writes}")
             check("--go：初始化完成即停（不发位置指令，不写 0x0103）",
@@ -145,7 +151,7 @@ def main() -> int:
         regs = {0x0100: 0, 0x0200: 1, 0x0201: 1, 0x0202: 1000,
                 0x0101: 50, 0x0103: 1000}
         with with_slave(regs, actual_reg=0x0202, target_reg=0x0103, step=1000) as slave:
-            rc, out = run_script(["--go", "--close"])
+            rc, out = run_script(["--go", "--close", "--init-timeout", "1.5"])
             check("--go --close：写了力与位置",
                   (0x0101, SCRIPT.FORCE_N) in slave.writes
                   and (0x0103, SCRIPT.TARGET_PERMILLE) in slave.writes,
@@ -160,13 +166,13 @@ def main() -> int:
         regs = {0x0100: 0, 0x0200: 0, 0x0201: 0, 0x0202: 400,
                 0x0101: 50, 0x0103: 1000}
         with with_slave(regs) as slave:
-            rc, out = run_script(["--go"])
-            check("--go：没走到 1000 时告警（不静默当成功）",
-                  "没走到 1000" in out, out)
+            rc, out = run_script(["--go", "--init-timeout", "1.5"])
+            check("--go：初始化完成但位置不是 1000 时告警（不静默当成功）",
+                  "不是 1000" in out, out)
 
         # ---- 6. 口打不开 → 退出码 2（不是 0）-----------------------------
         SCRIPT.PORT = "/dev/definitely-not-a-port"
-        rc, out = run_script(["--go"])
+        rc, out = run_script(["--go", "--init-timeout", "1.5"])
         check("退出码 2：口打不开时明确失败（2 是「环境不满足」，不是 0）",
               rc == 2, f"rc={rc}\n{out}")
 
