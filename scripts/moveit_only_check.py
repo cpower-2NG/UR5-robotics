@@ -8,9 +8,10 @@
   · `real.launch.py`，但 `start_ur_driver:=false` —— **没有驱动就没有
     controller_manager，物理上没有任何东西可动**（moveit_servo 也已被
     real.launch.py 显式关掉，D59）。
-  · `robot_state_publisher`（用 ur_description 的**未标定** URDF 起一份 TF 树。
-    真机上它由驱动顺带起；无臂预检时缺了它，/compute_ik 会报
-    FRAME_TRANSFORM_FAILURE —— 实测踩过，2026-09-28 板端）。
+  · `robot_state_publisher`（起一份 TF 树。真机上它由驱动顺带起；无臂预检时缺了它，
+    /compute_ik 会报 FRAME_TRANSFORM_FAILURE —— 实测踩过，2026-09-28 板端）。
+    它用的描述包**从 `real.launch.py` 里读**（`DESCRIPTION_PACKAGE`），
+    免得同一张图里出现两套几何 —— 见下面那条 ⚠️。
   · 一个**假 /joint_states** 发布器（HOME 姿态定频）。缺了它
     move_group 的 CurrentStateMonitor 拿不到状态，/compute_ik **挂住不回话**
     （服务在、也能列出来，但永远不完成 —— 实测踩过，同日）。
@@ -18,9 +19,17 @@
 然后跑 `elbow_guard_probe.py`（只调 /compute_ik、/compute_fk，绝不发轨迹），
 拿到抓取区/放置区候选位姿的肘/大臂高度余量。
 
-⚠️ 数值口径：这里用的是**未标定** URDF 的运动学（ur_description 自己的注释就
-   警告过：与示教器真值有非零偏差）。结论是「链路通 + 余量级」的，**最终
-   上电前的判读必须用 ur_calibration 校准后的 URDF 重跑一遍**。
+⚠️ 数值口径（**第八十三轮改**）：这里用的描述包与 `real.launch.py` **同源**，
+   所以 `move_group`（IK/FK）与 `robot_state_publisher`（TF）是**同一套几何**。
+   第八十二轮把 `real.launch.py` 的 `DESCRIPTION_PACKAGE` 换成了
+   `yolo_ur_description`（本机出厂标定），而本脚本原先写死从 `ur_description`
+   手搓 URDF ⇒ **同一张图里两套几何**（实测：`calib_209549117540498681` 对
+   `calib_2353869974907916917`，`tool0` 位置最多差 3.59 mm）。
+   现在两边都从 `DESCRIPTION_PACKAGE` 取，**不会再分叉**；开跑时会打印本次
+   实际用的包与 `kinematics/hash`，判读时先看那一行。
+
+   ⇒ 老口径（「这里用的是未标定 URDF，结论只是余量级，上电前必须用校准后的
+   URDF 重跑」）**已由本次改动消解**：预检用的就是上电要用的那一份。
 
 ⚠️ 机械臂动作属于高风险操作。本脚本**结构上不可能**让臂动：没有驱动、没有
    controller_manager、控制箱也没接。但它起 MoveIt，所以**不要**在任何
@@ -75,6 +84,12 @@ def leftovers():
     return out
 
 
+# `real.launch.py` 顶部那个常量。**读它，不要抄一个值下来** —— 抄下来的那份
+# 迟早和真身分叉，而分叉的后果是「同一张图两套几何」，见 description_package()。
+DESCRIPTION_PACKAGE_RE = re.compile(
+    r"""^DESCRIPTION_PACKAGE\s*=\s*["']([^"']+)["']""", re.M)
+
+
 def sh(cmd, timeout=15, **kw):
     """跑一条命令，**带超时**。
 
@@ -89,6 +104,72 @@ def sh(cmd, timeout=15, **kw):
         print(f"  ! `{cmd}` {timeout}s 没返回（环境问题？当没就绪处理）")
         return subprocess.CompletedProcess(cmd, returncode=124, stdout="",
                                            stderr="timeout")
+
+
+def description_package():
+    """从 `real.launch.py` 读出它实际用的 `DESCRIPTION_PACKAGE`。
+
+    读失败就返回 None（调用方退 2）——**不要**在这里兜底成 `ur_description`：
+    静默退回标称正是这次要修掉的那个 bug。
+    """
+    prefix = sh("ros2 pkg prefix yolo_bringup", timeout=15).stdout.strip()
+    if not prefix:
+        return None
+    launch = os.path.join(prefix, "share", "yolo_bringup", "launch",
+                          "real.launch.py")
+    try:
+        with open(launch, encoding="utf-8") as f:
+            m = DESCRIPTION_PACKAGE_RE.search(f.read())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def read_description_hashes(timeout=25.0):
+    """读 `/robot_state_publisher` 与 `move_group` 各自的 `robot_description`，
+    返回 `{节点名: calib_* 或 None}`。
+
+    **只调 `get_parameters` 服务，不走 `ros2` CLI** —— 理由同
+    `wait_for_services()`：CLI 会挂，而挂住和「真的没有」用 CLI 分不开。
+    """
+    import rclpy
+    from rcl_interfaces.srv import GetParameters
+    from rclpy.node import Node
+
+    own = not rclpy.ok()
+    if own:
+        rclpy.init()
+    node = Node("moveit_only_check_desc")
+    out, targets = {}, []
+    t0 = time.monotonic()
+    try:
+        while time.monotonic() - t0 < timeout:
+            rclpy.spin_once(node, timeout_sec=0.2)
+            targets = [n for n in node.get_node_names()
+                       if n in ("robot_state_publisher", "move_group",
+                                "move_group_node")]
+            if len(targets) >= 2:
+                break
+            time.sleep(0.3)
+        for name in targets:
+            cli = node.create_client(GetParameters, f"/{name}/get_parameters")
+            if not cli.wait_for_service(timeout_sec=5.0):
+                out[name] = None
+                continue
+            req = GetParameters.Request()
+            req.names = ["robot_description"]
+            fut = cli.call_async(req)
+            rclpy.spin_until_future_complete(node, fut, timeout_sec=10.0)
+            try:
+                m = re.search(r"calib_\d+", fut.result().values[0].string_value)
+            except Exception:
+                m = None
+            out[name] = m.group(0) if m else None
+    finally:
+        node.destroy_node()
+        if own and rclpy.ok():
+            rclpy.shutdown()
+    return out
 
 
 def wait_for_services(needed, timeout=180.0):
@@ -169,13 +250,38 @@ def main():
               + (" start_pipeline:=false" if args.no_pipeline else ""),
               args.log)
 
-        # 2) robot_state_publisher（未标定 URDF；⚠️ 只用于预检，见模块 docstring）
-        xr = sh("xacro $(ros2 pkg prefix ur_description)/share/ur_description"
-                f"/urdf/ur.urdf.xacro ur_type:={args.ur_type} name:=ur "
-                "safety_limits:=true > /tmp/ur5_check.urdf 2>/tmp/ur5_check.err")
+        # 2) robot_state_publisher
+        #    ⚠️ 描述包**必须与 real.launch.py 同源**（下面 move_group 就是它起的），
+        #    否则同一张图里两套几何：IK/FK 走一套、TF 走另一套。见模块 docstring。
+        desc_pkg = description_package()
+        if not desc_pkg:
+            print("读不到 real.launch.py 的 DESCRIPTION_PACKAGE（yolo_bringup "
+                  "装了吗？）—— 拒绝对一份不知道从哪来的几何做判读，退 2")
+            return 2
+        prefix = sh(f"ros2 pkg prefix {desc_pkg}", timeout=15).stdout.strip()
+        if not prefix:
+            print(f"描述包 {desc_pkg} 找不到，退 2")
+            return 2
+        share = os.path.join(prefix, "share", desc_pkg)
+        kin = os.path.join(share, "config", args.ur_type,
+                           "default_kinematics.yaml")
+        # `kinematics_params` 要**显式传**：`ur.urdf.xacro` 那个参数默认指向
+        # `$(find ur_description)/config/…`，不传就悄悄退回标称 —— 而本包存在的
+        # 全部意义就是把这一项换掉。
+        xr = sh(f"xacro {share}/urdf/ur.urdf.xacro ur_type:={args.ur_type} "
+                f"name:=ur safety_limits:=true kinematics_params:={kin} "
+                "> /tmp/ur5_check.urdf 2>/tmp/ur5_check.err")
         if xr.returncode != 0:
             print("xacro 失败：", xr.stderr or open("/tmp/ur5_check.err").read())
             return 2
+        try:
+            with open("/tmp/ur5_check.urdf", encoding="utf-8") as f:
+                used = re.search(r"calib_\d+", f.read())
+        except OSError:
+            used = None
+        print(f"描述包 = {desc_pkg}"
+              + (f"，kinematics/hash = {used.group(0)}" if used
+                 else "，⚠️ 生成物里没找到 calib_* hash"))
         spawn("rsp",
               'ros2 run robot_state_publisher robot_state_publisher --ros-args '
               '-p "robot_description:=$(cat /tmp/ur5_check.urdf)"',
@@ -192,6 +298,24 @@ def main():
             print(f"{waited:.0f} 秒内 /compute_ik 没起来 —— 日志：", args.log)
             return 2
         print(f"/compute_ik 就绪（约 {waited:.0f} 秒）")
+
+        # 4b) 复核「两套几何」真的没有了。这是本轮建立的不变量，也最容易悄悄回归：
+        #     RSP 与 move_group 各自持有一份 robot_description，只要描述包一分叉，
+        #     探针量到的姿态与 TF 树就不是同一个机器人（第八十二→八十三轮的真实教训）。
+        #     读不全（参数服务没起来 / 版本没声明这个参数）**只 SKIP，不判失败** ——
+        #     这一段的判据是下面的探针，这里是为它留证。
+        hashes = read_description_hashes()
+        print("描述一致性复核：")
+        for name, h in hashes.items():
+            print(f"  {name:22s} {h}")
+        vals = [h for h in hashes.values() if h]
+        if len(vals) >= 2 and len(set(vals)) == 1:
+            print("  [PASS] 两边同一个 hash —— 同一套几何")
+        elif len(vals) >= 2:
+            print("  [FAIL] 两边 hash 不同 —— 图里有两套几何，下面的数不能用来判读")
+            return 2
+        else:
+            print("  [SKIP] 没读全，不据此判失败")
 
         # 5) 肘高探针（只读）
         #    ⚠️ `--no-pipeline` 下**必须**显式给规划组名：没有 /grasp_planner 可读
