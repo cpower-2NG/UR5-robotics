@@ -12918,3 +12918,49 @@ x < 0 的块数：130 / 130
 1. **棋盘格（标定靶，写着 DO NOT TOUCH）压在那块安全矩形的右上角上** ——
    上机前必须撤走。槽位已经放在 x ≤ −0.44，避开了它（它占 x∈[−0.33,−0.14]）。
 2. **pick 区里有一块带孔的白色贴片**（照片左下那块）—— 是不是障碍/孔，要现场判。
+
+### 六、仿真端到端**跑通一整轮并录像**（2026-10-03，用户要求）
+
+用户：「先仿真跑一轮并录像（虽然场景不一定准，但是位置什么的，还有运动控制什么的
+可以说明，也能在真机的时候分析问题）」。
+
+**结论：一轮完整跑通 —— 6/6 全部放置成功，收工路径正确触发。**
+
+```
+已放置 6/6 | 已抓 6 个 | 连续未放置 0/10
+收工：放置槽位已用尽（6 个）—— 没有地方可放了
+  已成功放置 6 个 / 槽位共 6 个；已抓取记账 6 个
+  **不再接受新目标**。节点仍在运行，Ctrl-C 退出。
+```
+
+规划器启动行也确认了配置：`肘高护栏=True（台面 -0.390） | 桌面进场景=True`。
+
+**配方**（三处 source，缺一不可；台账 **E1** 记的叠加法）：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/<user>/grasp_ws/install/setup.bash          # ← gz_ros2_control（GZ_VERSION=harmonic）
+source ros2_ws/install/setup.bash
+export PYTHONPATH=/home/<user>/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
+ros2 launch arm_grasp_sim full.launch.py headless:=true
+```
+
+⚠️ **仿真只在 WSL 上跑**：板上**没有 Gazebo**（`which gz` 空、无 `ros_gz*` 包），
+而 WSL 有全套（gz + ros_gz + CUDA）。而且缺 `grasp_ws` 那次启动**被 launch 自己
+拦下了**并打印了怎么编 —— 这个「起不来要说清为什么」的守门是对的。
+
+**录像**：新增 `scripts/record_topic_video.py`（只订阅，录一路图像话题成 mp4；
+本条路用 `cv2.VideoWriter`，因为 **WSL 没有 ffmpeg**）。录的是
+**`/detections_image`**（带检测框那一路）—— 比录原始图有用，一眼看得出
+「它到底看见了什么」。
+
+    /home/<user>/sim_run.mp4   2562 帧 · 640×480 · 10 fps ≈ 4 分 16 秒（8.0 MB）
+
+**跑这一轮暴露的两条**（都不影响仿真结论，但真机上要处理）：
+
+1. **`max_sync_dt` 在丢批**：`perception_3d` 累计丢到 **155 批**
+   （深度与检测时间差 132~726 ms > 阈值 100 ms）。仿真里靠候选够多没受影响
+   （每轮仍有 3~7 个候选），但这正是台账里写过的形状 —— **真机上更慢，
+   症状是「悄无声息地看不到目标」，很像检测器坏了**。真机上线前要调大。
+2. **`tf2_buffer: Detected jump back in time` 刷了 34706 条** —— 仿真 `/clock`
+   与 TF 时间戳的老问题，真机没有 `/clock`，不会出现。**不要照着这条去改真机**。
