@@ -25,15 +25,31 @@
 回来了几个**不同的解**。
 
     $ python3 scripts/ik_repeat_check.py --table-z 0.0 --x 0.20 --y 0.10
-    $ python3 scripts/ik_repeat_check.py --table-z 0.0 --x 0.20 --y 0.10 --n 30
+    $ python3 scripts/ik_repeat_check.py --table-z 0.0 --x 0.55 --y 0.00
 
 **只读**：只调 `/compute_ik` 与 `/compute_fk`，不发轨迹、不写寄存器、不碰真机。
+
+2026-10-03 在真机组上实测的四个点（`n=20`，默认 `ik_seed`）：
+
+| 点位 | 结果 |
+|---|---|
+| `(0.55, 0.00)` 推荐矩形内部 | 四层各 **1** 个解 —— 可复现 |
+| `(0.40, 0.00)` 推荐矩形**近边** | 四层各 **1** 个解 —— 可复现 |
+| `(0.20, 0.10)` 近基座危险带 | **17/18/20/20** 个解（折回 (−π,π] 后 4/8/9 个位形）|
+
+第三行**拿其中一个解当种子再问 20 次 → 20/20 一模一样（差 0.0000 rad）**。
+所以随机性来自「**种子解不出来时** KDL 拿随机种子重启」，不是解算器凭空抖；
+本工具把这个复验**自动做掉**（见 `verdict` 的 `recheck`），不让判词去猜病根。
+
+⇒ 现场读法：**照抄推荐矩形**（矩形内实测可复现）；矩形外那片近基座带
+按「离边界至少留一格 0.05 m」读。
 
 退出码：0 = 每个位姿都只回来**一个**解（可复现）；1 = 有解分支翻转（不可复现，
 应当去修 `attempts` / `consistency_limits`）；2 = 环境问题（服务不在等）。
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -64,6 +80,34 @@ def tally(solutions, ndigits=3):
     return sorted(counts.items(), key=lambda kv: (kv[0] is None, -kv[1]))
 
 
+def fold(branch, ndigits=3):
+    """把每个关节**折回 (−π, π]**（``None`` 原样返回）。
+
+    为什么需要它：KDL 返回的是**原始关节值**，同一个物理位形可以差整数个 2π
+    —— 实测同一层的解里同时出现 `4.124` 与 `-2.160`，差的正是 6.284 = 2π。
+    不折回就会把「一个位形的两种绕法」数成「两个不同的解」，**把随机性说得
+    比事实狠**（第一次板上真跑就是这么报的：20 次报 20 个解，折回后是 9 个）。
+
+    ⚠️ 折回**只是归并，不是「无害」**：对规划器来说绕数是**实打实的大摆动**
+    （`_consistent_with` 会照着 `max_joint_jump` 把整条路径拒掉）。所以两个数
+    都要报 —— 原始数看**规划器会看到什么**，折回数看**几何上到底几个位形**。
+
+    ⚠️ 先折后取整。反过来的话，`3.1416` 附近的解会在 ±π 接缝上被取整劈成两类。
+    """
+    if branch is None:
+        return None
+    out = []
+    for v in branch:
+        w = (float(v) + math.pi) % (2.0 * math.pi) - math.pi
+        out.append(round(w, ndigits) if ndigits is not None else w)
+    return tuple(out)
+
+
+def n_poses(branches, ndigits=3):
+    """``branches``（``tally()`` 的输出）折回 2π 后还剩**几个真正不同的位形**。"""
+    return len({fold(k, ndigits) for k, _ in branches if k is not None})
+
+
 def spread(branch, seed):
     """``branch`` 与 ``seed`` 的最大逐关节差（rad）；算不出来时返回 ``None``。
 
@@ -81,8 +125,13 @@ def spread(branch, seed):
     return max(abs(float(a) - float(b)) for a, b in zip(branch, seed))
 
 
-def verdict(branches, seed, ndigits=3):
-    """一句话判词。``branches`` 是 ``tally()`` 的输出。"""
+def verdict(branches, seed, ndigits=3, recheck=None):
+    """一句话判词。``branches`` 是 ``tally()`` 的输出。
+
+    ``recheck`` 是**复验**的结果（拿「出现次数最多的那个解」当种子再问一遍），
+    也是 ``tally()`` 的输出；``None`` = 没做。有了它，判词里的病根才是**量出来的**
+    而不是猜的 —— 没做就**不许**说。
+    """
     real = [k for k, _ in branches if k is not None]
     n_fail = sum(v for k, v in branches if k is None)
     if not real:
@@ -92,22 +141,55 @@ def verdict(branches, seed, ndigits=3):
         tail = f"（另有 {n_fail} 次解不出）" if n_fail else ""
         return (f"✅ 只有一个解 ⇒ **可复现**{tail}。"
                 f"包线那张图的逐格判读在这台 move_group 上是可信的。")
+
+    n_can = n_poses(branches, ndigits)
+    winding = ("" if n_can == len(real) else
+               f"，折回 (−π,π] 后是 **{n_can} 个真正不同的位形**（其余是 ±2π 绕数）")
     far = max(real, key=lambda k: spread(k, seed) or 0.0)
     d = spread(far, seed)
-    return (f"❌ 回来了 **{len(real)} 个不同的解** ⇒ **不可复现**。\n"
-            f"     相差最大的一个与种子差 {d:.3f} rad"
-            f"（同一分支的噪声是 ~1e-4）—— 这是**肘分支翻转**，不是噪声。\n"
-            f"     ⇒ 包线的**逐格**分类在这台上是随机量，只能**按带余量读**\n"
-            f"       （离边界至少留一格 0.05 m）；上面那块「最大全安全矩形」\n"
-            f"       两次全扫都成立，仍然可用。\n"
-            f"     ⇒ 根治：给这个规划组补上 `kinematics_solver_attempts: 1` 与\n"
-            f"       `kinematics_solver_consistency_limits`（D54 的修法，\n"
-            f"       仿真那份已经有了，真机这份还没打）。")
+    lines = [
+        f"❌ 回来了 **{len(real)} 个不同的解**{winding} ⇒ **不可复现**。",
+        f"     相差最大的一个与种子差 {d:.3f} rad"
+        f"（同一分支的噪声是 ~1e-4）—— 这是**肘分支翻转**，不是噪声。",
+    ]
+    if recheck is None:
+        lines.append("     ⚠️ **病根还没量** —— 补一次复验（拿上面那个解当种子再问"
+                     "一遍），别直接断言「随机重启」。")
+    else:
+        r_real = [k for k, _ in recheck if k is not None]
+        if len(r_real) == 1:
+            lines.append("     ★ 复验（拿第一个解当种子再问一遍）**只回来一个解** ⇒ "
+                         "随机性来自**种子解不出来时的随机重启**，"
+                         "不是解算器凭空抖。")
+        else:
+            lines.append(f"     ★ 复验（拿第一个解当种子）**还是 {len(r_real)} 个解** ⇒ "
+                         f"不只是种子落点的问题，解算器本身就不可复现。")
+    lines += [
+        "     ⇒ 这个位姿的**逐格**分类是随机量，只能**按带余量读**"
+        "（离边界至少留一格 0.05 m）；",
+        "       「最大全安全矩形」三次全扫都成立 —— 实测矩形内（含近边）20/20 只回来"
+        "一个解，照抄它。",
+        "     ⇒ 根治：给这个规划组补上 `kinematics_solver_attempts: 1` 与"
+        " `kinematics_solver_consistency_limits`",
+        "       （D54 的修法，仿真那份已经有了，真机这份还没打）。",
+    ]
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------
 # 取数：只读
 # ----------------------------------------------------------------------
+def solve_n(pr, p, x, y, z, seed, grip, n):
+    """问 ``n`` 次，返回 ``(解列表, 失败原因计数)``。**只调 `/compute_ik`**。"""
+    sols, reasons = [], {}
+    for _ in range(n):
+        arm, why = pr.solve_ik(p, x, y, z, seed, grip)
+        sols.append(None if arm is None else tuple(float(v) for v in arm))
+        if why:
+            reasons[why] = reasons.get(why, 0) + 1
+    return sols, reasons
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="同一位姿连问 N 次 /compute_ik，看解会不会变（只读）")
@@ -122,7 +204,10 @@ def main():
     ap.add_argument("--block-height", type=float, default=None)
     ap.add_argument("--ik-group", default=None, help="覆盖规划组名（默认读节点参数）")
     ap.add_argument("--seed", default=None,
-                    help="覆盖种子；默认用节点参数里的 ik_seed（包线用的就是它）")
+                    help="覆盖种子；默认用节点参数里的 ik_seed（包线用的就是它）。"
+                         "⚠️ 值以负号开头（正常情况都是）时必须写成 `--seed=-0.048,…`"
+                         " —— 逗号列表不匹配 argparse 的「负数字面量」规则，"
+                         "空格写法会被当成选项，报 `expected one argument`")
     args = ap.parse_args()
 
     if args.z is None and args.table_z is None:
@@ -187,17 +272,15 @@ def main():
         bad = 0
         for i, (label, z) in enumerate(targets):
             print(f"\n--- {label}  tool0 z = {z:+.4f} ---")
-            sols = []
-            reasons = {}
-            for _ in range(args.n):
-                arm, why = pr.solve_ik(p, args.x, args.y, z, seed, grips.get(i))
-                sols.append(None if arm is None else tuple(float(v) for v in arm))
-                if why:
-                    reasons[why] = reasons.get(why, 0) + 1
+            sols, reasons = solve_n(pr, p, args.x, args.y, z, seed,
+                                    grips.get(i), args.n)
             br = tally(sols)
             real = [k for k, _ in br if k is not None]
-            print(f"  不同的解：{len(real)} 个" + (f"；解不出 {sum(v for k, v in br if k is None)} 次"
-                                                  if any(k is None for k, _ in br) else ""))
+            n_can = n_poses(br)
+            print(f"  不同的解：{len(real)} 个"
+                  + (f"（折回 (−π,π] 后 **{n_can} 个位形**）" if n_can != len(real) else "")
+                  + (f"；解不出 {sum(v for k, v in br if k is None)} 次"
+                     if any(k is None for k, _ in br) else ""))
             for k, n in br:
                 if k is None:
                     print(f"    × {n:>3} 次  解不出")
@@ -207,7 +290,22 @@ def main():
                       f"   {[round(a, 3) for a in k]}")
             if reasons:
                 print("  （失败原因：" + "、".join(f"{k}×{v}" for k, v in reasons.items()) + "）")
-            v = verdict(br, seed)
+
+            # 复验：拿**出现次数最多的那个解**当种子再问一遍。若只回来一个，随机性
+            # 就来自「种子解不出来时的随机重启」；若还是多个，解算器本身不可复现。
+            # 这一步的意义是**别让判词去猜病根** —— 量出来的才写。
+            recheck = None
+            if len(real) > 1:
+                best = list(br[0][0])
+                print(f"  ↳ 复验：拿上面第一个解当种子，再问 {args.n} 次 …")
+                sols2, _ = solve_n(pr, p, args.x, args.y, z, best, grips.get(i), args.n)
+                recheck = tally(sols2)
+                r_real = [k for k, _ in recheck if k is not None]
+                print(f"    复验结果：{len(r_real)} 个解"
+                      + (f"（折回后 {n_poses(recheck)} 个位形）"
+                         if n_poses(recheck) != len(r_real) else ""))
+
+            v = verdict(br, seed, recheck=recheck)
             print("  " + v.replace("\n", "\n  "))
             if len(real) > 1:
                 bad += 1
