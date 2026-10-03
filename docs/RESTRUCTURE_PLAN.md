@@ -11582,3 +11582,58 @@ calib_2353869974907916917
 - 未动 `main`；未推送任何外部远端（只推到板上的本地裸库 `board:`）。
 - **可清理**：板上 `~/ur_calib_ws`（打补丁的 `ur_calibration`）。**建议留着** ——
   重做标定还要用它，且它是「已发布版本都坏」这件事的可复现证据。
+
+### 十、旁证（用户当轮追问）：**原负责人的 URDF 也不匹配，而且半修的方式和我们一模一样**
+
+用户问「可不可以看看原负责人的 urdf 匹不匹配」。答案是**不匹配**，
+而且失配的结构与本轮修掉的那个**逐字同构**。这值得单独记一笔，因为它
+排除了「那份 ROS1 实现里有可抄的正确做法」这个可能性。
+
+**（1）文件本身拿不到，但生成方式在文档里是逐字给出的。**
+`/home/<user>/robotics/repos/2026.03.16真实机械臂端总结 副本/` 里只有
+`…总结 副本.md`（2220 行）与 `图片和附件/` 两张 png；**没有任何 `.xacro` / `.urdf`**。
+`my_ur5_calibration.yaml` 在 WSL、`/mnt/c/Users`、板子三处都搜过，**均无**。
+但文档第 43–64、68–98、370–400 行把三个文件全文贴了出来 —— 所以判据不依赖那个 yaml。
+
+**（2）判据一：喂给 `robot_description` 的是名义值。**
+他们的 `load_ur5_ag95.launch`（文档 :76）写的是
+
+```xml
+<arg name="kinematics_params" default="$(find ur_description)/config/ur5/default_kinematics.yaml"/>
+```
+
+即 **`default_kinematics.yaml` = 名义 UR5**。再往下追一层：他们的
+`ur5_ag95.xacro`（:43–64）**没有** `<xacro:arg name="kinematics_params">`，
+`<xacro:ur5_robot prefix="" />` 也**没带**这个参数，而 `:91` 却在 xacro
+命令行上把 `kinematics_params:=…` 传了进去。所以**在文件层没有任何一处**
+把逐台标定送进 `robot_description`；宏内部无论怎么取默认值，拿到的都是名义值。
+
+**（3）判据二（更硬，不依赖 xacro 语义）：标定只进了驱动。**
+他们的 `ur5_moveit_bringup.launch`（:383）写
+
+```xml
+<arg name="kinematics_config" default="$(find ur_description)/config/ur5/my_ur5_calibration.yaml"/>
+<arg name="robot_description_file" default="$(find ur_description)/launch/load_ur5_ag95.launch"/>
+…
+<include file="$(find ur_robot_driver)/launch/ur5_bringup.launch">
+  <arg name="kinematics_config" value="$(arg kinematics_config)"/>
+  <arg name="robot_description_file" value="$(arg robot_description_file)"/>
+```
+
+`kinematics_config` **只**被 include 进驱动；`robot_description` 走的是他们
+自己那个名义 URDF。**⇒ 驱动带标定 / URDF 名义** —— 正是本轮第三节论证的
+「两套几何」，也正是本轮修掉的东西。
+
+**（4）这不是巧合 —— 是同一台物理机器（第六十一轮四条指纹）。**
+控制箱 IP `<ur-controller-ip>` 逐字相同、桌面在 `base_link` 系 z ≈ −0.020、
+AG-95 95 mm 行程 / 0–1000 千分、腕部相机离法兰 85 mm。
+所以他们那份 `my_ur5_calibration.yaml` 的**内容**，就是我们从这台机器人
+身上抓出来的那份 —— `hash: calib_2353869974907916917`。
+**文件丢了，但已经从机器人本身重建。**
+
+**（5）不可验证与一条订正。**
+他们那份 yaml 的**数值内容**无从验证（文档从不打印 DH 或 hash，
+`grep -n "hash\|calib_\|delta_"` 在该 md 上**零匹配**）。
+另订正第六十一轮的一处措辞：那轮引的 `moveit_only_check.py` docstring
+**是我们自己仓库**的 `scripts/moveit_only_check.py:20-22`（读实确认），
+不是他们的文件 —— 「未标定 URDF 与示教器真值有非零偏差」那句告警是我们自己写的。
