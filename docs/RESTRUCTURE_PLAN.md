@@ -11194,3 +11194,170 @@ diff 全文**只有 6 处新增**，形态完全一致：
 - **本轮没有连控制箱的 Dashboard、没有启驱动、没有碰 RTDE。**
 - 板子身份每次用**模组序列号**核对（`<board-serial>`）—— 本轮又核了一次。
 - 未改板上任何文件；未动 `main`；未推送任何外部远端。
+
+---
+
+## 第八十一轮：**真机只读接入成功** —— IP 改对了、125 Hz、**臂全程未动**（2026-10-03）
+
+丙-3 的第 0 步（b）到此**完成**。这一轮是**第一次在本仓库里把板子和真机连起来**，
+全程只读、**没有发过任何轨迹**。
+
+### 一、Host IP 改对了 —— 这是**行为证据**，不是推断
+
+用户改完 URCap 的 `Host IP` 之后（改前是前负责人那台的 `<ip>`），
+在示教器上播放程序，板子日志出现**完整的三步握手**：
+
+```
+[UR_Client_Library]: Robot requested program                ← URCap 连到板子 :50002 取脚本
+[UR_Client_Library]: Sent program to robot                  ← 驱动把 ros_control.urscript 发过去
+[UR_Client_Library]: Robot connected to reverse interface. Ready to receive control commands.
+```
+
+板子本地 `ss` 同时看到**三条「控制箱 → 板子」的入向连接**（这一向才是关键的那一向）：
+
+```
+<ip>:50001 <- <ur-controller-ip>:37707   反向通道（脚本回连）
+<ip>:50003 <- <ur-controller-ip>:44790   轨迹口
+<ip>:50004 <- <ur-controller-ip>:41392   脚本命令口
+```
+
+> **50002 不在这个列表里是对的** —— 取脚本是**一次性**的，取完就关。所以
+> 「看端口有没有连上」来判断通没通**会误判**：该看的是 50001/50003/50004。
+
+要连上 50002，控制箱必须**先**按 `Host IP` 找对板子；要连上 50001，那份脚本必须
+**真的跑起来**。⇒ 两个方向都通，「IP 正确」这件事由**行为**确认。
+
+### 二、⚠️ 臂**没有动** —— 量化证明
+
+播放前后读同一批关节角：
+
+| 关节 | 播放前 | 播放后 | 差 |
+|---|---|---|---|
+| `shoulder_pan_joint` | −0.1555412451373499 | −0.15552932420839483 | **1.19e−5 rad** |
+| `wrist_2_joint` | −1.5431602636920374 | −1.5431721846209925 | 1.19e−5 |
+| `wrist_3_joint` | −1.1727913061725062 | −1.1727789084063929 | 1.24e-5 |
+| `wrist_1_joint` | −1.3737848440753382 | −1.3737967650042933 | 1.19e-5 |
+
+**~1.2e−5 rad = 0.0007°** —— 编码器量化噪声，不是运动。
+
+⚠️ **说清证据的边界**：播放前只读到 **4 个**关节（另外 `elbow_joint` /
+`shoulder_lift_joint` 当时被输出截掉了），所以这条只覆盖 4 个。机理上也没有会动的
+理由：External Control 程序节点里**没有运动指令**（`RequestProgram.class` 只做
+「联网取程序 → 交给 ScriptWriter」），拿回来的脚本是 `servoj` 保持当前位姿的控制环。
+
+### 三、只读验收 ① 「只起驱动」：过
+
+起的是**只驱动**那一档（照 `real.launch.py` docstring 的分阶段配方 ①）：
+`start_moveit:=false start_pipeline:=false` —— 没有 MoveIt、没有相机、没有规划器。
+
+| 项 | 实测 |
+|---|---|
+| RTDE | 协议 v2 协商成功、`URControl 3.15.3.0`、**125 Hz** |
+| 硬件接口 | `System successfully started!` |
+| 控制器 | `scaled_joint_trajectory_controller` **Configured and activated** |
+| `/joint_states` | **125.02 Hz**（不是假发布器那种 10 Hz） |
+| `tf2_echo base_link tool0` | `[0.297, 0.066, 0.459]`，RPY ≈ `(−178.6°, 0.9°, −31.7°)` |
+| 连接后新增的 WARN/ERROR | **一条都没有** |
+| 内存 | 可用 5.5 GiB（**没有压 ollama 也够**） |
+
+`ros2 control list_controllers` **不可用** —— 板上没装 `ros2controlcli`
+（`ros2: error: invalid choice: 'control'`）。**能证明控制器激活的是 launch 日志那一行，
+不是这条命令**；别把这条命令的缺席读成「控制器没起来」。**第 ② 步（MoveIt / `/compute_ik`）本轮没做**
+—— 按配方它是**单独一档**运行，需要先停驱动。
+
+### 四、⚠️ 新账：**机器人标定与 URDF 里的标称运动学不匹配**
+
+驱动启动时打了一条 **ERROR**（不是警告，原文照抄）：
+
+```
+[URPositionHardwareInterface]: Calibration checksum: 'calib_209549117540498681'.
+[URPositionHardwareInterface]: The calibration parameters of the connected robot don't match
+the ones from the given kinematics config file. Please be aware that this can lead to critical
+inaccuracies of tcp positions. Use the ur_calibration tool to extract the correct calibration
+from the robot and pass that into the description.
+```
+
+**它意味着**：驱动算 `tool0` 用的是**出厂标称运动学**，而这台机器人有**自己的工厂标定**
+（每台的连杆实际长度/零点都略有差异）⇒ **`tool0` 会偏**，量级要实测、**不猜**。
+
+**为什么它比看起来严重**：本项目的**手眼标定、TCP、`tool0_to_fingertip`、抓取高度**
+**全都建立在 `tool0` 之上**，这个偏差会**整条链传下去**，而症状是「从外面看都正常、
+只有抓不准」—— 正是最难查的那一类。
+
+**已排除「驱动会自己解决」**：查过 `ros2 topic list`，没有 payload / TCP / 标定相关的
+发布口；`ur_configuration_controller` 只有 `transition_event`，**没有接手这件事**。
+
+**修法**（官方 `ur_calibration`，只读、不运动；本轮**没做**，单独排一轮）：
+用 `ur_calibration calibration_correction --robot_ip <ur-controller-ip> --output_path …`
+把标定从机器人里取出来，再喂给 description。⚠️ 它要**自己开一条 RTDE**，
+而驱动正占着 —— **不要在驱动跑着的时候并行跑它**。
+
+### 五、两条现场读数（都记下来，以后要用）
+
+- **示教器速度滑条 = `26.0`**（`/speed_scaling_state_broadcaster/speed_scaling`）。
+  它证明 `scaled_joint_trajectory_controller` 真的在尊重滑条 —— 第一次真机动作会是**慢的**。
+  这也再次印证 D55 那条：滑条一慢，`time_from_start` 是死值的轨迹**每条都可能被判
+  `GOAL_TOLERANCE_VIOLATED`**（已在 `grasp_planner.yaml` 把 `goal_time_tolerance` 放到 2.0 s）。
+- **含 External Control 节点的那个程序是 `/programs/ur5ros.urp`**（Dashboard
+  `get loaded program` 报出；名字即「ur5 + ros」，前负责人留下的）。
+  示教器上另外几个是**出厂演示程序**，**播放即真机动作**。（播放前查过一次是
+  `No program loaded` —— 所以那时**没有**任何可以被捡起来的「上次留着的那个」。）
+
+### 六、收工：一次干净关闭 + **一个我自己算错并更正的信号坑**
+
+关闭顺序是**先示教器、后板子**：用户停掉程序 → 日志出现
+**`Connection to reverse interface dropped.`**（链路按预期断开）→ 再停驱动。
+
+驱动侧日志关得很漂亮：
+
+```
+[UR_Client_Library]: RTDE background read thread stopped
+[URPositionHardwareInterface]: System successfully stopped!
+[resource_manager]: Successful 'shutdown' of hardware 'ur5'
+[controller_manager]: Shutting down the controller manager.
+✅ robot_state_publisher / dashboard_client / robot_state_helper / urscript_interface
+   / trajectory_until_node / controller_stopper_node  六个 "process has finished cleanly"
+```
+
+**但 `ur_ros2_control_node` 没退。** 信号实测（**这是本轮的第二个更正**）：
+
+| 进程 | 被忽略 | 有处理器 |
+|---|---|---|
+| `ros2 launch`（父） | `SIGHUP` `SIGINT` `SIGQUIT` `SIGPIPE` `SIGXFSZ` | **无** ⇒ `SIGTERM` 走默认动作＝终止 |
+| `ur_ros2_control_node`（子） | `SIGHUP` | `SIGINT` `SIGTERM` `SIGSEGV` 等 |
+
+- `kill -INT <父>` → **毫无反应**（忽略且无处理器）。
+- `kill -INT <子>` → 它**开始**关（上面那几行都打了），**但卡在 futex 上不退**
+  （`wchan=futex_wait_queue_me`、23 线程）；**第二次 SIGINT 仍然无效**。
+- `kill -TERM <子>` → **走完并退出** ✅。
+
+⚠️ **本轮我在给用户的回复里先把这张表写错了**：小脚本把信号的**编号**（15）当成**位掩码**
+去和 `SigIgn` 比，于是把 `SIGTERM` 误标成「被忽略」。**是「SIGTERM 真的生效了」这个观测
+反驳了我的表**，才回头重算（信号 n 对应位 n−1）。
+**教训与第七十八、八十轮同源**：一个数字/字符串不会告诉你它的含义，
+**要看它被怎么用，并以行为为准**。
+
+⇒ 正确顺序写进了 `docs/待执行命令.md` 的收工一节：子节点先 `SIGINT`，~10 s 后对没退的
+补 `SIGTERM`，父进程最后 `SIGTERM`；**全程不 `kill -9` 进程组**（会让反向通道突然断开、
+机器人留错误，且极易留孤儿 —— 丙-4 就是这么来的）。
+
+**收工后复核**：无残留进程 ✅、50001–50004 全空 ✅、与控制箱的连接全断 ✅、
+机器人侧 `robotmode=RUNNING` / `safetymode=NORMAL` / `programState=STOPPED` ✅。
+
+### 七、改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `docs/待执行命令.md` §丙-3 | 播放那一步的真实判据（三步握手原文、50002 一次性所以别拿它判通断）、**含节点的程序是 `ur5ros.urp`**、新的「收工顺序」一节（含信号坑与方括号 `pgrep` 技巧）、标定不匹配这条新账与修法 |
+| 台账 | 本轮 |
+
+### 八、台面账
+
+- 板子上做了：`pgrep` / `ss` / `free` / `ip neigh` / 读 `/proc/<pid>/status` / 起停驱动
+  （**起停是状态变更，但不是运动**）/ 只读 ROS 话题（`/joint_states`、`tf2_echo`、
+  `/speed_scaling_state_broadcaster/*`）。
+- **给真机发的只有只读的 Dashboard 查询**（`robotmode` / `safetymode` / `programState` /
+  `get loaded program` / `get robot model` / `get serial number`）。
+  **没有碰 30001/30002/30003/30004 的手搓包、没有发任何轨迹、没有写任何寄存器。**
+- **臂全程未动**（第二节的量化对比 + 机理）。
+- 未改板上任何文件；未动 `main`；未推送任何外部远端。
