@@ -33,8 +33,8 @@ try:
     from table_safety_envelope import (                          # noqa: E402
         BLOCKED, LEVEL_KEYS, NEAR, NOIK, PROJECT_ROOT, REAL_BLOCK_HEIGHT, SAFE,
         SOLVABLE_OTHER, axis, cell_key, classify_one, combine, json_axis,
-        launch_const, max_rect, node_guard_note, num, render_map, row_runs,
-        worst, z_levels)
+        launch_const, max_rect, node_guard_note, num, pick_zone_z,
+        pick_zone_z_note, render_map, row_runs, worst, z_levels, PICK_Z_PAD)
 except ImportError as e:              # 没 source ROS 时 rclpy 拉不到
     print(f"环境不满足（{e}）—— 先 source /opt/ros/humble/setup.bash")
     sys.exit(2)
@@ -56,6 +56,30 @@ def check(name, cond, detail=''):
 
 def near(a, b, tol=1e-9):
     return abs(a - b) <= tol
+
+
+def tup_near(a, b, tol=1e-12):
+    """逐项比，**不许用 `==` 比带加法的浮点元组**。
+
+    这个坑本文件 D2/D4 两节早就写过一次（`0.10000000000000009`），我写 F2c 时
+    又踩了一遍：`0.10 + 0.05 = 0.15000000000000002`，于是
+    `pick_zone_z(0.0, 0.10, 0.05) == (0.05, 0.15, 0.10)` 红，而代码是对的。
+    **一条因为浮点相等而红的断言，会把注意力引到没有错的地方去。**
+    """
+    return len(a) == len(b) and all(near(x, y, tol) for x, y in zip(a, b))
+
+
+def calls(fn):
+    """`("ok", 返回值)` 或 `("raise", 异常类名)` —— 给「会不会抛」这类断言用。
+
+    直接写 `fn(...) is None` 的问题是：守卫一去掉，异常就从 check() 的**实参**里
+    抛出来，脚本当场中断，后面所有检查一条都不跑。这时的红是「崩了」而不是
+    「哪条错了」，跟它要防的 bug 一样难查。
+    """
+    try:
+        return ("ok", fn())
+    except Exception as e:
+        return ("raise", type(e).__name__)
 
 
 # ----------------------------------------------------------------------
@@ -284,6 +308,90 @@ check("矩形的上下边取自 ys（升序）—— 不是行号",
 check("单格结论也对（退化情形不该崩）",
       rect([[BLOCKED, SAFE], [BLOCKED, BLOCKED]]) == (1.0, 1.0, 0.0, 0.0, 1),
       f"got {rect([[BLOCKED, SAFE], [BLOCKED, BLOCKED]])!r}")
+
+
+# ----------------------------------------------------------------------
+# F2c. pick_zone_z：x/y 之外的最后一半
+# ----------------------------------------------------------------------
+# 这一节钉的是一件**会静默出错**的事：`pick_zone` 是 3D 盒子，x/y 由包线给，
+# z 得按方块高填 —— 而现行 yaml 的 z 是**仿真**的（仿真台面在 base 系 −0.39）。
+# 填错了不报错，只是规划器对每条检测走 `continue`（planner_node.py:1284），
+# 日志只剩「候选 0 个」，看着像检测坏了。
+#
+# ⚠️ 这一节里最要紧的是**头两条**：中心是「方块**顶面**」不是「方块中心」。
+#    我第一版按中心算（+0.01425），低了**半个方块**，而且**文档里也照着写了**。
+#    它靠什么抓出来 —— 拿**仿真**那三个已知数对一遍：台面 −0.39、方块 0.04、
+#    yaml 的 `place_z = -0.35` 恰好是两者之和。**真实数据自洽，才是口径对了的证据。**
+print("\n--- F2c. pick_zone_z：z 上下界（中心是**顶面**）与现行值当面比一次 ---")
+ZMIN, ZMAX, ZTOP = pick_zone_z(0.0, REAL_BLOCK_HEIGHT)
+check("真机台面 0.0 + 方块高 28.5 mm ⇒ **顶面** +0.0285（不是中心 +0.01425）",
+      near(ZTOP, 0.0 + REAL_BLOCK_HEIGHT, 1e-12), f"got {ZTOP!r}")
+# 这一条是**真数据自洽**检查：按「中心」算的那一版过不了它（−0.37 vs 实际 −0.35）。
+# `place_z` 是别人早就标定好写在那儿的数，拿它当标尺最难自欺。
+_SIM_TABLE, _SIM_BLOCK, _SIM_PLACE_Z = -0.39, 0.04, -0.35
+check("★ 用**仿真**那三个已知数对一遍：台面 −0.39 + 方块 0.04 = place_z −0.35"
+      "（yaml 里就是这么标的 ⇒ 顶面口径成立）",
+      near(pick_zone_z(_SIM_TABLE, _SIM_BLOCK)[2], _SIM_PLACE_Z, 1e-12),
+      f"got {pick_zone_z(_SIM_TABLE, _SIM_BLOCK)[2]!r}，place_z 是 {_SIM_PLACE_Z}")
+check("★ 而仿真那一带**落在** yaml 现行 z∈[-0.45,-0.30] 里 —— 仿真那份是对的，"
+      "真机那份只是没跟着改（所以现行值不能当旁证用）",
+      pick_zone_z(_SIM_TABLE, _SIM_BLOCK)[0] >= _SIM_TABLE - 0.45
+      and pick_zone_z(_SIM_TABLE, _SIM_BLOCK)[1] <= _SIM_TABLE + 0.09,
+      f"got {pick_zone_z(_SIM_TABLE, _SIM_BLOCK)!r}")
+check("★ 余量在**两侧**（上下各一份），且上界高过**方块顶面**",
+      near(ZMIN, ZTOP - PICK_Z_PAD) and near(ZMAX, ZTOP + PICK_Z_PAD),
+      f"got {(ZMIN, ZMAX)!r}")
+check("顶面**严格**在区间里（闭区间边界不算「在里面」的话就白算了）",
+      ZMIN < ZTOP < ZMAX, f"got {(ZMIN, ZTOP, ZMAX)!r}")
+check("下界**不低于台面**（方块躺在台面上，就不可能出现在台面之下；"
+      "台面之下的归 table_min_z 管，两个界不互相串）",
+      ZMIN >= 0.0, f"got {ZMIN!r}")
+check("方块薄于 pad 时，下界**夹在台面**上而不是掉到台面以下",
+      pick_zone_z(0.0, 0.005, 0.02)[0] == 0.0,
+      f"got {pick_zone_z(0.0, 0.005, 0.02)!r}")
+check("★ 真机那一带与**仿真**台面（−0.39）算出来的那一带**不相交**"
+      "—— 这就是照抄 x/y 却漏了 z 会踩的那个坑",
+      pick_zone_z(-0.39, REAL_BLOCK_HEIGHT)[1] < ZMIN,
+      f"got {pick_zone_z(-0.39, REAL_BLOCK_HEIGHT)!r} vs {(ZMIN, ZMAX)!r}")
+check("pad 放大时区间跟着变宽（上下各一份）—— 用个厚方块，免得撞上下面那条夹子",
+      tup_near(pick_zone_z(0.0, 0.10, 0.05), (0.05, 0.15, 0.10)),
+      f"got {pick_zone_z(0.0, 0.10, 0.05)!r}")
+# ⚠️ 这条是**写上面那条时自己踩到的**：pad=0.05、方块 28.5 mm 时，
+# `ztop - pad` = −0.0215 已经在台面以下了，夹子把它抬到 0.0。
+# 也就是说「pad 放大 ⇒ 区间两侧对称变宽」**在薄方块上不成立** —— 那是对的
+# （区不能伸到台面以下），但如果测试照着「对称」写，它会红，而红的不是代码。
+check("pad 大到会伸到台面以下 ⇒ **下界夹在台面**，上界照留（不是对称变宽）",
+      tup_near(pick_zone_z(0.0, REAL_BLOCK_HEIGHT, 0.05), (0.0, ZTOP + 0.05, ZTOP)),
+      f"got {pick_zone_z(0.0, REAL_BLOCK_HEIGHT, 0.05)!r}")
+check("pad=0 时区间塌成一个点，正好落在顶面上",
+      tup_near(pick_zone_z(0.0, REAL_BLOCK_HEIGHT, 0.0), (ZTOP, ZTOP, ZTOP)))
+
+# 判词：只在「方块顶面不在现行 z 区间里」时才说话
+SIM_ZONE = [0.30, 0.90, -0.18, 0.16, -0.45, -0.30]      # ✓ 现行 yaml 的值
+# ⚠️ 只算一次、存进 NOTE：这三条都拿它做 `in` / `all(... in ...)`。
+# 写成「每次都现调」的话，一旦判词方向反了（该说话时回 None），
+# `"x" in None` 会抛 TypeError 把整个脚本打断 —— 与上面 `calls()` 那条同一个理由。
+NOTE = pick_zone_z_note(SIM_ZONE, ZTOP, ZMIN, ZMAX)
+check("★ 现行 yaml 那份（z∈[-0.45,-0.30]，仿真的）⇒ **报警**", NOTE is not None)
+check("  警报里带着**改成的数**（不是只说「错了」）",
+      bool(NOTE) and f"[{ZMIN:+.4f},{ZMAX:+.4f}]" in NOTE)
+check("  警报点名 `in_zone` 与那两行（现场要知道去哪儿看）",
+      bool(NOTE) and all(s in NOTE for s in ("in_zone", ":1284")))
+check("z 已经对了 ⇒ 不说话（不制造常亮的假警告）",
+      pick_zone_z_note([0.40, 0.75, -0.45, 0.45, 0.005, 0.05], ZTOP, ZMIN, ZMAX) is None)
+check("顶面正好落在边界上 ⇒ 也算收得到（与 `in_zone` 的闭区间同口径）",
+      pick_zone_z_note([0.40, 0.75, -0.45, 0.45, ZTOP, 0.05], ZTOP, ZMIN, ZMAX) is None)
+check("节点没读到 pick_zone ⇒ None（不拿 None 参与比较）",
+      pick_zone_z_note(None, ZTOP, ZMIN, ZMAX) is None)
+# ⚠️ 这一条**必须**用 calls() 包着：直接写 `... is None`，一旦守卫被去掉就是
+# `IndexError` 从 check() 的实参里抛出来 —— 变异照样能杀掉（套件不会报「通过」），
+# 但整个脚本会**当场中断**，后面所有检查一条都不跑，红的是「崩了」不是「哪条错」。
+# 一条把后续检查全吞掉的断言，比它想防的那个 bug 更难查。
+check("pick_zone 长度不对 ⇒ None（不是 IndexError）",
+      calls(lambda: pick_zone_z_note([0.30, 0.90, -0.18, 0.16],
+                                     ZTOP, ZMIN, ZMAX)) == ("ok", None),
+      f"got {calls(lambda: pick_zone_z_note([0.30, 0.90, -0.18, 0.16], ZTOP, ZMIN, ZMAX))!r}")
+
 
 
 # ----------------------------------------------------------------------

@@ -68,6 +68,16 @@ D54）。所以：
     那是**种子**问题不是够不到 —— `_call_ik` 在这种格子上**直接返回 None**
     （跳过目标），所以它和 `x` 一样是「区别框到这儿」，只是原因不同、处置不同。
 
+`pick_zone` 是 **3D 盒子**：x/y 之外还有 **z 那两个界**（第八十七轮补的）
+----------------------------------------------------------------------
+x/y 由这张图给，z 却**没人给** —— 而 z 填错的症状比 x/y 填错**更难查**：
+`in_zone()` 要求三个轴全中（闭区间），现行 yaml 的 z 是**仿真**的
+`[-0.45,-0.30]`（仿真台面在 base 系 −0.39），真机方块**顶面**在 **+0.0285** 一带，
+**一个都落不进去**。规划器于是对每条检测都 `continue`（`planner_node.py:1284`），
+**一句报错都没有**，日志只剩「候选 0 个」—— 看着像**检测坏了**。
+所以脚本现在把它算出来（`pick_zone_z()`）并与**节点参数里那份**当面比一次
+（`pick_zone_z_note()`），对不上就出 ⚠️ 并给出该改成的数。
+
 用法（板端，先起无臂预检或任何一套带 /compute_ik 的 MoveIt）
     # 最省事：跟着无臂预检一起跑（那时几何与上电用的严格同源）
     python3 scripts/moveit_only_check.py --envelope-z 0.0
@@ -355,6 +365,64 @@ def node_guard_note(worst_z, table_z, node_table_z, guard_margin):
                    f"比真机台面还低、对真机几何已经没有意义」，"
                    f"不能当作「这里撞桌」的证据。")
 
+
+# `pick_zone` 的 z 上下界在「方块**顶面**」上下各留多少（m）。取 0.02 = 与
+# `guard_margin` 同量级：它要容的是**检测 z 的抖动**，不是机械安全余量。
+PICK_Z_PAD = 0.02
+
+
+def pick_zone_z(table_z, block_h, pad=PICK_Z_PAD):
+    """`pick_zone` 的 **z 上下界**。返回 `(zmin, zmax, 顶面 z)`。
+
+    为什么要有这个数：`pick_zone` 是 **3D** 盒子 —— `planner_node.in_zone()`
+    要求三个轴**全中**才算（闭区间，`planner_node.py:159`）。x/y 由包线给出，
+    **z 却没人给**：现行 `grasp_planner.yaml` 的 z 是**仿真**的
+    （`[-0.45,-0.30]`，因为仿真台面在 base 系 −0.39）。真机上它是一个都收不到的。
+
+    后果的形状值得记下来：规划器对每条检测都走 `continue`
+    （`planner_node.py:1284`），**一句报错都没有**，日志里只剩那条限流的
+    「候选 0 个」—— 于是看起来像**检测坏了**（相机？模型？话题？），
+    而实际上是区框错了。所以在这里算出来，并对着**节点参数里那份**现行值
+    当面比一次（`pick_zone_z_note()`）。
+
+    ⚠️ **中心是「方块顶面」，不是方块中心。** 这一版之前我按中心算过一版，
+    低了**半个方块**（14.25 mm），而且当时**文档里也照着写了**。错的原因不是
+    算错，是**没查 `wz` 到底是什么**：规划器比较用的那个 z 是 `perception_3d`
+    报出来的点，它是**俯视深度相机看到的顶面**。证据就在同一个 yaml 里
+    —— `place_z` 那条注释实测过「真值中心 −0.37、实测 −0.350，正好差半个方块」，
+    而 `place_z: -0.35` 本身就是「仿真台面 −0.39 + 仿真方块 0.04」。
+    **旁证一直摆在那儿，对一眼就会发现。**
+
+    `pad` 是上下各留的余量，容的是检测 z 的抖动。下界再**夹到不低于台面**
+    （`max(..., table_z)`）：方块既然是躺在台面上的，它就不可能出现在台面之下，
+    而台面之下的东西归 `table_min_z` 那条护栏管 —— 两个界不要互相串。
+    """
+    ztop = table_z + block_h
+    return (max(ztop - pad, table_z), ztop + pad, ztop)
+
+
+def pick_zone_z_note(node_pick_zone, ztop, zmin, zmax):
+    """把「现行 `pick_zone` 的 z」与刚算出来的那一带当面比一次；没问题返回 `None`。
+
+    单拎出来是因为这里**只做一件小事**：顶面在不在现行区间里。上一版没有
+    这一步时，包线只印「z 另按方块高度定」—— 一句**把球踢给现场**的话，
+    而现场手上那份 yaml 里的 z 正是错的，照抄 x/y 之后症状是「检测有框、
+    规划器一个都不抓」。**说了没查过的事**家族的同一个形状：结论正确，
+    但没人去比过一次。
+    """
+    if not node_pick_zone or len(node_pick_zone) != 6:
+        return None
+    lo, hi = node_pick_zone[4], node_pick_zone[5]
+    if lo <= ztop <= hi:
+        return None
+    return (f"     ⚠️ 但**节点参数里** `pick_zone` 的 z 是 [{lo:+.3f},{hi:+.3f}]，"
+            f"方块顶面 {ztop:+.4f} **不在里面** —— 改成 "
+            f"[{zmin:+.4f},{zmax:+.4f}] 才收得到。\n"
+            f"        `in_zone()` 三个轴全中才算（`planner_node.py:159`），"
+            f"所以真机上**每一条检测都会被丢掉**：\n"
+            f"        `:1284` 是个 `continue`，**一句报错都没有**，"
+            f"日志只剩「候选 0 个」—— 看着像检测坏了。\n"
+            f"        照抄这块矩形时，别忘了把 z 一起改掉。")
 
 
 def main():
@@ -703,8 +771,20 @@ def main():
             a, b, c, d, n = rect_safe
             print(f"  ★ **全安全**：x∈[{a:.2f},{b:.2f}]  y∈[{c:+.2f},{d:+.2f}]"
                   f"（{n} 格）")
-            print(f"     ⇒ 这一块可以直接当 `pick_zone` 的 x/y 范围"
-                  f"（z 另按方块高度定）。")
+            # x/y 只是 `pick_zone` 的一半 —— 它是 3D 盒子，z 那两个界同样要填。
+            zmin, zmax, ztop = pick_zone_z(args.table_z, args.block_height)
+            print(f"     ⇒ 这一块可以直接当 `pick_zone` 的 **x/y** 范围；"
+                  f"**z 那两个界**按方块顶面算：")
+            print(f"       检测报出来的 wz 是**方块顶面**（俯视深度看到的是顶面，"
+                  f"见 `grasp_planner.yaml` 的 `place_z` 注释）")
+            print(f"       = 台面 {args.table_z:+.4f} + 方块高 {args.block_height:.4f}"
+                  f" = {ztop:+.4f}")
+            print(f"       ⇒ 建议 z∈[{zmin:+.4f}, {zmax:+.4f}]"
+                  f"（顶面上下各留 {PICK_Z_PAD:.2f} m 容检测抖动；"
+                  f"下界已夹到不低于台面）")
+            note_z = pick_zone_z_note(p.get("pick_zone"), ztop, zmin, zmax)
+            if note_z:
+                print(note_z)
         else:
             print("  ⚠️ 没有一块**全安全**的矩形 —— 要么缩范围，要么按下面的"
                   "「含近限」那块用，但要知道它贴着下限。")
