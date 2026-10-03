@@ -706,11 +706,16 @@ def main():
 
         # ---- 汇总：把两类「越界」分开说，它们要的处置完全不同 ----
         print("\n" + "=" * 78)
-        n = len(cells)
+        # ⚠️ 变量名带 `_cells` 后缀、且结尾那行**不读这个变量**：第八十七轮实测
+        # 它被下面「照着划区」那两行的 `a, b, c, d, n = rect_*` **覆盖**了，
+        # 于是「用时 …s（n × 4 次 IK + FK）」印出的是矩形里的格数（152×4=608），
+        # 而实际跑的是 357×4=1428 次。跑得越久、矩形越小，这句话错得越离谱，
+        # 而且**它是一句「说出来的数」** —— 正是本文件反复在修的那一类。
+        n_cells = len(cells)
         blocks = [(x, y) for (x, y), s in cells.items() if s == BLOCKED]
         noiks = [(x, y) for (x, y), s in cells.items() if s == NOIK]
         seeds_only = [(x, y) for (x, y), s in cells.items() if s == SOLVABLE_OTHER]
-        print(f"汇总（{n} 格）：安全 {sum(1 for s in cells.values() if s == SAFE)}"
+        print(f"汇总（{n_cells} 格）：安全 {sum(1 for s in cells.values() if s == SAFE)}"
               f" / 近限 {sum(1 for s in cells.values() if s == NEAR)}"
               f" / 解不出 {len(noiks)} / **低于下限 {len(blocks)}**"
               + (f" / 换种子才可解 {len(seeds_only)}" if retry_seed is not None else ""))
@@ -794,9 +799,9 @@ def main():
         print("\n照着划区 —— 最大的整块矩形（逐行的段表**不能**直接当矩形用，"
               "理由见 max_rect 的说明）：")
         if rect_safe:
-            a, b, c, d, n = rect_safe
+            a, b, c, d, rect_n = rect_safe
             print(f"  ★ **全安全**：x∈[{a:.2f},{b:.2f}]  y∈[{c:+.2f},{d:+.2f}]"
-                  f"（{n} 格）")
+                  f"（{rect_n} 格）")
             # x/y 只是 `pick_zone` 的一半 —— 它是 3D 盒子，z 那两个界同样要填。
             zmin, zmax, ztop = pick_zone_z(args.table_z, args.block_height)
             print(f"     ⇒ 这一块可以直接当 `pick_zone` 的 **x/y** 范围；"
@@ -818,9 +823,9 @@ def main():
             print("  ⚠️ 没有一块**全安全**的矩形 —— 要么缩范围，要么按下面的"
                   "「含近限」那块用，但要知道它贴着下限。")
         if rect_any and rect_any != rect_safe:
-            a, b, c, d, n = rect_any
+            a, b, c, d, rect_n = rect_any
             print(f"  · 含**近限格**（离下限 <0.05 m）能放宽到："
-                  f"x∈[{a:.2f},{b:.2f}]  y∈[{c:+.2f},{d:+.2f}]（{n} 格）"
+                  f"x∈[{a:.2f},{b:.2f}]  y∈[{c:+.2f},{d:+.2f}]（{rect_n} 格）"
                   f" —— 这一块里有格子贴着下限，**不建议**直接照抄。")
 
         print("\n提醒：本脚本给的是**几何边界**，它不含：")
@@ -861,7 +866,9 @@ def main():
                 }, f, ensure_ascii=False, indent=1)
             print(f"\n网格已转储：{args.json}")
 
-        print(f"\n用时 {time.monotonic() - t0:.0f}s（{n * len(keys)} 次 IK + FK）")
+        # 直接从网格**算**出来，不读任何中间变量 —— 上面那两处覆盖就是这么来的。
+        print(f"\n用时 {time.monotonic() - t0:.0f}s"
+              f"（{len(xs) * len(ys) * len(keys)} 次 IK + FK）")
         # 退出码：**这里不是闸门**。图上出现撞桌格是结论（扫的范围本来就比任何
         # 合理的区大），不是失败；只有「一个位姿都没解出来」才是环境问题 ——
         # 那时「没有撞桌格」是假绿，跟肘高探针的 return 2 同一个理由。
