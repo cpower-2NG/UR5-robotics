@@ -183,6 +183,19 @@ def validate(data):
             bad.append(f"worst_at 的前两个要是数字，实际 {wa!r}")
         elif not isinstance(data.get("worst_link_z"), (int, float)):
             bad.append("有 worst_at 就必须有数字 worst_link_z")
+    # `max_rect_safe`：允许没有（旧 JSON）或 None（没算出全安全矩形），
+    # 否则必须是 5 元组 `[x_lo, x_hi, y_lo, y_hi, 格数]`。
+    # ⚠️ **长度也要查** —— 这里正是 `worst_at` 那次踩过的同一个坑：
+    # 解包前不验长度，错误就出现在 `draw()` 深处，报的话跟哪个键错了无关。
+    mr = data.get("max_rect_safe")
+    if mr is not None:
+        if not isinstance(mr, (list, tuple)) or len(mr) != 5:
+            bad.append(f"max_rect_safe 要是 null 或 5 元组"
+                       f"[x_lo,x_hi,y_lo,y_hi,格数]，实际 {mr!r}")
+        elif not all(isinstance(v, (int, float)) for v in mr):
+            bad.append(f"max_rect_safe 里全是数字才对，实际 {mr!r}")
+        elif not (mr[0] <= mr[1] and mr[2] <= mr[3]):
+            bad.append(f"max_rect_safe 的上下界反了：{mr!r}")
     return bad
 
 
@@ -310,6 +323,27 @@ def draw(data, which, zones, slots, out, title, dpi):
                                edgecolor="#1a3d7c", linewidth=2.0, zorder=5))
         ax.text(x0, y1 + 0.015, name, color="#1a3d7c", fontsize=10,
                 fontweight="bold", zorder=6)
+    # 建议矩形：包线脚本自己算出来的那块「最大全安全矩形」（`max_rect_safe`）。
+    # 与 `--zone` **分开画**是有意的 —— 两者回答的是两个问题：
+    #   · `--zone` 是**现状**（现在配的那个区）—— 看它有没有压到红格；
+    #   · 这一块是**建议**（可直接抄进 yaml 的范围）。
+    # 颜色、线型、图例文案都不同，叠在一起也不会看混。
+    rect_handle = None
+    mr = data.get("max_rect_safe")
+    if mr:
+        a, b, c, d = mr[0], mr[1], mr[2], mr[3]
+        ax.add_patch(Rectangle((a, c), b - a, d - c, fill=False,
+                               edgecolor="#0f7a3d", linewidth=2.2,
+                               linestyle=(0, (7, 3)), zorder=5))
+        ax.text(a, d + 0.015,
+                "建议 pick_zone（最大全安全矩形）" if font else
+                "suggested pick_zone (largest all-safe rect)",
+                color="#0f7a3d", fontsize=9.5, fontweight="bold", zorder=6)
+        rect_handle = Line2D(
+            [], [], color="#0f7a3d", linewidth=2.2, linestyle=(0, (7, 3)),
+            label=(f"建议 x[{a:.2f},{b:.2f}] y[{c:+.2f},{d:+.2f}]" if font else
+                   f"suggested x[{a:.2f},{b:.2f}] y[{c:+.2f},{d:+.2f}]"))
+
     slot_handle = None
     if slots:
         ax.scatter([s[0] for s in slots], [s[1] for s in slots], marker="x", s=55,
@@ -356,6 +390,8 @@ def draw(data, which, zones, slots, out, title, dpi):
         handles.append(slot_handle)
     for name, _ in zones:
         handles.append(Line2D([], [], color="#1a3d7c", linewidth=2.0, label=name))
+    if rect_handle is not None:
+        handles.append(rect_handle)
     leg = ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(1.01, 1.0),
                     fontsize=9.5, frameon=False)
     leg.set_title("判读" if font else "reading", prop={"size": 10.5})

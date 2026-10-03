@@ -165,6 +165,8 @@ GOOD = {
     "levels": {"grasp_descend": 0.2042}, "table_z": 0.0, "floor": 0.02,
     "guard_margin": 0.02, "worst_link_z": -0.0944,
     "worst_at": [0.20, 0.10000000000000009, "grasp_descend"],
+    # 第八十六轮实测算出来的那块（152 格）—— 照抄真值，不自己编。
+    "max_rect_safe": [0.40, 0.75, -0.45, 0.45, 152],
 }
 check("照抄真实形状的样本要通过", validate(GOOD) == [], f"got {validate(GOOD)!r}")
 check("★ 三元组 worst_at 不再被当成两元组（这就是当时炸掉的那条）",
@@ -191,6 +193,19 @@ check("**一次把所有问题都说出来**（不是修一个才发现下一个
       len(validate({})) >= 6, f"got {len(validate({}))}")
 check("合法的空 cells 不报（那只是这一层没数据，不是 JSON 坏）",
       validate({**GOOD, "cells": {}}) == [])
+# max_rect_safe：与 worst_at 同一个坑 —— 解包前不验长度，错误就出现在 draw() 深处。
+check("没有 max_rect_safe 也接受（旧 JSON 没这个键）",
+      validate({k: v for k, v in GOOD.items() if k != "max_rect_safe"}) == [])
+check("max_rect_safe = null 接受（没算出全安全矩形，是**合法结论**不是坏数据）",
+      validate({**GOOD, "max_rect_safe": None}) == [],
+      f"got {validate({**GOOD, 'max_rect_safe': None})!r}")
+check("★ 四元组 max_rect_safe ⇒ 报出来（这就是 worst_at 那次炸掉的同一个形状）",
+      len(validate({**GOOD, "max_rect_safe": [0.4, 0.75, -0.45, 0.45]})) == 1,
+      f"got {validate({**GOOD, 'max_rect_safe': [0.4, 0.75, -0.45, 0.45]})!r}")
+check("max_rect_safe 里混进字符串 ⇒ 报出来",
+      len(validate({**GOOD, "max_rect_safe": [0.4, "0.75", -0.45, 0.45, 152]})) == 1)
+check("上下界反了 ⇒ 报出来（画出来是个负宽度的框，什么也看不见）",
+      len(validate({**GOOD, "max_rect_safe": [0.75, 0.40, -0.45, 0.45, 152]})) == 1)
 
 # worst_point：**当初炸掉的就是这一处**。以前它在 draw() 里，纯函数自检够不着，
 # 所以 44 条全绿也照样漏。提出来之后这条契约才有断言。
