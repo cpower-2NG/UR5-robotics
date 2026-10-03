@@ -231,30 +231,83 @@ def render_map(cells, xs, ys):
     return "\n".join(out)
 
 
-def row_limits(cells, xs, ys):
-    """每一行（固定 y）从**近边**（x 最小处）起算的连续可用边界。
+def row_runs(cells, xs, ys):
+    """每一行的**连续可用段**：`{y: [(x_lo, x_hi, 含近限), ...]}`，按 x 升序。
 
-    返回 `{y: (x_安全, x_可用)}`：
-      · `x_安全` = 连续全是 `SAFE` 的最后一个 x（不含近限格）
-      · `x_可用` = 连续是 `SAFE` 或 `NEAR` 的最后一个 x（能抓，但贴着下限）
-    遇到第一个**不可用**（`NOIK` / `BLOCKED`）就停 —— 不「跳过空洞继续说安全」，
-    因为远处的孤岛在校验里等于没有（中间那一段臂过不去）。x 全不可用时给 None。
+    ⚠️ **这是第三版**，前两版都是同一种写法：「从某一边起算、遇到第一个不可用
+    就停」——
+
+      · 第一版 `row_limits` 从**近边**（x 最小处）起算。撞桌带贴着基座时，
+        21 行里有 9 行第一个格子就是 `X`，整行给 `—`。
+      · 第二版 `row_limits_outer` 从**远边**起算，以为「反过来就有答案了」。
+        实测（第八十六轮，真机几何全扫 357 格）：**21 行全是 `—`，一个值都
+        没产出过** —— 因为远边那一段是「够不到」（x≥0.75 全是 `NOIK`），
+        照样第一个格子就停。而我**没看它的输出就照它写了结论**
+        （「从远边起算就知道 x 至少要多大」），把它写进了文档，还配了自检。
+        自检是绿的：那几条用的样本恰好都是「近边脏、远边干净」。
+        这是「说了没查过的事」的**第四次**，也是唯一一次**我给自己写了张
+        全空的表、还夸了它一句**。
+
+    病根不在从哪边起算，在于「遇到不可用就停」这个假设本身是错的：
+    一行里可用的部分**本来就可以有好几段** —— 近处是撞桌带、中间可用、
+    远处够不到。任何「从头扫到第一个障碍」的写法都只能看见**最先遇到的那段**。
+
+    所以直接给**段**：谁读都能一眼看出可用区间，也不必再去猜「哪一边应该
+    有答案」。它同时把前两张表的信息都包含了。
     """
     out = {}
     for y in ys:
-        xs_safe = xs_usable = None
+        runs = []
+        lo = last = None
+        near = False
         for x in xs:
             s = cells.get((x, y), BLOCKED)
             if s in (SAFE, NEAR):
-                xs_usable = x
-                if s == SAFE:
-                    xs_safe = x
-                elif xs_safe is None:
-                    pass          # 近限格：可用但不计入「安全」
-            else:
-                break
-        out[y] = (xs_safe, xs_usable)
+                if lo is None:
+                    lo, near = x, False
+                if s == NEAR:
+                    near = True
+                last = x
+            elif lo is not None:
+                runs.append((lo, last, near))
+                lo = last = None
+        if lo is not None:
+            runs.append((lo, last, near))
+        out[y] = runs
     return out
+
+
+def max_rect(cells, xs, ys, safe_only=False):
+    """**最大的整块可用矩形** —— `(x_lo, x_hi, y_lo, y_hi, 格数)`，没有就 `None`。
+
+    这是「照着划区」那一步真正要的东西：`pick_zone` / `place_zone` 都是**矩形**，
+    而上面那张段表给的是每行各自的分段。逐行取交集是错的（会把互不相连的
+    小口袋也算进去），所以要的是**矩形**意义上的最大。
+
+    做法是直方图 + 单调栈（O(len(xs)·len(ys))）：逐行累加「这一列往上连续可用
+    有多高」，再在每行的直方图上求最大矩形。`ys` 必须**升序**（栈里靠行号
+    还原上下边）。
+
+    ``safe_only=True`` 时只认 `SAFE`（把「近限」格也算作障碍）。两个都算：
+    给划区用的一般是**全安全**那一个，而「可用」那一个能说明放宽到哪儿为止。
+    """
+    ok = (lambda s: s == SAFE) if safe_only else (lambda s: s in (SAFE, NEAR))
+    best = None
+    heights = [0] * len(xs)
+    for yi, y in enumerate(ys):
+        for i, x in enumerate(xs):
+            heights[i] = heights[i] + 1 if ok(cells.get((x, y), BLOCKED)) else 0
+        stack = []                      # [(列号, 高度), ...]，高度单调递增
+        for i in range(len(xs) + 1):
+            h = heights[i] if i < len(xs) else 0
+            j = i
+            while stack and stack[-1][1] >= h:
+                j, hj = stack.pop()
+                if hj and (best is None or hj * (i - j) > best[4]):
+                    best = (xs[j], xs[i - 1], ys[yi - hj + 1], ys[yi],
+                            hj * (i - j))
+            stack.append((j, h))
+    return best
 
 
 def cell_key(x, y):
@@ -275,23 +328,6 @@ def json_axis(vals):
     ⇒ 出口处圆一次，`float(f"{v:.4f}") == v` 就恒成立，老实读法也能对上。
     """
     return [round(v, 4) for v in vals]
-
-
-def row_limits_outer(cells, xs, ys):
-    """每一行从**远边**（x 最大处）起算的连续可用边界 —— 即 **x 的下界**。
-
-    ⚠️ 为什么需要第二张表（第八十四轮实测补的）：`row_limits` 是「从近边起算、
-    遇到第一个不可用就停」。第一次粗扫（步长 0.1、只看两个高度）时撞桌格是散的，
-    这张表够用。**全扫（步长 0.05、四个高度）之后撞桌格变成了贴着基座的一整条**
-    —— 于是 21 行里有 9 行**第一个格子就不可用**，`row_limits` 全给 `—`，
-    等于什么都没说。可这一片恰恰是「**x 不能小于多少**」这种约束，
-    正是从远边起算才读得出来的那一种。
-
-    实现就一句：把 x 反过来喂给 `row_limits`。近边换成远边之后，
-    「连续可用的最后一个 x」正好就是原来的**下界** —— 不需要另写一套扫描，
-    也就不会和 `row_limits` 悄悄分叉。返回 `{y: (x_安全 ≥, x_可用 ≥)}`。
-    """
-    return row_limits(cells, list(reversed(xs)), ys)
 
 
 def node_guard_note(worst_z, table_z, node_table_z, guard_margin):
@@ -319,10 +355,6 @@ def node_guard_note(worst_z, table_z, node_table_z, guard_margin):
                    f"比真机台面还低、对真机几何已经没有意义」，"
                    f"不能当作「这里撞桌」的证据。")
 
-
-
-def _fmt_x(v):
-    return "—" if v is None else f"{v:.2f}"
 
 
 def main():
@@ -562,24 +594,24 @@ def main():
             shown = per_level[args.map]
         print(render_map(shown, xs, ys))
 
-        # 两张表：从近边起算给的是「x 上界」，从远边起算给的是「x 下界」。
-        # 撞桌区贴着基座时**只有第二张表说得出来话**（第八十四轮实测，
-        # 那次 21 行里 9 行在近边就是撞桌格、第一张表全给 —）。两张都打。
-        lim = row_limits(shown, xs, ys)
-        lim_out = row_limits_outer(shown, xs, ys)
-        print("\n每行的连续可用边界（从近边 x 最小处起算；遇到第一个不可用就停）：")
-        print(f"{'y':>7}   {'x 安全 ≤':>10}   {'x 可用 ≤':>10}")
+        # 一行一张「连续可用段」表。**不**再分开打「从近边起算 / 从远边起算」
+        # 两张前缀表 —— 那两张都只能看见**最先遇到的那一段**，一行里可用部分
+        # 有好几段时就都说不全（第二版实测 21 行全空，见 `row_runs()`）。
+        runs = row_runs(shown, xs, ys)
+        print("\n每行的**连续可用段**（`—` = 这一行一格都不可用）：")
+        print(f"{'y':>7}   可用 x 段（自左向右；`~` = 这一段里含近限格）")
         for y in reversed(ys):
-            a, b = lim[y]
-            mark = "" if a == b else "   ← 有近限格"
-            print(f"{y:+7.2f}   {_fmt_x(a):>10}   {_fmt_x(b):>10}{mark}")
-
-        print("\n每行的连续可用边界（从**远边** x 最大处起算；给出的是 **x 的下界**）：")
-        print(f"{'y':>7}   {'x 安全 ≥':>10}   {'x 可用 ≥':>10}")
-        for y in reversed(ys):
-            a, b = lim_out[y]
-            mark = "" if a == b else "   ← 有近限格"
-            print(f"{y:+7.2f}   {_fmt_x(a):>10}   {_fmt_x(b):>10}{mark}")
+            rs = runs[y]
+            if not rs:
+                print(f"{y:+7.2f}   —")
+                continue
+            widest = max(b - a for a, b, _ in rs)
+            parts = []
+            for a, b, n in rs:
+                star = "★" if len(rs) > 1 and (b - a) == widest else ""
+                parts.append(f"{'~' if n else ''}[{a:.2f},{b:.2f}]{star}")
+            print(f"{y:+7.2f}   " + "  ".join(parts))
+        print("   ★ = 这一行最宽的那一段（只有一个段时不标）")
 
         # ---- 汇总：把两类「越界」分开说，它们要的处置完全不同 ----
         print("\n" + "=" * 78)
@@ -659,6 +691,29 @@ def main():
                   f"y∈[{min(y for _, y in usable):+.2f},"
                   f"{max(y for _, y in usable):+.2f}]")
 
+        # ---- 照着划区：**矩形**意义上的最大整块 ----
+        # 逐行取段表是不够的 —— 段表会列出贴着基座的那种**孤立小口袋**
+        # （y≥+0.15 那几行的 [0.15,0.20]）。它们是通的，但臂要够到就得穿过
+        # 撞桌带，当矩形用等于把危险区框了进去。所以这里给的是**矩形**。
+        rect_safe = max_rect(cells, xs, ys, safe_only=True)
+        rect_any = max_rect(cells, xs, ys, safe_only=False)
+        print("\n照着划区 —— 最大的整块矩形（逐行的段表**不能**直接当矩形用，"
+              "理由见 max_rect 的说明）：")
+        if rect_safe:
+            a, b, c, d, n = rect_safe
+            print(f"  ★ **全安全**：x∈[{a:.2f},{b:.2f}]  y∈[{c:+.2f},{d:+.2f}]"
+                  f"（{n} 格）")
+            print(f"     ⇒ 这一块可以直接当 `pick_zone` 的 x/y 范围"
+                  f"（z 另按方块高度定）。")
+        else:
+            print("  ⚠️ 没有一块**全安全**的矩形 —— 要么缩范围，要么按下面的"
+                  "「含近限」那块用，但要知道它贴着下限。")
+        if rect_any and rect_any != rect_safe:
+            a, b, c, d, n = rect_any
+            print(f"  · 含**近限格**（离下限 <0.05 m）能放宽到："
+                  f"x∈[{a:.2f},{b:.2f}]  y∈[{c:+.2f},{d:+.2f}]（{n} 格）"
+                  f" —— 这一块里有格子贴着下限，**不建议**直接照抄。")
+
         print("\n提醒：本脚本给的是**几何边界**，它不含：")
         print("  · 相机视野（看得见 ≠ 够得到，反之亦然）—— 那是 pick_zone 的另一半；")
         print("  · 夹爪/腕部本体的宽度（本判据与护栏同口径：只看连杆原点高度）；")
@@ -683,9 +738,13 @@ def main():
                     "cells": {cell_key(x, y): cells[(x, y)] for x, y in cells},
                     "per_level": {k: {cell_key(x, y): per_level[k][(x, y)]
                                       for x, y in per_level[k]} for k in keys},
-                    "row_limits": {f"{y:.4f}": list(lim[y]) for y in ys},
-                    "row_limits_outer": {f"{y:.4f}": list(lim_out[y])
-                                         for y in ys},
+                    # 每行的连续可用段（见 `row_runs()`）。旧的两张
+                    # `row_limits` / `row_limits_outer` 前缀表已删：它们是
+                    # 「从头扫到第一个障碍」，一行里有好几段时说不全。
+                    "row_runs": {f"{y:.4f}": [list(r) for r in runs[y]]
+                                 for y in ys},
+                    "max_rect_safe": list(rect_safe) if rect_safe else None,
+                    "max_rect_any": list(rect_any) if rect_any else None,
                     "counts": {k: counts[k] for k in keys},
                     "worst_link_z": worst_z,
                     "worst_links": worst_links,

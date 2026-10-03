@@ -33,8 +33,8 @@ try:
     from table_safety_envelope import (                          # noqa: E402
         BLOCKED, LEVEL_KEYS, NEAR, NOIK, PROJECT_ROOT, REAL_BLOCK_HEIGHT, SAFE,
         SOLVABLE_OTHER, axis, cell_key, classify_one, combine, json_axis,
-        launch_const, node_guard_note, num, render_map, row_limits,
-        row_limits_outer, worst, z_levels)
+        launch_const, max_rect, node_guard_note, num, render_map, row_runs,
+        worst, z_levels)
 except ImportError as e:              # 没 source ROS 时 rclpy 拉不到
     print(f"环境不满足（{e}）—— 先 source /opt/ros/humble/setup.bash")
     sys.exit(2)
@@ -173,65 +173,117 @@ check("缺失的格子画成 '?' 而不是当成安全（宁可出声）",
 
 
 # ----------------------------------------------------------------------
-# F. row_limits：从近边起算的连续边界
+# F. row_runs：每一行的**连续可用段**
 # ----------------------------------------------------------------------
-print("\n--- F. row_limits：连续可用边界 ---")
+# ⚠️ **这一节是第三版**，前两版测的是「从近边 / 从远边起算、遇到第一个障碍
+# 就停」的前缀表 —— 两版的自检**都是绿的**。可第二版在真机几何全扫里
+# **21 行全空，一个值都没产出过**（远边那一段全是「够不到」，第一个格子就停），
+# 而我还照着它写了「从远边起算就知道 x 至少要多大」并配了自检。
+# 绿的自检没能证明那个函数有用，只证明了它在**被挑中的那几个样本上**照规则跑
+# ——那些样本恰好都是「近边脏、远边干净」，正好躲开了它的死因。
+# 所以这一节**故意**放几行「两端都脏、中间可用」的，最后一条还直接抄了一行
+# **实测数据**（第八十六轮真机几何全扫的 y=+0.25）。
+print("\n--- F. row_runs：连续可用段 ---")
 X4, Y1 = [0.0, 1.0, 2.0, 3.0], [0.0]
 
 
-def limits(syms):
-    return row_limits({(x, 0.0): s for x, s in zip(X4, syms)}, X4, Y1)[0.0]
+def runs_of(syms):
+    return row_runs({(x, 0.0): s for x, s in zip(X4, syms)}, X4, Y1)[0.0]
 
 
-check("撞桌挡住后面的孤岛（不跳空洞继续说安全）",
-      limits([SAFE, SAFE, BLOCKED, SAFE]) == (1.0, 1.0),
-      f"got {limits([SAFE, SAFE, BLOCKED, SAFE])!r}")
-check("近限格不计入「安全」但计入「可用」",
-      limits([NEAR, SAFE]) == (1.0, 1.0), f"got {limits([NEAR, SAFE])!r}")
-check("只有近限格 ⇒ 安全列是 None（不是 0）",
-      limits([NEAR, BLOCKED]) == (None, 0.0), f"got {limits([NEAR, BLOCKED])!r}")
-check("全不可用 ⇒ (None, None)", limits([NOIK, BLOCKED]) == (None, None),
-      f"got {limits([NOIK, BLOCKED])!r}")
-check("全安全 ⇒ 一直到最远那一列", limits([SAFE] * 4) == (3.0, 3.0),
-      f"got {limits([SAFE] * 4)!r}")
+check("全安全 ⇒ 一整段",
+      runs_of([SAFE] * 4) == [(0.0, 3.0, False)], f"got {runs_of([SAFE] * 4)!r}")
+check("★ 两端都不可用、中间可用 ⇒ **中间那一段照旧报出来**"
+      "（这正是前两版都说不出来的那种行）",
+      runs_of([NOIK, SAFE, SAFE, NOIK]) == [(1.0, 2.0, False)],
+      f"got {runs_of([NOIK, SAFE, SAFE, NOIK])!r}")
+check("★ 一行里两个孤岛 ⇒ 两段都要在，且**自左向右**排",
+      runs_of([BLOCKED, SAFE, BLOCKED, SAFE]) == [(1.0, 1.0, False),
+                                                  (3.0, 3.0, False)],
+      f"got {runs_of([BLOCKED, SAFE, BLOCKED, SAFE])!r}")
+check("近限格**不切断**段，只给这一段打上「含近限」",
+      runs_of([SAFE, NEAR, SAFE, NOIK]) == [(0.0, 2.0, True)],
+      f"got {runs_of([SAFE, NEAR, SAFE, NOIK])!r}")
+check("整段都是近限格 ⇒ 段还在，含近限=True",
+      runs_of([BLOCKED, NEAR, NEAR, BLOCKED]) == [(1.0, 2.0, True)],
+      f"got {runs_of([BLOCKED, NEAR, NEAR, BLOCKED])!r}")
+check("全不可用 ⇒ **没有段**（不是 [(0,3)]、也不是 None）",
+      runs_of([NOIK, BLOCKED, NOIK, BLOCKED]) == [],
+      f"got {runs_of([NOIK, BLOCKED, NOIK, BLOCKED])!r}")
+check("一个格子都没有 ⇒ 空表（缺失的格子按不可用处理，与 render_map 同一取向）",
+      row_runs({}, X4, Y1)[0.0] == [], f"got {row_runs({}, X4, Y1)[0.0]!r}")
+check("★ 每一行都要有键（哪怕值是空表）—— 少一行会被读成「这一行没扫」",
+      sorted(row_runs({}, X4, [0.0, 1.0]).keys()) == [0.0, 1.0])
+check("多行互不串（相邻两行符号不同时，各自只报自己那行）",
+      row_runs({(0.0, 0.0): SAFE, (1.0, 0.0): SAFE,
+                (0.0, 1.0): BLOCKED, (1.0, 1.0): SAFE}, [0.0, 1.0], [0.0, 1.0])
+      == {0.0: [(0.0, 1.0, False)], 1.0: [(1.0, 1.0, False)]})
+
+# ★ 实测那一行：第八十六轮真机几何全扫（table_z=0.0）里 y=+0.25 的原文 ——
+#   `~  .  X X X  . . . . . . . . .  x x x`
+# 近处一个近限格、一段撞桌带、中间一大段可用、远处够不到。
+# 期望：**两段**，且第二段是最宽的那一段。
+_RX = [round(0.15 + 0.05 * i, 2) for i in range(17)]
+_RROW = ([NEAR, SAFE] + [BLOCKED] * 3 + [SAFE] * 9 + [NOIK] * 3)
+check("★ 实测那一行（y=+0.25）⇒ 两段：[0.15,0.20] 与 [0.40,0.80]",
+      row_runs({(x, 0.0): s for x, s in zip(_RX, _RROW)}, _RX, Y1)[0.0]
+      == [(0.15, 0.20, True), (0.40, 0.80, False)],
+      f"got {row_runs({(x, 0.0): s for x, s in zip(_RX, _RROW)}, _RX, Y1)[0.0]!r}")
+check("★ 同一行：最宽的那一段是 [0.40,0.80]（决定 pick_zone 该往哪儿框）",
+      max((b - a, (a, b)) for a, b, _ in
+          row_runs({(x, 0.0): s for x, s in zip(_RX, _RROW)}, _RX, Y1)[0.0])[1]
+      == (0.40, 0.80))
+# ⚠️ 这里原来还有一条「两张表互补」的自检 —— 它用的样本是
+# `[BLOCKED, BLOCKED, SAFE, SAFE]`（近边脏、远边干净），于是**绿着**，
+# 而现实中远边从来不干净。样本挑得对，断言就只能证明那句断言。
+# 删掉它，不换成「更好的样本」—— 换成样本还是同一个病：拿自造的干净行
+# 去证明一个函数的用途。**用途由实测那一行来证**（上面两条 ★）。
 
 
 # ----------------------------------------------------------------------
-# F2. row_limits_outer：从**远边**起算，给的是 x 的下界
+# F2b. max_rect：最大的整块**矩形**可用区（划区那一步真正要的东西）
 # ----------------------------------------------------------------------
-# 为什么需要它（第八十四轮实测）：全扫之后撞桌格变成贴着基座的一条，
-# 21 行里有 9 行**第一个格子就不可用**，`row_limits` 全给 «—»；
-# 而那一片恰恰是「x 不能小于多少」，只有从远边起算才说得出来。
-print("\n--- F2. row_limits_outer：x 的下界 ---")
+print("\n--- F2b. max_rect：最大整块矩形 ---")
+XS4 = [0.0, 1.0, 2.0, 3.0]
+YS3 = [0.0, 1.0, 2.0]
 
 
-def limits_out(syms):
-    return row_limits_outer({(x, 0.0): s for x, s in zip(X4, syms)}, X4, Y1)[0.0]
+def rect(rows, safe_only=False, xs=None, ys=None):
+    """rows 是**逐行**的符号表，第 0 行对应 ys[0]。"""
+    xs = XS4 if xs is None else xs
+    ys = YS3[:len(rows)] if ys is None else ys
+    cells = {(x, y): s for y, r in zip(ys, rows) for x, s in zip(xs, r)}
+    return max_rect(cells, xs, ys, safe_only=safe_only)
 
 
-check("撞桌格在近边 ⇒ 下界就是它后面那一格（这正是 row_limits 说不出话的那种）",
-      limits_out([BLOCKED, BLOCKED, SAFE, SAFE]) == (2.0, 2.0),
-      f"got {limits_out([BLOCKED, BLOCKED, SAFE, SAFE])!r}")
-check("远边就是撞桌格 ⇒ 挡住里面的孤岛，下界推到远边外（None）",
-      limits_out([SAFE, BLOCKED, SAFE, BLOCKED]) == (None, None),
-      f"got {limits_out([SAFE, BLOCKED, SAFE, BLOCKED])!r}")
-check("全安全 ⇒ 下界一直落到近边（x 可以小到 0）",
-      limits_out([SAFE] * 4) == (0.0, 0.0), f"got {limits_out([SAFE] * 4)!r}")
-check("贴远边的一串全是近限格 ⇒ 可用有值、安全是 None（不是 0）——"
-      "近限只让它「能用」，不许它冒充「安全」",
-      limits_out([SAFE, BLOCKED, NEAR, NEAR]) == (None, 2.0),
-      f"got {limits_out([SAFE, BLOCKED, NEAR, NEAR])!r}")
-check("远边第一个就是近限格时**不中断**扫描（否则可用会莫名其妙变成 None）",
-      limits_out([SAFE, SAFE, SAFE, NEAR]) == (0.0, 0.0),
-      f"got {limits_out([SAFE, SAFE, SAFE, NEAR])!r}")
-check("全不可用 ⇒ (None, None)", limits_out([NOIK, BLOCKED]) == (None, None))
-check("两张表在「全安全」这一行上必须同时到两端（互为镜像的自洽检查）",
-      limits_out([SAFE] * 4)[0] == 0.0 and limits([SAFE] * 4)[0] == 3.0)
-check("同一行上两张表是**互补**的、不是重复：近边表说不出话时远边表给出答案",
-      limits([BLOCKED, BLOCKED, SAFE, SAFE]) == (None, None)
-      and limits_out([BLOCKED, BLOCKED, SAFE, SAFE]) == (2.0, 2.0),
-      f"近边 {limits([BLOCKED, BLOCKED, SAFE, SAFE])!r} "
-      f"远边 {limits_out([BLOCKED, BLOCKED, SAFE, SAFE])!r}")
+check("全可用 ⇒ 整张图（4×3）",
+      rect([[SAFE] * 4] * 3) == (0.0, 3.0, 0.0, 2.0, 12),
+      f"got {rect([[SAFE] * 4] * 3)!r}")
+check("★ **逐行取交集会算错**的那种：三行各自都可用，但可用区间错开",
+      # 行 y=0: [safe,safe,blk,blk]  行 y=1: [blk,blk,safe,safe]
+      # 逐行交集 = 空；正确答案是**任一行里最大的那一块**（2 格宽 × 1 行 = 2）
+      rect([[SAFE, SAFE, BLOCKED, BLOCKED],
+            [BLOCKED, BLOCKED, SAFE, SAFE],
+            [BLOCKED, BLOCKED, BLOCKED, BLOCKED]])[4] == 2,
+      f"got {rect([[SAFE, SAFE, BLOCKED, BLOCKED], [BLOCKED, BLOCKED, SAFE, SAFE], [BLOCKED] * 4])!r}")
+check("★ 高比宽值钱：2×2（4 格）胜过 1×3（3 格）",
+      rect([[SAFE, SAFE, BLOCKED],
+            [SAFE, SAFE, BLOCKED],
+            [BLOCKED, BLOCKED, SAFE]])[4] == 4)
+check("safe_only=True 时「近限」格算障碍（可用但不安全）",
+      rect([[NEAR, NEAR], [SAFE, SAFE]], safe_only=True)[4] == 2
+      and rect([[NEAR, NEAR], [SAFE, SAFE]], safe_only=False)[4] == 4)
+check("全不可用 ⇒ None（不是 (0,0,0,0,0)）",
+      rect([[BLOCKED] * 4] * 3) is None)
+check("缺失的格子按不可用处理（与 render_map / row_runs 同一取向）",
+      max_rect({}, XS4, YS3) is None)
+check("矩形的上下边取自 ys（升序）—— 不是行号",
+      rect([[BLOCKED] * 4, [SAFE] * 4, [SAFE] * 4])[:4]
+      == (0.0, 3.0, 1.0, 2.0),
+      f"got {rect([[BLOCKED] * 4, [SAFE] * 4, [SAFE] * 4])!r}")
+check("单格结论也对（退化情形不该崩）",
+      rect([[BLOCKED, SAFE], [BLOCKED, BLOCKED]]) == (1.0, 1.0, 0.0, 0.0, 1),
+      f"got {rect([[BLOCKED, SAFE], [BLOCKED, BLOCKED]])!r}")
 
 
 # ----------------------------------------------------------------------
