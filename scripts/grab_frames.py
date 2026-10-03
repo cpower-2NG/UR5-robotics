@@ -50,6 +50,11 @@ except ImportError:
     Node = object
     CameraInfo = Image = None
 
+# ⚠️ 这两个名字**分两种**：驱动自己发的是**双层**的 `/camera/camera/...`，
+#    而 `pipeline.launch.py` 把它**重映射**成单层的 `/camera/color/...`
+#    （`real.launch.py` 里那串 `-r` 就是干这个）。连拍时subscibe 的必须是
+#    **发布方实际在用的那个** —— 名字不对的症状是「等了 20 秒没等到
+#    camera_info」，看着像相机坏了。所以做成可覆盖的，别写死。
 COLOR = "/camera/camera/color/image_raw"
 INFO = "/camera/camera/color/camera_info"
 
@@ -84,14 +89,16 @@ def camera_info_to_dict(ci):
 
 
 class Grabber(Node):                                        # noqa: F821
-    def __init__(self):
+    def __init__(self, color_topic=COLOR, info_topic=INFO):
+        self.color_topic = color_topic
+        self.info_topic = info_topic
         super().__init__("grab_frames_readonly")
         from cv_bridge import CvBridge
         self.bridge = CvBridge()
         self.images = []
         self.info = None
-        self.create_subscription(Image, COLOR, self._on_img, 10)
-        self.create_subscription(CameraInfo, INFO, self._on_info, 10)
+        self.create_subscription(Image, self.color_topic, self._on_img, 10)
+        self.create_subscription(CameraInfo, self.info_topic, self._on_info, 10)
 
     def _on_img(self, m):
         self.images.append(m)
@@ -108,6 +115,10 @@ def main(argv=None):
                     help="两帧之间的最小间隔秒（默认 0.08）")
     ap.add_argument("--ext", default="png", choices=("png", "jpg"),
                     help="PNG 无损但 1.2 MB/帧；JPG 约 8 倍小。默认 png")
+    ap.add_argument("--color-topic", default=COLOR,
+                    help=f"彩色图话题（默认 {COLOR}；launch 会重映射成 "
+                         f"/camera/color/image_raw）")
+    ap.add_argument("--info-topic", default=INFO, help=f"内参话题（默认 {INFO}）")
     ap.add_argument("--timeout", type=float, default=120.0,
                     help="收图总超时秒（默认 120）")
     a = ap.parse_args(argv)
@@ -121,14 +132,17 @@ def main(argv=None):
 
     os.makedirs(a.out, exist_ok=True)
     rclpy.init()
-    node = Grabber()
+    node = Grabber(a.color_topic, a.info_topic)
     try:
         t0 = time.monotonic()
         while node.info is None and time.monotonic() - t0 < 20:
             rclpy.spin_once(node, timeout_sec=0.2)
         if node.info is None:
-            print("❌ 20 秒没等到 camera_info —— 话题名或 ROS_DOMAIN_ID 不对？"
-                  "（本板实测是双层的 %s）" % INFO)
+            print("❌ 20 秒没等到 camera_info —— 话题名或 ROS_DOMAIN_ID 不对？\n"
+                  "   驱动自己发的是双层 %s；\n"
+                  "   `pipeline.launch.py` 把它重映射成单层 /camera/color/... —— "
+                  "订阅方要用**发布方实际在用的那个**，用 --info-topic 指定。"
+                  % a.info_topic)
             return 2
 
         seen = len(node.images)
