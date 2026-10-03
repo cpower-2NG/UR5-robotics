@@ -11637,3 +11637,139 @@ AG-95 95 mm 行程 / 0–1000 千分、腕部相机离法兰 85 mm。
 另订正第六十一轮的一处措辞：那轮引的 `moveit_only_check.py` docstring
 **是我们自己仓库**的 `scripts/moveit_only_check.py:20-22`（读实确认），
 不是他们的文件 —— 「未标定 URDF 与示教器真值有非零偏差」那句告警是我们自己写的。
+
+---
+
+## 第八十三轮：无臂预检里的**「同一张图两套几何」** —— 修掉、重跑、并量出标定对护栏的真实影响（2026-10-03）
+
+### 一、为什么是这一项
+
+用户「继续下一项」。`docs/待执行命令.md` §②「我做，你不用管」里，不需要真臂的只剩
+一条：**甲-12 无臂 MoveIt 预检「搬动之后复验」**。它现在多了一层必要性 ——
+`moveit_only_check.py` 自己的 docstring 写着「最终上电前的判读**必须**用校准后的
+URDF 重跑一遍」，而标定包第八十二轮刚落地。**那条 ⚠️ 就是本轮的入口，
+结论是：这句告警本身已经过期，而且它掩盖了一个真问题。**
+
+### 二、先查出来：这个预检**自己**就是「两套几何」
+
+第八十二轮把 `real.launch.py` 的 `DESCRIPTION_PACKAGE` 换成了
+`yolo_ur_description`（本机出厂标定）。而 `moveit_only_check.py` 第 2 步是
+**自己手搓一份 URDF 喂给自己的 `robot_state_publisher`**，写死从 `ur_description`
+生成 ⇒ 同一张 ROS 图里：
+
+| 谁 | 描述从哪来 | hash |
+|---|---|---|
+| `move_group`（IK / FK） | `real.launch.py` → `DESCRIPTION_PACKAGE` | `calib_2353869974907916917` |
+| `robot_state_publisher`（TF） | 脚本第 2 步手搓的 `ur_description` | `calib_209549117540498681` |
+
+板上实测（两份都用 `name:=ur safety_limits:=true` 生成）：
+
+```
+按脚本原样生成（ur_description，不传 kinematics_params）   calib_209549117540498681
+换成 yolo_ur_description + 显式 kinematics_params           calib_2353869974907916917
+diff 行数：16（= 8 删 + 8 增）—— 就是第八十二轮那张表的同一处差异
+```
+
+⇒ 第八十二轮之前两边**都是**标称，是一致的；换完之后**分叉**了，而且
+**不会有任何东西报错** —— 探针照跑、数字照出，只是它量的姿态来自标定、
+TF 树来自标称（`tool0` 最多差 3.59 mm）。这与 D50/D64 是同一族病：
+**改了没反应 vs 改了悄悄分叉，后者更难发现。**
+
+### 三、修法（`f940036`，三条都在同一个文件）
+
+| # | 改动 | 为什么这么改 |
+|---|---|---|
+| 1 | 新增 `description_package()`：**从 `real.launch.py` 源码里正则读出** `DESCRIPTION_PACKAGE` | 抄一个值下来迟早和真身分叉 —— 这次分叉就是这么来的。**读不到就退 2，不兜底成 `ur_description`**：静默退回标称正是要修的 bug |
+| 2 | 生成 URDF 时**显式传** `kinematics_params:=<描述包>/config/<ur_type>/default_kinematics.yaml` | `ur.urdf.xacro:15` 那个参数默认指向 `$(find ur_description)/config/…`，不传就悄悄变回标称 —— 而本包存在的全部意义就是换掉这一项 |
+| 3 | 新增运行时复核 `read_description_hashes()`：读 `/robot_state_publisher` 与 `move_group` 各自的 `robot_description`，**两边必须同 hash**，不同就退 2，读不全只 SKIP | 这是本轮建立的**不变量**，也最容易悄悄回归。只调 `get_parameters` 服务、**不走 `ros2` CLI**（理由同 `wait_for_services`：CLI 会挂，而挂住和「真的没有」用 CLI 分不开） |
+
+### 四、复验结果（板上实跑，`RC=0`）
+
+```
+描述包 = yolo_ur_description，kinematics/hash = calib_2353869974907916917
+描述一致性复核：
+  move_group             calib_2353869974907916917
+  robot_state_publisher  calib_2353869974907916917
+  [PASS] 两边同一个 hash —— 同一套几何
+```
+
+探针（`--grid 4`，44 个候选）：
+
+| 量 | 值 |
+|---|---|
+| IK 解出 | **38 / 44**；6 个 `NO_IK_SOLUTION` **全在 x=0.90**（区边界，可达范围外，非环境病） |
+| 全体候选最低 `wrist_1_link` | **−0.092 m**，离护栏下限 −0.370 还有 **+0.278 m** |
+| 全体候选最低 `forearm_link` | +0.069 m（余量 +0.439 m） |
+| 整段护栏（B 段，`test_guard_path.py --only D`） | **D0–D4 全过**，含「端点都过、中段俯冲，整段检查拦下」与「关掉采样就放行」这对对照 |
+| 收尾 | `pgrep` 复查无残留 ✅ |
+
+### 五、标定对护栏读数**到底有多少影响** —— 直接量，不猜
+
+护栏看的是 `forearm_link` / `wrist_1_link` 的原点高度，所以只要量这两个连杆在
+标称与标定下的位置差。用第八十二轮那个脚本的 `--tip` 开关（两份 URDF 用**同一个**
+解析器，约定误差在差值里自动抵消）：
+
+| `--tip` | 位置偏差 均值 | **最大** |
+|---|---|---|
+| `tool0`（对照，复现第八十二轮） | 1.6161 mm | **3.5945 mm** |
+| `forearm_link` | 0.3477 mm | **0.4984 mm** |
+| `wrist_1_link` | 1.5050 mm | **3.0459 mm** |
+
+⇒ **标定对护栏判读的影响 ≤ 3.05 mm，而余量是 +278 mm —— 完全不影响判决。**
+
+⚠️ **并且不能把基线那个差记在标定头上。** 2026-09-28 那次是
+`wrist_1 = −0.138 m`（余量 +0.232），这次是 `−0.092`（余量 +0.278），
+差 **46 mm —— 比标定的最大影响大 15 倍**。两次之间变的是别的东西：
+探针本身在 `2a51ac5`（「三个假绿」）被修过，`grasp_planner.yaml` 在 `8ba23c2`
+改过工具几何常数。**要精确归因得做 A/B（同参数、只换描述包跑两遍），本轮没做** ——
+所以这里只写「不是标定」，不写「是某某」。（与第八十二轮同一条教训：
+一个数字不会告诉你它的含义。）
+
+### 六、顺带查清一个「看起来像 bug」的矛盾
+
+日志里同时出现 `IK组=ur_manipulator`（探针头）与 `IK组=ur5_manipulator`
+（`/grasp_planner` 横幅）。查清了，**没有 bug**：
+
+- launch 的日志（`/tmp/moveit_only_check.log`）里那行是
+  **`IK组=ur_manipulator` / `指尖偏置=0.1757`** —— 真机路径的参数是对的；
+- `moc83.log` 里那块 `ur5_manipulator` / `0.13` 来自 `test_guard_path.py`
+  （第 6 步，跑在探针**之后**）—— 它在自己进程里 `from grasp_planner.planner_node
+  import GraspPlanner` 又起了一个**同名**节点，用的是源码 yaml 的仿真默认值。
+
+⇒ 探针读的是 launch 那份，读数有效。**但记一条**：预检期间会短暂存在
+**两个都叫 `/grasp_planner` 的节点**，此刻任何 `ros2 param get /grasp_planner …`
+都可能问到错的那个。不是当前故障，是下一次踩的坑。
+
+### 七、订正两条过期的文档（都是「理由错了」型）
+
+| 位置 | 原文 | 改成 |
+|---|---|---|
+| `docs/机械臂系统参考.md` §7.2「场景里有桌子」 | 「我们全仓库**一个碰撞物都没有**（D49）」 | W1b 第 2 项早就实现了（`planner_node` 经 `/apply_planning_scene` 发桌面 `CollisionObject`，**默认关闭**），这句已过期 |
+| `grasp_planner.yaml` 的 `table_scene_enabled` 注释 | 理由写「死键（全车入口下）—— **yaml 不被加载**」 | D50 修好后 `pipeline.launch.py:169` **是**加载它的。真正原因是 `pipeline.launch.py:478` 把同名 launch 参数（默认 `false`）放在 `planner_params` 的**后一个**字典里，后一份赢。**结论不变（改 yaml 无效），理由换了** —— 差别在于：按旧理由排查会去查「yaml 加载了吗」，查到「加载了」，于是误判成 yaml 写错 |
+
+### 八、改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `scripts/moveit_only_check.py` | `description_package()` + 显式 `kinematics_params` + `read_description_hashes()` + docstring 那条 ⚠️ 改写（见 §二/§三） |
+| `docs/机械臂系统参考.md` | §7.2 桌子那格订正 |
+| `ros2_ws/src/grasp_planner/config/grasp_planner.yaml` | `table_scene_enabled` 注释的理由订正 |
+| `docs/待执行命令.md` | §② 甲-12 那行：搬动后复验**已完成**，并写明「仿真几何 vs 真机几何」的分别 |
+| 台账 | 本轮（含第八十二轮第十节） |
+
+### 九、台面账
+
+- 板上做了：`git pull`（树哈希与本机 HEAD 一致，`21f0d3c2…`）、手跑两次 `xacro`、
+  跑一次 `moveit_only_check.py`（起停 MoveIt + pipeline；**`start_ur_driver:=false`，
+  没有驱动、没有 controller_manager**）、`scp` 两份 URDF 回本机。
+- **一个包都没往真机发**：没有 30001、没有 Dashboard 查询、没有轨迹、没有寄存器写入。
+  **这一轮连驱动都没起** —— 结构上不可能动，臂全程未动。
+- 未动 `main`；未推送任何外部远端（只推到板上的本地裸库 `board:`）。
+
+### 十、这一轮**没有**解决、但要说清的
+
+甲-12 现在量的是「**标定后、仿真几何**」：`pick_zone` 的 z∈[−0.45,−0.30]、
+`place_z=−0.35`、`table_plane_z=−0.39` **全部仍是仿真值**（yaml 里那几条注释
+本来就写着「真机上线时必须覆盖」）。所以本轮的价值是**结构性**的（两套几何 →
+一套、不变量有运行时复核）**外加**「标定不影响护栏判决」这个结论；
+**真正有现场意义的那次预检，要等真机的 zones 与台面高度定下来再跑。**

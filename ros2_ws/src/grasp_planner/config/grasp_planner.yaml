@@ -224,9 +224,16 @@ grasp_planner:
     # 去撞）。默认**关闭**：仿真与真机的桌子不同，一个默认值不可能两边都对，
     # 而**错的碰撞体比没有更坏**（可能把正确解全拒掉，看起来像 IK 坏了）。
     # 仿真侧在 arm_grasp_sim 的 launch 里打开。
-    # ⚠️ 死键（全车入口下）：真机要开必须走 launch 参数
-    #    `... bringup.launch.py table_scene_enabled:=true`。改这里无效
-    #    （第 33 轮实测踩过：yaml 写 true，日志仍打「桌面进场景=False」）。
+    # ⚠️ 真机要开必须走 launch 参数 `... bringup.launch.py table_scene_enabled:=true`，
+    #    **改这一行无效**。
+    #    🛠 第八十三轮订正了这里的**理由**：原文写「死键（全车入口下）—— yaml 根本
+    #       不被加载」。但 D50 修好之后 `pipeline.launch.py:169` **是**加载这份 yaml 的，
+    #       所以「不加载」已经不成立。真正的原因是另一条、且仍然成立：
+    #       `pipeline.launch.py:478` 把 `table_scene_enabled` 声明成 launch 参数
+    #       （默认 `false`）并放进 `planner_params` 的**后一个**字典 ——
+    #       同名键后一份赢，所以它盖掉了这里的值。
+    #       差别不是文字游戏：按旧理由排查会去查「yaml 加载了吗」（会得到「加载了」，
+    #       于是误判成 yaml 写错），按新理由一眼就知道该查 launch 参数。
     table_scene_enabled: false
     table_box_size: [0.8, 0.6, 0.03]
     table_box_pose: [0.6, 0.0, -0.405, 0.0, 0.0, 0.0]
