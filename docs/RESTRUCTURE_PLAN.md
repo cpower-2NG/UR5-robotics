@@ -12683,3 +12683,47 @@ $ python3 scripts/test_plot_table_envelope.py   → 通过 67，失败 0
   杀掉」看成「只被 1 条杀」。写了 `/tmp/mut2.sh` 印完整的 `失败项` 块。
   **先是 `tail -1` 骗了我一次**（工具），**然后是 `tail -6` 骗了我一次**
   （我自己的读法）—— 两次都是「看日志的方式」而不是被测对象在骗人。
+
+### 八、D60 落地 —— 以及**为什么改不了 launch**
+
+D60 的定义一直是「把 D54 的修法（`attempts: 1` + `consistency_limits`）补到真机组」。
+动手时先找接缝，结论是**没有接缝**：
+
+`ur_moveit_config/launch/ur_moveit.launch.py` **没有** kinematics 参数。它做的是
+
+```python
+robot_description_kinematics = PathJoinSubstitution(
+    [FindPackageShare(moveit_config_package), "config", "kinematics.yaml"])
+...
+move_group_node = Node(..., parameters=[robot_description,
+                                        robot_description_semantic,
+                                        robot_description_kinematics, ...])
+```
+
+—— 直接把这个**文件**当 `--params-file` 交给 `move_group`（板上 `ps` 里确实有这一行）。
+唯一的旋钮是 launch 参数 `moveit_config_package`，而 SRDF / joint_limits /
+ompl / rviz **也全从它取** —— 换掉它等于把整份 MoveIt 配置自己扛一遍，
+正是本文件反复警告的「两套几何」。
+
+**另一条路（仿真走的）在这里不适用**：`sim.launch.py` 是**自己起 `move_group`** 的
+（`load_yaml` 从 `ur_moveit_config` 读官方 yaml + 自己的 kinematics）。照搬到真机
+意味着要复刻官方那段 URDF/SRDF 的 xacro（`ur_control.launch.py` 那边还多几个参数）
+—— 复刻错一点就是驱动与 move_group 两套几何，**而且不报错**。为一个两行的配置
+改动换这个风险，不值。
+
+⇒ 所以 `scripts/real_kinematics_fix.py` 走**最小**那条：直接改那一个 yaml。
+行级改写（注释、别的组、别的键都不动）、幂等（已经是想要的就一个字节不写）、
+写完**立刻回读再判一次**、找不到那个组就 `LookupError` 而**不猜**。
+默认只看不改，`--apply` 要 sudo —— 那一下归现场（`docs/待执行命令.md` 丙-7）。
+
+**验收判据就是上一节那个工具**：改完重启 `move_group`，跑
+`ik_repeat_check.py --table-z 0.0 --x 0.20 --y 0.10`，从「3/4 个位姿不可复现」
+变成「四层各只回来一个解」。判据不是「我改过」。
+⚠️ 系统文件，`apt upgrade` 会覆盖回去，所以 `--check` 那半随时能再判一次。
+
+> **一处诚实的折扣**：`--apply` 之后的**实测我还没做** —— 那要 sudo（归现场）。
+> 已经实测的是：`--check` 对板上真文件判得对（读出 `attempts: '3'`、
+> `consistency_limits` 缺、并打印出恰好那两行的 diff，退出码 1），以及
+> 31 条纯函数自检 + 6 个变异全杀（含一条**真缺口**：目标组缺键、邻居有时
+> 块边界写错会改到邻居身上 —— 这一条是补出来的，原先那组用例里两个组都带
+> `attempts`，`_find` 取第一个匹配照样落在目标组，**看不出块边界写错**）。
