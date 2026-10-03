@@ -120,16 +120,23 @@ def edges(vals):
 
 
 def codes(data, which):
-    """把 JSON 的 cells/per_level 摊成 (xs, ys, sym 二维表)。
+    """把 JSON 的 cells/per_level 摊成 `(xs, ys, grid)`。
 
     `which` = `"worst"` 取 `cells`（所有高度取最坏，与 ASCII 图一致），
     否则取 `per_level[which]`。
+
+    ⚠️ 键按 **`%.4f` 格式化后再查**，不是拿 float 去配 —— 包线写键用的是
+    `f"{x:.4f}"`，而 `axis()` 给出的 x 可能是 `0.30000000000000004`。
+    两边都格式化成同一个字符串，配对就是**构造上精确**的。
+    （包线那边现在也会把 `xs` 圆到 4 位，所以老实读法也能对上；这里是第二道。）
+    查不到就是 `MISSING`（画成 `?`）—— **不是**当成安全。
     """
     src = data["cells"] if which == "worst" else data["per_level"][which]
     xs, ys = list(data["xs"]), list(data["ys"])
-    sym = {(float(k.split(",")[0]), float(k.split(",")[1])): v
-           for k, v in src.items()}
-    return xs, ys, sym
+    key = {(f"{float(k.split(',')[0]):.4f}",
+            f"{float(k.split(',')[1]):.4f}"): v for k, v in src.items()}
+    grid = [[key.get((f"{x:.4f}", f"{y:.4f}"), MISSING) for x in xs] for y in ys]
+    return xs, ys, grid
 
 
 def pick_font(available_names):
@@ -192,10 +199,15 @@ def draw(data, which, zones, slots, out, title, dpi):
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch, Rectangle
 
-    xs, ys, sym = codes(data, which)
+    xs, ys, grid_sym = codes(data, which)
     if not xs or not ys:
         print("!! JSON 里没有格子可画")
         return 2
+    n_missing_data = sum(1 for row in grid_sym for s in row if s == MISSING)
+    if n_missing_data:
+        # 静默画一片白才最坏：那看起来像「这些格子安全」
+        print(f"!! JSON 里有 {n_missing_data} 个格子取不到数据（会画成白色 {MISSING}）"
+              f" —— 多半是键格式对不上，别把它当结论。")
 
     # 字体：找不到 CJK 就**整张图换英文**。缺字体时 matplotlib 会把中文画成方框，
     # 而且一句警告都不给 —— 一张满是方框的图比一张英文图糟得多。
@@ -220,7 +232,7 @@ def draw(data, which, zones, slots, out, title, dpi):
     order = [s for s in SYM_ORDER if s != MISSING]
     idx = {s: i for i, s in enumerate(order)}
     n_missing = len(order)
-    grid = [[idx.get(sym.get((x, y), MISSING), n_missing) for x in xs] for y in ys]
+    grid = [[idx.get(s, n_missing) for s in row] for row in grid_sym]
     cmap = ListedColormap([SYM_COLOR[s] for s in order] + [SYM_COLOR[MISSING]])
     norm = BoundaryNorm(range(len(order) + 2), cmap.N)
 

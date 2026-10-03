@@ -257,6 +257,43 @@ def row_limits(cells, xs, ys):
     return out
 
 
+def cell_key(x, y):
+    """格子的 JSON 键。**写键和读键必须走同一个函数** —— 见 `json_axis()`。"""
+    return f"{x:.4f},{y:.4f}"
+
+
+def json_axis(vals):
+    """网格轴进 JSON 之前先圆到 4 位小数。
+
+    ⚠️ 为什么（第八十四轮实测踩到的）：`axis(0.15, 0.95, 0.05)` 算出来的**不是**
+    整齐的十进制浮点 —— 它是 `0.30000000000000004`、`0.45000000000000007` 这种。
+    键却按 `%.4f` 写成 `"0.3000"`。于是一个**老实巴交的消费者**（读 JSON、
+    把 `xs` 里的值和解析出来的键配对）会在 **17 列里静默漏掉 6 列**，
+    把它们当成「没有数据」—— 不报错，只是图/表上少一块。
+    （我自己写的 `plot_table_envelope.py` 第一版就是这样，而且**自检还是绿的**：
+    因为那份测试的样本用的是 `round(x, 2)` 的整齐数，正好躲开了。）
+    ⇒ 出口处圆一次，`float(f"{v:.4f}") == v` 就恒成立，老实读法也能对上。
+    """
+    return [round(v, 4) for v in vals]
+
+
+def row_limits_outer(cells, xs, ys):
+    """每一行从**远边**（x 最大处）起算的连续可用边界 —— 即 **x 的下界**。
+
+    ⚠️ 为什么需要第二张表（第八十四轮实测补的）：`row_limits` 是「从近边起算、
+    遇到第一个不可用就停」。第一次粗扫（步长 0.1、只看两个高度）时撞桌格是散的，
+    这张表够用。**全扫（步长 0.05、四个高度）之后撞桌格变成了贴着基座的一整条**
+    —— 于是 21 行里有 9 行**第一个格子就不可用**，`row_limits` 全给 `—`，
+    等于什么都没说。可这一片恰恰是「**x 不能小于多少**」这种约束，
+    正是从远边起算才读得出来的那一种。
+
+    实现就一句：把 x 反过来喂给 `row_limits`。近边换成远边之后，
+    「连续可用的最后一个 x」正好就是原来的**下界** —— 不需要另写一套扫描，
+    也就不会和 `row_limits` 悄悄分叉。返回 `{y: (x_安全 ≥, x_可用 ≥)}`。
+    """
+    return row_limits(cells, list(reversed(xs)), ys)
+
+
 def _fmt_x(v):
     return "—" if v is None else f"{v:.2f}"
 
@@ -442,6 +479,7 @@ def main():
         reasons, fk_fail = {}, 0
         retry_hits = {}                 # 重试后各判读的格数（只有 --retry-seed 时有）
         worst_z, worst_where = None, None
+        worst_links = {}                # 最坏那格两条护栏连杆各自的高度
         t0 = time.monotonic()
         for j, y in enumerate(ys):
             for x in xs:
@@ -459,6 +497,7 @@ def main():
                             lo = min(h.values())
                             if worst_z is None or lo < worst_z:
                                 worst_z, worst_where = lo, (x, y, k)
+                                worst_links = dict(h)
                         per_level[k][(x, y)] = classify_one(h, floor, args.near_band)
                     syms.append(per_level[k][(x, y)])
                 s = worst(syms)
@@ -496,11 +535,22 @@ def main():
             shown = per_level[args.map]
         print(render_map(shown, xs, ys))
 
+        # 两张表：从近边起算给的是「x 上界」，从远边起算给的是「x 下界」。
+        # 撞桌区贴着基座时**只有第二张表说得出来话**（第八十四轮实测，
+        # 那次 21 行里 9 行在近边就是撞桌格、第一张表全给 —）。两张都打。
+        lim = row_limits(shown, xs, ys)
+        lim_out = row_limits_outer(shown, xs, ys)
         print("\n每行的连续可用边界（从近边 x 最小处起算；遇到第一个不可用就停）：")
         print(f"{'y':>7}   {'x 安全 ≤':>10}   {'x 可用 ≤':>10}")
-        lim = row_limits(shown, xs, ys)
         for y in reversed(ys):
             a, b = lim[y]
+            mark = "" if a == b else "   ← 有近限格"
+            print(f"{y:+7.2f}   {_fmt_x(a):>10}   {_fmt_x(b):>10}{mark}")
+
+        print("\n每行的连续可用边界（从**远边** x 最大处起算；给出的是 **x 的下界**）：")
+        print(f"{'y':>7}   {'x 安全 ≥':>10}   {'x 可用 ≥':>10}")
+        for y in reversed(ys):
+            a, b = lim_out[y]
             mark = "" if a == b else "   ← 有近限格"
             print(f"{y:+7.2f}   {_fmt_x(a):>10}   {_fmt_x(b):>10}{mark}")
 
@@ -562,9 +612,26 @@ def main():
                       "（真机上由驱动顺带起）—— 不是几何问题。")
         if worst_where:
             x, y, k = worst_where
+            # 说清是**哪条**连杆最低：现场要拿它和「护栏在按 −0.39 判」对比 ——
+            # 这一格在今天的护栏下是**放行**的（−0.094 > −0.37），这正是本脚本
+            # 存在的理由，所以把两个数摆在一起看。
+            which = "、".join(f"{ln}={zv:+.4f}" for ln, zv in sorted(
+                worst_links.items(), key=lambda kv: kv[1]))
             print(f"  · 全场最低连杆 {worst_z:+.4f}，出现在 ({x:.2f},{y:+.2f}) 的"
                   f"「{LEVEL_LABEL[k]}」，离下限 {floor:+.4f} 还有"
                   f" {worst_z - floor:+.4f} m")
+            print(f"    （该格各连杆：{which}）")
+            if p["table_plane_z"] is not None and p["table_plane_z"] != args.table_z:
+                old_floor = p["table_plane_z"] + p["guard_margin"]
+                if worst_z >= old_floor:
+                    print(f"    ⇒ **按节点参数那份护栏判（table_plane_z="
+                          f"{p['table_plane_z']:+.2f} ⇒ 下限 {old_floor:+.4f}）"
+                          f"会放行它**：这条连杆 {worst_z:+.4f}，而真机台面在 "
+                          f"{args.table_z:+.4f} ⇒ 它已在**台面以下"
+                          f" {args.table_z - worst_z:.4f} m**。")
+                else:
+                    print(f"    ⇒ 这一格连节点参数那份护栏（下限 {old_floor:+.4f}）"
+                          f"也会拦下。")
 
         usable = [(x, y) for (x, y), s in cells.items() if s in (SAFE, NEAR)]
         if usable:
@@ -592,13 +659,16 @@ def main():
                     "ik_seed": list(p["ik_seed"]),
                     "retry_seed": retry_seed,
                     "retry_hits": retry_hits,
-                    "xs": xs, "ys": ys,
-                    "cells": {f"{x:.4f},{y:.4f}": cells[(x, y)] for x, y in cells},
-                    "per_level": {k: {f"{x:.4f},{y:.4f}": per_level[k][(x, y)]
+                    "xs": json_axis(xs), "ys": json_axis(ys),
+                    "cells": {cell_key(x, y): cells[(x, y)] for x, y in cells},
+                    "per_level": {k: {cell_key(x, y): per_level[k][(x, y)]
                                       for x, y in per_level[k]} for k in keys},
                     "row_limits": {f"{y:.4f}": list(lim[y]) for y in ys},
+                    "row_limits_outer": {f"{y:.4f}": list(lim_out[y])
+                                         for y in ys},
                     "counts": {k: counts[k] for k in keys},
                     "worst_link_z": worst_z,
+                    "worst_links": worst_links,
                     "worst_at": list(worst_where) if worst_where else None,
                 }, f, ensure_ascii=False, indent=1)
             print(f"\n网格已转储：{args.json}")

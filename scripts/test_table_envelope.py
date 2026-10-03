@@ -32,8 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from table_safety_envelope import (                          # noqa: E402
         BLOCKED, LEVEL_KEYS, NEAR, NOIK, PROJECT_ROOT, REAL_BLOCK_HEIGHT, SAFE,
-        SOLVABLE_OTHER, axis, classify_one, combine, launch_const, num,
-        render_map, row_limits, worst, z_levels)
+        SOLVABLE_OTHER, axis, cell_key, classify_one, combine, json_axis,
+        launch_const, num, render_map, row_limits, row_limits_outer, worst,
+        z_levels)
 except ImportError as e:              # 没 source ROS 时 rclpy 拉不到
     print(f"环境不满足（{e}）—— 先 source /opt/ros/humble/setup.bash")
     sys.exit(2)
@@ -193,6 +194,69 @@ check("全不可用 ⇒ (None, None)", limits([NOIK, BLOCKED]) == (None, None),
       f"got {limits([NOIK, BLOCKED])!r}")
 check("全安全 ⇒ 一直到最远那一列", limits([SAFE] * 4) == (3.0, 3.0),
       f"got {limits([SAFE] * 4)!r}")
+
+
+# ----------------------------------------------------------------------
+# F2. row_limits_outer：从**远边**起算，给的是 x 的下界
+# ----------------------------------------------------------------------
+# 为什么需要它（第八十四轮实测）：全扫之后撞桌格变成贴着基座的一条，
+# 21 行里有 9 行**第一个格子就不可用**，`row_limits` 全给 «—»；
+# 而那一片恰恰是「x 不能小于多少」，只有从远边起算才说得出来。
+print("\n--- F2. row_limits_outer：x 的下界 ---")
+
+
+def limits_out(syms):
+    return row_limits_outer({(x, 0.0): s for x, s in zip(X4, syms)}, X4, Y1)[0.0]
+
+
+check("撞桌格在近边 ⇒ 下界就是它后面那一格（这正是 row_limits 说不出话的那种）",
+      limits_out([BLOCKED, BLOCKED, SAFE, SAFE]) == (2.0, 2.0),
+      f"got {limits_out([BLOCKED, BLOCKED, SAFE, SAFE])!r}")
+check("远边就是撞桌格 ⇒ 挡住里面的孤岛，下界推到远边外（None）",
+      limits_out([SAFE, BLOCKED, SAFE, BLOCKED]) == (None, None),
+      f"got {limits_out([SAFE, BLOCKED, SAFE, BLOCKED])!r}")
+check("全安全 ⇒ 下界一直落到近边（x 可以小到 0）",
+      limits_out([SAFE] * 4) == (0.0, 0.0), f"got {limits_out([SAFE] * 4)!r}")
+check("贴远边的一串全是近限格 ⇒ 可用有值、安全是 None（不是 0）——"
+      "近限只让它「能用」，不许它冒充「安全」",
+      limits_out([SAFE, BLOCKED, NEAR, NEAR]) == (None, 2.0),
+      f"got {limits_out([SAFE, BLOCKED, NEAR, NEAR])!r}")
+check("远边第一个就是近限格时**不中断**扫描（否则可用会莫名其妙变成 None）",
+      limits_out([SAFE, SAFE, SAFE, NEAR]) == (0.0, 0.0),
+      f"got {limits_out([SAFE, SAFE, SAFE, NEAR])!r}")
+check("全不可用 ⇒ (None, None)", limits_out([NOIK, BLOCKED]) == (None, None))
+check("两张表在「全安全」这一行上必须同时到两端（互为镜像的自洽检查）",
+      limits_out([SAFE] * 4)[0] == 0.0 and limits([SAFE] * 4)[0] == 3.0)
+check("同一行上两张表是**互补**的、不是重复：近边表说不出话时远边表给出答案",
+      limits([BLOCKED, BLOCKED, SAFE, SAFE]) == (None, None)
+      and limits_out([BLOCKED, BLOCKED, SAFE, SAFE]) == (2.0, 2.0),
+      f"近边 {limits([BLOCKED, BLOCKED, SAFE, SAFE])!r} "
+      f"远边 {limits_out([BLOCKED, BLOCKED, SAFE, SAFE])!r}")
+
+
+# ----------------------------------------------------------------------
+# F3. JSON 的键/轴契约：**老实读法也必须对得上**
+# ----------------------------------------------------------------------
+# `axis(0.15, 0.95, 0.05)` 里的 x **不是**整齐十进制浮点（0.30000000000000004
+# 这种），而键按 %.4f 写成 "0.3000"。第八十四轮实测：一个老实的消费者
+# （拿 xs 的值去配解析出来的键）会在 17 列里**静默漏掉 6 列**，把那里当成
+# 「没有数据」—— 不报错，只是少一块。所以出口处圆一次。
+print("\n--- F3. cell_key / json_axis：键与轴必须能往返 ---")
+RAW_XS = axis(0.15, 0.95, 0.05)
+check("这个网格里**确实有**不能往返的 x（否则整节是空转）",
+      any(v != round(v, 4) for v in RAW_XS),
+      f"got {[v for v in RAW_XS if v != round(v, 4)]!r}")
+ROUNDED = json_axis(RAW_XS)
+check("json_axis 之后每个值都能 %.4f 往返（float(f'{v:.4f}') == v）",
+      all(float(f"{v:.4f}") == v for v in ROUNDED), f"got {ROUNDED!r}")
+check("圆过之后，键字符串与轴值**一一对上**（这正是老实读法依赖的性质）",
+      [cell_key(v, 0.0).split(",")[0] for v in ROUNDED]
+      == [f"{v:.4f}" for v in ROUNDED])
+check("圆只动小数点后 4 位以外的噪声（0.05 的偏差 < 1e-15）",
+      all(abs(a - b) < 1e-15 for a, b in zip(RAW_XS, ROUNDED)), f"got {ROUNDED!r}")
+check("cell_key 两边都按 %.4f（不是只圆一个）",
+      cell_key(0.30000000000000004, 0.1000000000000000)
+      == cell_key(0.3, 0.1) == "0.3000,0.1000")
 
 
 # ----------------------------------------------------------------------

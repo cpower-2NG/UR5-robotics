@@ -116,20 +116,37 @@ DATA = {
                                     "0.0000,0.0000": ".",
                                     "0.1000,0.0000": "x"}},
 }
-xs, ys, sym = codes(DATA, "worst")
+xs, ys, g = codes(DATA, "worst")
 check("xs/ys 原样取回", xs == [0.0, 0.1] and ys == [-0.1, 0.0])
-check("worst 取的是 cells", sym[(0.0, -0.1)] == "X" and sym[(0.0, 0.0)] == "s",
-      f"got {sym!r}")
-check("键 '0.0000,0.0000' 解析成 float 坐标（不是字符串键）",
-      (0.0, 0.0) in sym)
-_, _, sym2 = codes(DATA, "grasp_descend")
+check("grid 是 [y][x]、**y 升序**（作图要的朝向）",
+      len(g) == 2 and len(g[0]) == 2, f"got {g!r}")
+check("worst 取的是 cells", g[0][0] == "X" and g[1][0] == "s", f"got {g!r}")
+_, _, g2 = codes(DATA, "grasp_descend")
 check("单层取的是 per_level[那层]（和 worst 不同 ⇒ 没串台）",
-      sym2[(0.1, 0.0)] == "x" and sym2[(0.0, 0.0)] == ".")
+      g2[1][1] == "x" and g2[1][0] == ".", f"got {g2!r}")
 try:
     codes(DATA, "no_such_level")
     check("不存在的层 ⇒ KeyError（由 main 先拦，这里只钉住它不静默给空图）", False)
 except KeyError:
     check("不存在的层 ⇒ KeyError（由 main 先拦，这里只钉住它不静默给空图）", True)
+
+# ⚠️ 这一条是**真的踩到过**的坑，不是假想（第八十四轮）：
+# `axis(0.15, 0.95, 0.05)` 给出的 x 里有 `0.30000000000000004` 这种，
+# 而键按 %.4f 写成 "0.3000"。第一版 `codes()` 拿 float 去配 float，
+# 于是 **17 列里静默漏掉 6 列**，画出来是一片「无数据」，**而且自检是绿的**
+# —— 因为那份样本用的是 `round(x, 2)` 的整齐数，正好躲开了。
+# 下面这条样本专门放一个**不能往返**的 x，钉住「按格式查」这件事。
+print("\n--- D2. 键格式必须按 %.4f 配对（不许拿 float 硬配）---")
+RAW = 0.15 + 3 * 0.05                       # = 0.30000000000000004
+check("样本本身确实不能往返（否则这条测试是空转）",
+      RAW != round(RAW, 4) and f"{RAW:.4f}" == "0.3000", f"got {RAW!r}")
+DATA2 = {"xs": [RAW], "ys": [0.0], "cells": {"0.3000,0.0000": "X"},
+         "per_level": {"grasp_descend": {"0.3000,0.0000": "X"}}}
+_, _, g3 = codes(DATA2, "worst")
+check("不能往返的 x 也能取到数据（不是 MISSING）", g3[0][0] == "X", f"got {g3!r}")
+check("取不到时是 MISSING 而**不是** SAFE（宁可画成 ? 也不许当成安全）",
+      codes({"xs": [0.1], "ys": [0.0], "cells": {}, "per_level": {"k": {}}},
+            "worst")[2][0][0] == MISSING)
 
 
 # ----------------------------------------------------------------------
