@@ -19,6 +19,11 @@
 然后跑 `elbow_guard_probe.py`（只调 /compute_ik、/compute_fk，绝不发轨迹），
 拿到抓取区/放置区候选位姿的肘/大臂高度余量。
 
+加了 `--envelope-z` 还会再跑 `table_safety_envelope.py`：**扫一整片桌面**，画出
+「哪些 (x,y) 会把大臂/腕压到台面下、哪些够不到」的边界 —— 那是给现场**划区**用
+的（肘探针看的是「已经框好的区安不安全」）。两者共用同一份几何与同一套判据，
+所以包线的结论就是护栏会做的判断。
+
 ⚠️ 数值口径（**第八十三轮改**）：这里用的描述包与 `real.launch.py` **同源**，
    所以 `move_group`（IK/FK）与 `robot_state_publisher`（TF）是**同一套几何**。
    第八十二轮把 `real.launch.py` 的 `DESCRIPTION_PACKAGE` 换成了
@@ -40,6 +45,9 @@
     python3 scripts/moveit_only_check.py
     python3 scripts/moveit_only_check.py --grid 6
     python3 scripts/moveit_only_check.py --no-pipeline    # 见下
+    # 划区用：真机台面在 base_frame ≈ 0，扫一遍画边界
+    python3 scripts/moveit_only_check.py --envelope-z 0.0 --envelope-json /tmp/env.json
+    # 只想量包线时不重跑探针也行（扫得慢，可以先 --grid 1 快速过一遍探针）
 
 `--no-pipeline`：不 include `pipeline.launch.py`。**开发机上没有
 `ros-humble-realsense2-camera` 时必需** —— `camera_source:=realsense` 会去拉那个包，
@@ -51,7 +59,9 @@
    **不要**用它去主持护栏口径的判读（护栏要读运行中节点的参数才算数）。
 
 退出码：0 = 探针通过（所有候选连杆在护栏之上）；1 = 探针报告有候选低于护栏；
-2 = 环境不满足（残留进程 / 缺包 / 服务起不来）。
+2 = 环境不满足（残留进程 / 缺包 / 服务起不来 / 包线一个位姿都没量出来）。
+⚠️ 包线**自己**的结论（图上有撞桌格）**不进**退出码 —— 扫的范围本来就比任何
+   合理的区都大，那是结论不是失败。只有它「什么都没量到」才算失败。
 """
 
 import argparse
@@ -213,6 +223,20 @@ def main():
     ap.add_argument("--no-pipeline", action="store_true",
                     help="不 include pipeline.launch.py（开发机没装 "
                          "realsense2_camera 时必须；见模块 docstring）")
+    ap.add_argument("--envelope-z", type=float, default=None,
+                    help="**跑桌面安全包线**：给工作台台面在 base_frame 的 z"
+                         "（真机 ≈ 0.0）。不给就不跑。"
+                         "它扫一整片桌面、算出「哪些位置会把大臂压到台面下」的"
+                         "边界，用来定 pick_zone / place_zone（见 "
+                         "scripts/table_safety_envelope.py）。")
+    ap.add_argument("--envelope-step", type=float, default=0.05,
+                    help="包线的网格步长（m，默认 0.05）")
+    ap.add_argument("--envelope-bounds", default="0.15,0.95,-0.50,0.50",
+                    help="包线的 x_min,x_max,y_min,y_max（默认 0.15,0.95,-0.50,0.50）")
+    ap.add_argument("--envelope-levels", default="grasp,place",
+                    help="包线扫哪些高度（grasp / place / grasp,place）")
+    ap.add_argument("--envelope-json", default=None,
+                    help="把包线的网格转储到这个路径（留证用）")
     args = ap.parse_args()
 
     if not os.environ.get("ROS_DISTRO"):
@@ -330,6 +354,39 @@ def main():
             probe_cmd += ["--ik-group", "ur_manipulator"]
         rc = subprocess.call(probe_cmd)
 
+        # 5b) 桌面安全包线（可选，只读）
+        #     上一步量的是「我打算去的那些点安全吗」；这一步量的是「哪片桌面可以
+        #     选作区」—— 它扫一整片，用**同一份几何**（同一个 move_group、
+        #     同一套描述包，见上面的描述一致性复核）把撞桌边界画出来，现场照着
+        #     划 pick_zone / place_zone，而不是先框一个再跑一遍看。
+        #     ⚠️ 台面高度走**命令行**（真机 ≈ 0），不从 /grasp_planner 读 ——
+        #     节点手上那份是仿真 yaml 的 -0.39（`table_plane_z` 也没有 launch 覆盖口子）。
+        rc_env = 0
+        if args.envelope_z is not None:
+            b = [float(v) for v in args.envelope_bounds.split(",")]
+            if len(b) != 4:
+                print(f"!! --envelope-bounds 要 4 个数，收到 {args.envelope_bounds!r}")
+                return 2
+            env_cmd = [sys.executable,
+                       os.path.join(here, "table_safety_envelope.py"),
+                       "--node", "/grasp_planner",
+                       "--table-z", str(args.envelope_z),
+                       "--step", str(args.envelope_step),
+                       "--levels", args.envelope_levels,
+                       "--x-min", str(b[0]), "--x-max", str(b[1]),
+                       "--y-min", str(b[2]), "--y-max", str(b[3])]
+            if args.no_pipeline:
+                env_cmd += ["--ik-group", "ur_manipulator"]
+            if args.envelope_json:
+                env_cmd += ["--json", args.envelope_json]
+            print("\n>>> 5b) 桌面安全包线（台面 z = %+.4f）" % args.envelope_z)
+            rc_env = subprocess.call(env_cmd)
+            # 包线自己的退出码**只有 0/2**：图上出现撞桌格是结论不是失败（扫的范围
+            # 本来就比任何合理的区大），只有「一个位姿都没解出来」才是环境问题 ——
+            # 而那种「没有撞桌格」是假绿，跟探针的 return 2 同一个理由，所以并进来。
+            if rc_env == 2:
+                print("⚠️ 包线没能给出结论（环境问题）—— 预检按失败计。")
+
         # 6) 整段护栏接到真 FK 上验一遍（B）
         #    上一步量的是**路点**，这一步量的是**路点之间**：在真 UR5 的 URDF 上
         #    找一条「两端都在台面上、中段却俯冲下去」的真实路径，再看护栏拦不拦。
@@ -337,7 +394,7 @@ def main():
         #    controller_manager，结构上不可能动。
         rc2 = subprocess.call(
             [sys.executable, os.path.join(here, "test_guard_path.py"), "--only", "D"])
-        return rc or rc2
+        return rc or rc2 or rc_env
     finally:
         for name, p in reversed(procs):
             try:
