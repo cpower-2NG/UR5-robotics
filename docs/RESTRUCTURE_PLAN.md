@@ -7941,7 +7941,7 @@ ik_group               = 'ur5_manipulator'
 
 | 项 | 事实 | 处置 |
 |---|---|---|
-| **重心没勾选** | `real.launch.py:231` 的 `safety_limits` 默认 `true`，它自己的描述就写着「示教器上没配负载/重心就上动作会在中途保护性停机」 | 🔴 「第一批动作之前必须配好」。⚠️ **具体是什么行为（降速 / 停 / 报错、在哪一步）要到现场才知道** —— 沿用第五十八轮的说法，**不当作已证事实** |
+| **重心没勾选** | 示教器上负载/重心没配（**与 `safety_limits` 参数无关** —— 本行原先把两者绑在一起，2026-10-03 第七十九轮已订正：那个参数只让 URDF 多一条没人执行的 `<safety_controller>`） | 🔴 「第一批动作之前必须配好」。⚠️ **具体是什么行为（降速 / 停 / 报错、在哪一步）要到现场才知道** —— 沿用第五十八轮的说法，**不当作已证事实** |
 | **有效载荷 2.00 kg** | AG-95 实重约 1 kg，报了**两倍** | 报大了**偏保守**（UR 按更重的负载算，动作更慢更谨慎），不危险。若含转接板/螺钉/线缆那是有意，确认即可。**但重心位置比重量重要得多**：CoG 错会让 UR 的动态模型算错，症状是抖动/超差 |
 
 #### 5. 一条操作纪律（加到碰靶之前）
@@ -10919,13 +10919,17 @@ get_operational_mode  → success=False
    而且仿真的 `ur5_with_gripper.urdf.xacro` 读的也是
    `ur_description/config/ur5/*` —— 那个目录里的注释写着
    `UR5/CB3, Version 3.13` ⇒ **仿真与真机是同一套运动学**，这是好事。
-2. **`safety_limits` 在 CB3 上是惰性的。** 它是 **e-Series 功能**（靠 RTDE 往控制箱写
-   安全限值）。`liburcl.so` 里的文案是
+2. **`safety_limits` 不是这条链路上的一层保护。** ⚠️ **本节第七十九轮已订正** ——
+   我在这里原本写「它是 **e-Series 功能**（靠 RTDE 往控制箱写安全限值）」，并把
+   `liburcl.so` 里的
    `%s is only available for robots with PolyScope %s / %s or later. … This command will have no effect.`
-   ⇒ **W2 记的那条「没配负载就会在动作中途保护性停机」机制说错了**（那是 e-Series 的
-   `safety_limits` + `safety_k_position` 路径）。但**要做的动作仍然对**：CB3 上真正管
-   这件事的是**示教器上的负载/重心配置**（CB3 用它算动力学与限值）。保留
-   `safety_limits:=true` 无害（只 warn），但别指望它。
+   **当作证据引用。那条字符串是 `assertVersion` 给 Dashboard 命令用的模板，不是给
+   安全限制的 —— 引错了。** 第七十九轮实测得到的真实图景是：
+   官方 launch 只把 `safety_limits` 喂给 `robot_description` 的 xacro（**喂不到驱动
+   节点**），URDF 上只多出一条 `<safety_controller k_position="20" …>`，而板上
+   **没有任何组件执行那条软限** ⇒ **不能说是「CB3 上失效」，而是这条链路上从来就
+   没有执行者。** 要做的动作仍然对：**示教器上配负载/重心**，那是 URControl 自己的事。
+   保留 `safety_limits:=true` 无害（它让驱动与 `move_group` 拿到同一份 URDF）。
 3. **新的未知（要现场验）**：**External Control URCap 能不能装进 PolyScope 3.15.3。**
    板子上那份是 `/opt/ros/humble/share/ur_robot_driver/resources/externalcontrol-1.0.5.urcap`，
    而 CB3 的 URCap 是用 **U 盘**从示教器装的。**没有这个程序，驱动的轨迹接口起不来。**
@@ -10989,3 +10993,86 @@ get_operational_mode  → success=False
   只读会话（用完即关）。**没有发过任何轨迹**、没有碰 RTDE、没有碰 30001–30004。
 - AG-95 侧**只读**：Modbus 读功能码，**0 次写**。
 - `main` 两边都没动；没有推送任何外部远端。
+
+---
+
+## 第七十九轮：`safety_limits` 订正 —— **它不是一层保护，这条链路上没有执行者**（2026-10-03）
+
+**触发**：整理丙-3（真机接入）时回看 `real.launch.py`，发现第 28、179、236 三处注释把
+「没配负载就会在动作中途保护性停机」归因给驱动的 `safety_limits` 参数 —— 而**这恰恰是
+我上一轮刚写进台账的结论**。为了给那句话找硬证据，反而**把它推翻了**。
+
+### 一、订正：上一轮**引错了证据**
+
+| | |
+|---|---|
+| 上一轮（第七十八轮）写的 | 「`safety_limits` 是 **e-Series 功能**（靠 RTDE 往控制箱写安全限值）；CB3 上驱动仅发警告」，引 `liburcl.so` 里 `%s is only available for robots with PolyScope %s / %s or later. … This command will have no effect.` 为证 |
+| 实际是 | 那条模板属于 **`DashboardClient::assertVersion(e_series_min_ver, cb3_min_ver, …)`**（`ur_client_library/ur/dashboard_client.h:800`）—— 是**逐条 Dashboard 文本命令**的版本闸，作用对象是 29999 上的命令，**与安全限制无关**。判据：模板的 `%s / %s … %s` 三个占位与 `assertVersion` 的形参一一对应，且同段相邻字符串全是 `polyscope_version` 家族（`strings` 2661–2763） |
+| 后果 | 上一轮那条论证链建立在一句错证据上。**已在原处（本节上方第七十八轮第 2 项）标注订正**，不删原文 |
+
+**教训**：`strings` 里翻到一条措辞贴合的文案，**不等于它属于那个功能** —— 模板句要连调用点一起看。
+
+### 二、实测：`safety_limits` 对 URDF 到底做了什么
+
+板端生成两份 URDF 逐行 diff（纯文件处理，**不碰机器人**）：
+
+```
+$ X=$(ros2 pkg prefix ur_description)/share/ur_description/urdf/ur.urdf.xacro
+$ ros2 run xacro xacro "$X" ur_type:=ur5 name:=ur safety_limits:=false > /tmp/u_false.urdf
+$ ros2 run xacro xacro "$X" ur_type:=ur5 name:=ur safety_limits:=true  > /tmp/u_true.urdf
+false rc=0 lines=642 / true rc=0 lines=648
+```
+
+diff 全文**只有 6 处新增**，形态完全一致：
+
+```
+> <safety_controller k_position="20" k_velocity="0.0" soft_lower_limit="-6.133185307179586" soft_upper_limit="6.133185307179586"/>   ×5
+> <safety_controller k_position="20" k_velocity="0.0" soft_lower_limit="-2.991592653589793" soft_upper_limit="2.991592653589793"/>   ×1（肘）
+```
+
+两条结论：
+
+1. **`<limit>` 一字未动** ⇒ 它**不会收窄 IK 可达姿态**。改之前我先猜它会「把 CB3 的
+   关节范围收窄成 e-Series 的安全额定值」—— **被自己的实测否掉了**。
+   （`k_position="20"` 与官方默认 `safety_k_position:=20` 对得上，自洽。）
+2. 它唯一的产物就是那 6 条 `<safety_controller>`（±6.133 rad，肘 ±2.9916 rad）。
+
+### 三、谁执行那条软限：**找不到执行者**
+
+四条独立证据：
+
+| # | 查法 | 结果 |
+|---|---|---|
+| 1 | 官方 `ur_control.launch.py` 里 `safety_limits` 出现处 | 只在 `:136` 进 **xacro 命令串**（生成 `robot_description`），**没有一处把它当驱动节点的参数** |
+| 2 | 板上 `grep -rl safety_limits /opt/ros/humble/lib /opt/ros/humble/share/ur_robot_driver` | 命中的全是 **launch / xacro / 它自己的单元测试**；**任何二进制里都没有这个字面量** |
+| 3 | 上游 Humble `ur_robot_driver/src/hardware_interface.cpp` | **完全没有**安全限制逻辑 —— 只有 CB3 / e-Series 在**力矩模式**、**力/力矩坐标变换**、**力控增益**三处的分流 |
+| 4 | `grep -rl soft_lower_limit /opt/ros/humble/` | 只有 **urdfdom 解析器**、`urdf_parser_py`、**joint_state_publisher**（读来画滑块）；`safety_pos_margin` 只出现在 xacro/launch/测试里 |
+
+⇒ **在本仓库这条链路上，`safety_limits:=true` 既不会多出一层保护，也不会替你「保护性停机」。**
+
+⚠️ **诚实边界（写清楚，免得以后被当成铁证）**：第 4 条**不是决定性的** —— 编译过的消费者读
+`joint->safety` 是按结构体偏移访问，二进制里**不会**留下 `soft_lower_limit` 这个字符串。
+所以严格的说法是「**在这个工作区里找不到执行者**」，不是「确定无人执行」。但第 1、3 条
+（官方 launch 的实际去向 + 上游源码）已足够支撑那句操作性结论：**别把它当保护用**。
+
+### 四、据此改了什么（**全是注释与文档，零行为变更**）
+
+| 文件 | 改动 |
+|---|---|
+| `ros2_ws/src/yolo_bringup/launch/real.launch.py` | 三处：文件头第 28 行的「所有保护（…）都在机器人侧」把 `safety_limits` 摘出去；`_driver` 内 5 行注释换成实测结论；`DeclareLaunchArgument("safety_limits")` 的 description 重写 |
+| `docs/calib/外参-B路-臂点法.md` | 两处（第 5 步、以及「2. 顺带把负载/重心配了」）—— 这是**操作员标定时照着读**的文档，优先级最高 |
+| `docs/机械臂系统参考.md` | §5.3 之后补一段「`safety_limits` 与另外两项性质不同」 |
+| 本文件 | 第七十八轮第 2 项**原处标注订正**；第 7944 行那张安全项表格里「与 `safety_limits` 绑定」的说法一并订正 |
+
+**没有改默认值**：仍默认 `true`。理由 —— 既然它只影响 URDF 里那 6 行，`true` 让我们的
+`robot_description` 与官方默认一致；改它纯属噪音。`test_real_launch.py` 的 W2-5 检查
+（驱动与 `move_group` 必须传同一个值）**不受影响**，两处调用一字未动。
+
+顺带核对（未改）：`INITIAL_JOINT_CONTROLLER = "scaled_joint_trajectory_controller"`
+（`real.launch.py:79`）—— 与 W2 的要求一致（尊重示教器速度滑条）。
+
+### 五、台面账
+
+- **纯离线**：板端只跑了两次 `xacro`（输出到 `/tmp`）与若干次 `grep`/`strings`。
+  **没有启驱动、没有连控制箱、没有碰 RTDE、没有碰 30001–30004。**
+- 未改板上任何被跟踪文件（除 `/tmp`）；未动 `main`；未推送任何外部远端。

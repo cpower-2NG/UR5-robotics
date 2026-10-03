@@ -25,7 +25,8 @@
 
 ⚠️ 机械臂动作、控制器切换、真机抓取属于**高风险操作**：未经当次明确授权且
 急停就绪，不要启动真实运动。本文件只做「起节点」这件事，不改任何安全设置，
-所有保护（`safety_limits`、示教器速度滑条、急停）都在机器人侧。
+所有保护（示教器速度滑条、URControl 自己的安全/负载配置、急停）都在机器人侧。
+**注意 `safety_limits` 不在其列** —— 它在这条链路上不是一层保护，详见 `_driver`。
 
 ⚠️ 第一个真机 demo **不含抓取**，所以本文件的默认值就是那个组合：
 `gripper_backend:=none` + `carry_objects:=false`（只走位）。
@@ -176,10 +177,20 @@ def _driver(context):
                 # 显示机器人状态的窗口，但真机看的是示教器和实物）。
                 "launch_rviz": "false",
                 "initial_joint_controller": INITIAL_JOINT_CONTROLLER,
-                # 安全限制控制器：官方默认 true、k_position=20。**没在示教器上
-                # 配好负载/重心就会在动作中途保护性停机**（AG-95 约 1 kg、
-                # 离法兰 0.13 m+）。现场必须先在示教器上配 TCP 与负载，再跑动作。
-                # 只有在「负载尚未配、且你接受少一层保护」时才传 false。
+                # ⚠️ 这个参数**不是一层保护**，别指望它（本仓库文档早先写错、已订正，
+                # 证据见 RESTRUCTURE_PLAN.md 第七十九轮）：
+                #   · 官方 launch 只把它喂给 robot_description 的 xacro（`:136`），
+                #     **喂不到驱动节点** —— 板上任何二进制里都没有 `safety_limits`
+                #     这个字面量；上游 Humble 的 `hardware_interface.cpp` 里也没有
+                #     任何安全限制逻辑。
+                #   · 它对 URDF 的唯一影响是每个关节多一条
+                #     `<safety_controller k_position="20" soft_lower_limit=… />`
+                #     （实测：`<limit>` 一字未动），而板上**没有任何组件执行那条软限**
+                #     （`soft_lower_limit` 只出现在 urdfdom 解析器与 joint_state_publisher）。
+                #   · 所以传 true 既不会「少一层保护」，也不会替你「保护性停机」。
+                # 保留 true 的理由只有一个：让驱动与 move_group 拿到**同一份** URDF
+                # （见 _moveit 的注释）。真正的负载/重心在**示教器**上配 —— 那是
+                # URControl 自己的要求，没配就动臂该停的照样停，与这个参数无关。
                 "safety_limits": LaunchConfiguration("safety_limits"),
             }.items(),
         ),
@@ -234,8 +245,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "safety_limits", default_value="true",
-            description="安全限制控制器。⚠️ 示教器上没配负载/重心就上动作会在"
-                        "中途保护性停机；配好之前不要为了「先跑起来」关掉它",
+            description="⚠️ **不是一层保护**（本仓库文档早先写错、已订正）：官方 launch"
+                        "只拿它生成 URDF 里的 <safety_controller>，而板上没有组件执行"
+                        "那条软限 —— 详见 _driver 处的注释。保留 true 只为让驱动与"
+                        "move_group 拿到同一份 URDF；负载/重心在**示教器**上配",
         ),
         # ---- 分阶段 ----
         DeclareLaunchArgument(
