@@ -11076,3 +11076,121 @@ diff 全文**只有 6 处新增**，形态完全一致：
 - **纯离线**：板端只跑了两次 `xacro`（输出到 `/tmp`）与若干次 `grep`/`strings`。
   **没有启驱动、没有连控制箱、没有碰 RTDE、没有碰 30001–30004。**
 - 未改板上任何被跟踪文件（除 `/tmp`）；未动 `main`；未推送任何外部远端。
+
+---
+
+## 第八十轮：丙-3 的**一个**真卡点 + 一条我自己判错并撤回的（2026-10-03）
+
+用户直接给了两条关键线索：**「external control 已经有了，<ip>:50002，hostname `wf`」**
+与**「示教器上好像没有模式切换 Remote Control」**。两条都查实了：
+
+- **真卡点只有一个**：URCap 里 Host IP 指着前负责人那台机器（`<ip>` / `wf`），
+  实测**不存在** ⇒ 要改成板子 `<ip>`（端口 50002 不动）。
+- **「板子 ufw 挡着」是我判错的，已撤回**（§四）：实测 ufw **没有在过滤**。
+- **示教器上没有 Remote Control 可切**，因为 **CB3 上根本没有这个概念**（§二）。
+
+### 一、`<ip>` 上**什么都没有**
+
+| 项 | 实测 |
+|---|---|
+| 板子 `eno1` | **`<ip>/24`**（静态，未变） |
+| 控制箱 | `<ur-controller-ip>` —— ping 2/2、0.17 ms，ARP `<mac>` |
+| **`<ip>`** | **ping 2 发 0 收、100% 丢包；ARP 条目停在 `INCOMPLETE`** ⇒ 那个地址上**没有任何设备** |
+| `wf` 是谁 | **不是板子、也不是开发机**（开发机 `hostname` = `<host>`，Windows 侧 = `<host>`）⇒ 判定为**前负责人那台机器** |
+
+⇒ External Control URCap 的 Installation 页现在把机器人指向一台**不存在的机器**。
+程序一播放就会连不上 —— **这是丙-3 现在的第一卡点**，改法是把它填成板子的 `<ip>`。
+
+### 二、「CB3 上没有 Remote Control」—— 有据，不是没找到
+
+| 来源 | 原文 |
+|---|---|
+| 驱动自带头文件 `ur_client_library/ur/dashboard_client.h:386` | `\throws an UrException when called on CB3 robots`（`commandIsInRemoteControl()`） |
+| 同库 `dashboard_client_implementation.h:314` | `\throws an NotImplementedException when called on CB3 robots or PolyScope versions lower than 10.12.0` |
+| 上游 `ur_robot_driver/doc/installation/install_urcap_cb3.rst` | 全文**不要求任何操作模式**（只讲装 URCap → 填 Host IP → 插节点 → 保存） |
+| 前负责人那份文档（同一台机器，`robot_ip` 默认值就是 `<ur-controller-ip>`） | 流程里只有一句：**「UR示教器重新启动外部控制」** —— 没有模式切换 |
+
+⇒ **CB3 上「Remote Control」这个概念不存在**，`commandIsInRemoteControl()` 在 CB3 上直接抛异常。
+这同时**订正了第七十八轮里我的一处疑惑**：当时我在 Dashboard 上问 `is in remote control`
+被回 `could not understand`，我归因为「拼写不对」并放弃了 —— **真实原因是这台机器没有这条命令**。
+
+### 三、URCap 的端口语义：**50002 是对的，别改成 50001**
+
+驱动四端口默认值（`ur_control.launch.py:689-711`）：`reverse_port=50001`、
+`script_sender_port=50002`、`trajectory_port=50003`、`script_command_port=50004`。
+
+三条独立佐证指向「URCap 那个输入框 = `script_sender_port`」：
+
+1. **URCap 自己的字节码**（`ExternalControlInstallationNodeContribution.class`）：内建默认值
+   **`192.168.56.1` / `50002`**，字段名 `host_ip` / `port_nr`；Installation 页三个字段是
+   `Host name` / `Host IP` / `Custom port`；程序节点用 `java.net.Socket(hostIp, portNr)` **主动连出**。
+2. 上游 CB3 文档原文：**"The custom port should be left untouched for now."**
+3. 真正跑动的通道**不看这个输入框** —— 是驱动把地址填进脚本里：
+   `socket_open("{{SERVER_IP_REPLACE}}", {{SERVER_PORT_REPLACE}}, "reverse_socket")`
+   （`resources/ros_control.urscript:102`）。
+
+### 四、⚠️ **我自己的错判并撤回**：板子 `ufw` **并没有在过滤**
+
+本节初稿把 `systemctl is-active/enabled ufw` 读成「防火墙开着、50001–50004 很可能被挡」，
+并据此把它列为丙-3 的**第二卡点**、写了一条 sudo 放行命令进 `docs/待执行命令.md`。
+**这是错的，已撤回。** 两条独立证据：
+
+**① 配置值**：`/etc/ufw/ufw.conf` → **`ENABLED=no`**。单元文件是
+`Type=oneshot` + `RemainAfterExit=yes` + `ExecStart=/lib/ufw/ufw-init start quiet`，
+`ufw-init start` 读到 `ENABLED=no` 就**不装任何规则**；但单元「跑过」这件事会被
+`systemctl` 记成 `Active: active (exited) since Thu 1970-01-01 08:00:33`（开机极早，
+`Main PID: 505 code=exited status=0/SUCCESS`）。**`is-active` 报的是单元状态，不是
+「有没有在过滤」。**
+
+**② 行为实测（决定性）**：从开发机连板子一个**没有监听**的端口 —— 防火墙丢弃会**超时挂住**，
+没有防火墙会**立刻回 RST**：
+
+```
+    22: 连上（有监听）                        0.09s
+ 50002: ConnectionRefusedError [Errno 111]  0.00s
+ 12345: ConnectionRefusedError [Errno 111]  0.00s
+```
+
+**0.00 s 的 RST** 是板子 TCP 栈直接拒绝，不是被丢弃。⇒ ufw 不在路径上。
+
+**③ 这个雷本仓库早就记过。** `RESTRUCTURE_PLAN.md:3616-3627`（甲-1）逐字写着
+「`ufw disable` **不会**停掉 systemd 单元（`RemainAfterExit=yes`），所以防火墙关掉之后
+`systemctl is-active ufw` **照样报 active**」，并注明「同类的错在第二十八轮已经犯过一次」。
+**我踩的是一个白纸黑字写在自己台账里的雷** —— 教训不是「要更小心」，而是
+**看到状态字符串先问「它报的是谁的什么状态」，再去找那个真正决定行为的配置值。**
+
+**保留不变的是原始警告**（它是对的，且更该被看见）：`docs/board/arm-cleanup-sudo.sh`
+**会启用 ufw 且只放行 22/3389/5900** ⇒ **谁重跑它，回连立刻断**，而症状看起来像 URCap 装错了。
+「当前是关的」这个结论**也一直是对的**（`docs/机械臂系统参考.md` §2.4 原本就写对了）——
+只有我这一节读反了。
+
+### 五、上游 CB3 安装流程（现场依据，逐条摘）
+
+- URCap 装法：拷进机器人 programs 目录（scp 或 U 盘）→ *Setup Robot* → *URCaps* → 「+」选中
+  → **重启机器人**。**最低 PolyScope 3.7** ⇒ 我们的 3.15.3 在范围内（**「能不能装」这个
+  第七十八轮登记的未知，就此消掉**；且用户确认已装好）。
+- Installation 页要填的是**将要跑 ROS 驱动的那台 PC 的 IP**，且「机器人应与 PC 同网，
+  最好直连以减小网络扰动」。
+- 程序页：把 External Control 节点插进程序树 → 回 command 页核对 → **保存**。
+- 次序：**"Generally, you will launch the driver via ROS then start URCap from the pendant."**
+
+### 六、据此改了什么（**全是文档，零代码变更**）
+
+| 文件 | 改动 |
+|---|---|
+| `docs/待执行命令.md` §丙-3 | 「三条影响」改成四条：第 2 条**订正 safety_limits**（指向第七十九轮）、第 3 条**消掉 URCap 未知**、第 4 条**新增 Host IP 卡点**；新增「端口：50002 是对的」一节；**前置表重写**（删掉 Remote Control 那一行，换成改 Host IP）；优先级行同步更新 |
+| `docs/待执行命令.md` §丙-3（**改后即撤**） | 那条「🔴 先排掉板子的防火墙（要 sudo，你跑）」**当天就改掉了** —— 实测 ufw 没在过滤，写成 ✅ 不是卡点，并把「别重跑 `arm-cleanup-sudo.sh`」那条纪律留在原位 |
+| `docs/机械臂系统参考.md` §2.3.1 | **新增**：示教器 URCap 的 `Host name` / `Host IP` / `Custom port` 三个框该填什么、现状错在哪、以及**为什么端口是 50002 不是 50001** |
+| `docs/机械臂系统参考.md` §2.4 | 原本就写对了（「当前实测是关的」），本轮补上**复核方法与行为判据**，并写明 `systemctl is-active ufw` **不能**用来判断有没有在过滤 |
+| 台账 | 本轮（本节的 §四 初稿写错，**在同一轮内订正**，未带错入下一轮） |
+
+### 七、台面账
+
+- 全程**只读**：板子上 `ping` / `ip neigh` / `ss` / `systemctl is-active` / `grep` / `strings`
+  / 用 `python3 zipfile` 拆 URCap 包 / `cat /etc/ufw/ufw.conf` / 读单元文件；本机读前负责人文档。
+- 订正 ufw 那条时做了一次**本机 → 板子的 TCP 连接探测**（端口 `22` / `50002` / `12345`）：
+  都是**连接请求**，没有发数据、没有利用任何服务。`22` 有监听故连上，另两个立刻 RST。
+  **这是判「防火墙在不在」的判据本身，不是扫描。**
+- **本轮没有连控制箱的 Dashboard、没有启驱动、没有碰 RTDE。**
+- 板子身份每次用**模组序列号**核对（`<board-serial>`）—— 本轮又核了一次。
+- 未改板上任何文件；未动 `main`；未推送任何外部远端。
