@@ -12622,6 +12622,20 @@ $ python3 scripts/test_ik_repeat.py             → 通过 47，失败 0    （�
 $ python3 scripts/test_plot_table_envelope.py   → 通过 67，失败 0
 ```
 
+**整段护栏自检在**空闲**板上重跑了一次干净通过**（`test_guard_path.py`，
+`✓ 全部通过`，D 段按设计跳过 —— 那时臂栈已经收了，`/compute_fk` 不在）。
+这一条是补上一轮记的「有次跑了 3m25s 挂住，原因未查明」：这次没挂，
+**当时多半是臂栈开着**（`/compute_fk` 应答着，D 段会真的去解 UR5 的位姿），
+现在按脚本文档要求「在无臂栈里跑」就干净了。
+
+> ⚠️ 本地跑全套自检时有三个 `rc=1`，**都不是代码的问题**，记在这儿免得下次白查
+> （两种报错我各跑了一次，不是推的）：
+> `test_guard_path.py` / `test_pipeline_e2e.py` 要**两个** `source` ——
+> 一个都不 source：`ModuleNotFoundError: No module named 'rclpy'`；
+> 只 source `/opt/ros/humble`：`No module named 'grasp_planner'`（那是
+> `ros2_ws/install` 装的）；两个都 source 才过。
+> `test_minimal.py` 要 Conda 的 `yolo_ros` 环境（本机没有），与本轮改动无关。
+
 变异（`/tmp/mut2.sh` = 印完整失败块；`/tmp/mut3.sh` = 跑新套件）：
 
 | 变异 | 结果 | 被哪条杀掉 |
