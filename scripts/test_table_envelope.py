@@ -26,9 +26,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from table_safety_envelope import (                          # noqa: E402
-        BLOCKED, LEVEL_KEYS, NEAR, NOIK, REAL_BLOCK_HEIGHT, SAFE,
-        axis, classify_one, launch_const, num, render_map, row_limits,
-        z_levels)
+        BLOCKED, LEVEL_KEYS, NEAR, NOIK, PROJECT_ROOT, REAL_BLOCK_HEIGHT, SAFE,
+        SOLVABLE_OTHER, axis, classify_one, combine, launch_const, num,
+        render_map, row_limits, worst, z_levels)
 except ImportError as e:              # 没 source ROS 时 rclpy 拉不到
     print(f"环境不满足（{e}）—— 先 source /opt/ros/humble/setup.bash")
     sys.exit(2)
@@ -113,15 +113,35 @@ for label, zs, exp in cases:
 # D. worst：几层取最坏
 # ----------------------------------------------------------------------
 print("\n--- D. worst：一个格子跑四个高度，取最坏 ---")
-from table_safety_envelope import worst                         # noqa: E402
-
 for label, syms, exp in [
         ("撞桌赢过一切", [SAFE, NEAR, NOIK, BLOCKED], BLOCKED),
         ("撞桌赢过解不出", [NOIK, BLOCKED], BLOCKED),
-        ("解不出赢过近限/安全", [SAFE, NEAR, NOIK], NOIK),
+        ("解不出赢过种子问题", [SAFE, SOLVABLE_OTHER, NOIK], NOIK),
+        ("种子问题赢过近限/安全", [SAFE, NEAR, SOLVABLE_OTHER], SOLVABLE_OTHER),
         ("近限赢过安全", [SAFE, NEAR], NEAR),
         ("全安全还是安全", [SAFE, SAFE], SAFE)]:
     got = worst(syms)
+    check(label, got == exp, f"期望 {exp}，得到 {got}")
+
+
+# ----------------------------------------------------------------------
+# D2. combine：配的种子 + 换种子重试
+# ----------------------------------------------------------------------
+print("\n--- D2. combine：只有配的种子全解不出时才动重试 ---")
+for label, primary, retry, exp in [
+        # 配的种子能解 ⇒ 重试不参与（否则会把规划器真要走的解盖掉）
+        ("配的种子解得出来 ⇒ 忽略重试结果，哪怕它撞桌",
+         [SAFE], [BLOCKED], SAFE),
+        ("配的种子解不出、换种子撞桌 ⇒ **判撞桌**（对的保守侧：那个位置有分支会撞）",
+         [NOIK, NOIK], [NOIK, BLOCKED], BLOCKED),
+        ("配的种子解不出、换种子也解不出 ⇒ 够不到",
+         [NOIK], [NOIK], NOIK),
+        ("配的种子解不出、换种子解得出来且安全 ⇒ 种子问题",
+         [NOIK], [SAFE], SOLVABLE_OTHER),
+        ("配的种子解不出、换种子只是近限 ⇒ 仍然算种子问题（能解出来）",
+         [NOIK], [NEAR], SOLVABLE_OTHER),
+        ("没重试（None）⇒ 原样", [NOIK], None, NOIK)]:
+    got = combine(primary, retry)
     check(label, got == exp, f"期望 {exp}，得到 {got}")
 
 
@@ -193,6 +213,37 @@ if ttf_txt is not None:
     total = float(ttf_txt) + REAL_BLOCK_HEIGHT
     check("REAL_TOOL0_TO_FINGERTIP + REAL_BLOCK_HEIGHT = 0.2042（AG-95 闭合尺寸）",
           near(total, 0.2042, tol=1e-9), f"got {total!r}")
+
+
+# ----------------------------------------------------------------------
+# H. 「照着包线划区」要有地方写：几何键必须留在 planner_params_file 那一层
+# ----------------------------------------------------------------------
+# 包线给出的是**边界**，现场要把它落成一个区。落在哪儿？`pipeline.launch.py` 的
+# `planner_params = [<yaml 路径>, {覆盖项}]` —— 第二份 dict 里的键**赢过**现场
+# 传的 yaml，`tool0_to_fingertip` 这类后端属性就该在那儿（它随 camera_source 自动
+# 切）。而**几何区**（pick_zone / place_slots / place_z / table_plane_z / table_min_z）
+# 是现场实测值，必须留在地下那层，现场才能用
+#     planner_params_file:=<现场 yaml>
+# 覆盖它们而**不必去改仓库里那份共用的 yaml**（改了仿真一起变）。
+# ⇒ 这几条是**契约**：谁哪天把它们加进第二份 dict，现场唯一的覆盖口子就没了，
+#    而且是静默失效。这条测试就是钉住它。
+print("\n--- H. 现场覆盖口子：几何键不能进 planner_params 的第二份 dict ---")
+import re                                                       # noqa: E402
+
+with open(os.path.join(PROJECT_ROOT, "ros2_ws", "src", "yolo_bringup", "launch",
+                       "pipeline.launch.py"), encoding="utf-8") as f:
+    _src = f.read()
+_m = re.search(r"^(\s*)planner_params = \[(.*?)^\1\]", _src, re.S | re.M)
+check("读到了 planner_params 那个列表", _m is not None)
+_block = _m.group(2) if _m else ""
+check("planner_params_file 仍然是声明的 launch 参数（现场覆盖的入口）",
+      "'planner_params_file'" in _src and "DeclareLaunchArgument" in _src)
+check("sanity：解析到的确实是那个块（它里面**应该**有 tool0_to_fingertip）",
+      "'tool0_to_fingertip'" in _block)
+for key in ("pick_zone", "place_slots", "place_z", "table_plane_z", "table_min_z"):
+    check(f"{key} **不在**第二份 dict 里（现场 yaml 才盖得住）",
+          f"'{key}'" not in _block,
+          "它被 launch 覆盖了 ⇒ planner_params_file 里改它静默无效")
 
 
 print("\n通过 %d，失败 %d" % (N_PASS, N_FAIL))

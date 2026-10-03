@@ -40,12 +40,32 @@
 判读取**四个里最坏的那个**（一个格子只有在四个高度上都安全才算安全格）——
 因为规划器会把它们**全走一遍**。
 
+这张图**不**建模规划器的哪一步（读图前必看）
+-------------------------------------------
+包线量的是「**规划器配的那个种子**解出来的那个分支，连杆在台面之上吗」。
+它**没有**复刻 `planner_node._call_ik` 的后半段 —— 那一段是：解出来之后先过
+**肘高护栏**，不过才用「另一分支」的种子重解一次（重解的解**照样要过护栏**，
+D54）。所以：
+
+  · 图上 `X`（低于下限）**不等于**「规划器会把臂开到台面下」。它的意思是
+    **「这个位置不能依赖」**：护栏按对的台面高度判时，规划器会**拒掉**它
+    （或换分支解出另一个解），结果是**放弃这个目标**。
+  · 真正的风险恰恰是**护栏按错的台面高度判**：`table_plane_z` 现在还是仿真的
+    −0.39（`grasp_planner.yaml`，而且**没有 launch 覆盖口子**），于是护栏下限是
+    −0.37 —— 一个连杆高度 −0.055 的解**会一路放行**，而真机台面在 ≈ 0，
+    那是**台面以下 55 mm**。这张图就是拿真机台面重算的那个判据。
+  · 一个格子只有配的种子解不出、换种子才解得出时（`--retry-seed`），标 `s`：
+    那是**种子**问题不是够不到 —— `_call_ik` 在这种格子上**直接返回 None**
+    （跳过目标），所以它和 `x` 一样是「区别框到这儿」，只是原因不同、处置不同。
+
 用法（板端，先起无臂预检或任何一套带 /compute_ik 的 MoveIt）
     # 最省事：跟着无臂预检一起跑（那时几何与上电用的严格同源）
     python3 scripts/moveit_only_check.py --envelope-z 0.0
     # 或者对着已经在跑的图单独跑
     python3 scripts/table_safety_envelope.py --table-z 0.0
     python3 scripts/table_safety_envelope.py --table-z 0.0 --step 0.1 --json /tmp/env.json
+    # 分清「够不到」与「种子太偏」（推荐：后者的处置完全相反）
+    python3 scripts/table_safety_envelope.py --table-z 0.0 --retry-seed home
 
 退出码：0 = 图画出来了（有没有不安全格都算成功）；2 = 环境不满足
 （/compute_ik 或 /compute_fk 不在，或**一个位姿都没解出来** —— 那种情况下
@@ -96,12 +116,19 @@ LEVEL_LABEL = {
 # 图例。`worst()` 用这个序取最坏 —— **BLOCKED 赢过 NOIK**：一个格子在四个高度里
 # 只要有一个会把连杆压到台面下，那就是个危险的格子，与它另一个高度解不解得出来无关。
 SAFE, NEAR, NOIK, BLOCKED = ".", "~", "x", "X"
-_ORDER = {SAFE: 0, NEAR: 1, NOIK: 2, BLOCKED: 3}
+# `s` = 配的种子解不出、**换一个种子才解得出**。它单列一格，因为「够不到」与
+# 「种子太偏」要的处置完全不同：前者该缩区，后者该换种子（或至少知道规划器会在
+# 这一整片静默跳过、而 D54 那条「去种子重解」的补救恰恰会在这里翻出别的分支）。
+SOLVABLE_OTHER = "s"
+_ORDER = {SAFE: 0, NEAR: 1, SOLVABLE_OTHER: 2, NOIK: 3, BLOCKED: 4}
 
 
-def legend(near_band):
-    return (f"  {SAFE} 全安全   {NEAR} 安全但离下限 <{near_band:.2f} m（近限）   "
-            f"{NOIK} 解不出 IK（够不到）   {BLOCKED} **有连杆低于下限**（撞桌）")
+def legend(near_band, with_retry=False):
+    s = (f"  {SAFE} 全安全   {NEAR} 安全但离下限 <{near_band:.2f} m（近限）   "
+         f"{NOIK} 配的种子解不出（够不到）   {BLOCKED} **有连杆低于下限**（撞桌）")
+    if with_retry:
+        s += f"   {SOLVABLE_OTHER} 换个种子才解得出（**种子问题**，不是够不到）"
+    return s
 
 
 def launch_const(name):
@@ -159,6 +186,29 @@ def classify_one(zs, floor, near_band):
 def worst(syms):
     """把同一个格子在几个高度上的判读合成一个：取最坏（`_ORDER` 里最大的）。"""
     return max(syms, key=lambda s: _ORDER[s])
+
+
+def combine(primary_syms, retry_syms):
+    """配的种子 + 换种子重试 ⇒ 一个符号。
+
+    ⚠️ 顺序是**安全优先**，不是「谁先谁赢」：
+      · 配的种子能解 ⇒ 就用它的判读（换种子只在解不出时才试）；
+      · 配的种子全都解不出、换种子解出一个**撞桌**的解 ⇒ 判 **BLOCKED**。
+        看着保守，但这是对的那一侧：规划器确实有一条 `_call_ik` 失败后**换种子
+        重解**的补救路径（D54 那条「去种子重解」），而那条路径恰好会翻出别的
+        分支。一个「换个种子就撞桌」的位置，得当成危险位置记，不能记成「够不到」。
+      · 换种子也解不出 ⇒ NOIK（够不到）；
+      · 换种子解得出来且不撞桌 ⇒ SOLVABLE_OTHER（**种子问题**）。
+    """
+    w = worst(primary_syms)
+    if w != NOIK or retry_syms is None:
+        return w
+    rw = worst(retry_syms)
+    if rw == BLOCKED:
+        return BLOCKED
+    if rw == NOIK:
+        return NOIK
+    return SOLVABLE_OTHER
 
 
 def render_map(cells, xs, ys):
@@ -235,6 +285,14 @@ def main():
     ap.add_argument("--step", type=float, default=0.05, help="网格步长（m）")
     ap.add_argument("--near-band", type=float, default=0.05,
                     help="离下限多近算「近限」（m，默认 0.05）")
+    ap.add_argument("--retry-seed", default=None,
+                    help="**把「够不到」和「种子太偏」分开**：配的种子（节点参数 "
+                         "ik_seed）解不出来的格子，再用这个种子试一次。"
+                         "`home` = 用节点参数的 home_joints，或直接给 6 个数"
+                         "（逗号分隔）。不给就不重试。"
+                         "⚠️ 现象上这两类都是「解不出」，但够不到要**缩区**、"
+                         "种子偏要**换种子** —— 而 D54 那条「去种子重解」的补救"
+                         "恰恰会在后者里翻出别的分支（可能撞桌）。")
     ap.add_argument("--ik-group", default=None,
                     help="覆盖规划组名。**没有 /grasp_planner 可读参数时必须给** "
                          "（兜底默认是仿真的 ur5_manipulator，真机是 ur_manipulator，"
@@ -253,6 +311,21 @@ def main():
     if args.map != "worst" and args.map not in keys:
         print(f"!! --map 只认 worst 或 {keys}")
         return 2
+
+    retry_seed = None
+    if args.retry_seed:
+        if args.retry_seed.strip() == "home":
+            retry_seed = "home"        # 真正的值要等读到节点参数才知道，见下
+        else:
+            try:
+                retry_seed = [float(v) for v in args.retry_seed.split(",")]
+            except ValueError:
+                print(f"!! --retry-seed 要么是 home，要么是 6 个逗号分隔的数，"
+                      f"收到 {args.retry_seed!r}")
+                return 2
+            if len(retry_seed) != 6:
+                print(f"!! --retry-seed 要 6 个数，收到 {len(retry_seed)} 个")
+                return 2
 
     rclpy.init()
     pr = Probe(args.node, ik_group=args.ik_group)
@@ -323,6 +396,13 @@ def main():
         print(f"  护栏连杆          {links}（← 节点参数）")
         print(f"  规划组 {p['ik_group']} / 末端 {p['ik_link']} / 系 {p['base_frame']}"
               f"（← 节点参数{'，被 --ik-group 覆盖' if args.ik_group else ''}）")
+        print(f"  IK 种子           {[round(v, 3) for v in p['ik_seed']]}（← 节点参数）")
+        if retry_seed == "home":
+            retry_seed = list(p["home_joints"])
+        if retry_seed is not None:
+            print(f"  重试种子          {[round(v, 3) for v in retry_seed]}"
+                  f"（← 命令行 --retry-seed"
+                  f"{'，取节点的 home_joints' if args.retry_seed.strip() == 'home' else ''}）")
 
         # 节点参数与本次用的真机值不同 ⇒ 大声说出来。分叉不出声正是第八十三轮
         # 修掉的那类病（同一张图两套几何）。
@@ -344,12 +424,13 @@ def main():
         ys = axis(args.y_min, args.y_max, args.step)
         print(f"\n扫描 x∈[{xs[0]:.3f},{xs[-1]:.3f}] × y∈[{ys[0]:+.3f},{ys[-1]:+.3f}]"
               f"，实际 {len(xs)}×{len(ys)}={len(xs)*len(ys)} 格 × {len(keys)} 个高度")
-        print(legend(args.near_band))
+        print(legend(args.near_band, with_retry=retry_seed is not None))
         print("=" * 78)
 
         cells, per_level = {}, {k: {} for k in keys}
         counts = {k: {} for k in keys}
         reasons, fk_fail = {}, 0
+        retry_hits = {}                 # 重试后各判读的格数（只有 --retry-seed 时有）
         worst_z, worst_where = None, None
         t0 = time.monotonic()
         for j, y in enumerate(ys):
@@ -371,6 +452,20 @@ def main():
                         per_level[k][(x, y)] = classify_one(h, floor, args.near_band)
                     syms.append(per_level[k][(x, y)])
                 s = worst(syms)
+                # 配的种子全解不出时才动重试种子 —— 只在**失败**上加信息，
+                # 不去覆盖「配的种子能解」的那些格子（那才是规划器会走的解）。
+                if retry_seed is not None and s == NOIK:
+                    rsyms = []
+                    for k in keys:
+                        arm, why = pr.solve_ik(p, x, y, levels[k], retry_seed,
+                                               grips[k])
+                        if arm is None:
+                            rsyms.append(NOIK)
+                        else:
+                            rsyms.append(classify_one(pr.fk_heights(p, arm, links),
+                                                      floor, args.near_band))
+                    s = combine(syms, rsyms)
+                    retry_hits[s] = retry_hits.get(s, 0) + 1
                 cells[(x, y)] = s
                 for k in keys:
                     c = counts[k]
@@ -401,9 +496,11 @@ def main():
         n = len(cells)
         blocks = [(x, y) for (x, y), s in cells.items() if s == BLOCKED]
         noiks = [(x, y) for (x, y), s in cells.items() if s == NOIK]
+        seeds_only = [(x, y) for (x, y), s in cells.items() if s == SOLVABLE_OTHER]
         print(f"汇总（{n} 格）：安全 {sum(1 for s in cells.values() if s == SAFE)}"
               f" / 近限 {sum(1 for s in cells.values() if s == NEAR)}"
-              f" / 解不出 {len(noiks)} / **低于下限 {len(blocks)}**")
+              f" / 解不出 {len(noiks)} / **低于下限 {len(blocks)}**"
+              + (f" / 换种子才可解 {len(seeds_only)}" if retry_seed is not None else ""))
         if blocks:
             bx = [x for x, _ in blocks]
             by = [y for _, y in blocks]
@@ -416,10 +513,29 @@ def main():
         if noiks:
             nx = [x for x, _ in noiks]
             ny = [y for _, y in noiks]
-            print(f"  · 够不到（NO_IK_SOLUTION 之类）：{len(noiks)} 格，"
+            print(f"  · 够不到（两种种子都解不出）：{len(noiks)} 格，"
                   f"x∈[{min(nx):.2f},{max(nx):.2f}] y∈[{min(ny):+.2f},{max(ny):+.2f}]")
             print(f"    ⇒ 这一类**不是**新风险（仿真里同样够不到），只是说明"
                   f"区框到这儿就白框了。")
+        if retry_seed is not None:
+            print(f"  · 重试种子（{[round(v, 3) for v in retry_seed]}）的命中："
+                  + "、".join(f"{k}={v}" for k, v in sorted(retry_hits.items()))
+                  + "（都是配的种子解不出、才动重试的那些格子）")
+        if seeds_only:
+            sx = [x for x, _ in seeds_only]
+            sy = [y for _, y in seeds_only]
+            print(f"  ⚠️ **种子问题** {len(seeds_only)} 格：x∈[{min(sx):.2f},{max(sx):.2f}]"
+                  f" y∈[{min(sy):+.2f},{max(sy):+.2f}]")
+            print(f"     这些格子**够得到**（换 `home_joints` 当种子就解出来了），"
+                  f"只是配的 `ik_seed` 解不出。两种处置，**别搞混**：")
+            print(f"       · 想抓它们 ⇒ 改 `ik_seed`（它现在是仿真窄带 y∈"
+                  f"{{-0.12,0,+0.12}} 调出来的，偏在一侧）；")
+            print(f"       · 不改种子 ⇒ 规划器会在这一整片**静默跳过**"
+                  f"（只打一条 IK 失败日志），区框到这儿等于白框。")
+            print(f"     ⚠️ 说准一件事：`_call_ik` 现在**没有**「解不出来就换种子重解」"
+                  f"这一步（那条 `shoulder_pan > 1.40` 的判据已删，D54）—— "
+                  f"换种子重解只在**解出来之后、肘高护栏不过**时才发生，"
+                  f"所以这些格子规划器就是解不出 ⇒ **跳过该目标**（只打一条日志）。")
         if fk_fail:
             print(f"  ⚠️ /compute_fk 有 {fk_fail} 次没回话 —— 那些格子按「解不出」"
                   f"计数，被算进了上面那一类，别当成几何结论。")
@@ -460,6 +576,9 @@ def main():
                     "base_frame": p["base_frame"],
                     "levels": {k: levels[k] for k in keys},
                     "grips": {k: grips[k] for k in keys},
+                    "ik_seed": list(p["ik_seed"]),
+                    "retry_seed": retry_seed,
+                    "retry_hits": retry_hits,
                     "xs": xs, "ys": ys,
                     "cells": {f"{x:.4f},{y:.4f}": cells[(x, y)] for x, y in cells},
                     "per_level": {k: {f"{x:.4f},{y:.4f}": per_level[k][(x, y)]

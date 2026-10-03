@@ -235,6 +235,9 @@ def main():
                     help="包线的 x_min,x_max,y_min,y_max（默认 0.15,0.95,-0.50,0.50）")
     ap.add_argument("--envelope-levels", default="grasp,place",
                     help="包线扫哪些高度（grasp / place / grasp,place）")
+    ap.add_argument("--envelope-retry-seed", default=None,
+                    help="包线的重试种子（home 或 6 个数）：把「够不到」与"
+                         "「种子太偏」分开。不给就不重试。")
     ap.add_argument("--envelope-json", default=None,
                     help="把包线的网格转储到这个路径（留证用）")
     args = ap.parse_args()
@@ -377,6 +380,8 @@ def main():
                        "--y-min", str(b[2]), "--y-max", str(b[3])]
             if args.no_pipeline:
                 env_cmd += ["--ik-group", "ur_manipulator"]
+            if args.envelope_retry_seed:
+                env_cmd += ["--retry-seed", args.envelope_retry_seed]
             if args.envelope_json:
                 env_cmd += ["--json", args.envelope_json]
             print("\n>>> 5b) 桌面安全包线（台面 z = %+.4f）" % args.envelope_z)
