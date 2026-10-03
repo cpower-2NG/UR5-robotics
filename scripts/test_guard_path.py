@@ -24,6 +24,12 @@
 中间低，正是真实机械臂会发生的俯冲的形状（真实 FK 也是非线性的）。
 它不假装自己是 UR5，它只提供「已知答案的几何」来检采样逻辑。
 
+⚠️ 这个自检起的是**一个真的 `GraspPlanner` 实例**，而它自带一个 2 秒的
+「先开爪、再回 HOME」定时器 —— 也就是说**控制器在的时候它会指挥真机回 HOME**。
+板上实测过（无臂栈里，日志见 `main()` 里那段注释）。所以 `main()` 在起完节点后
+**立刻 cancel 那个定时器**，并把 `targets_topic` 指到一个没人发的话题；
+停不掉就**中止**，不发任何一条轨迹。**要把本自检对着真机跑之前，先看那段注释。**
+
 用法
 ----
     source /opt/ros/humble/setup.bash
@@ -428,13 +434,46 @@ def main():
 
     # 起一个**真的** GraspPlanner（`gripper_backend:=none`，不碰硬件）。
     # A/D 两段共用这一个实例 —— rclpy 在一个进程里 init 两次不可靠。
+    #
+    # `targets_topic` 指到一个**没人发**的话题：这个实例订阅的是真话题的话，
+    # 场上有感知在跑时它会真的去规划并执行抓取。
     rclpy.init(args=["--ros-args",
                      "-p", "gripper_backend:=none",
-                     "-p", "carry_objects:=false"])
+                     "-p", "carry_objects:=false",
+                     "-p", "targets_topic:=/precheck_guard_path_no_targets"])
     node = GraspPlanner()
     real_fk = node._call_fk          # A 段会打桩，D 段要用回真的
     # D 段拿它当「原装值」，用来断言前面的段没把状态漏过来（见 part_d 的说明）
     pristine_guard_links = list(node.guard_links)
+
+    # ⚠️⚠️ **这个实例必须一条轨迹都发不出去。**
+    #
+    # `GraspPlanner.__init__` 里有一个 2 秒的定时器，到点就走「先张开夹爪、
+    # 再回 HOME」——而 `_send_arm_trajectory` 只要求轨迹 action 服务在
+    # （`wait_for_server(5s)`），**不问它后面是不是仿真**。板上实测
+    # （2026-10-03，在无臂栈里跑本自检）：
+    #
+    #     [INFO]  初始化：先张开夹爪，再回 HOME ...
+    #     [INFO]  夹爪后端 none（未配置夹爪硬件）：跳过「张开」——不发任何夹爪指令
+    #     [ERROR] 轨迹 action 服务不可用（控制器起了吗？）
+    #     [ERROR] 初始 HOME失败：goal_status=<未知 None> error_code=None
+    #
+    # 少了控制器只是「发失败」；**控制器在的时候它就会真的动** —— 也就是说
+    # 一个开头就写明「不需要仿真器、不需要 MoveIt、不需要真机」的几何预检，
+    # 会指挥真机回 HOME。这不是假想：上面那几行就是它的日志。
+    #
+    # 执行器还没转（spin 线程在下面才起），所以这里 cancel 是确定性的。
+    # 拿不到就**直接中止** —— 宁可不跑预检，也不发一条真轨迹。
+    home_timer = getattr(node, "_home_timer", None)
+    if home_timer is None:
+        print("\n✗ 停不掉「初始回 HOME」定时器（planner_node 的内部结构变了？）\n"
+              "  —— 本次预检可能发出真实的 HOME 轨迹，已中止。\n"
+              "  请先确认控制器状态，再决定要不要继续。")
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        return 1
+    home_timer.cancel()
 
     # ⚠️ 必须**转**这个节点。`_call_fk` 是「投出去 → 用 threading.Event().wait()
     # 阻塞等 future」的写法，它自己**不转执行器**，靠的是**别处**在 spin
