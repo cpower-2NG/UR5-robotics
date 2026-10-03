@@ -31,10 +31,11 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from table_safety_envelope import (                          # noqa: E402
-        BLOCKED, LEVEL_KEYS, NEAR, NOIK, PROJECT_ROOT, REAL_BLOCK_HEIGHT, SAFE,
-        SOLVABLE_OTHER, axis, cell_key, classify_one, combine, json_axis,
-        launch_const, max_rect, node_guard_note, num, pick_zone_z,
-        pick_zone_z_note, render_map, row_runs, worst, z_levels, PICK_Z_PAD)
+        BLOCKED, LEVEL_KEYS, NEAR, NOIK, PROJECT_ROOT, REAL_BLOCK_HEIGHT,
+        REPEATABILITY_CAVEAT, SAFE, SOLVABLE_OTHER, axis, cell_key, classify_one,
+        combine, json_axis, launch_const, max_rect, node_guard_note, num,
+        pick_zone_z, pick_zone_z_note, render_map, row_runs, worst, z_levels,
+        PICK_Z_PAD)
 except ImportError as e:              # 没 source ROS 时 rclpy 拉不到
     print(f"环境不满足（{e}）—— 先 source /opt/ros/humble/setup.bash")
     sys.exit(2)
@@ -381,8 +382,13 @@ check("z 已经对了 ⇒ 不说话（不制造常亮的假警告）",
       pick_zone_z_note([0.40, 0.75, -0.45, 0.45, 0.005, 0.05], ZTOP, ZMIN, ZMAX) is None)
 check("顶面正好落在边界上 ⇒ 也算收得到（与 `in_zone` 的闭区间同口径）",
       pick_zone_z_note([0.40, 0.75, -0.45, 0.45, ZTOP, 0.05], ZTOP, ZMIN, ZMAX) is None)
+# ⚠️ 这一条**也要** calls() 包着，理由与下面那条同族、而且是**实测**出来的：
+# 「去掉守卫」这个变异第一次跑时，红的就是这里 —— `None[4]` 抛 TypeError，
+# 脚本当场中断，**F3 之后的检查一条都没跑**（第八十七轮）。也就是说
+# 「`None` 这一支」和「长度这一支」是守卫里的**两个半支**，各要一条自己的断言。
 check("节点没读到 pick_zone ⇒ None（不拿 None 参与比较）",
-      pick_zone_z_note(None, ZTOP, ZMIN, ZMAX) is None)
+      calls(lambda: pick_zone_z_note(None, ZTOP, ZMIN, ZMAX)) == ("ok", None),
+      f"got {calls(lambda: pick_zone_z_note(None, ZTOP, ZMIN, ZMAX))!r}")
 # ⚠️ 这一条**必须**用 calls() 包着：直接写 `... is None`，一旦守卫被去掉就是
 # `IndexError` 从 check() 的实参里抛出来 —— 变异照样能杀掉（套件不会报「通过」），
 # 但整个脚本会**当场中断**，后面所有检查一条都不跑，红的是「崩了」不是「哪条错」。
@@ -391,6 +397,18 @@ check("pick_zone 长度不对 ⇒ None（不是 IndexError）",
       calls(lambda: pick_zone_z_note([0.30, 0.90, -0.18, 0.16],
                                      ZTOP, ZMIN, ZMAX)) == ("ok", None),
       f"got {calls(lambda: pick_zone_z_note([0.30, 0.90, -0.18, 0.16], ZTOP, ZMIN, ZMAX))!r}")
+
+# 可复现性判词：**实测**出来的那件事（第八十七轮）。
+# 印在「照抄的那几行」旁边，所以它必须三样齐全：带**数**、给**读法**、点**病根**。
+# 只写「可能不可复现」是一句谁都不会照做的空话 —— 与上面 pick_zone_z_note 的
+# 「带了改成的数」是同一条要求。
+check("★ 判词带**实测**的数（19/357），不是「可能不稳定」这种空话",
+      "19/357" in REPEATABILITY_CAVEAT, f"got {REPEATABILITY_CAVEAT!r}")
+check("★ 判词给**可执行的读法**：留一格 0.05 m",
+      "0.05" in REPEATABILITY_CAVEAT and "一格" in REPEATABILITY_CAVEAT)
+check("判词点**病根**（attempts / consistency_limits / 真机组名）—— 现场要能去查",
+      all(s in REPEATABILITY_CAVEAT for s in ("attempts", "consistency_limits",
+                                              "ur_manipulator")))
 
 
 

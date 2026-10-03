@@ -401,6 +401,29 @@ def pick_zone_z(table_z, block_h, pad=PICK_Z_PAD):
     return (max(ztop - pad, table_z), ztop + pad, ztop)
 
 
+# ⚠️ 逐格分类**不可复现** —— 这一条不是通用告诫，是**实测**（第八十七轮）：
+# 同一份代码、**同一个 move_group 进程**、同样的命令行，两次全扫有
+# **19 / 357 格（5.3%）**判读不同（`x=0.30` 那列 10 格 ↔ 8 格、`x=0.35` 那列
+# 4 格 ↔ 6 格，有格子从「撞桌」翻成「安全」，也有反过来的）。
+#
+# 病根在**解算器**那头，不在本脚本：真机那个规划组（`ur_manipulator`）的 KDL
+# 仍是 `kinematics_solver_attempts: 3`、且**没有** `consistency_limits`
+# （`/opt/ros/humble/share/ur_moveit_config/config/kinematics.yaml`）—— 解与种子
+# 不一致时会**用随机种子重解**，同一个位姿问两次可能返回**不同的肘分支**，
+# 而肘高正是本判据。仿真那份 `ur5_manipulator` 早就把这两项钉死了（D54，
+# `arm_grasp_sim/config/kinematics.yaml` 的注释写着「KDL 的随机重启是**不可复现**
+# 的来源」），**真机这份没打上**。
+#
+# ⇒ 读法：**离边界至少留一格（0.05 m）**。所以下面给的是**矩形**而不是段表 ——
+# 矩形那条「x≥0.40」的边，两次全扫都成立。
+REPEATABILITY_CAVEAT = (
+    "  ⚠️ 逐格分类**不可复现**：同一份代码、同一个 move_group，两次全扫有\n"
+    "     19/357 格（5.3%）判读不同（真机组 `ur_manipulator` 的 KDL 仍是\n"
+    "     `attempts: 3` 且无 `consistency_limits` ⇒ 随机重启会翻肘分支）。\n"
+    "     ⇒ **离边界至少留一格（0.05 m）**；上面那块矩形的边两次都成立。"
+)
+
+
 def pick_zone_z_note(node_pick_zone, ztop, zmin, zmax):
     """把「现行 `pick_zone` 的 z」与刚算出来的那一带当面比一次；没问题返回 `None`。
 
@@ -788,6 +811,9 @@ def main():
             note_z = pick_zone_z_note(p.get("pick_zone"), ztop, zmin, zmax)
             if note_z:
                 print(note_z)
+            # 照抄之前先说清这张图的**精度** —— 就印在要抄的那几行旁边，
+            # 不放到末尾的「提醒」里去（那儿没人看）。
+            print(REPEATABILITY_CAVEAT)
         else:
             print("  ⚠️ 没有一块**全安全**的矩形 —— 要么缩范围，要么按下面的"
                   "「含近限」那块用，但要知道它贴着下限。")
