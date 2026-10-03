@@ -13046,3 +13046,49 @@ place_approach 17 个解（折回后 7 个位形）
 `0x0100` 读回恒 0，不再当判据）；`ag95_init_close.py` 的等待改成**轮询 `0x0200` 变 1**
 （原来等 `0x0202` 停稳，而初始化前半程它一直是 0 —— 今天就是这么误报
 「没走到 1000」的）。自检 probe 40 / gripper 64 / init_close 13 全绿，闸门 3 个变异全杀。
+
+### 八、真机链路打通（2026-10-03 晚）—— **到此为止都没发过一条轨迹**
+
+用户先按了播放，弹窗「连接被拒绝」，问是不是板子有问题。**不是。**
+
+**原因就是次序**：External Control 是**机器人主动连出来**到 `<URCap 里填的 Host IP>:50002`，
+而**驱动必须先在那边听着**。我前面收尾时把栈全停了 ⇒ 50002 无人监听 ⇒ 机器人
+一连就被 RST。佐证：「被拒绝」而不是「超时」⇒ 地址通、只是没人接
+（台账 §丙-3 早先为这个专门排过防火墙，结论是**板上 ufw 没在过滤**）。
+
+⇒ 按台账里早就写好的次序重来：**先起驱动，再播放**。
+
+```
+$ ss -lntp | grep 5000            # 起驱动之后
+LISTEN 0.0.0.0:50001/50002/50003/50004   users:(("ur_ros2_control",pid=97471,…))
+```
+
+播放后驱动日志：
+
+```
+[UR_Client_Library:]: Robot requested program
+[UR_Client_Library:]: Sent program to robot
+[UR_Client_Library:]: Robot connected to reverse interface. Ready to receive control commands.
+```
+
+**逐项核对过（全只读）**：
+
+| 项 | 结果 |
+|---|---|
+| `scaled_joint_trajectory_controller` | **active**；`joint_trajectory_controller` inactive（两者只能活一个） |
+| 规划器要发的 action | `/scaled_joint_trajectory_controller/follow_joint_trajectory` 在 —— 正是 `REAL_TRAJECTORY_ACTION` |
+| `/compute_ik` / `/compute_fk` | 都在 |
+| `/joint_states` | 真实关节角，velocity 0.0（静止） |
+| 驱动 | `Calibration checked successfully`（**标定那条告警确实没了**）· reverse interface 已连 |
+| 机器人 | `robotmode: RUNNING` · `safetystatus: NORMAL` · `programState: **PLAYING** ur5ros.urp` |
+
+⚠️ **两条工具上的坑，这次又踩到了，记下来免得下次怀疑链路**：
+
+- `ros2 action list --no-daemon` 一开始返回**空**，看着像「action server 不存在」。
+  不带 `--no-daemon`、给足时间就都出来了 —— **是 CLI 的发现慢，不是链路断了**。
+  （与台账里「daemon 会卡死」是同一个东西的两面：快慢都不该当成链路判据。）
+- 板上**没装 `ros2controlcli`**（`ros2 control` 这个子命令不存在）。查控制器状态
+  要用 `ros2 service call /controller_manager/list_controllers`。
+
+**现在的状态**：臂已交到驱动的控制回路里、保持当前位姿，**但一条轨迹都没发过**。
+下一步（真运动）需要单独授权。
