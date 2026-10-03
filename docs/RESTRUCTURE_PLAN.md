@@ -11361,3 +11361,224 @@ from the robot and pass that into the description.
   **没有碰 30001/30002/30003/30004 的手搓包、没有发任何轨迹、没有写任何寄存器。**
 - **臂全程未动**（第二节的量化对比 + 机理）。
 - 未改板上任何文件；未动 `main`；未推送任何外部远端。
+
+---
+
+## 第八十二轮：**标定落地** —— 「URDF 对不上」是什么、差多少、以及为什么半修等于没修（2026-10-03）
+
+用户这一轮的指令只有一句：**「先去做好标定。URDF对不上是什么情况，这应该比较致命」**。
+第七十八轮的 ERROR、第八十一轮的只读接入都停在这条账上，本轮把它做完。
+
+### 一、这条 ERROR 在说什么（机制，逐段实读）
+
+```
+[URPositionHardwareInterface]: Calibration checksum: 'calib_209549117540498681'.
+The calibration parameters of the connected robot don't match the ones from the given
+kinematics config file. ... critical inaccuracies of tcp positions.
+```
+
+链路（每一节都在板上读过原文，不是推断）：
+
+```
+ur_description/urdf/ur.urdf.xacro:15   kinematics_params 默认 →
+                                       config/<ur_type>/default_kinematics.yaml
+   ↓  inc/ur_common.xacro:241   kinematics_hash = sec_kinematics['hash']
+   ↓  urdf/ur_macro.xacro:126   传给 ur_robot 宏
+   ↓  urdf/ur.ros2_control.xacro:60   <param name="kinematics/hash">
+   ↓  ur_robot_driver hardware_interface.cpp:644  读参数
+   ↓                              :800  打印（**打的是 URDF 的**）
+   ↓                              :804  checkCalibration() 与
+                                        PrimaryClient::checkCalibration 从机器人
+                                        读来的 KinematicsInfo::toHash() 比字符串
+```
+
+⇒ 「对不上」= **URDF 用 UR5 的标称 DH，机器人用出厂实测 DH**。
+
+**一条容易读反的细节**：那行 `Calibration checksum` 是 **URDF 的**，不是机器人的。
+`:800` 打印的是刚从参数里读到的 `kinematics_hash`；`:804` 才拿去和机器人比。
+所以它不是「机器人的标定变了」，而是「我们这边的模型是标称的」。
+（本轮之前我一度按相反的方向理解，实读两行后才摆正。）
+
+### 二、它到底差多少 —— 从「有偏差」到「3.59 mm」
+
+第七十八轮写的是「量级通常是零点几毫米到一两毫米（要实测，别猜）」。
+本轮把它实测了（`scripts/ur_calibration_delta.py`，**纯 Python + numpy，不连机器人**）：
+
+做法是**同一份 xacro 只换 `kinematics_params` 那一份 yaml**，生成两份 URDF，
+在同一组随机关节角下各做一次 FK，比 `tool0`。3000 组 ±180° 均匀采样：
+
+| 量 | 均值 | 中位 | p95 | **最大** |
+|---|---|---|---|---|
+| `tool0` 位置偏差 | 1.6161 mm | 1.5643 mm | 2.9649 mm | **3.5945 mm** |
+| `tool0` 姿态偏差 | 0.1894° | 0.1934° | 0.3137° | **0.3923°** |
+
+逐关节 origin 的差（标定 − 标称，只列非零的）：
+
+| 关节 | Δx[mm] | Δy[mm] | Δz[mm] | 最大角差 |
+|---|---|---|---|---|
+| `shoulder_pan_joint` | 0 | 0 | +0.1555 | 0.0089° |
+| `shoulder_lift_joint` | +0.0805 | 0 | 0 | 0.0046° |
+| `elbow_joint` | −0.2179 | 0 | 0 | 0.0125° |
+| `wrist_1_joint` | +0.0500 | −0.2165 | **+1.4200** | 0.0814° |
+| `wrist_2_joint` | +0.1212 | −0.1432 | +0.0572 | 0.0069° |
+| `wrist_3_joint` | −0.0215 | +0.0592 | +0.0822 | 0.0047° |
+
+**判据用「最大」不用均值**：位置偏差是各连杆长度误差的矢量和，随关节角变化，
+工作区边缘最大。
+
+自检（用来确认解析器没搭错、不作判据）：标称模型在 q=0 时 `tool0` =
+`[0.8173, 0.1914, −0.0055] m`，即 UR5 的公开 home TCP 值 ✅。
+存档：`docs/calib/ur5_calibration_delta.json`。
+
+**判决：不致命，但必须修。** 驱动打完这条 ERROR **继续正常工作**（第八十一轮日志里紧接着
+就是 `System successfully started!`）；它不是安全/碰撞问题，是精度偏差。
+但 `tool0` 往下的一切（IK 目标、抓取高度、手眼投影）都带着这 1.6~3.6 mm。
+
+### 三、为什么**半修等于没修**（这是本轮的判据，决定了做法）
+
+驱动和 move_group **各拿一份 `robot_description`**。三种组合：
+
+| 驱动侧 | MoveIt 侧 | 末端实际偏差 |
+|---|---|---|
+| 标称 | 标称 | δ（IK 按标称解，真机按标称的逆解去动） |
+| **标定** | 标称 | **δ**（TF 准了，但 IK 还是按标称解） |
+| 标定 | 标定 | **≈0** |
+
+第二行是关键：**只把驱动换成标定，精度一点没改善**，只是那条 ERROR 消失了。
+所以这不是「驱动侧加个参数就行」，而是**必须让两个 launch 用同一份描述** ——
+这正是 `real.launch.py` 的 `_moveit` 注释里那条警告（「两份 description 不一致时，
+move_group 的 FK/IK 与驱动实际发布的 TF 是**两套几何**」）在说的事。
+
+### 四、把标定抓出来：官方工具是坏的
+
+**`ur_calibration` 2.14.0（板上装的）和 2.15.0（已发布的最新）都跑不起来。**
+
+`run()` 调了 `pipeline.run()` 却**漏了 `pipeline.init()`**，而
+`URProducer::setupProducer()`（唯一调用 `stream_.connect()` 的地方）**只被
+`Pipeline::init()` 调用**（`producer.h:154-165`、`pipeline.h:352`；两个构造函数
+`:305`/`:325` 都不调它）。⇒ stream 永远没连上，生产者线程无限刷
+`Stream is invalid. Connect it before trying to read!`，退避 2/4/8/16/32/64 s，工具永不退出。
+
+上游 `humble` 分支 HEAD 已修（同一行，还带了注释说明），**但没有任何已发布版本包含它** ——
+`apt-cache policy` 里 candidate 就是 2.14.0，**`apt upgrade` 拿不到**。
+
+修法：板上 `~/ur_calib_ws` 是 tag `2.15.0` 的检出 + 那一行补丁，`colcon build
+--packages-select ur_calibration`（30.7 s）得到能用的 `calibration_correction`。
+
+**另一个坑**：它的接口是 **ROS 参数**，不是命令行旗标。
+第七十八轮文档里写的 `--robot_ip` / `--output_path` **是错的**，实参是：
+
+```bash
+ros2 run ur_calibration calibration_correction --ros-args \
+    -p robot_ip:=<ur-controller-ip> -p target_filename:=/tmp/ur5_calibration.yaml
+```
+
+**误判并更正过一次**：抓回来的原始日志里 `dh_d` 是
+`[0.0893, 64.2024, -29.7635, -34.3286, 0.0948, 0.0824]`，64.2 / −29.76 / −34.33
+看着像乱码，我一度怀疑抓错了。**不对** —— 那是**原始 DH**，工具的
+`Calibration::correctChain()` 会把它转成 URDF 约定下的连杆变换，才是 yaml 里那份；
+yaml 里所有连杆偏差 ≤1.42 mm、角度 ≤0.14°，是合理的出厂量级。
+**教训与第八十轮同源：先看产物，别拿中间形态下结论。**
+
+### 五、做法：`yolo_ur_description`（一个覆盖包，仓库里不存上游副本）
+
+新增 `ros2_ws/src/yolo_ur_description/`：
+
+```
+urdf/ur.urdf.xacro          ← 构建期从已安装的 ur_description 镜像
+config/                     ← 同上，但 PATTERN "default_kinematics.yaml" EXCLUDE
+config/ur5/default_kinematics.yaml   ← 本包唯一自有的内容：出厂标定（1003 B）
+```
+
+**为什么不把上游文件拷进仓库**：拷副本就会「上游升级、副本悄悄过期」，而这里镜像的
+每个文件都**必须与上游逐字节相同** —— 两份 description 差一个字节就是第三节那张表的
+第二行（两套几何，且两边都不报错）。构建期镜像 ⇒ 永远跟着板上装的 `ur_description` 走。
+
+**为什么镜像得住**：被复制过去的 `ur.urdf.xacro` 内部所有 `xacro:include` 都是
+`$(find ur_description)/…` 的绝对形式（`:6`、`ur_macro.xacro:53,54,112`），
+所以它照样引用真正的 `ur_description`，这份副本本身很薄。
+
+**接线**（上游两个 launch 都有 `description_package` 参数，且在各自文件里分别决定
+xacro 的全部输入路径，所以一个参数就能同时钉住两边）：
+
+| 文件 | 事实 |
+|---|---|
+| `ur_robot_driver/launch/ur_control.launch.py` | `description_package` 决定 `:97,100,103`（三份 config）与 `:119`（xacro）；`kinematics_params_file` 的**默认值**就是 `<description_package>/config/<ur_type>/default_kinematics.yaml`（`:529-537`）⇒ 不必单独传 |
+| `ur_moveit_config/launch/ur_moveit.launch.py` | `description_package` 决定 `:71,74,77,80,87`；**没有**任何 kinematics 参数，这是唯一入口。SRDF（`:139`）、`kinematics.yaml`（`:159`）、rviz（`:236`）都来自 `moveit_config_package`，不受影响 |
+
+⇒ `real.launch.py` 里加一个模块常量 `DESCRIPTION_PACKAGE = "yolo_ur_description"`，
+`_driver` 与 `_moveit` **两处引用同一个常量**（`:210`、`:256`），结构上不可能再分叉。
+`yolo_bringup/package.xml` 补 `exec_depend`（仿真路径用不到它）。
+
+### 六、不用机器人就验完的两条（都通过）
+
+**(a) 驱动侧**：用两个包各生成一份 description，比 `kinematics/hash`：
+
+```
+/tmp/desc_new.urdf  (yolo_ur_description)  kinematics/hash">calib_2353869974907916917
+/tmp/desc_old.urdf  (ur_description 原版)   kinematics/hash">calib_209549117540498681
+```
+
+第二行**正好复现了第八十一轮 ERROR 里那个 checksum** ⇒ 整条链闭合：换包能把那个值换掉。
+
+为什么换成 `calib_2353869974907916917` 就一定会通过 —— **上下文里读到的，不是猜的**
+（`ur_calibration/src/calibration_consumer.cpp`）：
+
+```cpp
+calibration_parameters_["kinematics"]["hash"] = kin_info->toHash();
+```
+
+yaml 里那个 `hash` 就是机器人实时的 `KinematicsInfo::toHash()`，
+**正是驱动 `checkCalibration()` 拿来比的那一个**。所以 URDF 取到它 ⇒ 相等。
+
+顺带一条镜像保真度检查：两份 description 逐行 `diff`，**只有 8 行不同**
+（1 行 xacro 自述路径 + 1 行 hash + 6 个关节的 6 行 origin），其余逐字节一致 ✅
+⇒ 镜像没有引入任何额外差异。
+
+**(b) MoveIt 侧**（不连机器人，`ur_moveit.launch.py` 本来就不连）：起 `move_group`，
+再读它自己的 `robot_description` 参数：
+
+```
+=== description_package:=yolo_ur_description ===
+calib_2353869974907916917
+--- 残留进程（应为空）---
+(无)
+```
+
+⇒ **move_group 确实拿到了标定那份**，第三节那张表能走到第三行。
+
+**还剩一条要连真机**（只读、不运动）：起一次驱动，判据是那条 ERROR 消失、
+出现 **`Calibration checked successfully.`**。这个字符串是从驱动二进制里
+`strings libur_robot_driver_plugin.so` 出来的，不是我猜的。命令已写进
+`docs/待执行命令.md`。**本轮没做**：需要机器人在场且处于可接入状态，而上面两条已经把
+「会通过」证到了 —— 剩下的只是复核。
+
+### 七、手眼标定不用重做（这是能放心改的前提）
+
+`docs/calib/外参-B路-臂点法.md:308` 那四个角点的 `base_link` 系坐标是
+**从示教器上读的**，即来自 **URControl 自己的（已标定的）FK**，**不是**我们的 URDF。
+所以修 URDF 不影响那份手眼结果。
+
+### 八、改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `ros2_ws/src/yolo_ur_description/` | **新增**：`package.xml` / `CMakeLists.txt` / `README.md` / `config/ur5/default_kinematics.yaml` |
+| `ros2_ws/src/yolo_bringup/launch/real.launch.py` | 新增 `DESCRIPTION_PACKAGE` 常量（含判据注释）；`_driver`、`_moveit` 两处各传 `description_package` |
+| `ros2_ws/src/yolo_bringup/package.xml` | 补 `exec_depend: yolo_ur_description` |
+| `scripts/ur_calibration_delta.py` | **新增**：把「有偏差」量化成毫米数，可复跑 |
+| `docs/calib/ur5_calibration_delta.json` | **新增**：上面那张表的存档 |
+| `docs/待执行命令.md` | 第七十八轮那节改成「☑ 已了结」，**订正了错的修法命令**，补上：实测偏差表、两条无机器人验证、现场那一条判据、`ur_calibration` 坏在哪 + 重抓命令 |
+| 台账 | 本轮 |
+
+### 九、台面账
+
+- 板子上做了：`git pull`（到 `c765aee`，工作树干净）、
+  `colcon build --packages-select yolo_ur_description`（1.04 s）、
+  `--packages-select yolo_bringup`（1.85 s）、跑两次 `xacro` 生成 description、
+  起停一次 `ur_moveit.launch.py`（**机器人无关**，收工后 `pgrep` 确认无残留）。
+- **本轮一个包都没往真机发。** 没有 30001 连接、没有 Dashboard 查询、没有轨迹、
+  没有寄存器写入、**臂全程未动**。（上一轮抓标定那次只读 30001 是拿到当次授权的。）
+- 未动 `main`；未推送任何外部远端（只推到板上的本地裸库 `board:`）。
+- **可清理**：板上 `~/ur_calib_ws`（打补丁的 `ur_calibration`）。**建议留着** ——
+  重做标定还要用它，且它是「已发布版本都坏」这件事的可复现证据。
