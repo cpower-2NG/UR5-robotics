@@ -48,6 +48,9 @@ def main():
     ap.add_argument("--extrinsics", default=os.path.expanduser(
         '~/yolo_ros_original/docs/calib/extrinsics-2026-10-03-base_link.json'))
     ap.add_argument("--jpeg-quality", type=int, default=92)
+    ap.add_argument("--pair-tol", type=float, default=0.15,
+                    help="画面与深度/关节/检测的**最大时间差**（秒）；超了这一帧不录"
+                         "—— 宁可少录一帧，也不要录一对「不是一个时刻」的东西")
     a = ap.parse_args()
 
     import cv2
