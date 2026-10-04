@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np                                                   # noqa: E402
 from draw_zone_on_frame import (                                     # noqa: E402
-    R_LINK_TO_OPTICAL, axis_angles, compose_base_optical, parse_zone, project)
+    R_LINK_TO_OPTICAL, T_LINK_TO_OPTICAL, axis_angles, compose_base_optical,
+    parse_zone, project)
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -69,12 +70,22 @@ check("正交：|RᵀR − I| < 1e-12",
       float(np.abs(M.T @ M - np.eye(3)).max()) < 1e-12)
 check("★ 是**纯旋转**（det = +1，不是镜像）", abs(float(np.linalg.det(M)) - 1.0) < 1e-12,
       f"det={np.linalg.det(M)}")
-check("★ opt_z（朝前）= link_x：R_lo @ (0,0,1) = (1,0,0)",
-      np.allclose(M @ np.array([0., 0., 1.]), [1., 0., 0.]))
-check("★ opt_x（朝右）= −link_y：R_lo @ (1,0,0) = (0,−1,0)",
-      np.allclose(M @ np.array([1., 0., 0.]), [0., -1., 0.]))
-check("★ opt_y（朝下）= −link_z：R_lo @ (0,1,0) = (0,0,−1)",
-      np.allclose(M @ np.array([0., 1., 0.]), [0., 0., -1.]))
+# ⚠️ 这里**不能**再断言「严格等于理想旋转」：常数已换成**实机实测值**，
+#    它与理想值差 0.2° 量级（D435i 的彩色模块相对 camera_link 的真实安装）。
+#    断言要钉的是「接近理想（在 1° 内）」＋「正交」。
+IDEAL = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]])
+_ang = math.degrees(math.acos(min(1.0, max(-1.0, (np.trace(M.T @ IDEAL) - 1) / 2))))
+check(f"★ 与理想旋转相差 {_ang:.3f}°（应在 1° 内 —— 实机不是理想安装）",
+      _ang < 1.0, f"got {_ang}")
+check("★ opt_z（朝前）≈ link_x", np.allclose(M @ np.array([0., 0., 1.]), [1., 0., 0.], atol=0.02))
+check("★ opt_x（朝右）≈ −link_y", np.allclose(M @ np.array([1., 0., 0.]), [0., -1., 0.], atol=0.02))
+check("★ opt_y（朝下）≈ −link_z", np.allclose(M @ np.array([0., 1., 0.]), [0., 0., -1.], atol=0.02))
+check("★★ **平移非零且约 15 mm** —— 这一条钉的正是「只转不平移」那个 bug；"
+      "理想旋转没有平移，漏掉它会让离线投影偏约 16 mm",
+      abs(float(np.linalg.norm(T_LINK_TO_OPTICAL)) - 0.01496) < 0.001,
+      f"|T|={np.linalg.norm(T_LINK_TO_OPTICAL)*1000:.2f} mm")
+check("★ 平移主要在 link 的 +y 方向（实测 14.96 mm）",
+      abs(T_LINK_TO_OPTICAL[1] - 0.014957) < 1e-5)
 
 
 # ----------------------------------------------------------------------
@@ -84,8 +95,15 @@ print("\n--- B. compose_base_optical ---")
 R_a, t_a = safe(compose_base_optical, ARCHIVE)
 check("camera_link ⇒ 左乘那个固定旋转",
       np.allclose(R_a, np.array(ARCHIVE["R"]) @ M))
-check("t 不参与旋转（相机光心在 parent 系就是 t）",
-      np.allclose(t_a, ARCHIVE["t"]))
+# ⚠️ 这条**曾经断言错了方向**：原文是「camera_link ⇒ t 不变」，而那恰恰把
+#    「漏掉 link→光学系的 15 mm 平移」锁死成了「正确行为」—— 一条**把 bug
+#    写成契约**的断言。正确语义：光学系的光心在 parent 系里是 `t + R·T_lo`。
+check("★ camera_link ⇒ 光心 = t + R·T_lo（不是 t 本身）",
+      np.allclose(t_a, np.array(ARCHIVE["t"])
+                  + np.array(ARCHIVE["R"]) @ T_LINK_TO_OPTICAL))
+check("  且确实与 t 相差 ≈15 mm（钉住那个漏平移的 bug）",
+      not np.allclose(t_a, ARCHIVE["t"], atol=1e-4)
+      and abs(float(np.linalg.norm(np.array(t_a) - np.array(ARCHIVE["t"]))) - 0.01496) < 0.002)
 R_o, t_o = safe(compose_base_optical, {**ARCHIVE, "frame_child":
                                       "camera_color_optical_frame"})
 check("★ 已经是光学系 ⇒ **原样返回，不重复左乘**",

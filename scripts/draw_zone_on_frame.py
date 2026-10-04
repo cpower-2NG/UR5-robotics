@@ -49,9 +49,24 @@ import numpy as np
 
 # camera_link → 光学系（REP-103/105）。列 = 光学系三个轴在 link 系里的表示：
 #   opt_x(右) = −link_y, opt_y(下) = −link_z, opt_z(前) = link_x
-R_LINK_TO_OPTICAL = np.array([[0.0, 0.0, 1.0],
-                              [-1.0, 0.0, 0.0],
-                              [0.0, -1.0, 0.0]])
+# ⚠️ **不要用「理想旋转」代替它。** 真实的相机里，`camera_link` 与彩色光学系
+#    之间**既有旋转也有平移**。实测（D435i，2026-10-04 从 TF 读出）：
+#
+#        平移 = (0.000167, 0.014957, 0.000243) m   ⇒ |t| ≈ 15.0 mm
+#        四元数 = (-0.499712, 0.498354, -0.500934, 0.500995)
+#
+#    理想值（REP-103/105 的 `opt_x=−link_y, opt_y=−link_z, opt_z=link_x`）**没有平移**，
+#    而**那 15 mm 恰好落在相机光心上** ⇒ 射线原点偏 15 mm ⇒ 与台面的交点偏约 16 mm
+#    （深度约 0.86 m、54° 斜视下，图上约 18 px）。
+#
+#    这个错误**只影响离线工具**：在线链路走 tf2，用的是真实变换 ✓。
+#    它曾经把「视频叠加偏了 15 mm」伪装成「检测框偏心」—— 两者的图上表现都是
+#    「红叉落在方块外面」，而只有对照「投影器自己算的 cam↔uv 完全自洽」才分得开。
+R_LINK_TO_OPTICAL = np.array(
+    [[0.001416664908236942, 0.003864084575033483, 0.9999915309196047],
+     [-0.9999981520935433, -0.0012940828139881844, 0.0014216747760910642],
+     [0.0012995653258697226, -0.9999916970655645, 0.0038622441528556317]])
+T_LINK_TO_OPTICAL = np.array([0.000167, 0.014957, 0.000243])
 
 OPTICAL_FRAMES = ("camera_color_optical_frame", "camera_optical_frame")
 
@@ -88,7 +103,10 @@ def compose_base_optical(doc):
     if child in OPTICAL_FRAMES:
         return R, t
     if child == "camera_link":
-        return R @ R_LINK_TO_OPTICAL, t
+        # ⚠️ 必须**连平移一起**复合。只乘旋转（本函数原来的写法）会漏掉
+        #    `camera_link → 光学系` 那 15 mm 的平移，而它正好在相机的光心上。
+        return (R @ R_LINK_TO_OPTICAL,
+                R @ T_LINK_TO_OPTICAL + t)
     raise ValueError(f"不认识的 frame_child={child!r}："
                      f"只认 camera_link 与 {OPTICAL_FRAMES}（拒绝猜）")
 
