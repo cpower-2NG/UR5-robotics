@@ -557,8 +557,14 @@ class Perception3D(Node):
                 if score > best_score:
                     best_score, best_pose, best_class = score, base_pose, class_name
 
+                # ⚠️ 日志里带上**本节点实际用的 (u,v) 与框尺寸**：出问题时最需要
+                #    判的就是「算 3D 点用的那个像素，和发布的 2D 框中心是不是同一个」。
+                #    只打 3D 结果的话，这条无法从外部核对 —— 而几何上一套
+                #    (u,v)+K+TF 的往返**必然闭合**，所以往返不闭合就说明 (u,v) 不同。
                 self.get_logger().info(
                     f'Target [{class_name}] projected: '
+                    f'uv=({u:.1f},{v:.1f}) size=({size_x:.1f}×{size_y:.1f}) '
+                    f'{"[平面模式 " + format(self.target_plane_z, ".4f") + "]" if self.target_plane_z is not None else "[深度模式]"} '
                     f'cam=({x:.3f},{y:.3f},{z:.3f}) → '
                     f'base=({base_pose.pose.position.x:.3f},'
                     f'{base_pose.pose.position.y:.3f},'
