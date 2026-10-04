@@ -67,23 +67,53 @@ def main():
     rclpy.init()
     n = Node('replay_record')
     got = {}
+
+    # ⚠️ 每条话题各存一个 **(时间戳, 消息)** 的缓冲，采样时**按时间戳配对**。
+    #    旧版是「各自取最新的一条」—— 两条话题的到达时刻可以差几十毫秒，
+    #    于是「这一帧画面」和「这一条检测」根本不是同一时刻的东西。
+    #    症状不是画面糊，而是**叠加位置看着偏**、且偏得没规律 —— 我曾据此
+    #    判「检测框偏心」，查了很久才发现是录制器自己造成的。
+    #    回放里的叠加要能当证据，就必须成对取。
+    def keep(store, m, stamp):
+        store.append((stamp, m))
+        while len(store) > 8:                     # 8 条足够配对，更久就是延迟
+            store.pop(0)
+
+    def stamp_of(msg):
+        h = msg.header.stamp
+        return float(h.sec) + float(h.nanosec) * 1e-9
+
+    def pick(key, ref_stamp, tol, drop_stale=True):
+        """取**时间戳最接近 ref_stamp** 的那一条；差超过 ``tol`` 就返回 None。
+
+        宁可这一帧不录，也不要录一对「不是一个时刻」的东西 —— 那正是旧版的病。
+        """
+        best, bd = None, tol
+        for st, m in bufs[key]:
+            d = abs(st - ref_stamp)
+            if d <= bd:
+                best, bd = (st, m), d
+        if drop_stale and best is not None:
+            bufs[key] = [x for x in bufs[key] if x[0] >= best[0]]
+        return best
+
+    bufs = {'color': [], 'depth': [], 'det': [], 'js': []}
     qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
     n.create_subscription(CameraInfo, '/camera/color/camera_info',
                           lambda m: got.setdefault('info', m), 5)
     n.create_subscription(Image, '/camera/color/image_raw',
-                          lambda m: got.__setitem__('color', m), 5)
+                          lambda m: keep(bufs['color'], m, stamp_of(m)), 5)
     n.create_subscription(Image, '/camera/aligned_depth_to_color/image_raw',
-                          lambda m: got.__setitem__('depth', m), qos)
-    # ⚠️ QoS 必须用 BEST_EFFORT：`/targets_3d` 由 projector_node 以 BEST_EFFORT 发布，
-    #    订阅端用 RELIABLE 会**兼容失败**，症状是「一条消息都收不到」而发布端
-    #    看起来一切正常（第一版就是这么录到 detections=0 的）。
-    #    BEST_EFFORT 订阅端对 RELIABLE 与 BEST_EFFORT 两种发布端都兼容。
+                          lambda m: keep(bufs['depth'], m, stamp_of(m)), qos)
+    # ⚠️ QoS 用 BEST_EFFORT：对 RELIABLE 与 BEST_EFFORT 两种发布端都兼容
+    #    （订阅端用 RELIABLE 而发布端是 BEST_EFFORT 时会**收不到任何消息**）。
     n.create_subscription(Detection3DArray, '/targets_3d',
-                          lambda m: got.__setitem__('det', m), qos)
+                          lambda m: keep(bufs['det'], m, stamp_of(m)), qos)
 
     from sensor_msgs.msg import JointState
     n.create_subscription(JointState, '/joint_states',
-                          lambda m: got.__setitem__('js', m), 10)
+                          lambda m: keep(bufs['js'], m, stamp_of(m)), 10)
+
 
     t0 = time.time()
     print(f'录制到 {a.out}，最多 {a.seconds:.0f}s @ {a.fps:g} fps，Ctrl-C 可提前停')
@@ -94,19 +124,28 @@ def main():
             if time.time() < nxt:
                 continue
             nxt = time.time() + 1.0 / a.fps
-            need = ('color', 'depth', 'js')
-            if any(k not in got for k in need):
+            if not bufs['color']:
+                skipped += 1
+                continue
+            # 以**彩色帧的时间戳**为基准，其余按「最接近」配对 —— 见上面 keep() 的说明
+            ref, color_msg = bufs['color'][-1]
+            got_d = pick('depth', ref, a.pair_tol)
+            got_j = pick('js', ref, a.pair_tol)
+            got_t = pick('det', ref, a.pair_tol, drop_stale=False)
+            if got_d is None or got_j is None:
                 skipped += 1
                 continue
             try:
-                color = np.frombuffer(got['color'].data, dtype=np.uint8).reshape(
-                    got['color'].height, got['color'].width, -1)
-                color = color[:, :, :3]
+                color = np.frombuffer(color_msg.data, dtype=np.uint8).reshape(
+                    color_msg.height, color_msg.width, -1)[:, :, :3]
             except Exception:                                     # noqa: BLE001
                 skipped += 1
                 continue
-            depth = np.frombuffer(got['depth'].data, dtype=np.uint16).reshape(
-                got['depth'].height, got['depth'].width)
+            depth = np.frombuffer(got_d[1].data, dtype=np.uint16).reshape(
+                got_d[1].height, got_d[1].width)
+            js_msg = got_j[1]
+            det_msg = None if got_t is None else got_t[1]
+            det_dt = None if got_t is None else round(abs(got_t[0] - ref), 4)
             stamp = time.time() - t0
 
             if idx == 0 and 'info' in got:
@@ -120,19 +159,20 @@ def main():
                         color, [cv2.IMWRITE_JPEG_QUALITY, a.jpeg_quality])
             cv2.imwrite(os.path.join(a.out, 'depth', f'{idx:06d}.png'), depth)
 
-            d = dict(zip(got['js'].name, got['js'].position))
+            d = dict(zip(js_msg.name, js_msg.position))
             q = [float(d.get(k, float('nan'))) for k in ARM]
-            rec = {'i': idx, 't': round(stamp, 3), 'joints': [round(v, 6) for v in q]}
+            rec = {'i': idx, 't': round(stamp, 3), 'stamp': round(ref, 4),
+                   'det_dt': det_dt, 'joints': [round(v, 6) for v in q]}
             if all(v == v for v in q):        # NaN 检查：缺关节角就不画 tool0
                 rec['tool0'] = [round(float(v), 5) for v in urdf_fk(q)[:3, 3]]
-            if 'det' in got:
+            if det_msg is not None:
                 rec['dets'] = [
                     {'x': round(x.results[0].pose.pose.position.x, 5),
                      'y': round(x.results[0].pose.pose.position.y, 5),
                      'z': round(x.results[0].pose.pose.position.z, 5),
                      's': round(x.results[0].hypothesis.score, 3),
                      'cls': x.results[0].hypothesis.class_id}
-                    for x in got['det'].detections]
+                    for x in det_msg.detections]
             with open(os.path.join(a.out, 'meta.jsonl'), 'a', encoding='utf-8') as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
             idx += 1
