@@ -286,6 +286,22 @@ def generate_launch_description():
     max_sync_dt_default = PythonExpression([
         "'0.1' if '", LaunchConfiguration('camera_source'), "' == 'sim' else '0.3'",
     ])
+    _plane_args = [
+        DeclareLaunchArgument(
+            'use_target_plane', default_value='false',
+            description='true = 目标位置改用「像素射线 ∩ z=target_plane_z」求得，'
+                        '不经深度定位。适用于「物体躺在已知高度平面上」的场景；'
+                        '深度只用于校验该处确有物体。默认 false（沿用深度反投影）'),
+        DeclareLaunchArgument(
+            'target_plane_z', default_value='0.0285',
+            description='use_target_plane=true 时的平面高度（base_link 系，米）。'
+                        '对躺在台面上的方块应取 table_z + 方块高（顶面）'),
+        DeclareLaunchArgument(
+            'plane_depth_tol', default_value='0.03',
+            description='平面模式下，深度反投影出的 z 与平面高度的允许差（米）。'
+                        '超过则判该检测无效（用于挡住「空台面被检测成方块」）'),
+    ]
+
     max_sync_dt_arg = DeclareLaunchArgument(
         'max_sync_dt', default_value=max_sync_dt_default,
         description='检测↔深度 最大时间差（秒），超过则丢弃整批检测。'
@@ -545,6 +561,12 @@ def generate_launch_description():
             'tf_required': LaunchConfiguration('tf_required'),
             # 默认值随 camera_source 变（仿真 0.1 / 真机 0.3），见上面 max_sync_dt_arg
             'max_sync_dt': LaunchConfiguration('max_sync_dt'),
+            # 「已知平面」定位模式：位置 = 像素射线 ∩ z=target_plane_z，
+            # 不用深度定位（深度只做「那里确实有东西」的校验）。
+            # 默认关闭 ⇒ 行为与原来完全一致。详见 projector_node 里的参数说明。
+            'use_target_plane': LaunchConfiguration('use_target_plane'),
+            'target_plane_z': LaunchConfiguration('target_plane_z'),
+            'plane_depth_tol': LaunchConfiguration('plane_depth_tol'),
             # 采样/配准旋钮：全部在参数面上出现，理由见上面那一组 DeclareLaunchArgument
             'depth_scale': LaunchConfiguration('depth_scale'),
             'depth_grid': LaunchConfiguration('depth_grid'),
@@ -603,6 +625,7 @@ def generate_launch_description():
         realsense_params_arg,
         depth_topic_arg,
         tf_required_arg,
+        *_plane_args,
         max_sync_dt_arg,
         depth_scale_arg,
         depth_grid_arg,

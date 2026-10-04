@@ -95,6 +95,27 @@ class Perception3D(Node):
         self.declare_parameter('depth_buffer_len', 10)     # 深度帧环形缓冲长度
         self.declare_parameter('tf_required', False)       # True = 查不到 TF 就退出
 
+        # ---- 「已知平面」定位模式（默认关闭）----
+        # 为什么需要它：俯视相机以约 54° 斜视，深度反投影出的 z 若有偏差，
+        # 会**同时**在高度和横向上出错（横向误差 ≈ Δz / tan(54°) ≈ 1.4·Δz）。
+        # 实测 D435i 在该距离上：台面反投影出的 z 中位 −13.2 mm（应为 0），
+        # 标准差 7.0 mm —— 对 28.5 mm 的方块，这个量级足以让夹爪咬在边上。
+        #
+        # 方块躺在**已知高度**的台面上，因此它的位置可以由「像素射线 ∩ 平面
+        # z = target_plane_z」直接得到，**完全不经过深度**；精度于是回到
+        # 标定水平（碰点残差 1.1 mm），而不是深度水平（十几毫米）。
+        #
+        # ⚠️ 不开这项时行为与原来完全一致（走深度反投影）。
+        # 开了之后深度**仍然要用**，但只用来做「那里确实有东西」的校验：
+        # 深度反投影出的 z 若与平面高度相差超过 plane_depth_tol，判为无效
+        # （例如空台面被检测成方块时，深度会指向台面而不是方块顶面）。
+        # 开关与数值分成两个参数：单一参数用 NaN 表示「关闭」在 launch 的
+        # 参数求值里不可靠（yaml 规则下 'nan' 是字符串、'.nan' 才是浮点），
+        # 而 bool + float 的组合在任何一侧都明确。
+        self.declare_parameter('use_target_plane', False)
+        self.declare_parameter('target_plane_z', 0.0285)   # = 台面 + 方块高（顶面）
+        self.declare_parameter('plane_depth_tol', 0.03)
+
         # 话题名做成参数（P2-7）。原因很具体：真机上 realsense2_camera 打开
         # align_depth.enable:=true 后，**对齐后的深度发布在
         # /camera/aligned_depth_to_color/image_raw**，而 /camera/depth/image_raw
@@ -112,6 +133,10 @@ class Perception3D(Node):
         self.depth_scale_param = self.get_parameter('depth_scale').value
         self.max_sync_dt = self.get_parameter('max_sync_dt').value
         self.tf_required = self.get_parameter('tf_required').value
+        _use_plane = bool(self.get_parameter('use_target_plane').value)
+        self.target_plane_z = (float(self.get_parameter('target_plane_z').value)
+                               if _use_plane else None)
+        self.plane_depth_tol = float(self.get_parameter('plane_depth_tol').value)
 
         # ---- 相机模型 ----
         self.camera_model = PinholeCameraModel()
@@ -305,6 +330,63 @@ class Perception3D(Node):
     # ------------------------------------------------------------------
     # TF
     # ------------------------------------------------------------------
+    @staticmethod
+    def _quat_to_matrix(q):
+        """四元数（x,y,z,w）→ 3×3 旋转矩阵。与 scripts/ 下同名函数同一约定。"""
+        x, y, z, w = float(q.x), float(q.y), float(q.z), float(q.w)
+        n = math.sqrt(x * x + y * y + z * z + w * w)
+        if n < 1e-12:
+            raise ValueError('四元数长度为 0')
+        x, y, z, w = x / n, y / n, z / n, w / n
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ])
+
+    def _ray_plane_pose(self, x, y, z, transform, u, v, stamp):
+        """像素射线 ∩ 平面 ``z = target_plane_z``，**位置不经过深度**。
+
+        ``x, y, z`` 是同一像素的深度反投影点（相机光学系），这里只借它表达
+        射线方向 ``(x/z, y/z, 1)``；位置由射线与平面的交点给出。
+
+        深度仍参与一处判断：把同一个反投影点变到 target_frame 后取其 z，
+        与平面高度比较。相差超过 ``plane_depth_tol`` 时判为无效并返回 None ——
+        这一条是用来挡「空台面被检测成方块」的：那时深度指向的是台面，
+        高度会明显低于方块顶面所处的平面。
+
+        返回 ``PoseStamped``；平面在相机背后或校验不通过时返回 ``None``。
+        """
+        tr = transform.transform
+        R = self._quat_to_matrix(tr.rotation)
+        t = np.array([tr.translation.x, tr.translation.y, tr.translation.z])
+
+        d_cam = np.array([x / z, y / z, 1.0])
+        d_base = R @ d_cam
+        if abs(float(d_base[2])) < 1e-9:
+            return None                      # 射线与平面平行
+        s = (self.target_plane_z - float(t[2])) / float(d_base[2])
+        if s <= 0.0:
+            return None                      # 平面在相机背后
+        p = t + s * d_base
+
+        z_from_depth = float((R @ np.array([x, y, z]) + t)[2])
+        if abs(z_from_depth - self.target_plane_z) > self.plane_depth_tol:
+            self.get_logger().debug(
+                f'平面模式：({u:.1f},{v:.1f}) 深度反投影 z={z_from_depth:+.4f} '
+                f'与平面 {self.target_plane_z:+.4f} 相差 '
+                f'{abs(z_from_depth - self.target_plane_z) * 1000:.1f} mm '
+                f'（上限 {self.plane_depth_tol * 1000:.0f} mm）—— 判为无效'
+            )
+            return None
+
+        out = PoseStamped()
+        out.header.stamp = stamp
+        out.header.frame_id = self.target_frame
+        out.pose.position = Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
+        out.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        return out
+
     def _transform_pose(self, pose_stamped: PoseStamped, transform):
         """PoseStamped 的 TF 变换（D33）。
 
@@ -414,6 +496,10 @@ class Perception3D(Node):
                 continue
 
             # ---- Step 3: 针孔投影 (u,v,Z) → (X_c, Y_c, Z_c) ----
+            # 这一组是**深度反投影点**。两种定位模式都要先算它：
+            #   · 深度模式（默认）：它就是最终位置；
+            #   · 平面模式：只借它表达射线方向 (x/z, y/z, 1)，位置另由
+            #     射线与已知平面求交得到（见 _ray_plane_pose 的说明）。
             # X = (u - cx) * Z / fx
             # Y = (v - cy) * Z / fy
             x = (u - self.camera_model.cx()) * depth_val / self.camera_model.fx()
@@ -422,12 +508,6 @@ class Perception3D(Node):
 
             # ---- Step 4: TF 变换 camera_frame → target_frame ----
             try:
-                cam_pose = PoseStamped()
-                cam_pose.header.stamp = stamp
-                cam_pose.header.frame_id = camera_frame
-                cam_pose.pose.position = Point(x=x, y=y, z=z)
-                cam_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
-
                 transform = self.tf_buffer.lookup_transform(
                     self.target_frame,
                     camera_frame,
@@ -435,7 +515,19 @@ class Perception3D(Node):
                     timeout=rclpy.duration.Duration(seconds=1.0)
                 )
 
-                base_pose = self._transform_pose(cam_pose, transform)
+                if self.target_plane_z is not None:
+                    base_pose = self._ray_plane_pose(x, y, z, transform, u, v, stamp)
+                    if base_pose is None:
+                        # 平面在相机背后，或深度校验没过（例如空台面被判成方块）
+                        continue
+                else:
+                    cam_pose = PoseStamped()
+                    cam_pose.header.stamp = stamp
+                    cam_pose.header.frame_id = camera_frame
+                    cam_pose.pose.position = Point(x=x, y=y, z=z)
+                    cam_pose.pose.orientation = Quaternion(
+                        x=0.0, y=0.0, z=0.0, w=1.0)
+                    base_pose = self._transform_pose(cam_pose, transform)
                 base_pose.header.stamp = self.get_clock().now().to_msg()
                 base_pose.header.frame_id = self.target_frame
 

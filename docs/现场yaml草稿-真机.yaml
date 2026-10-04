@@ -33,6 +33,7 @@ grasp_planner:
     - -1.571
     - -2.122
     tool0_to_fingertip: 0.13
+    grasp_clearance: 0.01
     approach_clearance: 0.05
     lift_height: 0.15
     table_min_z: -0.5

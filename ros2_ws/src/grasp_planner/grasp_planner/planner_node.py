@@ -183,6 +183,7 @@ class GraspPlanner(Node):
         self.home_joints = list(p["home_joints"])
         self.ik_seed = list(p["ik_seed"])
         self.tool0_to_fingertip: float = p["tool0_to_fingertip"]
+        self.grasp_clearance: float = p["grasp_clearance"]
         self.approach_clearance: float = p["approach_clearance"]
         self.lift_height: float = p["lift_height"]
         self.table_min_z: float = p["table_min_z"]
@@ -417,6 +418,15 @@ class GraspPlanner(Node):
         d("ik_seed", [-0.551, -0.429, 2.045, 3.094, -1.571, -2.122])
 
         d("tool0_to_fingertip", 0.13)   # tool0 到指尖的距离（m）
+        # 抓取高度的额外余量（m）。tool0_to_fingertip 的定义是
+        # 「闭合时 法兰→指尖 − 方块高」，所以指尖按设计**正好落到台面**；
+        # 这个参数把整个下降抬高一点，让闭合后的指尖离台面留出余量。
+        #
+        # 为什么需要：AG-95 闭合时指尖还会沿法兰轴**再伸出约 15.6 mm**，
+        # 而 `wz` 若偏低（深度在小物体上取到台面而不是顶面），这一点偏差
+        # 会直接变成指尖压进台面的深度。余量是第二道保险，不能代替
+        # `wz` 本身的准确性（那由 perception_3d 的定位方式决定）。
+        d("grasp_clearance", 0.01)
         d("approach_clearance", 0.05)   # 接近时在抓取高度之上再抬多少（m）
         d("lift_height", 0.15)          # 抓取后抬起高度（m）
         # 低于此高度视为已落地物体，跳过（**单位是 base_frame 的 z**，不是世界系！）
@@ -1392,9 +1402,11 @@ class GraspPlanner(Node):
             self._open_and_reset()
             return
 
-        self.get_logger().info("接近完成 —— 下降到抓取高度")
+        self.get_logger().info(
+            f"接近完成 —— 下降到抓取高度（含余量 {self.grasp_clearance * 1000:.1f} mm）")
         wx, wy, wz = self._grasp_target
-        arm = self._call_ik(wx, wy, wz + self.tool0_to_fingertip,
+        arm = self._call_ik(wx, wy,
+                            wz + self.tool0_to_fingertip + self.grasp_clearance,
                             seed=self._approach_arm, prev=self._approach_arm)
         if arm is None:
             self.get_logger().warn("抓取高度 IK 失败")
