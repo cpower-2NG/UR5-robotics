@@ -78,13 +78,18 @@ def main():
     #    判「检测框偏心」，查了很久才发现是录制器自己造成的。
     #    回放里的叠加要能当证据，就必须成对取。
     def keep(store, m, stamp):
+        # ⚠️ 配对用的是**到达时刻**（下面的 stamp_of 已改成 time.time()），
+        #    **不是消息里的 header.stamp**。理由：画面来自 RealSense 的硬件时钟、
+        #    关节角来自机器人的 RTDE 时钟 —— 两个时钟的**纪元不同**，绝对时间戳
+        #    本来就对不齐。第一版按消息戳配对，结果是 573 次里跳过 563 次。
+        #    到达时刻由同一个进程的同一只钟给出，才是可比的量。
         store.append((stamp, m))
         while len(store) > 8:                     # 8 条足够配对，更久就是延迟
             store.pop(0)
 
-    def stamp_of(msg):
-        h = msg.header.stamp
-        return float(h.sec) + float(h.nanosec) * 1e-9
+    def stamp_of(_msg):
+        """**到达时刻**（本进程的钟），不是消息里的 header.stamp。"""
+        return time.time()
 
     def pick(key, ref_stamp, tol, drop_stale=True):
         """取**时间戳最接近 ref_stamp** 的那一条；差超过 ``tol`` 就返回 None。
@@ -164,8 +169,11 @@ def main():
 
             d = dict(zip(js_msg.name, js_msg.position))
             q = [float(d.get(k, float('nan'))) for k in ARM]
-            rec = {'i': idx, 't': round(stamp, 3), 'stamp': round(ref, 4),
-                   'det_dt': det_dt, 'joints': [round(v, 6) for v in q]}
+            rec = {'i': idx, 't': round(stamp, 3),
+                   # `arrive`: 配对基准（到达时刻，本机钟）；`det_dt` 是检测与画面
+                   # 的到达时差 —— 它才是「这对东西是不是一个时刻」的度量。
+                   'arrive': round(ref, 4), 'det_dt': det_dt,
+                   'joints': [round(v, 6) for v in q]}
             if all(v == v for v in q):        # NaN 检查：缺关节角就不画 tool0
                 rec['tool0'] = [round(float(v), 5) for v in urdf_fk(q)[:3, 3]]
             if det_msg is not None:
