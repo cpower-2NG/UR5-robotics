@@ -64,6 +64,7 @@ ALLOWED_EMAILS = {
     'JointState@gz.msgs.Model':      'ROS/Gazebo 话题类型写法，不是邮箱',
     'serial-getty@ttyGS0.service':   'systemd 单元名，不是邮箱',
     'serial-getty@ttyTCU0.service':  'systemd 单元名，不是邮箱',
+    'git@github.com':                'git 的 SSH 远端写法（git@主机:路径），不是邮箱',
     # 下面两个是提交信息里的 AI 协作署名，**不是**使用者身份或位置信息，
     # 本脚本管的就是那两类，所以放行。要不要在公开历史里保留这个署名是另一件事
     # （属可读性/署名偏好），需要的话另行决定，别在这里悄悄抹掉。
