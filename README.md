@@ -217,7 +217,7 @@ yolo_ros/
 
 ## 自检与验收
 
-十六个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+十七个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
 前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
 `test_board_a1.py`、`test_deidentified.py`、`test_slot_routing.py` 与
@@ -315,6 +315,26 @@ python3 scripts/test_live_infer_record.py # 实时推理录像那个脚本的**�
                                          #   越界类别号不崩、**绝不联网下载权重**
                                          #   （YOLO("yolov8n.pt") 缺文件时会自动下 COCO，
                                          #   症状是"检测不到方块"而不是报错）
+python3 scripts/test_eval_class_recall.py # A2 验收面那把**尺子**准不准：47 项（含 4 个变异）
+                                         #   A2 判据里写着「类别错分必须能被测试发现」——
+                                         #   那句话的对象不是模型，是这把尺子。所以逐个把实现
+                                         #   改坏，断言判据必须变红：
+                                         #   M1 行/列对调（ultralytics 是「行=预测、列=真值」，
+                                         #      与 sklearn **相反**；反了会让召回与精确整体互换，
+                                         #      报表仍然自洽、只是说的是另一件事）
+                                         #   M2 分母只取类别块（漏检不计入 → 「整类全漏」会
+                                         #      因为分母塌成 0 被当成「没样本」，正好从报表消失）
+                                         #   M3 只看召回、不判类别对混淆
+                                         #   M4 矩阵表两个背景轴的**标注**要与所装的数一致
+                                         #      （第一版标反过；而当时的检查只问「'漏检'这三个字
+                                         #      在不在报表里」、不问在哪个轴，所以照样全绿）
+                                         #   结构面还钉住两个不许漂的数：`model.val()` 必须显式传
+                                         #   conf —— 不传的话 ultralytics 会把 val 的默认值
+                                         #   悄悄改写成 0.25（process_batch 里那行三元式），
+                                         #   矩阵就建在一个你不知道的阈值上；必须 == 
+                                         #   pipeline.launch.py 的 `confidence_threshold`；
+                                         #   录像脚本的 `--conf` 同理
+                                         #   只要标准库（纯逻辑部分不 import ultralytics/numpy）
 python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
                                          #   扫**全部被跟踪的文本文件**、**未跟踪（未忽略）的文件**
                                          #   与**全部提交信息**

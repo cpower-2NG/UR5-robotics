@@ -166,7 +166,11 @@ def main(argv=None):
     ap.add_argument("--model", default="block_best_7cls.pt", help="权重文件")
     ap.add_argument("--color-topic", default=COLOR,
                     help=f"彩色图话题（默认 {COLOR}；launch 会重映射成单层）")
-    ap.add_argument("--conf", type=float, default=0.25, help="置信度阈值")
+    ap.add_argument("--conf", type=float, default=0.5,
+                    help="置信度阈值。默认 0.5 = pipeline.launch.py 的 "
+                         "confidence_threshold —— 审核录像要看到**线上真正会去抓的那些框**；"
+                         "阈值比线上松，画面里就会多出一堆实际不会动的框。"
+                         "想看临界框可以显式传低（如 0.25），那是诊断、不是验收。")
     ap.add_argument("--imgsz", type=int, default=640, help="推理尺寸")
     ap.add_argument("--fps", type=float, default=10.0,
                     help="写进 mp4 的帧率（不是推理帧率，见文件头）")
