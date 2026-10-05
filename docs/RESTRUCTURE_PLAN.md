@@ -13624,6 +13624,11 @@ following controllers do not have to be checked, because it cannot be activated.
 | 1 | `scripts/board_a1.py` 上板脚本（起栈 + 盯日志 + 判分，退出码 0/1/2） | ✅ |
 | 2 | `scripts/test_board_a1.py` 判分自检 36 断言 + 3 变异 | ✅ 全过 |
 | 3 | 真机两条判据 | ✅ **两次独立复现**（`a1_board.log` / `a1_video3.log`） |
-| 4 | **录像** | ⏳ 第 90 轮这一跑已把「按 PLAY 就能跑」变成可复现流程，素材待用户确认 |
+| 4 | **录像** | ✅ 2026-10-05 拍到（这一跑就是第 90 轮那一次，两条判据同时成立；素材在用户处，未入库） |
+
+⇒ **A1 的交付物到此全部齐了**：脚本、自检、两条判据（两次独立复现）、录像。
+栈已收干净（残留 0、5000x 端口全释放）；收栈后 Dashboard 只读三连为
+`robotmode RUNNING` / `safetystatus NORMAL` / `programState STOPPED ur5ros.urp`
+—— 与前一条一致，掉的是 URCap 那头，不是驱动或机械臂。
 
 `Aborting` 计数已作为**起栈是否健康**的判据写进 `docs/待执行命令.md` 的补录像步骤。
