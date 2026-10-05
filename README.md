@@ -1,7 +1,12 @@
-# YOLO + ROS2 视觉抓取系统 (YOLO-ROS)
+# ur5-vision-grasp — UR5 视觉感知抓取（YOLO + ROS 2）
 
 > YOLOv8 检测 → 2D→3D 投影 → MoveIt2 逆解 → UR5 抓取，**仿真闭环已全量跑通**。
 > 部署目标：**NVIDIA Orin（JetPack 6.2 / aarch64）接真机 UR5**。
+>
+> 本仓是**公开**副本。硬件序列号、内网地址、用户名等身份信息已从全部历史中
+> 剔除，并且由 [`scripts/test_deidentified.py`](scripts/test_deidentified.py)
+> 把守 —— 提交前请跑它。相机序列号等**本机专有**的值放在仓库之外的
+> `~/.config/ur5-vision-grasp/`，见下文「相机序列号」。
 
 ---
 
@@ -212,9 +217,10 @@ yolo_ros/
 
 ## 自检与验收
 
-九个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+十个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
-前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py` 只要 numpy）：
+前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py` 与
+`test_deidentified.py` 只要 Python 标准库）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -226,8 +232,10 @@ export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PY
 python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学（3 项）
 python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
 python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
-python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生：80 项（本机，另有 3 项 SKIP）
-                                         #   板上是 81 项、2 SKIP（ur_robot_driver 只有板上有）
+python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生 + 相机序列号守卫：
+                                         #   108 项（本机，另有 3 项 SKIP）
+                                         #   板上是 109 项、2 SKIP（ur_robot_driver 只有板上有）
+                                         #   其中 11 项是相机序列号占位符守卫（含变异检查）
                                          #   本机的三个 SKIP：没装 ur_robot_driver；
                                          #   planner_node 与 fake_joint_states 回调里
                                          #   没有 publish（那条竞态断言不适用）
@@ -243,6 +251,11 @@ python3 scripts/test_ag95_init_close.py  # AG-95 初始化/合拢脚本：13 项
 python3 scripts/test_ur5_fk_check.py     # UR5 正运动学 + 「示教器 Base 是不是机器人 base」
                                          #   的判决工具：20 项断言（含 3 个变异测试）
                                          #   只要 numpy，不需要 ROS / 真机 / 示教器
+python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
+                                         #   扫**全部被跟踪的文本文件**与**全部提交信息**
+                                         #   （后者不是多余的：--replace-text 只改 blob、
+                                         #   不改提交信息，这条路径真的漏过）
+                                         #   只要标准库；**不需要** source ROS
 ```
 
 > 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
@@ -360,8 +373,9 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 
   另缺 AG-95 侧的 `pymodbus`（⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的
   `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
-- ✅ **检测这一半已在板上跑通**（2026-09-28 实测）：权重 `block_best.pt` **被 git 跟踪**，
-  `clone` 即得（sha256 `a926d959…`）；板上 `torch 2.5.0a0+nv24.08` + `ultralytics 8.4.26`
+- ✅ **检测这一半已在板上跑通**（2026-09-28 实测）：权重 `block_best.pt`
+  **不在本仓**（6 MB，属构建产物，按规范走外链；sha256 `a926d959…` 可用于核对
+  你手上那份是不是同一个）；板上 `torch 2.5.0a0+nv24.08` + `ultralytics 8.4.26`
   加载 0.1 s、`names={0:'block'}`、CUDA 可用；拿数据集里一张真图（9 个标注框）推理，
   **9 个框全部对上、逐对 IoU ≥ 0.966**；预热后**单帧 38 ms**（约 26 FPS）。
 - 📷 **相机话题的「两层命名空间」陷阱**（真机部署最容易白忙一场的地方）：
@@ -419,12 +433,50 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
   # 完整真机链路（需要控制箱 IP；臂没接上/没配好时先别跑这条）
   ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense robot_ip:=<控制箱 IP>
   ```
-- **模型权重必须显式指定，别依赖「按目录找」**（D67）。`block_best.pt` 在仓库根、
-  被跟踪，所以能随 clone 过去；但 `model:=block_best.pt` 这个**相对名**是按
-  **启动时的 CWD** 解析的 —— 从仓库根启动才找得到。板上的推荐写法是
+- **模型权重必须显式指定，别依赖「按目录找」**（D67）。⚠️ `block_best.pt`
+  **不在仓库里**（6 MB，按规范走外链；需要它请见下面「模型权重」一节）。
+  `model:=block_best.pt` 这个**相对名**是按**启动时的 CWD** 解析的 ——
+  从放权重的那一层启动才找得到。推荐写法是
   `export YOLO_MODEL_DIR=<放权重的目录>`（或直接传绝对路径），这样与 CWD 无关。
   包内**刻意不放任何权重**：找不到时会抛出可操作的 `FileNotFoundError`，
   而不是静默换一个别的模型。
+
+### 模型权重（不在本仓）
+
+`block_best.pt`（单类 `block` 检测器）是**构建产物**，按仓库约定不入库
+（`.gitignore` 里 `ros2_ws/src/yolo_detector/models/*.pt` 同理）。取到它之后：
+
+```bash
+mkdir -p ~/models && cp block_best.pt ~/models/
+export YOLO_MODEL_DIR=~/models          # 或把绝对路径直接传给 model:=
+sha256sum ~/models/block_best.pt        # 应为 a926d959…（与本文档记录一致）
+```
+
+> 外链地址：**待补** —— 发布前请把权重放到一个可公开访问的位置并在此写明。
+> 校验和 `a926d959…` 是这份权重的身份，换文件前请先比对。
+
+### 相机序列号（本机专有，不入库）
+
+真机要钉死用**哪一台** D435i，靠的是 `serial_no`；而序列号是**设备身份**，
+和 IP、用户名同类，所以公开仓里只有**模板**
+（[`config/realsense_camera.yaml`](ros2_ws/src/yolo_bringup/config/realsense_camera.yaml)），
+序列号位是占位符。用之前先建一份自己的：
+
+```bash
+mkdir -p ~/.config/ur5-vision-grasp
+cp ros2_ws/src/yolo_bringup/config/realsense_camera.yaml \
+   ~/.config/ur5-vision-grasp/realsense_camera.yaml
+# 编辑它，把 serial_no 换成你这台相机**外壳标签**上的号（引号要留着）
+```
+
+`pipeline.launch.py` 的解析顺序是
+`UR5_REALSENSE_PARAMS` 环境变量 → 上面那个本机文件 → 包内模板。
+
+> ⚠️ **忘了填不会被无视，会被拦下**：起 `camera_source:=realsense` 时若序列号仍是
+> 占位符，守卫会**当场抛错**并给出填法。放行的话症状是**静默**的 —— 驱动每 6 秒
+> 重试一次、永不退出，「进程都在、就是没有 `/camera` 图像」。
+> 为什么序列号不能像别的参数那样在 launch 里传，见那份 yaml 的文件头
+> （一句话：纯数字串在两侧被判成了不同类型，**没有中间态**）。
 - 夹爪 = **大寰 AG-95**（Modbus RTU / RS485），是**独立设备**，不在 JTC 关节里。
 - 前置：手眼标定（外参）、AG-95 寄存器映射现场核实、抓取位姿/TCP 偏置按 AG-95 重新推导。
 
@@ -457,3 +509,13 @@ python3 scripts/ag95_probe.py --port /dev/ttyTHS1 --slave 1 --watch   # 用手�
 - [Gazebo Harmonic 文档](https://gazebosim.org/docs/harmonic)
 - [MoveIt2 文档](https://moveit.picknik.ai/)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/)
+
+---
+
+## 许可
+
+[MIT](LICENSE)。
+
+本仓是内部工程仓的公开副本，**不含**任何第三方教材/数据集原文，也不含模型权重
+（权重按上文「模型权重」走外链）。引用到的 RealSense / UR / MoveIt / Gazebo 等
+均为各自所有者的商标，此处仅作指代。

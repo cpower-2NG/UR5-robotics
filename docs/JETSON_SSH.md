@@ -20,7 +20,7 @@ ssh -i ~/.ssh/board_ed25519 jetson@<host-ip>
 | 主机名 | `yahboom` |
 | IP | `<host-ip>` |
 | 登录用户 | `jetson` |
-| 密码 | 仅在密钥失效时使用；明文记录在 Windows 侧项目文档 `docs/环境与访问.md`，**不要写进本仓库任何文件** |
+| 密码 | 仅在密钥失效时使用。**本仓库不记录**（凭据只放本机未跟踪位置 —— 这条是硬规矩：别把口令贴进 issue / 提交信息 / 本仓任何文件） |
 | 系统 | Ubuntu 22.04.5 LTS aarch64 / JetPack 6.2 / ROS 2 Humble |
 
 ## WSL 侧已就绪的状态
