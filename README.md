@@ -8,26 +8,31 @@
 > 把守 —— 提交前请跑它。相机序列号等**本机专有**的值放在仓库之外的
 > `~/.config/ur5-vision-grasp/`，见下文「相机序列号」。
 
+> 📖 **接手本项目 / 让 AI 改造本项目，先读 [`AGENTS.md`](AGENTS.md)。**
+> 那里是这个项目的**核心约定**：目标与范围、红线、跨阶段不变的结构性约定、
+> 阶段梯子、以及「四层文档各以什么时钟维护」。
+> README（本文件）是**公开仓的门面**，讲「这仓库里有什么」；
+> **项目怎么约定、下一步做什么，以 `AGENTS.md` 为准。**
+
 ---
 
 ## 现在能跑到什么程度
 
-**仿真里 9/9 方块全自动搬运成功**，且经 Gazebo 物理真值核对（不是关节回读）：
+**仿真**：9/9 方块全自动搬运成功，经 Gazebo 物理真值核对（不是关节回读）。
 
-| 证据 | 实测值 |
-|---|---|
-| 搬运数量 | 9/9，与规划器日志「累计 9 个」逐一对应 |
-| 落点一致性 | x 跨度 0.7 mm、y 跨度 10.1 mm |
-| 堆叠高度 | z 0.020 → 0.340（九层，每层 40 mm 方块） |
+**真机**：✅ **2026-10-05 通过 A1 验收** —— 连续抓放 **4/4**，且收工走的是
+「放置槽位已用尽」这条正常路径（判分见 [`scripts/board_a1.py`](scripts/board_a1.py)）。
 
-**尚未证明的三件事**（别把上表读成「全都行了」）：
+**尚未证明的三件事**（别读成「全都行了」）：
 
-- **检测框本身准不准** → 归 YOLO 模型。仿真里 9/9 检出、分数 0.68~0.94，但**未在真机数据上量过**。
-- **相机外参准不准** → 归**手眼标定**。仿真里相机位姿是我们自己写死的常量，真机必须实测；代码层修不了。
-- **真机夹爪能不能用** → AG-95 后端的**代码侧已就绪**（读/写/到位轮询都在 `gripper.py`，
-  写路径由 `ag95_dry_run` 挡着、默认只读）。挡着的是**硬件**：板上还没有 USB-RS485
-  适配器，后端一构造就去开串口、打不开就抛。适配器到位后按 `docs/待执行命令-留档.md`
-  的 **丙-1** 走（只读探映射 → 离臂试写 → 上臂）。
+- **检测框在真机数据上准不准** —— 仿真里 9/9 检出、分数 0.68~0.94，真机数据**未量过**。
+- **真机相机外参的长期稳定性** —— 手眼标定会**无声过期**（实测一天漂 0.945°）。
+- **夹爪写路径** —— 代码侧就绪，`ag95_dry_run` 默认只读；解锁要求「拆下臂 + 工作台 +
+  急停在手边」（见 [`AGENTS.md`](AGENTS.md) §2）。
+
+> ⚠️ **本节的数字不在这里维护。** 逐项的**当前值、核对命令与保质期**见
+> [`docs/当前状态.md`](docs/当前状态.md)——状态写进 README 就会烂，本项目已经
+> 付过一次代价（一份维护得最认真的参考文档，它的现状段三天全错）。
 
 > 真机动作属高风险操作，需当次明确授权与安全条件确认后才可启动。
 
@@ -192,71 +197,70 @@ UR5 + 夹爪
 ## 目录结构
 
 ```
-yolo_ros/
+ur5-vision-grasp/
+├── AGENTS.md              # ★ 项目核心约定：红线 / 不变量 / 阶段梯子。**接手先读这一份**
+├── CLAUDE.md              # 只有一行 @AGENTS.md（给 Claude Code 用的转发）
 ├── ros2_ws/src/
 │   ├── yolo_detector/     # YOLOv8 检测；设备退化、权重路径解析
 │   ├── perception_3d/     # 2D→3D 投影（唯一投影点）；深度尺度/时间戳配对/TF
 │   ├── grasp_planner/     # 抓取规划；夹爪抽象层（sim / ag95）
 │   ├── arm_grasp_sim/     # 仿真世界 + UR5 + 控制器 + MoveIt  ← 工作站专用
 │   └── yolo_bringup/      # 唯一入口 bringup + pipeline + 方阵世界
-├── scripts/               # 自检、训练、数据合成脚本
+├── scripts/               # 自检、训练、数据合成脚本（每个会自己报自己的项数）
 └── docs/
-    ├── RESTRUCTURE_PLAN.md   # ★ 缺陷台账 + 改造计划 + 验收证据（先读这个）
-    ├── 待执行命令.md         # ★ 要**你亲自执行**的命令 —— 只放「还没做的」，一屏
-    ├── 待执行命令-留档.md     # 上面那份的全部历史（甲-1…甲-33）+ 每条背后的论证
-    ├── TECHNICAL_SPEC.md     # 设计稿（含环境对照表，注意其前提已过时）
-    ├── GRID_ENV_DESIGN.md    # 方阵世界与训练流水线
-    ├── MIGRATION_HANDOFF.md  # Orin 迁移交接
-    ├── JETSON_SSH.md         # 板子 SSH 连接方式（含连接信息与字段说明）
+    ├── 当前状态.md          # ★ 这台系统**现在**什么样 —— 唯一写现状的地方，带保质期
+    ├── 文档地图.md          # ★ 全仓索引：分层、是否现行、**旧文件名别名**
+    ├── 机械臂系统参考.md     # 恒久：设备与接口（只写不随任务变化的东西）
+    ├── 经验总结-问题模式与处置.md  # 恒久：复发问题模式（跨阶段累积）
+    ├── 待执行命令.md         # 要**你亲自执行**的命令 —— 只放「还没做的」
+    ├── 待执行命令-留档.md     # 上面那份的全部历史（甲-1…）+ 每条背后的论证
+    ├── RESTRUCTURE_PLAN.md   # 流水：缺陷台账 + 改造计划 + 验收证据（历史，全文保留）
+    ├── 阶段/阶段1-点对点抓放/  # 已完成阶段的产出：契约 / 技术文档 / 实验记录
+    ├── calib/                # 标定产物与标定方法（外参、TCP、探针长度）
     ├── board/                # 板端资产留档：6 个 arm-*.sh + 体检清单 + UR5 接入方案
-    ├── YOLO_TUTORIAL.md, YOLO_VISION_DESIGN.md
-    └── reference/            # 外部参考项目（不入库）
+    ├── archive/              # 已归档文档（正文一字未改，仅供追溯）
+    ├── TECHNICAL_SPEC.md     # 设计稿（含环境对照表，注意其前提已过时）
+    ├── JETSON_SSH.md         # 板子 SSH 连接方式（含字段说明）
+    ├── PROBE_LENGTH.md       # 探针长度标定
+    └── GRID_ENV_DESIGN.md, YOLO_*.md   # 仿真/YOLO 训练流水线，**与本仓主线关系待定**
 ```
+
+> **哪份讲哪一层、搬过家的叫什么** → [`docs/文档地图.md`](docs/文档地图.md)。
+> 那份地图由 `scripts/test_docs_map.py` 把守：每份文档恰好登记一次、自报层级一致、链接不断。
 
 ---
 
 ## 自检与验收
 
-十一个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+这些脚本**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
 前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
-`test_board_a1.py` 与 `test_deidentified.py` 只要 Python 标准库）：
+`test_board_a1.py`、`test_deidentified.py`、`test_docs_map.py` 与 `state_check.py`
+只要 Python 标准库）：
 
 ```bash
 source /opt/ros/humble/setup.bash
-# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余六个不需要，
+# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余不需要，
 # 但叠了一起跑没问题）。不加这一行，test_minimal 会报「ultralytics 未安装」，
 # 看起来像项目坏了 —— 其实只是解释器不对。
 export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
 
-python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学（3 项）
-python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
-python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
-python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生 + 相机序列号守卫：
-                                         #   108 项（本机，另有 3 项 SKIP）
-                                         #   板上是 109 项、2 SKIP（ur_robot_driver 只有板上有）
-                                         #   其中 11 项是相机序列号占位符守卫（含变异检查）
-                                         #   本机的三个 SKIP：没装 ur_robot_driver；
-                                         #   planner_node 与 fake_joint_states 回调里
-                                         #   没有 publish（那条竞态断言不适用）
-                                         #   其中 9 项是「收工时必须是 cleanly」（W2-9，D70）
-python3 scripts/test_model_resolution.py # 加载的是哪个模型：12 项断言（D67）
-python3 scripts/test_ag95_probe.py       # AG-95 只读探针：40 项断言
-                                         #   没有 pymodbus 时 → 26 PASS / 6 SKIP
-python3 scripts/test_ag95_gripper.py     # AG-95 驱动（读 / dry-run 闸门 / 写）：51 项断言
-                                         #   没有 pymodbus 时 → **退出码 2**（见下）
-python3 scripts/test_ag95_init_close.py  # AG-95 初始化/合拢脚本：13 项断言
+python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学
+python3 scripts/test_perception_3d.py    # 感知单元
+python3 scripts/test_detector_device.py  # 设备退化分支
+python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生 + 相机序列号守卫
+python3 scripts/test_model_resolution.py # 加载的是哪个模型（D67）
+python3 scripts/test_ag95_probe.py       # AG-95 只读探针
+python3 scripts/test_ag95_gripper.py     # AG-95 驱动（读 / dry-run 闸门 / 写）
+python3 scripts/test_ag95_init_close.py  # AG-95 初始化/合拢脚本
                                          #   重点只有一条：**不给 --go 时从站一次写都没收到**
-                                         #   没有 pymodbus 时 → 1 PASS / 10 SKIP、退出码 0
 python3 scripts/test_ur5_fk_check.py     # UR5 正运动学 + 「示教器 Base 是不是机器人 base」
-                                         #   的判决工具：20 项断言（含 3 个变异测试）
+                                         #   的判决工具（含变异测试）
                                          #   只要 numpy，不需要 ROS / 真机 / 示教器
-python3 scripts/test_board_a1.py         # A1 真机验收的**判分逻辑 + 起栈命令**：36 项断言（含 3 个变异测试）
+python3 scripts/test_board_a1.py         # A1 真机验收的**判分逻辑 + 起栈命令**（含变异测试）
                                          #   纯离线，拿真机日志原文当夹具，不碰 ROS / 臂 / 串口
                                          #   判分错了的代价不是「测试红一下」，而是误判整轮
                                          #   真机实验 —— 所以这里连判据本身也要测
-                                         #   第 5 节还钉住起栈命令的关键参数（漏一个不报错，
-                                         #   只会静默跑成另一回事，比如少了 start_delay）
 python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
                                          #   扫**全部被跟踪的文本文件**、**未跟踪（未忽略）的文件**
                                          #   与**全部提交信息**
@@ -264,11 +268,15 @@ python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，
                                          #   不改提交信息；未跟踪的文件在 git add 之前对
                                          #   ls-files 是隐形的 —— 两条路径都真的漏过）
                                          #   只要标准库；**不需要** source ROS
+python3 scripts/test_docs_map.py         # 文档地图全覆盖 + 层声明一致 + 相对链接不断
+python3 scripts/state_check.py           # 状态层过期检查（把「哪些行超期」算出来）
 ```
 
-> 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
-> —— 写错不影响运行，但会让人以为「我这边少跑了几项」。
-> ⚠️ **三个脚本缺依赖时的行为不一样，别只看退出码**：
+> ⚠️ **每个脚本会自己报自己的项数 —— 这里故意不写数字。**
+> 断言数随开发一直在涨（本仓实测过同一脚本从 24 涨到 81 项），把数字抄进文档
+> 就等于给自己埋一个必然过期的东西。想知道跑了多少项，看它自己打印的输出。
+>
+> ⚠️ **几个脚本缺依赖时的行为不一样，别只看退出码**：
 > - `test_ag95_probe.py`：只有第 2 段要 pymodbus，所以缺了会**降级**跑其余部分，
 >   报 `26 PASS / 6 SKIP` 且**退出码 0** —— 这次运行覆盖不全，不能当「验过了」。
 > - `test_ag95_gripper.py`：每一项都走 pymodbus 的串口客户端，**没有可降级的部分**，
@@ -541,7 +549,7 @@ python3 scripts/ag95_probe.py --port /dev/ttyTHS1 --slave 1 --watch   # 用手�
 ⚠️ 2026-09-27 在板子上实测过 `--frames` / `--list-ports`（能跑，且如实报「没有发现任何串口」，
 与 `lsusb` 无 USB-串口芯片一致）；**`--scan-slaves` / `--dump` / `--watch` 还没有真设备可验**。
 
-详见 [`docs/MIGRATION_HANDOFF.md`](docs/MIGRATION_HANDOFF.md) 与
+详见 [`docs/archive/MIGRATION_HANDOFF.md`](docs/archive/MIGRATION_HANDOFF.md) 与
 [`docs/RESTRUCTURE_PLAN.md`](docs/RESTRUCTURE_PLAN.md)（P4/P5 组）。
 
 ---
