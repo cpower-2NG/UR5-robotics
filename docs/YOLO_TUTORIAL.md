@@ -95,7 +95,11 @@ gz sim -r ros2_ws/src/yolo_bringup/worlds/block_grid_world.sdf
 | 随机散布（**默认**） | `python3 scripts/generate_grid_world.py --num_blocks 9 --pos_jitter 0.06` | N 个方块随机放置、互不重叠，随机分配颜色与形状（1~3 个圆柱） |
 | 固定网格（`--fixed`，调试用） | `python3 scripts/generate_grid_world.py --fixed` | 3×3，**一行一类** |
 
-两者都接受 `--classes`（逗号分隔，默认 `red,orange,yellow,cyan,purple`）——
+两者都接受 `--classes`（逗号分隔）。默认取 `scripts/block_classes.py` 里那份
+**唯一定义**的 `DEFAULT_CLASSES`；2026-10-05 拿用户那批积木实测后是 7 色：
+`red,orange,tan,yellow,yellowgreen,cyan,purple`。
+⚠️ 别在文档里再抄一份列表 —— 抄了就会漂移，而类别表漂移是**静默**故障，
+见 §4.4 多类别。
 类别名与类别号会一并写进 meta，供自动标注与建数据集读取（见 §4.4 多类别）。
 颜色取值集中在 `scripts/block_classes.py` 的 `PALETTE`，生成器不再自带一份颜色池。
 > ⚠️ 旧的颜色池里有成对的**同色相、只差明度**的颜色（蓝/钢蓝、绿/深绿、橙/深橙），

@@ -43,18 +43,15 @@ from pathlib import Path
 
 # ---- 路径 ----
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATASET_DIR = PROJECT_ROOT / "block_dataset"
+# 默认数据集。可以用 --data 换成别的（例如 scripts/relabel_by_color.py 产出的
+# 多类别版本），所以下面所有目录都由**传入的数据集目录**派生，不再是模块常量。
+DEFAULT_DATASET = PROJECT_ROOT / "block_dataset"
 
 # 微调起点：**真 COCO yolov8n**（原名为 yolov8n_backup.pt，已改名以免混淆）。
 # 注意：旧版此处写的是 "yolov8n.pt"，而仓库根那个文件其实是上一次训练产出的
 # 方块模型——于是「微调」实际上是在**上一代方块模型**上继续训，而不是从 COCO
 # 起。行为随 CWD 变化，且文件名与内容不符（详见 docs/RESTRUCTURE_PLAN.md D6）。
 BASE_WEIGHTS = PROJECT_ROOT / "yolov8n_coco.pt"
-TRAIN_IMG = DATASET_DIR / "train" / "images"
-TRAIN_LBL = DATASET_DIR / "train" / "labels"
-VAL_IMG = DATASET_DIR / "val" / "images"
-VAL_LBL = DATASET_DIR / "val" / "labels"
-DATA_YAML = DATASET_DIR / "data.yaml"
 
 
 def images_in(d):
@@ -67,20 +64,117 @@ def arrangement_of(path):
     return path.name.split("__")[0]
 
 
-def check_dataset():
+def read_yaml_names(path):
+    """只解析 data.yaml 里的 ``names:`` / ``nc:``，不引入 pyyaml 依赖。
+
+    为什么要自己解析：训练机上未必装了 pyyaml，而这几个字段是**必须**在训练前
+    核对的东西 —— 为了省一个可选依赖就跳过核对，等于把「类别表漂移」这个静默
+    故障放进来。
+    """
+    names, nc, in_names = {}, None, False
+    for raw in open(path, encoding="utf-8"):
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if in_names and line.startswith((" ", "\t")):
+            k, _, v = line.strip().partition(":")
+            if v.strip():
+                names[int(k)] = v.strip().strip("'\"")
+            continue
+        in_names = False
+        key, _, val = line.partition(":")
+        key, val = key.strip(), val.strip()
+        if key == "names":
+            in_names = not val          # `names:` 后跟缩进块；`names: {0: a}` 内联
+            if val.startswith("{"):
+                for part in val.strip("{} \n").split(","):
+                    k, _, v = part.partition(":")
+                    if v.strip():
+                        names[int(k.strip())] = v.strip().strip("'\"")
+        elif key == "nc":
+            nc = int(val)
+    return names, nc
+
+
+def check_class_table(ds, strict_known_classes=True):
+    """核对 ``data.yaml`` 的类别表，并核对每个标签里的类别号都在范围内。
+
+    这是本脚本**唯一**能拦住「类别表漂移」的地方，而漂移的症状是静默的：标签里
+    的类别号与 names 错位之后，训练照样跑完、loss 照样下降，只是模型学到的名字
+    全错（详见 scripts/block_classes.py 开头的 ⚠️）。所以宁可在这里拒绝开训。
+
+    ``strict_known_classes``：类别数 >1 时，要求 names 与 block_classes 里那份
+    **唯一定义**逐位相同。顺序不同不算通过 —— 顺序即索引，换顺序等于重编所有标签。
+    """
+    ok = True
+    y = ds / "data.yaml"
+    if not y.is_file():
+        print(f"[ERROR] 没有 {y} —— 数据集不完整。")
+        return False
+    names, nc = read_yaml_names(y)
+    if nc is None:
+        nc = len(names)
+    if sorted(names) != list(range(nc)):
+        print(f"[ERROR] data.yaml 的 names 不是 0..{nc - 1} 的连续编号：{sorted(names)}")
+        return False
+    ordered = [names[i] for i in range(nc)]
+    print(f"  类别表 ({nc} 类)：{ordered}")
+
+    if nc != len(names):
+        print(f"[ERROR] nc={nc} 与 names 的项数 {len(names)} 对不上。")
+        ok = False
+
+    if nc > 1 and strict_known_classes:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from block_classes import DEFAULT_CLASSES
+        except ImportError:
+            print("  [WARN] 找不到 block_classes.py，跳过类别表核对。")
+            DEFAULT_CLASSES = None
+        if DEFAULT_CLASSES is not None and ordered != list(DEFAULT_CLASSES):
+            print("[ERROR] 多类别数据集的类别表与 scripts/block_classes.py 不一致：")
+            print(f"        data.yaml  : {ordered}")
+            print(f"        唯一定义处 : {list(DEFAULT_CLASSES)}")
+            print("        顺序不同也算不一致 —— 类别号 = 下标，换顺序等于重编所有标签，")
+            print("        而且**不会报错**。确认这是有意为之再传 --allow-other-classes。")
+            ok = False
+
+    # 标签里的类别号越界：写法是「静默错」，所以要逐文件查，别抽查
+    bad = {}
+    for split in ("train", "val"):
+        ldir = ds / split / "labels"
+        if not ldir.is_dir():
+            continue
+        for f in sorted(ldir.glob("*.txt")):
+            for ln, line in enumerate(open(f, encoding="utf-8"), 1):
+                if not line.strip():
+                    continue
+                cid = int(line.split()[0])
+                if not 0 <= cid < nc:
+                    bad.setdefault(str(f.relative_to(ds)), []).append((ln, cid))
+    if bad:
+        print(f"[ERROR] {len(bad)} 个标签文件里有越界类别号（应当都在 [0,{nc})），例如：")
+        for k in sorted(bad)[:3]:
+            print(f"        {k}:{bad[k][0][0]} 类别号={bad[k][0][1]}")
+        print("        多半是标签用一张类别表写的、data.yaml 用了另一张。")
+        ok = False
+    return ok
+
+
+def check_dataset(ds, strict_known_classes=True):
     """训练前的体检。**切分不在这里做**，只检查它已经是对的。
 
-    三件事：图与标签一一对应、两边都非空、**train 与 val 的排布不重叠**。
-    最后一条是这份数据集唯一不能出错的地方 —— 重叠了 val 指标就不可信，
-    而且它不会报错，只会让数字好看。
+    四件事：图与标签一一对应、两边都非空、**train 与 val 的排布不重叠**、
+    类别表自洽。排布不重叠是这份数据集最容易出错的地方 —— 重叠了 val 指标就
+    不可信，而且它不会报错，只会让数字好看。
     """
     ok = True
     arrs = {}
-    for split, idir, ldir in (("train", TRAIN_IMG, TRAIN_LBL),
-                              ("val", VAL_IMG, VAL_LBL)):
+    for split in ("train", "val"):
+        idir, ldir = ds / split / "images", ds / split / "labels"
         imgs = images_in(idir)
         if not imgs:
-            print(f"[ERROR] {idir}/ 里没有图像 —— 先跑 scripts/build_dataset.py 装配。")
+            print(f"[ERROR] {idir}/ 里没有图像 —— 先装配数据集。")
             return False
         missing = [p.name for p in imgs if not (ldir / (p.stem + ".txt")).exists()]
         if missing:
@@ -96,25 +190,36 @@ def check_dataset():
         print("        请重跑 scripts/build_dataset.py 重新按排布切分。")
         ok = False
 
-    man = DATASET_DIR / "dataset_manifest.json"
+    if not check_class_table(ds, strict_known_classes):
+        ok = False
+
+    # 清单是装配那一刻的快照，两种数据集写出来的**格式不同**（build_dataset.py 按
+    # split 统计，relabel_by_color.py 按类别统计），所以这里只做能做的核对，别硬解。
+    man = ds / "dataset_manifest.json"
     if man.exists():
         import json
         m = json.load(open(man))
-        print(f"  清单（**构建时**的记录）：train {m['split']['train']['boxes']} 框 / "
-              f"val {m['split']['val']['boxes']} 框")
-        # 清单是装配那一刻的快照。跟现况对一下 —— 对不上说明有人手工动过目录，
-        # 那时清单里的出处追溯就不可信了，比数字本身更值得警惕。
-        for split, idir in (("train", TRAIN_IMG), ("val", VAL_IMG)):
-            now, was = len(images_in(idir)), m["split"][split]["frames"]
-            if now != was:
-                print(f"  [WARN] {split} 实际 {now} 帧，清单记的是 {was} 帧 "
-                      f"—— 目录被手工改过，清单里的出处不再可信。")
+        if "split" in m:
+            print(f"  清单（**构建时**的记录）：train {m['split']['train']['boxes']} 框 / "
+                  f"val {m['split']['val']['boxes']} 框")
+            for split in ("train", "val"):
+                now, was = len(images_in(ds / split / "images")), m["split"][split]["frames"]
+                if now != was:
+                    print(f"  [WARN] {split} 实际 {now} 帧，清单记的是 {was} 帧 "
+                          f"—— 目录被手工改过，清单里的出处不再可信。")
+        elif "class_counts" in m:
+            cc = m["class_counts"]
+            print("  清单（重标工具写的）：" +
+                  "  ".join(f"{k}={v}" for k, v in cc.items()))
+            if m.get("overrides_applied"):
+                print(f"  其中 {m['overrides_applied']} 个框是人工复核后改判的，"
+                      f"明细见清单的 manual_overrides。")
     else:
         print("  [WARN] 没有 dataset_manifest.json —— 无法追溯每帧的出处。")
     return ok
 
 
-def train(epochs, batch, imgsz, device_arg, name, workers):
+def train(ds, epochs, batch, imgsz, device_arg, name, workers, weights_out):
     """训练 YOLOv8n。"""
     try:
         from ultralytics import YOLO
@@ -140,12 +245,13 @@ def train(epochs, batch, imgsz, device_arg, name, workers):
         sys.exit(1)
 
     print(f"\n加载预训练模型 {BASE_WEIGHTS.name}，设备: {device}")
+    print(f"数据集: {ds}")
     print(f"epochs={epochs} batch={batch} imgsz={imgsz}")
     model = YOLO(str(BASE_WEIGHTS))
 
     print("开始训练...")
     results = model.train(
-        data=str(DATA_YAML),
+        data=str(ds / "data.yaml"),
         epochs=epochs,
         imgsz=imgsz,
         batch=batch,
@@ -162,10 +268,15 @@ def train(epochs, batch, imgsz, device_arg, name, workers):
         verbose=True,
     )
 
-    # 复制最佳模型到项目根目录（yolo_detector 的默认 model 参数就指向它）
+    # 复制最佳模型到项目根目录（yolo_detector 的默认 model 参数就指向 block_best.pt）
     best_src = PROJECT_ROOT / "runs" / name / "weights" / "best.pt"
-    best_dst = PROJECT_ROOT / "block_best.pt"
+    best_dst = PROJECT_ROOT / weights_out
     if best_src.exists():
+        # 覆盖前说一声：单类别与多类别的权重都叫 block_best.pt 系列，覆盖错了
+        # 只会表现为「检测出来的名字不对」，不会报错。
+        if best_dst.exists():
+            print(f"\n[注意] 覆盖已有权重 {best_dst}"
+                  f"（{best_dst.stat().st_size / 1e6:.1f} MB）")
         shutil.copy(str(best_src), str(best_dst))
         print(f"\n✅ 训练完成！最佳模型: {best_dst}")
         print(f"   验证指标: {results.results_dict}")
@@ -189,15 +300,29 @@ if __name__ == "__main__":
                          "每个 worker 都持有一份数据集缓存的引用）")
     ap.add_argument("--device", default=None, help="cuda:0 / cpu（默认自动）")
     ap.add_argument("--name", default="block_detect", help="runs/ 下的子目录名")
+    ap.add_argument("--data", default=str(DEFAULT_DATASET),
+                    help="数据集目录（含 data.yaml）。默认 block_dataset；"
+                         "多类别用 scripts/relabel_by_color.py 产出的那份。")
+    ap.add_argument("--weights-out", default="block_best.pt",
+                    help="训练完把 best.pt 复制到仓库根的这个文件名。"
+                         "多类别模型**别**默认覆盖单类别的 block_best.pt。")
+    ap.add_argument("--allow-other-classes", action="store_true",
+                    help="允许 data.yaml 的类别表与 block_classes.DEFAULT_CLASSES 不同")
     a = ap.parse_args()
 
     print("=" * 60)
     print("  YOLOv8 方块检测训练")
     print("=" * 60)
 
-    print("\n体检数据集（切分已由 build_dataset.py 按排布固化）...")
-    if not check_dataset():
+    ds = Path(a.data).resolve()
+    if not ds.is_dir():
+        print(f"\n❌ 数据集目录不存在：{ds}（退 2）")
+        sys.exit(2)
+
+    print(f"\n体检数据集（切分已由装配脚本按排布固化）...")
+    if not check_dataset(ds, strict_known_classes=not a.allow_other_classes):
         print("\n❌ 数据集不合格，拒绝训练。")
         sys.exit(1)
 
-    train(a.epochs, a.batch, a.imgsz, a.device, a.name, a.workers)
+    train(ds, a.epochs, a.batch, a.imgsz, a.device, a.name, a.workers,
+          a.weights_out)

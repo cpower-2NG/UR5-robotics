@@ -135,9 +135,17 @@ def main():
         m = import_labeler(img_dir, lbl_dir, classes='cyan,red,yellow')
         check('类别表就是传进去的顺序',
               m.CLASS_NAMES == ['cyan', 'red', 'yellow'], str(m.CLASS_NAMES))
-        check('默认类别表是 block_classes.DEFAULT_CLASSES',
-              m.DEFAULT_CLASSES == ['red', 'orange', 'yellow', 'cyan', 'purple'],
-              str(m.DEFAULT_CLASSES))
+        # ⚠️ 这里原先写死了一份五类表（['red','orange','yellow','cyan','purple']）。
+        # 那是**第三份**会漂移的副本：block_classes.py 改了默认类别表，label_blocks
+        # 跟着变（它本来就是 import 的），反而是这条断言红了 —— 红得毫无信息量，
+        # 只逼着人把测试里的字面量再抄一遍，抄错就又埋一颗雷。
+        # 真正该守住的不变量是「它是**引用**唯一定义处，不是自己抄的一份」。
+        import block_classes as _bc
+        check('默认类别表就是 block_classes 的那一份（同一个对象，不是副本）',
+              m.DEFAULT_CLASSES is _bc.DEFAULT_CLASSES,
+              '%r vs %r' % (m.DEFAULT_CLASSES, _bc.DEFAULT_CLASSES))
+        check('默认类别表非空且未超切换键上限 9',
+              2 <= len(m.DEFAULT_CLASSES) <= 9, str(len(m.DEFAULT_CLASSES)))
         check('导入后已装好第一张图（img_list 非空）', len(m.img_list) == 1)
 
         # ------------------------------------------------ [2] 写出的格式

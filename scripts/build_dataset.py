@@ -29,7 +29,7 @@ train 里一帧都不能是它的。这份脚本把这条写死成断言（`plan
     python3 scripts/build_dataset.py --out block_dataset \\
         --val r02,r06a2 --jpeg-quality 92
     python3 scripts/build_dataset.py --out block_dataset_multiclass \\
-        --class-names red,orange,yellow,cyan,purple
+        --class-names red,orange,tan,yellow,yellowgreen,cyan,purple
 
 **类别表（多类别）**
 
@@ -48,7 +48,7 @@ import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from block_classes import parse_classes                             # noqa: E402
+from block_classes import DEFAULT_CLASSES, parse_classes            # noqa: E402
 
 try:
     import cv2
@@ -265,7 +265,7 @@ def main(argv=None):
         if a.class_name is not None and a.class_names is not None:
             raise ValueError(
                 "--class-name 与 --class-names 同时给了。请只用一个：\n"
-                "    多类别用 --class-names red,orange,yellow,cyan,purple\n"
+                "    多类别用 --class-names " + ",".join(DEFAULT_CLASSES) + "\n"
                 "    单类别用 --class-names block（或旧的 --class-name block）")
         spec = a.class_name if a.class_name is not None else a.class_names
         # 都不传 = 单类 "block"（与旧行为一致，别把老命令弄坏）

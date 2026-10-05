@@ -273,7 +273,7 @@ python3 scripts/test_planner_class_sort.py  # 上面那条判据**有没有真�
                                          #        A 参数通路（命令行 + 随仓 yaml 两条路径，
                                          #          含「末尾裸逗号被静默丢掉」那个写法陷阱）
                                          #   B2 段钉住「不路由时收工原因与 A1 逐字相同」
-python3 scripts/test_block_classes.py    # 类别表的**交付前关卡**：17 项断言（含 5 个变异）
+python3 scripts/test_block_classes.py    # 类别表的**交付前关卡**：22 项断言（含 5 个变异）
                                          #   调色板 ↔ data.yaml 的 names ↔
                                          #   dataset_manifest.json 的 class_names，
                                          #   比的是**逐位相等**而不是集合 —— 顺序错一位，
@@ -291,6 +291,17 @@ python3 scripts/test_palette_survey.py   # 量颜色那把尺子本身准不准�
                                          #   红跨在 0°/360° 上会算出 176°，而「不是 None」
                                          #   的断言照样通过 —— 断言因为错误的原因绿了
                                          #   只要 numpy + OpenCV（不需要真照片、不连相机）
+python3 scripts/test_relabel_by_color.py # 按颜色重标那把尺子准不准：31 项断言
+                                         #   （含 4 个变异）每一节都对应一次**真实翻车**：
+                                         #   环形距离（跨 0° 的紫会被算成红）、
+                                         #   框心权重（大邻居从框边渗进来会翻盘，且
+                                         #   **不能**再乘饱和度 —— 紫的饱和天生低）、
+                                         #   组内饱和归一化（橙/棕只差 8°，换曝光就翻面）、
+                                         #   掩码（白纸 S≈24 / 木桌面 S≈30 必须被挡住）
+                                         #   第 6 节还把人工改判端到端验到底：
+                                         #   翻开 block_dataset_7cls 的文件看那一行真的写了
+                                         #   改判后的类别号（数据集不在就跳过，不算失败）
+                                         #   只要 numpy（第 5 节另需 OpenCV）
 python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
                                          #   扫**全部被跟踪的文本文件**、**未跟踪（未忽略）的文件**
                                          #   与**全部提交信息**
