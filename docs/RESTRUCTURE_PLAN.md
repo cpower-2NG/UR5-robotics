@@ -14472,3 +14472,204 @@ cyan 那 24 个虚警里 **23 个是紫方块被认成青**。桌上不放紫，
 - purple 的重标/重训（用户说「之后在增强训练」）。
 - `palette_survey.py` 那两个工具缺口（无 `--crop`；`find_modes` 只按色相聚类）仍在。
 - 真机分拣（要 `colcon build` 规划器那一半）—— 本轮一行 ROS 代码都没动。
+---
+
+## 第九十七轮：分拣的**规划面**立起来 + 复扫包线 —— 顺带逮到护栏探针「把合法的 0 当成没填」（2026-10-05）
+
+上一轮（九十六）把 A2 的**检测面**（召回/混淆矩阵）立起来了，本轮做**规划面**：
+现场 yaml 的 8 格分拣表、配置层判据、板子树同步、真起一次规划器验证、包线复扫。
+结论一句话：**路由表与槽位几何都对得上真机包线**；而验证过程里逮到一处一直
+在**悄悄放行**的护栏读参 bug —— 它让「上电前那道闸门」比真机松了 0.39 m。
+
+### 1. 规划器按 `site_sort.yaml` 真起一次：路由表八格全对（板端实测）
+
+`ros2 run grasp_planner planner_node --ros-args --params-file ~/site_sort.yaml`
+（无 MoveIt、无驱动 ⇒ 只出启动日志，**不下发任何运动**）：
+
+```
+抓取区 x[0.400,0.600] y[0.000,0.450] z[0.000,0.049] | 放置槽位 8 个 @ place_z=0.029（间距下限告警 95 mm）
+类别路由：0:(0.50,-0.10) red  1:(0.60,-0.10) red  2:(0.50,-0.20) orange  3:(0.60,-0.20) orange
+          4:(0.50,-0.30) yellow  5:(0.60,-0.30) yellow  6:(0.50,-0.40) cyan  7:(0.60,-0.40) cyan
+```
+
+- `_validate_zones` 没拦：8 格全在 `pick_zone` 之外（槽位 y<0，抓取区 y∈[0,0.45]）；
+- 间距 100 mm ≥ 夹爪行程 95 mm ⇒ **只是告警不是错误**（`间距下限告警 95 mm` 那句是说明口径，
+  不是命中告警）；
+- 末尾那批 `轨迹 action 服务不可用` / `FK 服务不可用` / `初始 HOME失败` 是**没有 MoveIt/控制器**
+  的预期结果，正好也证明这条直跑路径**不会有动作**。
+
+> ⚠️ 这条直跑路径**只能看路由表这类不涉及几何的输出**。它读到的
+> `tool0_to_fingertip` 是 yaml 里的 **0.13（仿真值）**，而真机由
+> `pipeline.launch.py` 覆盖成 **0.1757** —— 差 45.7 mm。见第 4 节。
+
+### 2. 包线复扫：8 个槽位全部落在安全区，与上次逐字一致（板端实测）
+
+`table_safety_envelope.py --table-z 0.0 --retry-seed home --ik-group ur_manipulator
+--x-min 0.15 --x-max 0.95 --y-min -0.50 --y-max 0.50 --step 0.05`
+（357 格 × 4 个 tool0 高度，1428 次 IK+FK，973 s）：
+
+| 项 | 结果 |
+|---|---|
+| 最大**全安全**矩形 | **x∈[0.40,0.75] y∈[−0.45,+0.45]**（152 格）—— 与上一次扫描**逐字相同** |
+| 撞桌格 | 40 格，全在 **x∈[0.15,0.35] 且 y∈[−0.25,+0.50]** |
+| 够不到 | 62 格，x∈[0.75,0.95]（两类种子都解不出） |
+| 全场最低连杆 | −0.1050，在 (0.30,+0.40) 的「抓取下降」（`forearm_link`） |
+| 逐格可复现性 | 两次全扫有 **19/357（5.3%）** 判读不同 ⇒ **离边界留一格（0.05 m）** |
+
+**逐格核对 8 个槽位**（用逐行可用段表，不用矩形——矩形会把段表抹平）：
+
+| y | 该行可用 x 段 | 落在这里的槽位 | 到最近边界的余量 |
+|---|---|---|---|
+| −0.10 | `[0.30,0.85]★` | x=0.50、0.60 | ≥0.20 m |
+| −0.20 | `[0.25,0.85]` | x=0.50、0.60 | ≥0.15 m |
+| −0.30 | `[0.15,0.80]` | x=0.50、0.60 | ≥0.20 m |
+| −0.40 | `[0.15,0.75]` | x=0.50、0.60 | ≥0.15 m |
+
+⇒ **8 格全在可用段内**，且离撞桌带（x≤0.35）与够不到带（x≥0.75）都还有 ≥0.15 m。
+台账「**丙-6：照着包线划 zones**」到这一轮**结清了一半**：place 侧量过了；
+pick 侧还剩一条 —— 扫描建议 z 下界取 **+0.0085**（= 台面 + 方块顶 − 0.02 容差），
+而现用 `pick_zone` 的 z 下界是 **0.0**。0.0 更宽、更不容易漏检，A1 也是这么跑过的，
+所以**本轮不改**，只记下这个建议值待用户定。
+
+### 3. ⚠️ 逮到一个一直在放行的 bug：`elbow_guard_probe` 把**合法的 0** 当成「没填」
+
+第 2 节的日志里有一句刺眼的：
+
+```
+⇒ **按节点参数那份护栏判（table_plane_z=-0.39 ⇒ 下限 -0.3700）会放行它**
+```
+
+可**同一时刻**直接问运行中的 `/grasp_planner`，答案是 `table_plane_z = 0.0`
+（现场 yaml 写的、也是真机的正确值：台面就在 base 上）。**那句话是脚本自己造的。**
+
+根因在 `elbow_guard_probe.py` 的 `read_params`：
+
+```python
+if v in ([], 0, 0.0, "") and FALLBACK[name] not in ([], 0, 0.0, ""):
+    v = FALLBACK[name]        # ← 把「合法的 0/0.0/False」当成「未声明」
+```
+
+它想判的是「节点没声明这个参数」，判的却是「值看起来像空的」。后果：
+
+| | 正确 | 实际（改前） |
+|---|---|---|
+| `table_plane_z`（真机正确值 **0.0**） | 0.0 | 被换成仿真兜底 **−0.39** |
+| 护栏下限 `table_plane_z + guard_margin` | **+0.02** | **−0.37** |
+| 台面下 0.37 m 的连杆 | 拦下 | **放行** |
+| `elbow_guard_enabled: false`（想关护栏） | False | 被换成 True（`False == 0`） |
+
+这个脚本是**现场上电前那道闸门**（退出码 0 = 可以动），下限一松，闸门就等于没做。
+影响面要说准：**A1 那次真机预检里靠 `table_plane_z` 的那一层是按 −0.39 判的**。
+A1 的抓放本身没出事（抓取区 x∈[0.4,0.6] y∈[0,0.45] 在包线里全是安全格），
+但**那道闸门当时没在量它以为在量的东西**。
+
+改法：判据换成 **type == `PARAMETER_NOT_SET`**，落成一个可单独测的纯函数：
+
+```python
+NOT_SET = 0
+def pick(field_type, value, fallback):
+    if field_type == NOT_SET:
+        return fallback
+    return value
+```
+
+新增 `scripts/test_elbow_guard_params.py`：**17 项断言、2 个变异**。它按 AST 只抽出
+`pick`（不依赖任何 ROS 类型）来跑，所以**不需要 rclpy**、开发机上秒级可跑。
+变异是把旧判据文本塞回去再 exec，断言它在 `(DOUBLE, 0.0, −0.39)` 上**必须答错** ——
+证明这几条输入真的在量东西。
+
+> 顺带记一笔：本文件第 3 节第一版**自己是假绿的**。它用 `'in ([], 0, 0.0, "")' not in src`
+> 扫原文，而那句历史写法**正当地**留在 `pick` 的注释里 ⇒ 断言红在「注释里有这句话」上。
+> 改成 AST 只认代码节点后又发现**第二个假绿**：合成样本 `v in ([], 0, 0.0, "")` 认不出来，
+> 因为第一个元素是 `ast.List` 而不是 `ast.Constant` —— 只认 Constant 的话这条判据一个都
+> 抓不到，而源码「恰好没有」时照样全绿。两条都是自己把自己绊倒，也都被自己的断言逮住。
+
+### 4. 「yaml 里写的是仿真值、由 launch 覆盖」——量清楚是**哪 7 项**
+
+第 1 节那条直跑路径会读到仿真值，这不是新问题，但以前只有一句笼统的「现场值必须走显式
+命令行」。本轮把边界量出来了（读 `pipeline.launch.py` 的 `planner_params` 第二段 dict +
+直接 `GetParameters` 问运行中的节点）：
+
+**被 launch 无条件覆盖的 7 项**（命令行 `-p` 优先于 `--params-file`，yaml 里写什么都不生效）：
+
+| 参数 | yaml 里（仿真） | 真机实际 |
+|---|---|---|
+| `ik_group` | `ur5_manipulator` | `ur_manipulator` |
+| `trajectory_action` | `/joint_trajectory_controller/…` | `/scaled_joint_trajectory_controller/…` |
+| `tool0_to_fingertip` | 0.13 | **0.1757**（差 45.7 mm） |
+| `place_release_lift` | 0.01 | 0.0156 |
+| `gripper_backend` | `sim` | `ag95`（命令行给） |
+| `carry_objects` | true | 命令行给 |
+| `table_scene_enabled` | false | 命令行给 |
+
+**其余项**从 yaml 生效 —— 实测节点实读值与 yaml **逐字一致**：
+`table_plane_z=0.0`、`pick_zone=[0.4,0.6,0.0,0.45,0.0,0.0485]`、
+`place_slots=[0.5,-0.1,…]`、`place_slot_classes=['red','red','orange','orange','yellow','yellow','cyan','cyan']`、
+`place_z=0.0285`、`ag95_stroke_mm=95.0`。
+
+⇒ 已写进 `docs/现场yaml草稿-真机.yaml` 的注释块，并点明**别绕过 launch 直跑节点**：
+那样法兰会比真机应有的位置低 45.7 mm（放置下降会压台面），`ik_group` 也会用仿真名
+（实测 **1428/1428 全是 `IK INVALID_GROUP_NAME`** —— 第一次扫包线就是这么废掉的）。
+
+### 5. 无臂栈：**域隔离**是唯一没被挡住的路
+
+本轮要起 MoveIt 但**不能碰真机**，正路是 `scripts/no_arm_stack.py`。它起不来，原因不是它：
+
+```
+另有 3 个进程在跑（本脚本无从判断是上一份栈还是残留）：
+  move_group            ppid=1，已挂 5h28m
+  realsense2_camera     ppid=1，28 分钟前（上一轮推理录像的残留）
+```
+
+两个都是**父进程已消失的孤儿**，而 `no_arm_stack.py` 用 **ps** 判残留 ⇒ 直接退 2。
+清场需要用户点头（我起 kill 被权限闸拦了，那是对的：不是我起的进程）。
+
+于是改走 **`ROS_DOMAIN_ID=77` 域隔离** + 手工起四件，一个孤儿都不碰：
+
+```bash
+export ROS_DOMAIN_ID=77
+ros2 launch yolo_bringup real.launch.py start_ur_driver:=false start_pipeline:=false \
+    publish_camera_tf:=false tf_required:=false gripper_backend:=none carry_objects:=false &
+ros2 run robot_state_publisher robot_state_publisher --ros-args -p "robot_description:=$(cat /tmp/a2.urdf)" &
+python3 scripts/fake_joint_states.py &
+ros2 run grasp_planner planner_node --ros-args --params-file ~/site_sort.yaml &
+```
+
+- `start_pipeline:=false` 是关键：**不起相机** ⇒ 不与那台孤儿 realsense 抢 USB 设备。
+- `real.launch.py` 的 `start_ur_driver:=false` 会**连 RSP 一起省掉**（RSP 是驱动顺带起的），
+  所以 RSP 必须自己起，描述包从 `real.launch.py` 的 `DESCRIPTION_PACKAGE` 读
+  （本轮 = `yolo_ur_description`，`calib_2353869974907916917`）。
+- ⚠️ **`--ik-group` 必须显式给 `ur_manipulator`**：`elbow_guard_probe` 的兜底是仿真的
+  `ur5_manipulator`，而这里没有 `pipeline.launch.py` 去覆盖它（第一次扫就是死在这上面）。
+
+### 6. 板子树同步（安全路径）
+
+板子上原来那份检出（`~/yolo_ros_original`）停在 `migrate/humble-orin @ c33edac`，
+**没有** `slot_routing.py`（`place_slot_classes` 0 处）。**不能在板上切分支** ——
+那份检出**跟踪着** `block_dataset/`(422) 等共 **1004 个**被新仓过滤掉的文件，
+切过去会**删掉**它们。所以：把 `a2-multiclass` 推到板上那个裸仓（`migrate/humble-orin`
+原地不动）→ `~/ur5-vision-grasp` **全新 clone** → `colcon build`（6 包、6.01 s、无错）。
+旧检出与其 `block_dataset` 完好；新检出里 `slot_routing` 可导入、`planner_node` 有
+`place_slot_classes`。
+
+### 7. 本轮验证清单（全部板端实跑）
+
+| 项 | 结果 |
+|---|---|
+| `test_site_yaml_sort.py` | 17 PASS / 0 FAIL（配置层「类别错分必须能被发现」） |
+| `test_slot_routing.py` | 30 PASS / 0 FAIL |
+| `test_elbow_guard_params.py`（新） | **17 PASS / 0 FAIL**（本机 + 板端都能跑） |
+| `test_table_envelope.py` | 107 PASS / 0 FAIL |
+| `test_guard_path.py`（板上，要 ROS） | **全部通过**（含 D3/D4：端点都过、中段不过的真路径） |
+| `test_deidentified.py` | rc=0 干净（201 文件 + 356 条提交信息） |
+| 全量本地自检 | 无回归（rc=1 的几个都是缺 rclpy / ultralytics / 真硬件） |
+
+### 8. 留给下一轮 / 需要用户
+
+- 🔴 **板上那两个孤儿进程要人工清**（`kill 158368`；realsense 那对 163859/163861）。
+  不清理的话 `no_arm_stack.py` 会一直退 2，只能用域隔离绕。
+- 真机分拣**还没跑**：要当次明确授权 + 安全条件确认。起栈命令在
+  `docs/待执行命令.md` 的「A2 第三步」（照 A1 那条整条抄、只换 yaml，含
+  `gripper_backend:=ag95 carry_objects:=true start_delay:=120`）。
+- `pick_zone` 的 z 下界：扫描建议 +0.0085，现用 0.0（见第 2 节）。
+- 包线逐格 5.3% 不可复现（KDL `attempts:3`、无 `consistency_limits`）—— 划区留一格。

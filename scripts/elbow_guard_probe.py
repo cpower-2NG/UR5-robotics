@@ -108,6 +108,43 @@ def rpy_to_quat(rpy):
             cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy)
 
 
+# `rcl_interfaces/ParameterType.PARAMETER_NOT_SET` —— 节点**没声明**这个参数时
+# GetParameters 回的 type。它是「该用兜底了」的**唯一**正确判据。
+NOT_SET = 0
+
+
+def pick(field_type, value, fallback):
+    """一个参数该取「节点给的那个」还是「兜底」—— 只看 **type**。
+
+    ⚠️ 这一段原先写的是「值看起来空就用兜底」：
+
+        if v in ([], 0, 0.0, "") and FALLBACK[name] not in ([], 0, 0.0, ""):
+            v = FALLBACK[name]
+
+    它把**合法的** `0` / `0.0` / `False` 当成「未声明」。而真机现场 yaml 里
+    `table_plane_z` 的**正确值恰好就是 `0.0`**（台面就在 base 上，见台账
+    「台面就在 base 上」），于是它被静默换成**仿真兜底 `-0.39`** ——
+
+        护栏下限 = table_plane_z + guard_margin
+        正确  0.00 + 0.02 = +0.02
+        实际 -0.39 + 0.02 = -0.37
+
+    ⇒ 连杆压到**台面以下 0.37 m** 仍然判「安全」。这脚本是现场上电前的那道
+    闸门（`_posture_ok` 的离线版），它一松，护栏就等于没做。
+
+    同一条式子还吃掉 `elbow_guard_enabled: false`（`False == 0`）⇒ 护栏明明
+    关着，脚本却按「开」判。
+
+    实测（2026-10-05，板端，`ROS_DOMAIN_ID=77` + `site_sort.yaml`）：
+    直接 `GetParameters` 读运行中的 `/grasp_planner` 得 `table_plane_z=0.0`，
+    而同一次 `table_safety_envelope.py` 打印的是「节点参数 table_plane_z=-0.39」
+    —— 那句 ⚠️ 是**脚本自己造出来的**，与节点无关。
+    """
+    if field_type == NOT_SET:
+        return fallback
+    return value
+
+
 def val(rs, i, default):
     """从 rcl_interfaces/ParameterValue 里取值。
 
@@ -198,11 +235,9 @@ class Probe(Node):
         rs = fut.result()
         p = {}
         for i, name in enumerate(PARAM_NAMES):
-            v = val(rs, i, FALLBACK[name])
-            # 未声明的参数回的是默认值（空数组/0），此时用兜底
-            if v in ([], 0, 0.0, "") and FALLBACK[name] not in ([], 0, 0.0, ""):
-                v = FALLBACK[name]
-            p[name] = v
+            # 取「真值」还是「兜底」由 `pick` 判 —— 判据是 type，不是值长什么样。
+            p[name] = pick(rs.values[i].type, val(rs, i, FALLBACK[name]),
+                           FALLBACK[name])
         return self._apply_override(p)
 
     def _apply_override(self, p):

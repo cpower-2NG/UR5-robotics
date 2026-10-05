@@ -217,10 +217,11 @@ yolo_ros/
 
 ## 自检与验收
 
-十九个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+二十个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
 前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
-`test_board_a1.py`、`test_deidentified.py`、`test_slot_routing.py` 与
+`test_board_a1.py`、`test_deidentified.py`、`test_slot_routing.py`、
+`test_elbow_guard_params.py` 与
 `test_block_classes.py` 只要 Python 标准库；`test_palette_survey.py` 只要
 numpy（夹具自己造合成图，**不需要真照片**）；`test_planner_class_sort.py`
 要 ROS 2 与 `colcon build` 过的 `grasp_planner`，但**不需要 MoveIt、
@@ -320,6 +321,21 @@ python3 scripts/test_live_infer_record.py # 实时推理录像那个脚本的**�
                                          #   越界类别号不崩、**绝不联网下载权重**
                                          #   （YOLO("yolov8n.pt") 缺文件时会自动下 COCO，
                                          #   症状是"检测不到方块"而不是报错）
+python3 scripts/test_elbow_guard_params.py  # 肘高护栏探针**读节点参数**那一步：17 项（含 2 个变异）
+                                         #   为什么值得单独钉：`elbow_guard_probe.py` 是
+                                         #   现场上电前那道闸门，而它的下限是
+                                         #   `table_plane_z + guard_margin`——从运行中的
+                                         #   规划器读来的。读错一步，闸门松紧跟着错，
+                                         #   而它自己**不会报错**，会照样打印一行看着
+                                         #   很正常的「下限 -0.370」
+                                         #   实测（2026-10-05）：旧写法把**合法的 0.0**
+                                         #   当成「未声明」，而真机 `table_plane_z` 恰好
+                                         #   就是 0.0 ⇒ 被静默换成仿真兜底 -0.39，
+                                         #   下限从 +0.02 掉到 -0.37（台面下 0.37 m 仍判安全）
+                                         #   现在判据是 type == PARAMETER_NOT_SET；
+                                         #   本文件用 AST 只抽出 `pick` 那个纯函数来测
+                                         #   （它不依赖 ROS 类型），所以**不需要 rclpy**
+                                         #   只要标准库，秒级跑完
 python3 scripts/test_eval_class_recall.py # A2 验收面那把**尺子**准不准：47 项（含 4 个变异）
                                          #   A2 判据里写着「类别错分必须能被测试发现」——
                                          #   那句话的对象不是模型，是这把尺子。所以逐个把实现

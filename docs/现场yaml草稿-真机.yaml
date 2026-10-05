@@ -1,5 +1,26 @@
 grasp_planner:
   ros__parameters:
+    # ⚠️⚠️ 这张表**不是自足的**：下面这 7 项在本文件里写的是**仿真值**，
+    #      跑真机时由 `pipeline.launch.py` **无条件覆盖**成真机值
+    #      （实测 2026-10-05：那 7 项由 `planner_params` 的第二段 dict 传入，
+    #      命令行 -p 优先于 --params-file，所以 yaml 里写什么都不生效）：
+    #
+    #        ik_group            ur5_manipulator → ur_manipulator
+    #        trajectory_action   ..._controller   → scaled_joint_trajectory_controller
+    #        tool0_to_fingertip  0.13             → 0.1757   ← 差 45.7 mm！
+    #        place_release_lift  0.01             → 0.0156
+    #        gripper_backend     sim              → ag95（由命令行给）
+    #        carry_objects       true             → 由命令行给
+    #        table_scene_enabled false            → 由命令行给
+    #
+    #      **其余项都从本文件生效**（实测：table_plane_z / pick_zone / place_slots /
+    #      place_slot_classes 的节点实读值与本文件逐字一致）。
+    #
+    #      ⇒ 后果：**不要**绕过 launch 直接
+    #        `ros2 run grasp_planner planner_node --params-file 本文件`
+    #        那样会读到 0.13 —— 法兰比真机应有的位置**低 45.7 mm**，
+    #        放置下降会压到台面；`ik_group` 也会用仿真的名字（IK 全 `INVALID_GROUP_NAME`，
+    #        实测 1428/1428）。直跑节点只适合看**路由表/槽位校验**这类不涉及几何的输出。
     targets_topic: /targets_3d
     ik_service: /compute_ik
     trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
@@ -59,11 +80,13 @@ grasp_planner:
     #   · 沿 y 铺 4 列（跨度 0.30 m，居中后两端各留 0.05 m）时，x 只用到
     #     {0.50, 0.60} —— **这两个值正是 A1 真机跑过 4/4 的那两列**，已实测。
     #
-    # ⚠️ 下面这些数字**还没有过包线复扫**（台账「丙-6：照着包线划
-    #    pick_zone/place_zone」仍是未做项）。它们是从已扫出的安全矩形
-    #    x∈[0.40,0.75] y∈[-0.45,+0.45] **推**出来的，不是量出来的。
-    #    上机前用 `scripts/table_safety_envelope.py --table-z 0.0` 复扫一遍，
-    #    并留意每个槽位的 IK 层数与最低连杆高度。
+    # ✅ 这些数字**已过包线复扫**（2026-10-05，357 格 × 4 个 tool0 高度，
+    #    1428 次 IK+FK）：8 格全部落在本行「可用 x 段」内，离最近边界 ≥0.15 m；
+    #    撞桌带在 x∈[0.15,0.35] 且 y∈[-0.25,+0.50]（离槽位 x=0.50 还差 0.15 m）、
+    #    够不到带在 x∈[0.75,0.95]（离槽位 x=0.60 还差 0.15 m）。
+    #    最大全安全矩形 x∈[0.40,0.75] y∈[-0.45,+0.45]，与上一次扫描逐字一致。
+    #    ⚠️ 但逐格分类有 **5.3%（19/357）不可复现**（KDL attempts:3、无
+    #    consistency_limits ⇒ 随机重启会翻肘分支）⇒ **离边界留一格 0.05 m**。
     #
     # 约束（规划器启动时会自己查，见 `_validate_zones`）：
     #   1. 必须落在 pick_zone **之外** —— 槽位在 y<0，pick_zone 在 y∈[0,0.45] ✓
