@@ -302,6 +302,19 @@ python3 scripts/test_relabel_by_color.py # 按颜色重标那把尺子准不准�
                                          #   翻开 block_dataset_7cls 的文件看那一行真的写了
                                          #   改判后的类别号（数据集不在就跳过，不算失败）
                                          #   只要 numpy（第 5 节另需 OpenCV）
+python3 scripts/test_live_infer_record.py # 实时推理录像那个脚本的**只读性**：20 项
+                                         #   第 1 节是 **AST 结构断言** —— 源码里
+                                         #   不该存在任何 create_publisher /
+                                         #   create_service / create_client，也不该
+                                         #   import 机械臂相关模块。理由不是洁癖：
+                                         #   起完整栈会占住 29999/30001/30004，
+                                         #   有把示教器程序打成 STOPPED 的前科
+                                         #   还要反向确认 subscribe 真存在（否则
+                                         #   上一条会因为在别的文件上跑而空过）
+                                         #   另钉：框色两两不同、调色板外不抛异常、
+                                         #   越界类别号不崩、**绝不联网下载权重**
+                                         #   （YOLO("yolov8n.pt") 缺文件时会自动下 COCO，
+                                         #   症状是"检测不到方块"而不是报错）
 python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
                                          #   扫**全部被跟踪的文本文件**、**未跟踪（未忽略）的文件**
                                          #   与**全部提交信息**
