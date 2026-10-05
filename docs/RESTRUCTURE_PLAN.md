@@ -13525,3 +13525,105 @@ self._select_and_approach(latest)   # ← 闸门在里面，永远到不了
 | 4 | **录像** | ⬜ **仍缺**（步骤见 `docs/待执行命令.md`「补录像」） |
 
 `test_deidentified.py` 干净（含提交信息）；板上已同步加固后的脚本。
+
+---
+
+## 第九十轮：录像轮的**次序**才是真问题 —— 连接后没人修控制器，规划器一发目标就收工（2026-10-05）
+
+### 1. 现象：臂一下都没动，却已经「收工」
+
+补录像第一轮（板上 `~/a1_video.log`）跑完是：
+
+```
+候选 5 个 ['block' × 5] | 已放置 0/4 | 连续未放置 0/10
+接近轨迹失败：goal_status=<未知 None> error_code=None
+失败后回 HOME失败：goal_status=<未知 None> error_code=None
+收工：失败恢复时回 HOME 也失败
+  已成功放置 0 个 / 槽位共 4 个；已抓取记账 0 个
+```
+
+注意 `goal_status=<未知 None>` —— 这是**动作在客户端侧压根没被接受**的样子，
+不是「规划失败」。日志里躺着 4 处：
+
+```
+Controller with name 'friction_model_controller' is not inactive so ... cannot be activated
+Aborting, no controller is switched! (::STRICT switch)
+```
+
+### 2. 根因：连接来得太晚，STRICT 批量切换被自己绊倒
+
+`ur_ros2_control_node` 在 URCap 连上时会发一次 **STRICT**（`strictness=2`）的
+`switch_controller`，请求激活 `scaled_joint_trajectory_controller` +
+`friction_model_controller`。但 `friction_model_controller` **已经在 active**，
+而 STRICT 的语义是「整批要么全成、要么全不成」⇒ `Aborting, no controller is
+switched!` ⇒ **`scaled_joint_trajectory_controller` 被留在 not-running**。
+
+时序对得上：这一轮连接发生在控制器激活之后 **93 s**；而通过的那一轮（`a1_board.log`）
+只差 **4.3 s**。同一条代码路径，差别只在起栈流程。
+
+### 3. 「先 PLAY 再起栈」走不通 —— URCap 必须先有对端
+
+第一反应是「那就让 PLAYING 先于驱动」。**不成立**：URCap 的 External Control 程序
+在没有对端监听时按 PLAY，示教器直接显示**「连接被拒绝」**、程序停在 STOPPED。
+实测守着轮询 5 分钟：`t=30s programState=STOPPED ur5ros.urp（连续 PLAYING=0）`、
+`t=60s` 相同。
+
+⇒ 合法次序只有一条：**先起栈（驱动立刻开始监听）→ 人按 PLAY → 连接之后再把控制器拉回来**。
+
+### 4. 闸门：本次的修法
+
+「拉回来」走服务，不走 CLI —— 板上**没装 `ros2 control`**（`invalid choice: 'control'`）：
+
+- 服务 `/controller_manager/switch_controller`（`controller_manager_msgs/srv/SwitchController`）
+- `activate_controllers: [scaled_joint_trajectory_controller, friction_model_controller]`
+- **`strictness: 1`（BEST_EFFORT）** —— 这是关键：已经 active 的那个只会**告警**，
+  不会中止整批
+- 每 4 s 一次，从「日志出现 `Robot connected to reverse interface`」守到规划器启动之前
+  （规划器由 `start_delay` 推到 t=120s，闸门守到 t=112s，留 8 s 余量）
+
+实测（`a1_video3.log`）：连接发生在 t=12s；闸门采样 `t=17s … t=110s` 全部
+`state='active'`（t=69s 那一次是服务调用超时没查到，下一拍即恢复，不是状态掉了）。
+
+### 5. BEST_EFFORT 的告警是**良性**的 —— 别被 `grep` 的计数吓到
+
+`grep -E "STRICT|not inactive|Aborting"` 在**通过的那一轮里也有 20 处命中**，
+但全部是闸门自己每拍触发的：
+
+```
+WARN ... Controller with name 'friction_model_controller' is not inactive so its
+following controllers do not have to be checked, because it cannot be activated.
+```
+
+—— 这正是 BEST_EFFORT 的正确行为：跳过它、继续激活别的。
+
+**判决要盯的是那一行 `Aborting, no controller is switched!` 在不在**：
+失败轮 **4** 处，通过轮 **0** 处。（只看关键词计数会把成功的轮次误判成失败。）
+
+📌 这条同时是一次「**状态字符串报告的是它自己的主题，不是你以为的那个行为**」的实例
+—— 见第二十九轮那条同源教训。
+
+### 6. 通过轮的完整证据
+
+```
+候选 5(放置0) → 4(放置1) → 3(放置2) → 2(放置3) → 1(放置4)
+已放置 1/4 → 2/4 → 3/4 → 4/4
+收工：放置槽位已用尽（4 个）—— 没有地方可放了
+  已成功放置 4 个 / 槽位共 4 个；已抓取记账 4 个
+```
+
+- `连续未放置 0/10` **全程** —— 第八十九轮 `start_delay` 的根治继续成立
+- `State tolerances failed` 出现 **0 次**
+- 夹爪回读 24.99 / 27.36 / 24.89 / 25.18 mm（四块都在 ~25 mm，像夹住方块）
+- 判分：`board_a1.py --no-launch --log ~/a1_video3.log --slots 4` → **退出码 0**
+- 两条判据均 ✅ 过；候选数轨迹同上
+
+### 7. 交付物
+
+| # | 项 | 状态 |
+|---|---|---|
+| 1 | `scripts/board_a1.py` 上板脚本（起栈 + 盯日志 + 判分，退出码 0/1/2） | ✅ |
+| 2 | `scripts/test_board_a1.py` 判分自检 36 断言 + 3 变异 | ✅ 全过 |
+| 3 | 真机两条判据 | ✅ **两次独立复现**（`a1_board.log` / `a1_video3.log`） |
+| 4 | **录像** | ⏳ 第 90 轮这一跑已把「按 PLAY 就能跑」变成可复现流程，素材待用户确认 |
+
+`Aborting` 计数已作为**起栈是否健康**的判据写进 `docs/待执行命令.md` 的补录像步骤。
