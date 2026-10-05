@@ -1166,6 +1166,119 @@ def main():
     check("至少真的查了 3 个节点文件（否则上面几条是空断言）", seen_mains >= 3,
           f"实际查了 {seen_mains} 个")
 
+    # ------------------------------------------------- 相机序列号守卫（公开仓）
+    # 公开仓里那份 `config/realsense_camera.yaml` **不可能**带上某台具体相机的
+    # 序列号，所以它是模板、号是占位符。而占位符的失效方式正是本仓最怕的那类：
+    # 驱动**不报错**，只是每 6 秒重试一次、永不退出 ⇒「进程都在、就是没有图像」。
+    # 所以这里钉住两件事：① 守卫真的会拦；② 占位符常量与那份模板**同步**
+    # （改了 yaml 里的占位符却忘了改常量，守卫就会**静默**放行）。
+    print("\n--- 相机序列号：占位符守卫 ---")
+    import tempfile
+
+    pipeline = load_launch("pipeline.launch.py")
+    if pipeline is None:
+        skip("相机序列号守卫", "pipeline.launch.py 不存在")
+    else:
+        guard = getattr(pipeline, "_guard_realsense_serial", None)
+        phs = getattr(pipeline, "SERIAL_PLACEHOLDERS", None)
+        check("pipeline.launch.py 定义了序列号守卫", callable(guard))
+        check("pipeline.launch.py 定义了占位符常量 SERIAL_PLACEHOLDERS",
+              bool(phs), f"got {phs!r}")
+
+        # 同步性：模板 yaml 里**必须**真的出现这些占位符。这条防的是「改了
+        # yaml 的占位符字形、没改常量」——那样守卫再也匹配不上，永远放行。
+        tmpl = (PROJECT_ROOT / "ros2_ws" / "src" / "yolo_bringup"
+                / "config" / "realsense_camera.yaml")
+        if not tmpl.exists():
+            check("相机模板 yaml 存在", False, f"{tmpl} 不存在")
+        elif phs:
+            body = tmpl.read_text(encoding="utf-8")
+            # 只看**生效的那一行**（`serial_no:`），别被文件头注释里的同名占位符
+            # 骗过 —— 那些注释里的字提到占位符但不是配置值。
+            val = ""
+            for line in body.splitlines():
+                s = line.strip()
+                if s.startswith("serial_no:"):
+                    val = s.split(":", 1)[1].strip().strip('"').strip("'")
+                    break
+            check("模板 yaml 的 serial_no 就是某个已知占位符",
+                  val in tuple(phs),
+                  f"serial_no={val!r}，常量={phs!r} —— 不同步的话守卫会静默放行")
+
+        if not callable(guard) or not phs:
+            skip("守卫的行为（拦/放）", "函数或常量缺失，上面已报")
+        else:
+            tmpdir = tempfile.mkdtemp(prefix="serial_guard_")
+            ph_file = os.path.join(tmpdir, "ph.yaml")
+            ok_file = os.path.join(tmpdir, "ok.yaml")
+            miss_file = os.path.join(tmpdir, "missing.yaml")
+            with open(ph_file, "w", encoding="utf-8") as fh:
+                fh.write(f'serial_no: "{phs[0]}"\n')
+            with open(ok_file, "w", encoding="utf-8") as fh:
+                fh.write('serial_no: "987654321098"\n')
+
+            # ① 只看 realsense 那条路：sim 时这份文件根本不传下去，不该拦。
+            check("camera_source=sim 时不拦（那份文件没被传下去）",
+                  guard(ctx(camera_source="sim",
+                            realsense_params_file=ph_file)) == [])
+
+            # ② 核心：realsense + 占位符 → **必须抛异常**（不是打日志）。
+            check("camera_source=realsense + 占位符 → 抛异常",
+                  _raises(lambda: guard(ctx(
+                      camera_source="realsense",
+                      realsense_params_file=ph_file)), RuntimeError),
+                  "放行的话，真机上表现是『进程都在、永远没有图像』")
+
+            # 报错必须**自带填法**，否则等于换了个地方让人卡住。
+            err = ""
+            try:
+                guard(ctx(camera_source="realsense",
+                          realsense_params_file=ph_file))
+            except RuntimeError as exc:
+                err = str(exc)
+            check("报错里给出填序列号的办法",
+                  ".config/ur5-vision-grasp" in err and "ASIC" in err,
+                  "缺了填法/『别用 ASIC 号』的提醒，用户还是得去翻文档")
+
+            # ③ 反例：真序列号必须放行（否则谁也用不了）。
+            check("camera_source=realsense + 真序列号 → 放行",
+                  guard(ctx(camera_source="realsense",
+                            realsense_params_file=ok_file)) == [])
+
+            # ④ 文件不存在／路径为空 → 出声但**放行**，不能把整个 launch 炸掉
+            #    （包没编出来时默认值就是空串，那是文档化的用法）。
+            check("参数文件不存在 → 放行（只出声）",
+                  guard(ctx(camera_source="realsense",
+                            realsense_params_file=miss_file)) == [])
+            check("参数文件路径为空 → 放行，不抛 TypeError",
+                  guard(ctx(camera_source="realsense",
+                            realsense_params_file="")) == [])
+
+            # ⑤ 变异检查：把常量清空，②必须**不再**抛 —— 证明②真的由它把关，
+            #    而不是碰巧抛在别处。
+            saved = pipeline.SERIAL_PLACEHOLDERS
+            try:
+                pipeline.SERIAL_PLACEHOLDERS = ()
+                check("变异（清空占位符常量）后不再拦 —— 证明②不是假绿",
+                      guard(ctx(camera_source="realsense",
+                                realsense_params_file=ph_file)) == [])
+            finally:
+                pipeline.SERIAL_PLACEHOLDERS = saved
+
+        # 结构性：守卫必须**排在节点之前**。排在后面就等于没拦 —— 驱动已经
+        # 起来了，日志里已经在每 6 秒刷 NOT found 了。
+        if pipeline is not None:
+            lc = pipeline.generate_launch_description()
+            ents = list(lc.entities)
+            names = [type(e).__name__ for e in ents]
+            if "OpaqueFunction" not in names or "TimerAction" not in names:
+                check("守卫 OpaqueFunction 排在节点之前", False,
+                      f"实体里找不到 OpaqueFunction/TimerAction: {names}")
+            else:
+                check("守卫 OpaqueFunction 排在节点之前",
+                      names.index("OpaqueFunction") < names.index("TimerAction"),
+                      f"顺序: {names}")
+
     # ------------------------------------------------------------------ 收尾
     print("\n" + "=" * 56)
     if _skipped:

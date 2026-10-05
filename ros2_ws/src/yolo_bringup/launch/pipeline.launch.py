@@ -41,7 +41,7 @@ from ament_index_python.packages import (
     get_package_share_directory,
 )
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
@@ -178,6 +178,26 @@ def _default_planner_params_file():
         return ''
 
 
+# ── 相机序列号：为什么不是一个普通的 launch 参数 ─────────────────────────
+# 序列号**不能**走 launch 参数传（纯数字串在两侧判断相反，见那份 yaml 的文件头
+# 与 generate_launch_description 里的长注释），只能写在**一份带引号的 yaml** 里。
+# 公开仓里那份 yaml 不可能带上某台具体相机的号，所以约定成：
+#
+#   环境变量 UR5_REALSENSE_PARAMS  →  本机未跟踪文件  →  包内模板
+#
+# 本机文件放 `~/.config/ur5-vision-grasp/realsense_camera.yaml`，**不进仓库** ——
+# 与「凭据只放本机未跟踪位置」是同一条理由（序列号是设备身份，属同类信息）。
+USER_REALSENSE_PARAMS = os.path.join(
+    os.path.expanduser('~'), '.config', 'ur5-vision-grasp', 'realsense_camera.yaml',
+)
+
+# 包内模板的序列号位是占位符。它**永远匹配不到任何设备**，而驱动对「找不到」
+# 的反应是**每 6 秒重试一次、永不退出**（不是报错退出）⇒「进程都在、就是没有
+# 图像」，正是本仓反复栽的那类**静默**失效。所以命中占位符必须在起 launch 时
+# 当次拦下，别让它退化成一个看起来像「检测器坏了」的排查。
+SERIAL_PLACEHOLDERS = ('<topcam-serial>', '<wristcam-serial>')
+
+
 def _default_realsense_params_file():
     """真机 RealSense 的参数文件路径；包没编出来时返回空串。
 
@@ -185,7 +205,24 @@ def _default_realsense_params_file():
     generate_launch_description 里那段长注释）。丢了它**不会报错** ——
     驱动会退回「枚举到的第一台」，插着两台相机时就是**随机**认一台。
     所以这里必须出声，不能静默。
+
+    解析顺序（先命中先用）：
+      1. `UR5_REALSENSE_PARAMS` 环境变量指向的文件（显式覆盖，验机时好用）
+      2. `~/.config/ur5-vision-grasp/realsense_camera.yaml`（本机未跟踪）
+      3. 包内 `config/realsense_camera.yaml`（**模板**，序列号是占位符）
     """
+    env = os.environ.get('UR5_REALSENSE_PARAMS')
+    if env:
+        if os.path.exists(env):
+            return env
+        print(
+            f'[pipeline.launch.py] 警告: UR5_REALSENSE_PARAMS 指向的 {env} '
+            '不存在，忽略它继续往下找。',
+            file=sys.stderr,
+        )
+    if os.path.exists(USER_REALSENSE_PARAMS):
+        return USER_REALSENSE_PARAMS
+
     try:
         return os.path.join(
             get_package_share_directory('yolo_bringup'),
@@ -199,6 +236,56 @@ def _default_realsense_params_file():
             file=sys.stderr,
         )
         return ''
+
+
+def _guard_realsense_serial(context):
+    """起 launch 时检查序列号文件，命中占位符就**当场报错**。
+
+    只在 camera_source:=realsense 时生效（那份文件也只在那时被传下去）。
+    报错而不是警告，是因为放行的后果不是「差一点」，而是驱动每 6 秒重试、
+    永不退出、且**没有任何一处**会说「序列号没填」—— 那正是本仓记了很多次的
+    静默失效。这里把它的排查成本从「翻驱动日志找 NOT found」降到「读这一条」。
+    """
+    if context.launch_configurations.get('camera_source') != 'realsense':
+        return []
+
+    path = context.launch_configurations.get('realsense_params_file', '')
+    if not path or not os.path.exists(path):
+        print(
+            f'[pipeline.launch.py] 警告: 相机参数文件 {path!r} 不存在，'
+            '序列号没钉住 —— 插着两台 D435i 时驱动会**静默**取枚举到的第一台。',
+            file=sys.stderr,
+        )
+        return []
+
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except OSError as exc:
+        print(
+            f'[pipeline.launch.py] 警告: 读不了相机参数文件 {path}: {exc}',
+            file=sys.stderr,
+        )
+        return []
+
+    for ph in SERIAL_PLACEHOLDERS:
+        if ph in text:
+            raise RuntimeError(
+                f'\n{"=" * 72}\n'
+                f'相机序列号还是占位符 {ph}（{path}）。\n'
+                f'这样起不来，而且**不会报错**：驱动会每 6 秒重试一次、永不退出，\n'
+                f'表现为「进程都在、就是没有 /camera 图像」。\n\n'
+                f'填上你这台 D435i 的 **SDK 号**（= 外壳标签上印的那个，别用\n'
+                f'/sys/bus/usb 里的 ASIC 号），二选一：\n\n'
+                f'  · 建 {USER_REALSENSE_PARAMS}\n'
+                f'      mkdir -p ~/.config/ur5-vision-grasp\n'
+                f'      cp {path} ~/.config/ur5-vision-grasp/realsense_camera.yaml\n'
+                f'      # 然后编辑它，把 serial_no 换成你的号（**引号要留着**）\n'
+                f'  · 或设 UR5_REALSENSE_PARAMS=/path/to/your.yaml\n\n'
+                f'（也走 realsense_params_file:=... 显式指定。）\n'
+                f'{"=" * 72}'
+            )
+    return []
 
 
 def generate_launch_description():
@@ -645,6 +732,9 @@ def generate_launch_description():
         planner_params_arg,
         table_scene_arg,
         start_delay_arg,
+        # 序列号守卫必须**排在节点之前**：它要在 realsense 驱动起来**之前**
+        # 把「序列号还是占位符」挡下来，否则驱动会安静地每 6 秒重试下去。
+        OpaqueFunction(function=_guard_realsense_serial),
         TimerAction(
             period=LaunchConfiguration('start_delay'),
             actions=[realsense, detector, perception, planner],

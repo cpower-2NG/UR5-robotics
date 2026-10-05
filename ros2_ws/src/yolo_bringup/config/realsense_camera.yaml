@@ -1,19 +1,38 @@
-# 真机 RealSense D435i 的固定参数。
+# 真机 RealSense D435i 的参数文件 —— **模板**。
+#
+# ⚠️ 仓库里这份是模板，序列号是占位符，**直接用会让你没有图像**（而且不报错）。
+#    先照下面「怎么填」做一份自己的，再上真机。
+#
+# ── 怎么填 ──────────────────────────────────────────────────────────────
+# 把你的相机序列号填进来，二选一（推荐第一条，序列号就不会被误提交）：
+#
+#   1. 放到本机未跟踪位置（pipeline.launch.py 会自动优先用它）：
+#        mkdir -p ~/.config/ur5-vision-grasp
+#        cp <这个文件> ~/.config/ur5-vision-grasp/realsense_camera.yaml
+#        然后编辑它，把下面的 serial_no 换成你的号（**引号要留着**）
+#
+#   2. 或另存一份，起 launch 时显式指：
+#        ros2 launch ... realsense_params_file:=/path/to/your.yaml
+#      （也可以设环境变量 UR5_REALSENSE_PARAMS=/path/to/your.yaml）
+#
+# 号从哪来：**看相机外壳标签上印的那个**，即 SDK 号，`serial_no` 认的就是它。
+# ⚠️ 别用 /sys/bus/usb/devices/*/serial 里的 ASIC 号 —— 用错**不报错退出**，
+#    而是驱动每 6 秒重试一次、永不退出 ⇒「进程都在、永远没有图像」。
 #
 # ⚠️⚠️ 这个文件存在的**唯一**理由是 `serial_no` 的那对引号。别把它挪回
 #      pipeline.launch.py 的参数字典里 —— 那样**必然**起不来，原因见下。
 #
 # ── 为什么引号不能省、也不能靠 launch 传 ──────────────────────────────
 # 「launch 里传 serial_no」这条路对**纯数字串**是结构性走不通的，因为两侧
-# 对同一个标量的判断**相反**（2026-09-30 板端逐条实测）：
+# 对同一个标量的判断**相反**（板端逐条实测）：
 #
 #   launch 侧用 PyYAML 把参数字典写成 YAML。PyYAML 认为
-#       '<topcam-serial>'
+#       '123456789012'
 #   是**普通字符串**，所以**不加引号**地写出去，落盘就是：
-#       serial_no: <topcam-serial>          ← 实测，没有引号
+#       serial_no: 123456789012              ← 实测，没有引号
 #   而节点侧 rcl 的 **C 版** YAML 解析器把**没引号的全数字**读成**数字**：
 #       · 数字全在 0-7  → 合法八进制 → int   （如 ASIC 号 <topcam-asic-serial> → <octal-int>）
-#       · 含 8 或 9     → 落成 double        （如 SDK 号 <topcam-serial>）
+#       · 含 8 或 9     → 落成 double
 #   于是节点报错并**退出**：
 #       parameter 'serial_no' has invalid type: Wrong parameter type,
 #       parameter {serial_no} is of type {string}, setting it to {double} is not allowed
@@ -22,43 +41,39 @@
 #   投出来的影子 —— 看到哪个号报哪种错，就能反推出它被读成了什么。
 #
 # 两条看起来该管用的路，实测都**救不了**：
-#   · `ParameterValue(LaunchConfiguration(...), value_type=str)` —— D60 用过，
+#   · `ParameterValue(LaunchConfiguration(...), value_type=str)` —— 用过，
 #     落盘仍是**无引号**（问题出在 PyYAML 的 dump，不在类型声明）。
-#   · 命令行 `camera_serial:="'<topcam-serial>'"` —— 单引号被**原样保留**进值里，
+#   · 命令行 `camera_serial:="'123…'"` —— 单引号被**原样保留**进值里，
 #     驱动拿着带引号的串去找设备，报 NOT found。加了引号数值就错，不加就被
 #     读成数字，**没有中间态**。
 #   ⇒ 所以只有**自己写一个带引号的 yaml** 这一条路。
 #
-# ── 这两台相机的两个号 ────────────────────────────────────────────────
-# 本台机械手上挂了**两台** D435i（腕部 + 俯视），都插在同一块 Orin 上。
-# 每台报**两个不同的序列号**，`serial_no` 认的是 **SDK 号**：
+# ── 一台相机报两个号 ──────────────────────────────────────────────────
+# 每台 D435i 报**两个不同的序列号**，`serial_no` 认的是 **SDK 号**：
 #
-#                     SDK 号 = 外壳标签上印的 = serial_no 认的那个      ASIC 号 = /sys/bus/usb/devices/*/serial
-#   俯视 (USB 2-1.3)        <topcam-serial>                                 <topcam-asic-serial>
-#   腕部 (USB 2-1.1)        <wristcam-serial>                                 <wristcam-asic-serial>
+#     SDK 号  = 外壳标签上印的 = serial_no 认的那个
+#     ASIC 号 = /sys/bus/usb/devices/*/serial
 #
-#   · 用 ASIC 号是 D60 犯的错（已修）。症状**不是**报错退出，而是驱动报
-#       The requested device with serial number <topcam-asic-serial> is NOT found. Will Try again.
+#   用 ASIC 号的症状**不是**报错退出，而是驱动报
+#       The requested device with serial number <号> is NOT found. Will Try again.
 #     **每 6 秒重试一次、永不退出** ⇒ 「pipeline 起来了、进程都在、但永远没有
-#     图像」。与 D50/D45 同一类：**静默**失效，看起来像「检测器坏了」。
-#   · 用户目视复核：**外壳标签上印的是 `036…`**（= SDK 号），与上表一致。
-#     ⇒ 认相机**看外壳标签**，别看 `/sys/bus/usb`，两者不是一个号。
-#   · 驱动做的是**字符串精确比较，不支持正则**（2026-09-30 实测：传
-#     `.*22072963` 被当成字面量去找，同样报 NOT found）。所以别想着用通配。
+#     图像」。与「静默失效」同一类，看起来像「检测器坏了」。
+#   ⇒ 认相机**看外壳标签**，别看 /sys/bus/usb，两者不是一个号。
+#   · 驱动做的是**字符串精确比较，不支持正则**（实测：传 `.*22072963` 被当成
+#     字面量去找，同样报 NOT found）。所以别想着用通配。
 #
-# ── 为什么必须显式钉、以及默认钉哪台 ──────────────────────────────────
+# ── 为什么必须显式钉 ──────────────────────────────────────────────────
 # 不传 `serial_no` 时驱动取**枚举到的第一台**，而枚举顺序**随插拔变化**
-# ⇒ 今天起俯视、明天可能起腕部，**而且不报错**。
+# ⇒ 今天起 A 相机、明天可能起 B 相机，**而且不报错**。
 #
-# 这里默认钉的是**俯视那台**：本仓库的下游（detector / projector / 手眼外参）
-# 当前都按**一台固定相机**写，而第一个真机 demo 用的是俯视。
-# ⚠️ 换相机（例如上腕部）必须**同时**改这个号和相机外参，别只改一半 ——
+# ⚠️ 挂了多台 D435i 时，换相机必须**同时**改这个号和相机外参，别只改一半 ——
 #    所以它是**配置文件**而不是命令行开关。
-# 只有一台相机插着时，钉这个号也无害（就是那一台）。
+# 只有一台相机插着时，钉不钉这个号都指向同一台。
 
 # 用 `/**` 而不是 `/camera/camera`：这个文件**只**传给 realsense 那个节点，
 # 通配可以跟着 launch 里改的节点名走，不会因为改名而**静默**失去作用。
 /**:
   ros__parameters:
     # ↓↓ 引号是**功能性的**，不是风格。理由见文件头。 ↓↓
+    # ↓↓ 换成你自己相机外壳标签上的号，否则没有图像且不报错。 ↓↓
     serial_no: "<topcam-serial>"
