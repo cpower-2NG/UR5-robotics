@@ -155,22 +155,33 @@ ros2 launch yolo_bringup bringup.launch.py \
 
 `tf_required:=true` 是**真机建议值**：查不到 TF 就让 `perception_3d` 报错退出，
 而不是发一帧坐标可疑的数据下去——仿真里默认 `false`（TF 树起得慢，早几帧查不到是正常的）。
-⚠️ **`gripper_backend` 的默认值随入口变，两个真机入口不一样**（见上）：
+⚠️ **`gripper_backend` 的默认值随入口变** —— 它在代码里**不是写死的常量**，
+而是 `'sim' if camera_source == 'sim' else 'none'`（`pipeline.launch.py`）：
 
 | 入口 | `gripper_backend` 默认 | 要额外传吗 |
 |---|---|---|
-| `camera_source:=realsense`（→ `real.launch.py`） | **`none`**（只走位，不报错） | 不用 |
-| `camera_source:=external`（→ `pipeline.launch.py`） | **`ag95`** | **必须**传 `gripper_backend:=none`，否则规划器启动即死（见下） |
+| `camera_source:=sim` | **`sim`**（JTC 第 7 关节） | 不用 |
+| 其余入口（含 `realsense` / `external`） | **`none`**（只走位，不报错） | 不用 |
+
+（上表是 `camera_source` 那套入口。单独起 `grasp_planner/planner.launch.py` 时
+默认仍是 `sim` —— 它不走 `camera_source`，别把这行结论套过去。）
 
 > **「看不到目标」先看这一条**：`perception_3d` 会把**检测↔深度时间差超窗**的批次整批丢掉
 > （不报错退出），日志每 5 s 一条 `…丢弃本批检测（累计 N 批）`。真机默认窗口已经是 **0.3 s**
 > （仿真 0.1 s），若 **N 持续增长**就调大：`max_sync_dt:=0.5`。调小它的症状恰好也是
 > 「一直没目标」，而那时日志里**只有这一条线索**。
 
-> **`external` 入口是唯一要提防的**：它落到 `ag95`，而后端一构造就去开串口 ——
-> 板上没有 USB-RS485 适配器，于是 `planner_node` **启动就死**（`RuntimeError: 打不开
-> 串口 /dev/ttyUSB0`）。所以 `external` 一定要带 `gripper_backend:=none`。
-> 这只影响「只验感知」这条路：`realsense` 入口的默认已经是 `none`，不会报错。
+> **这条默认值是 2026-10 才改成现在这样的**（D71）。改之前非仿真入口默认 `ag95`，
+> 代码注释给的理由是「后端一构造就去开串口，板上没适配器时**大声报错**」——
+> **那个前提已经不成立**：适配器早在位、`pymodbus` 已装，`ag95` 会**安静地连上真夹爪**。
+> 而 `planner_node` 在只走位模式（`carry_objects:=false`）下**仍会调用 `gripper.open()`**
+> （初始化那一步 `_start_initial_home`）⇒ 真正要提防的不是「启动即死」，
+> 是**「启动即写寄存器」**。所以默认值改成了 `none`。
+>
+> 要真夹取，**必须显式三件一起给**：
+> `gripper_backend:=ag95 carry_objects:=true`，再另配 `ag95_dry_run:=false`。
+> ⚠️ 写寄存器 = **真机动作**，仅限「夹爪已拆下臂 + 放工作台 + 急停在手边」，
+> 见 [`AGENTS.md`](AGENTS.md) §2 红线 2。
 
 ---
 
