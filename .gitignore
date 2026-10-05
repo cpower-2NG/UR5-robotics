@@ -24,6 +24,14 @@ docs/reference/
 # demo_pipeline.py 的独立数据集输出（几何与 block_dataset/ 不同，见 D30）
 block_dataset_demo/
 
+# 训练数据集本体（实验室现场图，44 MB）。公开仓不含样本 —— 「是否随仓发一小份
+# 样例」是规划里的**待定项**，未定之前一律不入库。
+# ⚠️ 原先没有任何一条盖住 `block_dataset/`。这是**实测**发现的，不是假想：
+#    `git status --short` 里它是 `??`，一次 `git add -A` 就会把现场图提进公开仓，
+#    而且 44 MB 进了历史就再也删不干净（要 filter-repo 重写）。
+block_dataset/
+block_dataset_7cls/
+
 # YOLO 训练产物：`train_yolo_block.py --name X` 会在这里堆检查点、日志、
 # 混淆矩阵、以及每轮的 batch 预览图，几百 MB 且**每次训练都不一样**。
 # 真正要留下的是它最后复制到仓库根的 block_best.pt。
@@ -37,3 +45,10 @@ runs/
 # detector_node 会按 $YOLO_MODEL_DIR → CWD 逐级向上 → 包内 models/ 的顺序查找，
 # 找不到就明确报错，**不会**联网下载 COCO 权重冒充（见 D6/D24）。
 ros2_ws/src/yolo_detector/models/*.pt
+
+# 上面那条只盖住了包内的 models/*.pt，**仓库根**的同名同类（预训练起点
+# yolov8n_coco.pt / yolo26n.pt）没有被盖住 —— 同样是 6 MB 量级的构建产物。
+# ⚠️ 故意**不**写笼统的 `*.pt`：`block_best.pt` 是否随仓公开是规划的待定项，
+#    用 `*.pt` 会顺手把它也挡掉，而这个决定不该由一条 gitignore 替你做。
+/yolov8n_coco.pt
+/yolo26n.pt
