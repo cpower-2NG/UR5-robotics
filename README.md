@@ -217,10 +217,14 @@ yolo_ros/
 
 ## 自检与验收
 
-十一个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+十六个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
 前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
-`test_board_a1.py` 与 `test_deidentified.py` 只要 Python 标准库）：
+`test_board_a1.py`、`test_deidentified.py`、`test_slot_routing.py` 与
+`test_block_classes.py` 只要 Python 标准库；`test_palette_survey.py` 只要
+numpy（夹具自己造合成图，**不需要真照片**）；`test_planner_class_sort.py`
+要 ROS 2 与 `colcon build` 过的 `grasp_planner`，但**不需要 MoveIt、
+不需要 Gazebo、不碰真机**）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -257,6 +261,36 @@ python3 scripts/test_board_a1.py         # A1 真机验收的**判分逻辑 + �
                                          #   真机实验 —— 所以这里连判据本身也要测
                                          #   第 5 节还钉住起栈命令的关键参数（漏一个不报错，
                                          #   只会静默跑成另一回事，比如少了 start_delay）
+python3 scripts/test_slot_routing.py     # 多类别分拣的「哪一类进哪一格」判据：30 项断言
+                                         #   **含 4 个变异**：把类别比较/占用检查/通配/长度
+                                         #   校验各改坏一处，对应断言必须失效
+                                         #   只要标准库，秒级跑完（不需要 source ROS）
+python3 scripts/test_planner_class_sort.py  # 上面那条判据**有没有真的接进规划器**：
+                                         #   31 项断言，含 1 个变异
+                                         #   ⚠️ 需要先 colcon build --packages-select grasp_planner
+                                         #   三段：B 节点里的按类别消费顺序、
+                                         #        D 变异（旁路 pick_slot 必须被发现）、
+                                         #        A 参数通路（命令行 + 随仓 yaml 两条路径，
+                                         #          含「末尾裸逗号被静默丢掉」那个写法陷阱）
+                                         #   B2 段钉住「不路由时收工原因与 A1 逐字相同」
+python3 scripts/test_block_classes.py    # 类别表的**交付前关卡**：17 项断言（含 5 个变异）
+                                         #   调色板 ↔ data.yaml 的 names ↔
+                                         #   dataset_manifest.json 的 class_names，
+                                         #   比的是**逐位相等**而不是集合 —— 顺序错一位，
+                                         #   所有标签语义全反且一步都不报错
+                                         #   数据集不在仓里时第 2 节明说「跳过」，不是失败
+                                         #   ⚠️ 它挡的是**别的原因也在抛异常**那种假绿：
+                                         #   断言连「是哪一条检查在挡」一起比
+                                         #   只要标准库 + PyYAML
+python3 scripts/test_palette_survey.py   # 量颜色那把尺子本身准不准：20 项断言（含 5 个变异）
+                                         #   合成色相已知的图，断言数出的色团数/中心/
+                                         #   名字与真值一致；再各改坏一处（饱和度下限、
+                                         #   合并、最小占比、环形标准差、取名字），
+                                         #   对应断言必须失效
+                                         #   ⚠️ 本轮**真逮到一个 bug**：漂移用了线性标准差，
+                                         #   红跨在 0°/360° 上会算出 176°，而「不是 None」
+                                         #   的断言照样通过 —— 断言因为错误的原因绿了
+                                         #   只要 numpy + OpenCV（不需要真照片、不连相机）
 python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
                                          #   扫**全部被跟踪的文本文件**、**未跟踪（未忽略）的文件**
                                          #   与**全部提交信息**

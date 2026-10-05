@@ -64,8 +64,14 @@ rclpy 的 ``create_subscription(..., 10)`` 走的就是默认的 VOLATILE，所�
 | 灰 | **规划器已经在这个槽位上走完了一次放置动作** |
 | 橙 | **被跳过** —— 接近位姿 IK 解不出来，已放弃（见 ``_on_home_with_object_done``） |
 
-灰与橙必须分开：``_place_index`` 在「放成功」和「解不出而跳过」两种情况下**都会**
-自增，所以拿 ``i < place_index`` 判断占用会把跳过的槽位错报成已占用。
+灰与橙必须分开：一个槽位会因「放成功」和「解不出而跳过」两种原因被消费掉，
+拿任何**单一计数器**去反推占用（比如「下标小于游标的都算用过」）都会把
+跳过的槽位错报成已占用。占用状态现在存在 ``_place_used[]`` 里，且**由状态机
+在真的发生时逐格标记**（``mark_slot``），不从计数器推。
+
+（A2 之前这里写的是「``_place_index`` 在两种情况下都会自增」—— 那个自增游标
+已经不存在了，现在 ``_place_index`` 只是「正在处理的那一格」，占用看
+``_place_used``。结论没变，理由换了。）
 
 ⚠️ 灰的准确含义是「**规划器消费掉了这个槽位**」，不是「这里物理上有一个方块」：
 ``carry_objects:=false``（只走位模式，第一个真机 demo 用）下夹爪不夹取也不张开，
@@ -145,7 +151,8 @@ class PlannerTelemetry:
         self._finish_ok = True
         self._reason = ""
         # 槽位占用情况。**只有这里知道「用过」与「跳过」的区别** ——
-        # planner_node 的 _place_index 把两者混在一个计数器里（见模块文档）。
+        # planner_node 的 _place_used[] 只记「这一格还能不能用」，不区分原因
+        # （见模块文档）。
         self._slot_status: Dict[int, str] = {}
 
         self._pub_target = node.create_publisher(

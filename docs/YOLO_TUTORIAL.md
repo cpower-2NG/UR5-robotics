@@ -93,7 +93,13 @@ gz sim -r ros2_ws/src/yolo_bringup/worlds/block_grid_world.sdf
 | 模式 | 命令 | 布局 |
 |---|---|---|
 | 随机散布（**默认**） | `python3 scripts/generate_grid_world.py --num_blocks 9 --pos_jitter 0.06` | N 个方块随机放置、互不重叠，随机分配颜色与形状（1~3 个圆柱） |
-| 固定网格（`--fixed`，调试用） | `python3 scripts/generate_grid_world.py --fixed` | 3×3 |
+| 固定网格（`--fixed`，调试用） | `python3 scripts/generate_grid_world.py --fixed` | 3×3，**一行一类** |
+
+两者都接受 `--classes`（逗号分隔，默认 `red,orange,yellow,cyan,purple`）——
+类别名与类别号会一并写进 meta，供自动标注与建数据集读取（见 §4.4 多类别）。
+颜色取值集中在 `scripts/block_classes.py` 的 `PALETTE`，生成器不再自带一份颜色池。
+> ⚠️ 旧的颜色池里有成对的**同色相、只差明度**的颜色（蓝/钢蓝、绿/深绿、橙/深橙），
+> 那种对子在检测端本来就分不开 —— 现在只取**色相分得开**的颜色。
 
 > ⚠️ **当前提交的 `block_grid_world.sdf` 是 `--fixed` 产物**（`meta.json` 里 `fixed_mode: true`，
 > `seed=824517619`），而脚本默认是随机模式。不带 `--seed` 重新生成会得到**另一个场景**；
@@ -183,10 +189,44 @@ python3 scripts/auto_label_grid.py
 如需对非方阵数据标注：
 
 ```bash
-python3 scripts/label_blocks.py
+python3 scripts/label_blocks.py --classes red,yellow,cyan
 ```
 
-操作：`Alt+拖动` 画框，`D` 下一张，`A` 上一张。
+操作：`Alt+拖动` 画框（归**当前类别**），`1..9` 切类别，`D` 下一张，`A` 上一张，
+`Backspace` 撤销。启动横幅会打出当前的类别表；重新打开已有的标签会**读回类别号**
+（不会抹成 0 —— 自检 `test_label_blocks.py` 专门钉住这一点）。
+
+### 4.4 多类别（分拣用）
+
+方块按**颜色**分类，类别表由 `scripts/block_classes.py` **单点定义**（生成器、标注器、
+建数据集、手工标注四处都从它取，不再各写一份）。固定网格模式下**一行一类**：
+
+```bash
+python3 scripts/generate_grid_world.py --fixed --classes red,yellow,cyan
+python3 scripts/auto_label_grid.py            # 类别号从 meta 里读，不必再传
+python3 scripts/build_dataset.py --class-names red,yellow,cyan
+```
+
+> ⚠️ **类别号 = 类别表里的下标**。同一个列表、同一个顺序要贯穿
+> 生成器 → 标注 → 建数据集 → 权重文件；顺序变了**标签不会报错，只是语义全反**
+> （每个号仍然落在 `[0, nc)` 里，所以没有一处会报警）。规划器侧的
+> `place_slot_classes` 因此用**类别名**而不是类别号 —— 名字对不上是看得见的。
+>
+> ⚠️ 调色板只有 8 个颜色名（见 `block_classes.PALETTE`），手工标注工具的切换键
+> 只有 `1..9`。选类别时以**实测色相**为准：`block_classes.py` 的文档里记着
+> 上一批方块的实测直方图（红 ~5°、暖色 15–60°、青 ~190°、紫 300–325°，
+> **65°–180° 是空的 —— 没有绿色**）。那批数据来自前负责人，你自己的方块要重新拍一份。
+>
+> **别猜类别数**，用尺子量 —— `scripts/palette_survey.py`（离线看图，不连机器人）：
+>
+> ```bash
+> python3 scripts/palette_survey.py --images ~/block_photos --out /tmp/palette.png
+> ```
+>
+> 它自己给结论：每个色团按「**图内展开 vs 跨图漂移**」判一遍
+> （展开 ≫ 漂移 ⇒ 里面藏着多种颜色，该拆），最后打出建议类别数与可直接粘的
+> `--classes …`。复核图**一定要打开看** —— 多出来的色团是积木还是旁边的水果，
+> 只有看图才知道。命令与拍法见 `docs/待执行命令.md` 的 **A2** 一节。
 
 ---
 
@@ -382,8 +422,11 @@ A: 编辑 `scripts/generate_grid_world.py` 中的配置参数，运行即可重�
 
 | 文件 | 用途 |
 |------|------|
-| `scripts/generate_grid_world.py` | 方阵世界生成器 |
-| `scripts/auto_label_grid.py` | 自动标注（相机投影） |
+| `scripts/block_classes.py` | **类别表的单点定义**（调色板 + 校验 + 颜色名↔类别号） |
+| `scripts/palette_survey.py` | **量现场有几种颜色** —— 定类别数的尺子（离线看图，不连机器人） |
+| `scripts/generate_grid_world.py` | 方阵世界生成器（`--classes` 决定类别表） |
+| `scripts/auto_label_grid.py` | 自动标注（相机投影，类别号从 meta 读） |
+| `scripts/build_dataset.py` | 建数据集（`--class-names` 写进 data.yaml 与 manifest） |
 | `scripts/collect_training_data.py` | Gazebo 图像采集 |
 | `scripts/label_blocks.py` | 手动标注工具（备用） |
 | `scripts/train_yolo_block.py` | YOLO 训练脚本 |

@@ -56,13 +56,16 @@ def listing(out, sub):
     return sorted(os.listdir(os.path.join(out, sub, 'images')))
 
 
-def write_tree(root, spec):
+def write_tree(root, spec, classes=(0,)):
     """``spec = {排布名: (扩展名, [(帧号, 框数), ...])}`` —— 按 ``B.SOURCES`` 的**真实
     相对路径**造一棵假的 rounds 树。
 
     用真实路径而不是自造一张表，是因为子进程会重新 import 模块，
     测试进程里改 ``B.SOURCES`` 对它无效 —— 那正是第一版测试踩的坑。
     走真实路径还顺带把 SOURCES 表本身测了。
+
+    ``classes`` 是框的类别号序列，按框**轮发**（与真数据的类内数量均衡一致）。
+    单类别传默认的 ``(0,)`` 即可，行为与旧版逐字节相同。
     """
     rel = {n: (i, l) for n, i, l in B.SOURCES}
     for name, (ext, frames) in spec.items():
@@ -74,9 +77,28 @@ def write_tree(root, spec):
             with open(os.path.join(idir, 'img_%04d%s' % (i, ext)), 'wb') as f:
                 f.write(b'\xff\xd8\xff' if ext == '.jpg' else b'\x89PNG\r\n\x1a\n')
             with open(os.path.join(ldir, 'img_%04d.txt' % i), 'w') as f:
-                for _b in range(nbox):
-                    f.write('0 0.5 0.5 0.1 0.1\n')
+                for b in range(nbox):
+                    f.write('%d 0.5 0.5 0.1 0.1\n' % classes[b % len(classes)])
     return root
+
+
+def label_classes(out, sub='train'):
+    """某个 split 里**实际落盘的标签文件**用到了哪些类别号，以及各自框数。
+
+    为什么不只看 ``data.yaml``：yaml 写的是**声明的**类别表，而这里读的是
+    **数据**。只测 yaml 的话，一个「标签全被写成 0」的 bug 能全绿地通过 ——
+    那恰好是多类别最典型的静默失效（训练照跑、loss 照降、只是不分颜色）。
+    """
+    from collections import Counter
+    c = Counter()
+    ldir = os.path.join(out, sub, 'labels')
+    for fn in sorted(os.listdir(ldir)):
+        with open(os.path.join(ldir, fn)) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 5:
+                    c[int(p[0])] += 1
+    return c
 
 
 def main():
@@ -294,6 +316,97 @@ def main():
             got_jpg2 = os.path.join(out, 'train', 'images', 'r06a1__img_0000.jpg')
             check('已是 JPEG 的原样复制（字节相同，没有二次有损）',
                   open(got_jpg2, 'rb').read() == open(src_jpg, 'rb').read())
+
+    # ------------------------------------------------------- [6] 多类别
+    print('\n[6] 多类别 —— 类别号必须真的落进标签，且类别表要能与数据对上')
+    with tempfile.TemporaryDirectory() as td:
+        root = os.path.join(td, 'rounds')
+        # 每个排布 1 帧 3 框（轮发得到 0/1/2 各一个），r00 多一帧。
+        # 这样各类框数**可以心算**：train = 6 个排布 7 帧 = 21 框 → 每类 7；
+        # val = r02 1 帧 3 框 → 每类 1；全库每类 8。
+        # （不用 BOILER 的默认 spec：它那几个 1 框的排布都轮到第 0 类，
+        #   会让「每类框数」变成 7/3/3 这种要靠算才知道对不对的数。）
+        spec = {n: ('.png', [(0, 3)]) for n, _i, _l in B.SOURCES}
+        spec['r00'] = ('.png', [(0, 3), (1, 3)])
+        write_tree(root, spec, classes=(0, 1, 2))
+        out = os.path.join(td, 'ds')
+        r = run_cli(out, root, 'r02', '--class-names', 'red,yellow,cyan')
+        check('退出码 0', r.returncode == 0, r.stdout[-500:] + r.stderr[-500:])
+        # 护栏：CLI 没跑成时后面的断言全都会去读不存在的文件，
+        # 于是测试自己抛 FileNotFoundError —— 那样输出里只剩一个 traceback，
+        # 看不出**是哪一个断言**先塌的（变异测试时尤其明显）。
+        if r.returncode != 0:
+            check('  CLI 没跑成 → 跳过本节其余断言', False, r.stdout[-300:])
+            print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
+            print('未通过：' + '; '.join(FAILS))
+            return 1
+
+        yml = open(os.path.join(out, 'data.yaml')).read()
+        for want in ('0: red', '1: yellow', '2: cyan', 'nc: 3'):
+            check('data.yaml 有 %r' % want, want in yml, yml)
+
+        man = json.load(open(os.path.join(out, 'dataset_manifest.json')))
+        check('清单的 class_names 是传进去的顺序',
+              man['class_names'] == ['red', 'yellow', 'cyan'], str(man['class_names']))
+        check('清单记了每类框数（全库，各类 8）', man['class_boxes'] ==
+              {'red': 8, 'yellow': 8, 'cyan': 8}, str(man.get('class_boxes')))
+
+        # ⬇⬇ **本节的核心断言**：类别号真的进了标签文件，而不是只在 yaml 里声明。
+        # 少了这一条，「标签统一写 0」的 bug 会全绿通过 —— 那正是多类别
+        # 最典型的静默失效：训练照跑、loss 照降，只是模型不分颜色。
+        tr_cls = label_classes(out, 'train')
+        check('**落盘标签里三类都有，且各 7 框**（不是只在 yaml 里声明）',
+              tr_cls == {0: 7, 1: 7, 2: 7}, str(dict(tr_cls)))
+        check('  val 也是三类各 1 框',
+              label_classes(out, 'val') == {0: 1, 1: 1, 2: 1},
+              str(dict(label_classes(out, 'val'))))
+        check('  各类框数在输出里报出来', 'red' in r.stdout and 'cyan' in r.stdout,
+              r.stdout[-400:])
+
+        print('\n[6b] 类别表与数据对不上 → 必须报出来（不是静默建完）')
+        # 数据里只有 0/1/2 三类，却声明 5 类。**这不是错误**（真实数据集可能
+        # 就是这一批只拍了 3 类），但必须显式告诉人 —— 否则训出来的模型对
+        # 后两类只会瞎猜，而混淆矩阵显示成「整行全零」，看着像模型不行。
+        r = run_cli(os.path.join(td, 'ds5'), root, 'r02',
+                    '--class-names', 'red,yellow,cyan,purple,orange')
+        check('退出码 0（缺类别不是数据错误）', r.returncode == 0, r.stdout[-400:])
+        check('  点名 purple 一个框都没有', 'purple' in r.stdout and '0 框' in r.stdout,
+              r.stdout[-500:])
+        yml5 = open(os.path.join(td, 'ds5', 'data.yaml')).read()
+        check('  data.yaml 仍按传进去的 5 类写（不偷偷删空类）',
+              'nc: 5' in yml5 and '4: orange' in yml5, yml5)
+
+        print('\n[6c] 变异：把类别表顺序改掉 —— 标签**不会**跟着变（这就是风险）')
+        # 这是多类别最危险的一条：build_dataset **不重编类别号**，它只搬运。
+        # 所以 `--class-names` 顺序与标注时不一致时，数据一个字节都不变、
+        # 退出码照样 0，只是 yaml 里 0 号从此叫别的颜色。
+        # 测试把这个事实钉住：顺序变了，标签文件必须**逐字节相同**。
+        out_r = os.path.join(td, 'ds_reordered')
+        r = run_cli(out_r, root, 'r02', '--class-names', 'cyan,yellow,red')
+        check('退出码 0（顺序错不会报错 —— 所以只能靠人/靠清单核对）',
+              r.returncode == 0, r.stdout[-400:])
+        same = all(
+            open(os.path.join(out, 'train', 'labels', fn)).read() ==
+            open(os.path.join(out_r, 'train', 'labels', fn)).read()
+            for fn in os.listdir(os.path.join(out, 'train', 'labels')))
+        check('  **标签逐字节不变**（类别号不重编，只搬）', same)
+        yml_r = open(os.path.join(out_r, 'data.yaml')).read()
+        check('  但 yaml 里 0 号已经变成 cyan —— 语义被换掉了',
+              '0: cyan' in yml_r and '2: red' in yml_r, yml_r)
+
+        print('\n[6d] 参数互相矛盾 / 名字非法 → 退出码 2')
+        r = run_cli(os.path.join(td, 'ds6'), root, 'r02',
+                    '--class-names', 'red,yellow', '--class-name', 'block')
+        check('--class-name 与 --class-names 同时给 → 退出码 2',
+              r.returncode == 2, '实际 %d' % r.returncode)
+        for bad, why in (('red,red', '类别名重复'),
+                         ('Red', '大写'),
+                         ('red,,yellow', '空项'),
+                         ('', '空表')):
+            r = run_cli(os.path.join(td, 'ds7'), root, 'r02', '--class-names', bad)
+            check('  --class-names %-14r → 退出码 2（%s）' % (bad, why),
+                  r.returncode == 2 and 'Traceback' not in r.stderr,
+                  '实际 %d / %s' % (r.returncode, r.stdout[-200:]))
 
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:

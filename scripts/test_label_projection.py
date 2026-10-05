@@ -440,6 +440,84 @@ def test_sim_meta(L):
           worst < 1e-9, f"最大偏差 {worst:.3e} m")
 
 
+# ── 6. 多类别的**写标签**那一半 ────────────────────────────────────────
+def test_multiclass_labels(L):
+    """端到端跑一遍 auto_label_grid，只问一件事：**写出来的类别号对不对**。
+
+    为什么单开一节：前面五节全在验几何，而多类别的失效**不在几何上** ——
+    投影可以精确到 1e-16，类别号却全部写成 0，而且没有任何一步会报错。
+    所以这一节不看坐标，只数类别号。
+    """
+    import json
+    import subprocess
+    import tempfile
+
+    print("\n--- 6. 多类别：类别号必须按方块逐个写进标签 ---")
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        img_dir, out_dir = td / "img", td / "lbl"
+        img_dir.mkdir()
+        # 用真实 meta 的相机与几何，只把类别改成 4 类、方块缩到 6 个，
+        # 好让每类的框数可以心算（6 个方块轮发 4 类 → 2/2/1/1）。
+        meta = json.load(open(SIM_META))
+        meta["classes"] = ["red", "yellow", "cyan", "purple"]
+        names = ["red", "yellow", "cyan", "purple"]
+        meta["blocks"] = meta["blocks"][:6]
+        for i, b in enumerate(meta["blocks"]):
+            b["class_name"] = names[i % 4]
+            b["class_id"] = i % 4
+        meta_path = td / "meta.json"
+        meta_path.write_text(json.dumps(meta))
+
+        # 一张黑图就够：投影几何与图像内容无关，这里只关心写出的标签行。
+        import cv2
+        cv2.imwrite(str(img_dir / "f0.jpg"), np.zeros((480, 640, 3), np.uint8))
+
+        r = subprocess.run(
+            [sys.executable, str(LABELER_PY), "--sim-meta", str(meta_path),
+             "--images", str(img_dir), "--out", str(out_dir)],
+            capture_output=True, text=True)
+        check("auto_label_grid 退出码 0", r.returncode == 0,
+              (r.stdout + r.stderr)[-500:])
+        txt = out_dir / "f0.txt"
+        check("写出了标签文件", txt.exists())
+        if not txt.exists():
+            return
+        cls = [int(l.split()[0]) for l in txt.read_text().splitlines() if l.strip()]
+        check("每个方块一行，共 6 行", len(cls) == 6, str(cls))
+        # ⬇⬇ 本节的核心：类别号**逐块**来自 meta，不是统一写 0
+        check("**类别号逐块来自 meta（不是统一写 0）**",
+              cls == [0, 1, 2, 3, 0, 1], str(cls))
+        check("  四类都出现过（不是只有第 0 类）", sorted(set(cls)) == [0, 1, 2, 3],
+              str(sorted(set(cls))))
+        check("  按类别报框数", "0=2" in r.stdout and "3=1" in r.stdout,
+              r.stdout[-400:])
+
+    print("  -- 类别的兜底与拒绝 --")
+    # 没有 class_id 又没有 --class-id：必须报错退出，**不能默认 0**
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        img_dir, out_dir = td / "img", td / "lbl"
+        img_dir.mkdir()
+        import cv2
+        cv2.imwrite(str(img_dir / "f0.jpg"), np.zeros((480, 640, 3), np.uint8))
+        meta = json.load(open(SIM_META))
+        for b in meta["blocks"]:
+            b.pop("class_id", None)
+            b.pop("class_name", None)
+        meta_path = td / "meta.json"
+        meta_path.write_text(json.dumps(meta))
+        r = subprocess.run(
+            [sys.executable, str(LABELER_PY), "--sim-meta", str(meta_path),
+             "--images", str(img_dir), "--out", str(out_dir)],
+            capture_output=True, text=True)
+        check("meta 没有 class_id → 非 0 退出 + 说清原因",
+              r.returncode != 0 and "class_id" in (r.stdout + r.stderr),
+              (r.stdout + r.stderr)[-300:])
+        check("  没有 Traceback（是拒绝，不是崩）",
+              "Traceback" not in r.stderr, r.stderr[-300:])
+
+
 def main():
     print("=" * 62)
     print("标注投影自检（W4）—— 训练几何必须 == 推理几何")
@@ -450,6 +528,7 @@ def main():
     test_degenerate(L)
     test_homography_agrees_with_tf(L)
     test_sim_meta(L)
+    test_multiclass_labels(L)
 
     print("\n" + "=" * 62)
     if _failed:

@@ -28,6 +28,15 @@ train 里一帧都不能是它的。这份脚本把这条写死成断言（`plan
 
     python3 scripts/build_dataset.py --out block_dataset \\
         --val r02,r06a2 --jpeg-quality 92
+    python3 scripts/build_dataset.py --out block_dataset_multiclass \\
+        --class-names red,orange,yellow,cyan,purple
+
+**类别表（多类别）**
+
+`--class-names` 写进 `data.yaml` 的 `names`/`nc`，同时是**类别号的上界**：
+`parse_label_line()` 拿 `nc` 校验每一行的类别号。所以顺序错了不会报错 ——
+每个号都还在 `[0,nc)` 里，错的是语义。**必须与生成世界时的
+`generate_grid_world.py --classes` 传同一个列表、同一顺序。**
 
 退出码：0 = 装好；1 = 数据本身有问题（图/标签对不上、标签越界）；2 = 输入不对。
 """
@@ -37,6 +46,9 @@ import json
 import os
 import shutil
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from block_classes import parse_classes                             # noqa: E402
 
 try:
     import cv2
@@ -136,8 +148,12 @@ def plan_split(names, val_names):
 
 
 def collect(rounds_root, sources, nc, log=print):
-    """把各排布的帧读进来并校验，返回 ``{排布: [(图, 标签, 框数), ...]}``。"""
-    out = {}
+    """把各排布的帧读进来并校验。
+
+    返回 ``({排布: [(图, 标签, 框数), ...]}, {类别号: 框数})``。
+    第二个返回值是**全库**的每类框数，供调用方查「声明了但没数据」的类别。
+    """
+    out, per_class = {}, {}
     for name, img_rel, lbl_rel in sources:
         idir = os.path.join(rounds_root, img_rel)
         ldir = os.path.join(rounds_root, lbl_rel)
@@ -166,8 +182,17 @@ def collect(rounds_root, sources, nc, log=print):
             raise ValueError("%s：这些标签没有图：%s" % (name, only_lbl))
         if not pairs:
             raise ValueError("%s：一帧都没配上" % name)
-        out[name] = [(i, l, len(read_label(l, nc))) for i, l in pairs]
-    return out
+        frames = []
+        for i, l in pairs:
+            boxes = read_label(l, nc)
+            for cls, _cx, _cy, _w, _h in boxes:
+                per_class[cls] = per_class.get(cls, 0) + 1
+            frames.append((i, l, len(boxes)))
+        out[name] = frames
+    # 返回每类的框数：调用方靠它发现「data.yaml 里声明了、数据里一个框都没有」
+    # 的类别。那个症状不是报错，而是**混淆矩阵里一整行全零** ——
+    # 看着像「这一类召回 0」，实际是「这批数据里根本没有这一类」，两回事。
+    return out, per_class
 
 
 def write_split(frames, split_dir, name_to_out, jpeg_quality=None):
@@ -225,10 +250,34 @@ def main(argv=None):
                     help="把非 JPEG 源转成该质量的 JPEG（默认不转，原样复制）")
     ap.add_argument("--clean", action="store_true",
                     help="先删掉输出目录里已有的 train/ val/（不动 data.yaml 之外的东西）")
-    ap.add_argument("--class-name", default="block")
+    # 两个参数都默认 None，才能区分「没传」与「传了默认值」——
+    # 否则 `--class-names block --class-name foo` 这种矛盾调用会被静默放行，
+    # 而类别表选错的症状是「标签与 names 整体错位、且一步都不报错」。
+    ap.add_argument("--class-names", default=None,
+                    help="类别表，逗号分隔，**顺序即类别号**（默认 block）。"
+                         "必须与 generate_grid_world.py --classes 传同一个列表。")
+    ap.add_argument("--class-name", default=None,
+                    help="旧参数，等价于只有一类的 --class-names。"
+                         "两个都给会报错（谁赢都是猜）。")
     a = ap.parse_args(argv)
 
-    names = [a.class_name]
+    try:
+        if a.class_name is not None and a.class_names is not None:
+            raise ValueError(
+                "--class-name 与 --class-names 同时给了。请只用一个：\n"
+                "    多类别用 --class-names red,orange,yellow,cyan,purple\n"
+                "    单类别用 --class-names block（或旧的 --class-name block）")
+        spec = a.class_name if a.class_name is not None else a.class_names
+        # 都不传 = 单类 "block"（与旧行为一致，别把老命令弄坏）
+        # allow_unknown=True：真实数据集的类别名不必在仿真调色板里
+        # （那只是仿真渲染用的颜色表）。这里只用它校验名字的**语法**
+        # —— 小写、无重复、非空。类别名会进 data.yaml 与 ROS 话题，
+        # 名字里有空格或逗号会让下游的 split(",") 静默切错。
+        names = parse_classes(spec if spec is not None else "block",
+                              allow_unknown=True)
+    except ValueError as e:
+        print("❌ %s" % e)
+        return 2
     nc = len(names)
     val_names = [s.strip() for s in a.val.split(",") if s.strip()]
 
@@ -239,7 +288,7 @@ def main(argv=None):
         return 2
 
     try:
-        by_arr = collect(a.rounds_root, SOURCES, nc)
+        by_arr, per_class = collect(a.rounds_root, SOURCES, nc)
     except (ValueError, OSError) as e:
         print("❌ %s" % e)
         return 1
@@ -254,6 +303,25 @@ def main(argv=None):
               % (name, "val  " if name in val_names else "train",
                  len(by_arr[name]), sum(b for _i2, _l2, b in by_arr[name])))
 
+    # 类别表与数据是否对得上 —— 这是**本脚本多类别下唯一能做的语义检查**。
+    # 号码顺序错位它查不出来（每个号都还在 [0,nc) 里），但「某一类一个框都
+    # 没有」查得出来，而那正是最常见的错法：类别表照新方案写了 5 类，
+    # 数据却是老的单类数据。
+    print("\n类别表 → 框数：")
+    zero = []
+    for i, nm in enumerate(names):
+        n = per_class.get(i, 0)
+        print("  %d:%-12s %5d 框" % (i, nm, n))
+        if n == 0:
+            zero.append(nm)
+    if zero:
+        print("⚠️ 这些类别**一个框都没有**：%s" % ", ".join(zero))
+        print("   不是「召回率 0」，是这批数据里根本没有这一类 —— "
+              "训出来的模型对这些类只会瞎猜，而验证集上的混淆矩阵"
+              "会显示成整行全零，看着像模型不行。")
+        print("   要么这批数据确实缺这些类，要么 --class-names 与标注时的"
+              "类别表不是同一套。")
+
     prov, stat = {}, {}
     for split, arr_names in (("train", train_names), ("val", val_names)):
         frames = [(n, i, l, b) for n in arr_names for (i, l, b) in by_arr[n]]
@@ -264,6 +332,10 @@ def main(argv=None):
     with open(os.path.join(a.out, "dataset_manifest.json"), "w") as f:
         json.dump({"sources": {n: {"images": i, "labels": l} for n, i, l in SOURCES},
                    "split": stat, "class_names": names,
+                   # 每类框数进清单：训练时对不上就能回溯到「这批数据本来
+                   # 就没有这一类」，而不是怀疑模型。
+                   "class_boxes": {nm: per_class.get(i, 0)
+                                   for i, nm in enumerate(names)},
                    "jpeg_quality": a.jpeg_quality,
                    "files": prov}, f, indent=1, ensure_ascii=False)
 

@@ -81,6 +81,7 @@ from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose
 from moveit_msgs.msg import CollisionObject, PlanningScene
 from moveit_msgs.srv import ApplyPlanningScene, GetPositionFK, GetPositionIK
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
@@ -94,6 +95,15 @@ from grasp_planner.gripper import make_gripper
 
 # 遥测（只读发布，不参与任何决策）。见 telemetry.py 的模块文档。
 from grasp_planner.telemetry import SLOT_SKIPPED, SLOT_USED, PlannerTelemetry
+# 类别→槽位的路由判据（纯函数，无 ROS 依赖）。抽出去是为了能单测 ——
+# 这段逻辑错了不会报错，只会把方块放进错的格子，见 slot_routing.py。
+from grasp_planner.slot_routing import (
+    class_histogram,
+    describe_routing,
+    is_routed,
+    pick_slot,
+    validate_slot_classes,
+)
 
 JointAngles = List[float]
 
@@ -213,6 +223,11 @@ class GraspPlanner(Node):
         self.place_slots_flat = [float(v) for v in p["place_slots"]]
         self.place_slots = list(zip(self.place_slots_flat[0::2],
                                    self.place_slots_flat[1::2]))
+        # 类别→槽位的路由表（空 = 不路由）。校验放在 __init__ 里、_validate_zones
+        # 之前，因为它决定「哪些槽位能被谁用」，后面的重叠/间距检查都建立在
+        # 「槽位一共就这些」上。长度错会在这里直接拒绝启动（见 slot_routing）。
+        self.slot_classes = validate_slot_classes(
+            p["place_slot_classes"], len(self.place_slots))
         self.place_z: float = float(p["place_z"])
         self.place_release_lift: float = float(p["place_release_lift"])
         self.max_attempts_without_place: int = int(p["max_attempts_without_place"])
@@ -252,9 +267,22 @@ class GraspPlanner(Node):
         self._grasped_positions: set = set()
         self._approach_arm: JointAngles = [0.0] * self._n_arm
         self._grasp_target: Optional[Tuple[float, float, float]] = None
-        # 放置槽位游标：**只增不减**，放成功一个才前进一个（解不出来的槽位跳过）
+        # 槽位占用表：**一槽一位**，放过东西、或试过但 IK 解不出被跳过的，都算占用。
+        # 为什么是「占用表」而不是原来的单一游标：按类别分之后，各家的槽位在
+        # 表里是**交错**的（red,red,yellow,yellow），一个只增不减的下标没法表达
+        # 「red 用掉第 0 格、yellow 用掉第 2 格、red 还能用第 1 格」。
+        # 全通配（不路由）时，从 0 往后找第一个未占用的下标，序列恰好是
+        # 0,1,2,3,... —— 与旧游标**逐次相同**，所以 A1 的行为一个字节都没变。
+        self._place_used: List[bool] = [False] * len(self.place_slots)
+        # 正在处理的那个槽位下标（遥测标注 + 日志用）。注意它**不再是**
+        # 「下一个要用的槽位」—— 那个概念已经由 _place_used 表达。
         self._place_index = 0
+        # 真正放下成功的个数（跳过的不算）。收工日志报的是它，不是 _place_index。
+        self._place_placed = 0
         self._place_target: Optional[Tuple[float, float]] = None
+        # 手上（或即将去抓）那个方块的类别名。放置段靠它挑槽位 ——
+        # 抓取段选目标时记下，放下后清掉。
+        self._holding_class: Optional[str] = None
         # 「夹爪里可能夹着东西」——原设计**根本没有这个状态**（D53），
         # 于是放置段失败时方块留在爪里，下一次接近会带着它去撞别的目标。
         self._holding = False
@@ -367,7 +395,12 @@ class GraspPlanner(Node):
         return {
             # 只走位模式下槽位的「灰 = 已消费」不代表那里真有方块（见 telemetry.py）
             "carry_objects": self.carry_objects,
+            # ⚠️ place_index 的语义在本轮变了：以前是「下一个要用的槽位」，
+            #    现在是「正在处理的那一格」（按类别分之后槽位是交错消费的，
+            #    没有单一的「下一个」）。真正放下成功的个数是 place_placed。
             "place_index": self._place_index,
+            "place_placed": self._place_placed,
+            "holding_class": self._holding_class or "-",
             "place_target": ("-" if place is None
                              else f"{place[0]:.3f},{place[1]:.3f}"),
             "target": ("-" if tgt is None
@@ -392,9 +425,11 @@ class GraspPlanner(Node):
         #    节点启动直接 KeyError。从结构上把第二份清单删掉，这类错就没了。
         declared: List[str] = []
 
-        def d(name, default):
+        def d(name, default, descriptor=None):
             declared.append(name)
-            return self.declare_parameter(name, default)
+            if descriptor is None:
+                return self.declare_parameter(name, default)
+            return self.declare_parameter(name, default, descriptor)
 
         d("targets_topic", "/targets_3d")
         d("ik_service", "/compute_ik")
@@ -471,6 +506,37 @@ class GraspPlanner(Node):
             0.44, 0.24, 0.60, 0.24, 0.76, 0.24,
             0.44, -0.24, 0.60, -0.24, 0.76, -0.24,
         ])
+        # 多类别分拣：**每个槽位专属的类别名**，与 place_slots 等长（第 i 项 =
+        # 第 i 个槽位）。空串 = 通配。**整个留空 = 不按类别分**，行为与单类别
+        # （A1）完全一致 —— 这是默认值，所以老配置一个字都不用改。
+        #   例：["red","red","yellow","yellow"]  → 两类各两格
+        #   例：["red","red","yellow","yellow","",""]  → 另有两格谁都能放
+        #
+        # ⚠️ 用**类别名**而不是类别号。类别号是「类别表里的下标」，而类别表在
+        #    生成器/标注器/数据集/权重四处各有一份，顺序一变同一个数字的含义
+        #    就全反了、而且**四处都不会报错**（见 scripts/block_classes.py）。
+        #    名字对不上只是匹配不到槽位，是看得见的。
+        #    名字必须与**权重文件里的类别名逐字相同**（检测器把 model.names
+        #    直接塞进 ObjectHypothesis.class_id）—— `yellow` 与 `Yellow` 是两个
+        #    不同的名字，写错的后果是这一类永远放不下去。
+        #
+        # ⚠️ 命令行写法（实测，别想当然）：通配槽位要写**带引号的空串** ——
+        #      `-p 'place_slot_classes:=[red,red,yellow,yellow,""]'`  ✓
+        #      `-p 'place_slot_classes:=[red,red,yellow,yellow,]'`    ✗ 末尾的裸空项
+        #        会被 ROS 解析器**静默丢掉**，变成 4 项（看着像「4 类 + 1 个通配」，
+        #        实际是「只有 4 个槽位」）；
+        #      `-p 'place_slot_classes:=[red,,yellow]'`               ✗ 中间裸空项更狠，
+        #        rclpy.init 直接抛 RCLError，节点起不来。
+        #    改用 yaml 的 `place_slot_classes: ["red", "red", ""]` 没有这个问题。
+        #    这三种写法都钉在 scripts/test_planner_class_sort.py 的 A 段里。
+        #
+        # ⚠️ 这里必须给 descriptor：`declare_parameter(name, [])` 的空列表会被
+        #    rclpy 推断成 **BYTE_ARRAY**（实测），于是 launch/yaml 里写字符串数组
+        #    会撞类型错误。`dynamic_typing=True` 才允许它事后被设成 STRING_ARRAY
+        #    （也已实测：命令行 -p place_slot_classes:=[red,red] 能读进来）。
+        #    这是本项目第二次踩「空数组的类型是推断出来的」这件事，别删这段注释。
+        d("place_slot_classes", [],
+          ParameterDescriptor(dynamic_typing=True))
         # 放置参考高度（base_frame 系）：**与抓取段同一个约定** —— perception
         # 报的那个点落到槽位上时的 z，即方块静止时**可见顶面**的高度，不是中心。
         # 仿真：桌面顶面 -0.39 + 方块高 0.04 = -0.35。
@@ -669,6 +735,21 @@ class GraspPlanner(Node):
             f"抓取区 {zone_str(self.pick_zone)} | 放置槽位 {len(self.place_slots)} 个"
             f" @ place_z={self.place_z:.3f}（间距下限告警 {min_pitch*1000:.0f} mm）"
         )
+        # 路由表要**逐槽打印**：类别名与权重里的名字对不上时，症状是「这一类
+        # 一个都放不下去」，而现场唯一能对照的就是这一行。见 slot_routing.py。
+        if is_routed(self.slot_classes):
+            self.get_logger().info(
+                f"类别路由：{describe_routing(self.slot_classes, self.place_slots)}"
+            )
+            n_wild = sum(1 for n in self.slot_classes if not n)
+            if n_wild:
+                self.get_logger().info(
+                    f"（其中 {n_wild} 个槽位是通配 \"\" —— 任何类别都能放）"
+                )
+        else:
+            self.get_logger().info(
+                "类别路由：**关闭** —— 所有槽位谁都能放（单类别/A1 行为）"
+            )
         self.get_logger().info(
             f"放置下降位 tool0 z={self._place_descend_z:.3f}"
             f"（= place_z {self.place_z:.3f} + 指尖偏移 {self.tool0_to_fingertip:.3f}"
@@ -1261,9 +1342,24 @@ class GraspPlanner(Node):
         self.get_logger().info("=" * 60)
         self.get_logger().info(f"收工：{reason}")
         self.get_logger().info(
-            f"  已成功放置 {self._place_index} 个 / 槽位共 {len(self.place_slots)} 个"
+            f"  已成功放置 {self._place_placed} 个 / 槽位共 {len(self.place_slots)} 个"
+            f"（跳过 {sum(self._place_used) - self._place_placed} 个）"
             f"；已抓取记账 {len(self._grasped_positions)} 个"
         )
+        # 按类别分的时候，逐类报一遍占了多少格 —— 收工后一眼就能看出
+        # 「是不是有一类一个都没放进去」（那通常意味着类别名拼错了，
+        # 或者检测器根本没认出这一类）。
+        if is_routed(self.slot_classes):
+            cap = class_histogram(self.slot_classes)
+            used = {}
+            for i, name in enumerate(self.slot_classes):
+                if self._place_used[i]:
+                    used[name] = used.get(name, 0) + 1
+            self.get_logger().info(
+                "  各类占用：" + "  ".join(
+                    f"{(n or '通配')}={used.get(n, 0)}/{c}"
+                    for n, c in cap.items())
+            )
         self.get_logger().info("  **不再接受新目标**。节点仍在运行，Ctrl-C 退出。")
         if self._holding:
             self.get_logger().warn(
@@ -1302,18 +1398,30 @@ class GraspPlanner(Node):
         # 正常跑动时一个周期远超 2 s，所以真正的进展一条都不会被吞掉。
         self.get_logger().info(
             f"候选 {len(candidates)} 个 {[c[1] for c in candidates]}"
-            f" | 已放置 {self._place_index}/{len(self.place_slots)}"
+            f" | 已放置 {self._place_placed}/{len(self.place_slots)}"
             f" | 已抓 {len(self._grasped_positions)} 个"
             f" | 连续未放置 {self._attempts_since_place}"
             f"/{self.max_attempts_without_place}",
             throttle_duration_sec=2.0,
         )
 
+        # ③ 挑目标。按类别分的时候，**这里就要把「这一类没地方放了」的候选
+        #    剔掉**，而不是等选中之后再发现放不下 —— 后者会让某一类槽位满了
+        #    就整轮收工，哪怕别的类还有格、场上还有它们的方块。
+        #    ⚠️ 两个计数器要分开记：`blocked` 是「类别没地方放」，等多久都没用；
+        #    `score_blocked` 是「有地方放但这一帧分数不够」，下一帧可能就好了。
+        #    混在一起会让后者把收工判据提前触发（或反过来，永远不收工）。
         best = None
+        blocked: List[str] = []
+        score_blocked = 0
         for score, label, wx, wy, wz in candidates:
             if (round(wx, 2), round(wy, 2), round(wz, 2)) in self._grasped_positions:
                 continue
+            if self._next_place_slot(label) is None:
+                blocked.append(label)
+                continue
             if score < self.min_score:
+                score_blocked += 1
                 continue
             best = (score, label, wx, wy, wz)
             break
@@ -1324,6 +1432,13 @@ class GraspPlanner(Node):
                 if (round(c[2], 2), round(c[3], 2), round(c[4], 2))
                 not in self._grasped_positions
             ]
+            # 只剩「类别没地方放」这一种未抓候选 → 这就是真正的收工条件。
+            # 用与槽位用尽相同的判据（而不是等空闲看门狗），理由是**原因不同**：
+            # 空闲看门狗报的是「21 秒没有新目标」，那听起来像检测坏了；
+            # 而这里的事实是「黄块的格子用完了」。收工原因要能直接读出来。
+            if blocked and not score_blocked:
+                self._finish(self._place_exhausted_reason(blocked[0]))
+                return
             if not ungrasped and candidates:
                 # 候选都在 _grasped_positions 里：本批没有新目标。**不是**收工 ——
                 # 收工交给空闲看门狗（_idle_check）。这里只回到待命，并让
@@ -1334,7 +1449,7 @@ class GraspPlanner(Node):
                 threading.Timer(self.retry_delay, self._reset_busy).start()
             return
 
-        # ③ 槽位闸门：**起步之前**先确认还有地方可放。
+        # ④ 槽位闸门：**起步之前**再确认一次还有地方可放。
         #    这条闸门必须在这里，不能只在 _on_lift_done 里判 —— 否则节点会
         #    先抓起来、再发现无处可放，收工时夹爪里吊着一个方块，还白跑了一整
         #    个抓取周期（实测 run 3：6 个槽位放满后仍有第 7 次抓取，日志出现
@@ -1342,10 +1457,15 @@ class GraspPlanner(Node):
         #    抓取是整条链上**唯一不可撤销**的一步：接近/下降/抬起失败都能原地
         #    恢复，唯独「夹起来了」没法靠重试退回。所以闸门要设在它前面。
         #    _on_lift_done 里那道检查保留，作为「手上有物体」的兜底。
-        if self._next_place_slot() is None:
-            self._finish(
-                f"放置槽位已用尽（{len(self.place_slots)} 个）—— 没有地方可放了"
-            )
+        #
+        #    ⚠️ 上面 ③ 的循环里已经用同一个谓词筛过一遍，这里为什么还要再判？
+        #    因为 ③ 与这里之间隔着 `best = (...)` 的分解和看门狗计数，而
+        #    `_next_place_slot` 是**只读**的（不消费槽位），所以再判一次没有
+        #    副作用；但**不能因此删掉它** —— 它是「无论从哪条路走到这里，
+        #    _place_target 都一定有个合法槽位」的保证。删掉的话，将来有人在
+        #    ③ 里加一条 `continue` 分支就会静默地把这条保证弄丢。
+        if self._next_place_slot(best[1]) is None:
+            self._finish(self._place_exhausted_reason(best[1]))
             return
 
         # 看门狗：从这里开始算「一次尝试」。成功放置时清零（见 _on_place_released）。
@@ -1365,6 +1485,10 @@ class GraspPlanner(Node):
 
         score, label, wx, wy, wz = best
         self._grasp_target = (wx, wy, wz)
+        # 记下这个方块的类别：整个抓取周期（接近→下降→抬起→回 HOME，几十秒）
+        # 都在用它决定去哪个槽位。**不能等到放置时再读检测流** —— 那时方块
+        # 已经在爪子里、原位置多半已经被后来的帧改写成别的东西了。
+        self._holding_class = label
         # 遥测：把瞄准点挂到 RViz 上。**这一条的价值最高** —— 把「相机看到的
         # 检测框」与「规划器实际用的 3D 点」叠在一起，投影错了、或目标被
         # pick_zone 滤掉了，一眼就能看出来。IK 失败时**也保留**这个点：
@@ -1444,7 +1568,7 @@ class GraspPlanner(Node):
                 f"夹爪疑似空夹（回读位置={pretty}）——张开后重试，本次不计入已抓"
             )
             # **不**记入 _grasped_positions：没夹到就该能重试
-            self._holding = False
+            self._clear_holding()
             self._open_and_reset()
             return
 
@@ -1509,51 +1633,123 @@ class GraspPlanner(Node):
         # 逐个试剩余槽位：某个槽位解不出来（够不着 / 肘高护栏不过）就**跳过它**
         # 继续试下一个。不跳过的话会卡死在同一个槽上，而槽位表就那么长。
         approach_z = self._place_descend_z + self.approach_clearance
+        cls = self._holding_class
         while True:
-            slot = self._next_place_slot()
+            # ⚠️ 按**手上那个方块的类别**找槽位。用 _holding_class 而不是重新读
+            # 检测：从抓起来到现在，检测流一直在跑，同一格位置上的类别可能已经
+            # 被后来的某一帧改写（方块被拿走了），照那样放会进错格。
+            slot = self._next_place_slot(cls)
             if slot is None:
                 # ⚠️ 走到这里时**方块已经在夹爪里**了 —— 和 _select_and_approach
                 # 里那道槽位闸门不同：那道闸门是「没地方放就别去抓」，防的是白跑
                 # 一个周期；这一条是「抓都抓了，却没地方放」，只能收工并告警。
-                # 它是可达的：下面每个解不出来的槽位都会 _place_index += 1 跳过，
-                # 跳着跳着就可能把槽位表耗尽。
+                # 它是可达的：下面每个解不出来的槽位都会被标记跳过，
+                # 跳着跳着就可能把这一类可用的槽位耗尽。
                 self._finish(
-                    f"放置槽位已用尽（{len(self.place_slots)} 个）—— 没有地方可放了",
+                    self._place_exhausted_reason(cls),
                     ok=False,   # ⚠️ 与 _select_and_approach 里同样文案的那处相反：
                                 # 这里是**方块已经在夹爪里**却没处放，不是正常收工。
                 )
                 return
-            sx, sy = slot
+            i, sx, sy = slot
             arm = self._call_ik(sx, sy, approach_z, seed=self.ik_seed)
             if arm is not None:
                 break
             self.get_logger().warn(
-                f"槽位[{self._place_index}] ({sx:.3f}, {sy:.3f}) 接近位姿解不出来，"
-                "跳过它"
+                f"槽位[{i}] ({sx:.3f}, {sy:.3f}) 接近位姿解不出来，跳过它"
             )
-            # 遥测：橙色标出来。**必须在这里标，不能靠 i < place_index 事后推** ——
-            # _place_index 在「放成功」和「跳过」两种情况下都会自增，事后推会把
-            # 跳过的槽位错报成已占用（见 telemetry.py）。
-            self._telem.mark_slot(self._place_index, SLOT_SKIPPED)
-            self._place_index += 1      # 放弃这个槽位，继续试下一个
+            # 遥测：橙色标出来。**必须在这里标，不能靠「下标小于某个值」事后推** ——
+            # 槽位会因「放成功」和「跳过」两种原因被标记，事后推会把跳过的槽位
+            # 错报成已占用（见 telemetry.py）。
+            self._telem.mark_slot(i, SLOT_SKIPPED)
+            self._place_used[i] = True  # 放弃这个槽位，继续试下一个
+            self._place_index = i
 
+        self._place_index = i
         self._place_target = (sx, sy)
         # 放置段全程用这个解当种子，理由与抓取段相同（见 _select_and_approach）
         self._approach_arm = list(arm)
         self.get_logger().info(
-            f"已到 HOME —— 去放置位[{self._place_index}] "
-            f"({sx:.3f}, {sy:.3f})"
+            f"已到 HOME —— 去放置位[{i}] ({sx:.3f}, {sy:.3f})"
+            + (f"（类别 {cls}）" if is_routed(self.slot_classes) else "")
         )
         self._telem.set_target(sx, sy, self._place_descend_z)
         self._telem.set_state("PLACE_APPROACH")
         self._send_arm_trajectory(arm, self.move_duration,
                                   done_cb=self._on_place_approach_done)
 
-    def _next_place_slot(self) -> Optional[Tuple[float, float]]:
-        """下一个槽位；用尽返回 ``None``。**不消费** —— 消费在放下成功时。"""
-        if self._place_index >= len(self.place_slots):
+    def _clear_holding(self):
+        """「手里没东西了」—— ``_holding`` 与 ``_holding_class`` **必须一起清**。
+
+        为什么要有这么个只有两行的方法：这两个字段是同一件事的两个侧面
+        （有没有东西 / 那东西是哪一类），分开写就会漏。漏 ``_holding`` 的症状
+        早已知道（D53：带着方块去撞下一个目标）；漏 ``_holding_class`` 的症状是
+        **把方块放进上一类的格子里** —— 一声不响。四处清零点全走这里。
+        """
+        self._holding = False
+        self._holding_class = None
+
+    def _place_exhausted_reason(self, class_name: Optional[str]) -> str:
+        """「没地方放了」的收工原因。**不路由时逐字保持 A1 的那句话**。
+
+        为什么非要区分两种文案：A1 的验收判据就是日志里那句话（`已放置 4/4` +
+        `放置槽位已用尽（4 个）—— 没有地方可放了`）。按类别分之后，真正发生的事
+        是「某一类的格子用完了」，报成「槽位用尽」会让人以为全部满了 ——
+        而实际可能是黄的满了、红的还空着。
+        """
+        if not is_routed(self.slot_classes):
+            return (f"放置槽位已用尽（{len(self.place_slots)} 个）"
+                    f"—— 没有地方可放了")
+        if class_name is None or class_name == "":
+            return ("有一个**没带类别名**的目标没有槽位可放"
+                    "（只有通配槽位能接，而它们都占满了）—— 没有地方可放了")
+        mine = sum(1 for c in self.slot_classes if c == class_name)
+        # 「专属 0 个」与「专属 4 个但占满了」是**两件完全不同的事**，而症状
+        # 一模一样（这一类一个都放不进去）。前者几乎总是类别名拼错了 ——
+        # 名字必须与权重文件里逐字相同，`Yellow` 与 `yellow` 是两个名字。
+        # 所以这句话要把这两条路分开说，现场才不用猜。
+        if mine == 0:
+            return (f"类别 {class_name} 在 place_slot_classes 里**一个槽位都没有**"
+                    f"（配置里的类别名：{sorted(set(self.slot_classes))}）"
+                    f"—— 这个名字与权重文件里的类别名逐字相同吗？"
+                    f"没有地方可放了")
+        n = self._slots_left_for(class_name)
+        return (f"类别 {class_name} 的放置槽位已用尽"
+                f"（专属 {mine} 个，剩余 {n} 个；总槽位 {len(self.place_slots)} 个）"
+                f"—— 没有地方可放了")
+
+    def _next_place_slot(self, class_name: Optional[str] = None
+                         ) -> Optional[Tuple[int, float, float]]:
+        """能给 ``class_name`` 用的下一个槽位 ``(下标, x, y)``；没有则 ``None``。
+
+        **不消费、不改任何状态** —— 占用要在真的放下之后由调用方标（见
+        ``_on_place_released``）。这个函数会被候选筛选循环反复调用，
+        有副作用的话「查一下」就会把槽位吃掉。
+
+        不路由时（``place_slot_classes`` 为空 = 默认）所有槽位通配，
+        返回的就是「从 0 往后第一个没占用的」，与 A1 的只增游标逐次相同。
+        """
+        i = pick_slot(self._place_used, self.slot_classes, class_name)
+        if i is None:
             return None
-        return self.place_slots[self._place_index]
+        sx, sy = self.place_slots[i]
+        return i, sx, sy
+
+    def _slots_left_for(self, class_name: Optional[str]) -> int:
+        """这类还剩几个空槽位（日志/告警用）。
+
+        刻意**复用 ``pick_slot`` 而不是另写一遍判据**：同一个谓词写两份，
+        改了一处忘了另一处的话，「还剩几格」的日志会与真实行为不符 ——
+        而这条日志正是现场判断「为什么它不收工/为什么它收工了」的依据。
+        """
+        used = list(self._place_used)
+        n = 0
+        while True:
+            i = pick_slot(used, self.slot_classes, class_name)
+            if i is None:
+                return n
+            used[i] = True
+            n += 1
 
     def _on_place_approach_done(self, status, result):
         if self._traj_failed("放置位接近轨迹", status, result):
@@ -1587,14 +1783,17 @@ class GraspPlanner(Node):
 
     def _on_place_released(self, _status, _result):
         """放下完成：消费槽位、清 ``_holding``、清看门狗，然后抬起并回 HOME。"""
-        # 遥测：这个槽位**真的用掉了**（绿色 → 灰色）。要在自增**之前**标，
-        # 因为自增之后 _place_index 指的是下一个槽位。
+        # 遥测：这个槽位**真的用掉了**（绿色 → 灰色）。_place_index 就是刚刚
+        # 放下东西的那一格，别在这里再动它。
         self._telem.mark_slot(self._place_index, SLOT_USED)
-        self._place_index += 1
-        self._holding = False
+        self._place_used[self._place_index] = True
+        self._place_placed += 1
+        self._clear_holding()
         self._attempts_since_place = 0
         self.get_logger().info(
-            f"已放置 {self._place_index}/{len(self.place_slots)} 个"
+            f"已放置 {self._place_placed}/{len(self.place_slots)} 个"
+            + (f"（类别 {self.slot_classes[self._place_index]} → 槽位"
+               f"[{self._place_index}]）" if is_routed(self.slot_classes) else "")
         )
         # 先抬起再回 HOME：避免张着的爪子贴着台面横移。
         sx, sy = self._place_target
@@ -1620,7 +1819,7 @@ class GraspPlanner(Node):
                                   done_cb=self._on_home_done)
 
     def _on_open_done(self, _status, _result):
-        self._holding = False
+        self._clear_holding()
         self.get_logger().info("返回 HOME ...")
         self._telem.set_state("HOME")
         self._send_arm_trajectory(self.home_joints, self.move_duration,

@@ -72,11 +72,14 @@ yolo_ros/
 │   └── block_grid_world.sdf        # ★ 新建：3×3 方阵环境（425 行，block_0..8）
 │
 ├── scripts/
-│   ├── generate_grid_world.py      # ★ 方阵世界生成器（可调参数）
-│   ├── auto_label_grid.py          # ★ 自动标注脚本（相机投影）
+│   ├── block_classes.py            # ★ 类别表单点定义（调色板 / 校验 / 颜色名↔类别号）
+│   ├── palette_survey.py           # ★ 量现场有几种颜色（定类别数；离线看图）
+│   ├── generate_grid_world.py      # ★ 方阵世界生成器（--classes 决定类别表）
+│   ├── auto_label_grid.py          # ★ 自动标注脚本（相机投影，类别号从 meta 读）
+│   ├── build_dataset.py            # ★ 建数据集（--class-names → data.yaml + manifest）
 │   ├── demo_pipeline.py            # ★ 端到端演示脚本（合成数据）
 │   ├── collect_training_data.py    # Gazebo 图像采集
-│   ├── label_blocks.py             # 手动标注工具（备用）
+│   ├── label_blocks.py             # 手动标注工具（备用，支持多类别，1..9 切类别）
 │   └── train_yolo_block.py         # YOLO 训练脚本
 │
 ├── block_dataset/

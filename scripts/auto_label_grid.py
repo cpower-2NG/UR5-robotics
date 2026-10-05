@@ -115,10 +115,14 @@ homography.json    : {"H":[[h11,h12,h13],[h21,h22,h23],[h31,h32,h33]],
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from block_classes import describe, parse_classes                      # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -328,6 +332,10 @@ def sim_inputs(meta_path):
     为什么让仿真也走 tf 后端：这样**仿真与真机用同一段数学**。仿真的相机
     位姿是已知常量（不是标定出来的），把它写成外参即可，于是仿真变成这条
     数学的一次实跑验证 —— 而不是一条只有仿真才走的旁路。
+
+    **多类别**：类别从 meta 里逐块带出来（`class_id`），不再由命令行统一指定。
+    旧版把 `shape` 和 `color` 都丢掉了，于是只能写单一类别号 —— 那是单类
+    数据集时代的写法。这里保留 `class_name` 只为报错时能说人话。
     """
     meta = json.load(open(meta_path))
     cam = meta["camera"]
@@ -339,8 +347,26 @@ def sim_inputs(meta_path):
             "camera_frame": SIM_CAMERA_FRAME,
             "translation": list(cam["position"]),
             "rotation": list(SIM_CAMERA_Q)}
-    blocks = [{"x": b["x"], "y": b["y"], "z": b["z"], "size": 0.04}
-              for b in meta["blocks"]]
+    # ⚠️ meta 里没有 `class_id` 时**不退回 0**，直接报错。
+    # 退回 0 的后果是整批标签全变成第 0 类，而训练照样跑完、loss 照样降 ——
+    # 最后一个「多类别」模型其实只会认一种颜色，且没有任何一步会报错。
+    classes = meta.get("classes")
+    blocks = []
+    for b in meta["blocks"]:
+        if "class_id" not in b:
+            raise SystemExit(
+                "meta 里方块 %d 没有 class_id —— 这份 meta 是旧版 "
+                "generate_grid_world.py 生成的（那个版本只写 color/shape，"
+                "不记类别）。请用新版重新生成世界：\n"
+                "    python3 scripts/generate_grid_world.py --classes ... "
+                "--out-dir <目录>\n"
+                "（不要手工补一个类别号：类别号必须与 build_dataset.py "
+                "--class-names 的顺序一致，猜错不会报错。）" % b.get("id", -1))
+        blocks.append({"x": b["x"], "y": b["y"], "z": b["z"], "size": 0.04,
+                       "class_id": b["class_id"],
+                       "class_name": b.get("class_name", "?")})
+    if classes:
+        print(f"[INFO] meta 的类别表：{describe(classes)}")
     return info, extr, blocks
 
 
@@ -355,17 +381,29 @@ def load_json(path, what):
 
 
 def load_blocks(path, default_size):
+    """读手工写的 blocks 文件（真机路径，没有 meta 可依）。
+
+    类别来自每个方块自己的 `class_id`，缺失时**留给调用方补 `--class-id`** ——
+    这里不填默认值，因为「这一块到底属于哪一类」只有写这个文件的人知道。
+    """
     doc = load_json(path, "blocks 文件")
     if not isinstance(doc, list):
         sys.exit("blocks 文件必须是一个**列表**：[{\"x\":..,\"y\":..,\"z\":..}, ...]")
     out = []
     for i, b in enumerate(doc):
         try:
-            out.append({"x": float(b["x"]), "y": float(b["y"]),
-                        "z": float(b.get("z", 0.0)),
-                        "size": float(b.get("size", default_size))})
+            item = {"x": float(b["x"]), "y": float(b["y"]),
+                    "z": float(b.get("z", 0.0)),
+                    "size": float(b.get("size", default_size))}
         except (KeyError, TypeError, ValueError) as e:
             sys.exit(f"blocks[{i}] 读不出 x/y/z：{b!r}（{e}）")
+        if "class_id" in b:
+            try:
+                item["class_id"] = int(b["class_id"])
+            except (TypeError, ValueError) as e:
+                sys.exit(f"blocks[{i}] 的 class_id 不是整数：{b['class_id']!r}（{e}）")
+            item["class_name"] = str(b.get("class_name", item["class_id"]))
+        out.append(item)
     if not out:
         sys.exit("blocks 文件是空的，没什么可标。")
     return out
@@ -395,7 +433,10 @@ def parse_args(argv=None):
                          "自动填好内参/外参/方块（走 tf 后端）")
     ap.add_argument("--block-size", type=float, default=0.04,
                     help="方块边长（m，默认 0.04）")
-    ap.add_argument("--class-id", type=int, default=0, help="YOLO 类别号（默认 0）")
+    ap.add_argument("--class-id", type=int, default=None,
+                    help="**兜底**类别号：只用于 blocks 文件里没写 class_id 的方块"
+                         "（仿真的 --sim-meta 路径不走这里，类别逐块来自 meta）。"
+                         "不传且又有方块缺类别号 → 直接报错，不猜 0。")
     ap.add_argument("--draw", action="store_true",
                     help="另外在 --draw-out 写出画了框的图，供人工复核"
                          "（计划要求自动标注当**提案**、人工过一遍）")
@@ -424,9 +465,32 @@ def build_projector(args):
     return HomographyProjector(load_json(args.homography, "单应文件")), blocks
 
 
+def resolve_class_ids(blocks, fallback):
+    """给每个方块定下写进标签的类别号；缺类别号又没兜底就**报错退出**。
+
+    ⚠️ 这里曾经是「统一写 `--class-id`，默认 0」。那个默认值的后果不是
+    「单类数据集」而是**静默的错误标签**：多类别的世界被整批标成第 0 类，
+    训练照样收敛，只是类别信息全丢了。
+    """
+    missing = [b for b in blocks if "class_id" not in b]
+    if missing:
+        if fallback is None:
+            sys.exit(
+                "有 %d 个方块没有类别号，而 --class-id 也没传 —— 不猜。\n"
+                "  仿真的话用 --sim-meta（类别逐块来自 meta）；\n"
+                "  手工 blocks 文件的话，给每个方块加 \"class_id\"，"
+                "或传 --class-id 把**全部**方块标成同一类。"
+                % len(missing))
+        for b in missing:
+            b["class_id"] = fallback
+            b["class_name"] = str(fallback)
+    return blocks
+
+
 def main(argv=None):
     args = parse_args(argv)
     proj, blocks = build_projector(args)
+    blocks = resolve_class_ids(blocks, args.class_id)
     print(proj.describe())
 
     if not args.images.is_dir():
@@ -443,6 +507,7 @@ def main(argv=None):
         draw_dir.mkdir(parents=True, exist_ok=True)
 
     total_boxes, total_skipped, bad = 0, 0, []
+    per_class = {}                       # 类别号 -> 写出的框数
     for img in images:
         lines, skipped = [], 0
         for b in blocks:
@@ -450,7 +515,9 @@ def main(argv=None):
             if bbox is None:
                 skipped += 1
                 continue
-            lines.append(f"{args.class_id} " + " ".join(f"{v:.6f}" for v in bbox))
+            cid = b["class_id"]
+            lines.append(f"{cid} " + " ".join(f"{v:.6f}" for v in bbox))
+            per_class[cid] = per_class.get(cid, 0) + 1
         total_boxes += len(lines)
         total_skipped += skipped
         if skipped:
@@ -465,6 +532,18 @@ def main(argv=None):
     print(f"\n图像 {len(images)} 张 → 框 {total_boxes} 个"
           f"（平均 {total_boxes/max(1,len(images)):.1f} 个/张，"
           f"方块共 {len(blocks)} 个）")
+
+    # 按类别报框数。**这是「类别表与标签对得上」的第一道闸**：
+    # 类别号不连续（缺号）说明类别表与写出的标签不是同一套；
+    # 某个类别一个框都没有，则混淆矩阵里那一行会全零 —— 看着像「召回 0」，
+    # 实际是「这批数据里根本没有这一类」，两者要分清楚。
+    if per_class:
+        print("各类别框数：" + "  ".join(
+            f"{c}={per_class[c]}" for c in sorted(per_class)))
+        gaps = [c for c in range(max(per_class) + 1) if c not in per_class]
+        if gaps:
+            print(f"⚠️ 类别号 {gaps} 一个框都没有（类别号应当连续 0..{max(per_class)}）"
+                  f" —— 要么这批方块里确实缺这几类，要么类别表与生成世界时不一致。")
     if total_skipped:
         # 不静默：画面外/相机背后的方块数必须报出来，否则「少标了几个」
         # 会被当成正常，而漏标会直接变成训练里的假阴性。
@@ -501,9 +580,14 @@ def draw_overlay(img_path, proj, blocks, out_path):
         if bbox is None:
             continue
         xc, yc, bw, bh = bbox
-        d.rectangle([(xc - bw / 2) * W, (yc - bh / 2) * H,
-                     (xc + bw / 2) * W, (yc + bh / 2) * H],
+        x0, y0 = (xc - bw / 2) * W, (yc - bh / 2) * H
+        d.rectangle([x0, y0, (xc + bw / 2) * W, (yc + bh / 2) * H],
                     outline=(40, 220, 40), width=2)
+        # 把类别号写在框上。复核图存在的意义就是**人工看一遍**，
+        # 而多类别下「框对不对」之外还多了一问「类别号对不对」——
+        # 不写出来这张图就只能回答前一半。
+        d.text((x0, max(0, y0 - 11)), f"{b['class_id']}",
+               fill=(255, 255, 0))
     im.save(out_path)
 
 
