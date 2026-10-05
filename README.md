@@ -217,7 +217,7 @@ yolo_ros/
 
 ## 自检与验收
 
-十七个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+十九个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
 前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
 `test_board_a1.py`、`test_deidentified.py`、`test_slot_routing.py` 与
@@ -265,6 +265,11 @@ python3 scripts/test_slot_routing.py     # 多类别分拣的「哪一类进哪�
                                          #   **含 4 个变异**：把类别比较/占用检查/通配/长度
                                          #   校验各改坏一处，对应断言必须失效
                                          #   只要标准库，秒级跑完（不需要 source ROS）
+python3 scripts/test_site_yaml_sort.py   # 上面那条判据的**输入**（现场 yaml 的槽位/类别表）
+                                         #   本身对不对：17 项断言，含 5 个变异
+                                         #   把「同列同色」当**结构不变量**钉：同一列必须同一个类、
+                                         #   不同列必须不同类 —— 对调两个类别名就会红。
+                                         #   还要 PyYAML（`import yaml`），比上面那条多一个依赖
 python3 scripts/test_planner_class_sort.py  # 上面那条判据**有没有真的接进规划器**：
                                          #   31 项断言，含 1 个变异
                                          #   ⚠️ 需要先 colcon build --packages-select grasp_planner
@@ -302,7 +307,7 @@ python3 scripts/test_relabel_by_color.py # 按颜色重标那把尺子准不准�
                                          #   翻开 block_dataset_7cls 的文件看那一行真的写了
                                          #   改判后的类别号（数据集不在就跳过，不算失败）
                                          #   只要 numpy（第 5 节另需 OpenCV）
-python3 scripts/test_live_infer_record.py # 实时推理录像那个脚本的**只读性**：20 项
+python3 scripts/test_live_infer_record.py # 实时推理录像那个脚本的**只读性 + 收工不崩**：23 项
                                          #   第 1 节是 **AST 结构断言** —— 源码里
                                          #   不该存在任何 create_publisher /
                                          #   create_service / create_client，也不该

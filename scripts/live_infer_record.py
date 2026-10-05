@@ -266,7 +266,15 @@ def main(argv=None):
         if writer is not None:
             writer.release()
         node.destroy_node()
-        rclpy.shutdown()
+        # ⚠️ **必须判 `rclpy.ok()`，不能直接 shutdown。**
+        # Ctrl-C 时 rclpy 自带的信号处理器**已经**关过一次上下文了；这里再关一次
+        # 会抛 `RCLError: rcl_shutdown already called`。而异常从 finally 里逃出去
+        # 会**跳过下面整段汇总** —— 偏偏 Ctrl-C 正是本脚本**正常**的收工方式，
+        # 于是「逐类累计」和「实际处理 fps」这两条判据平时一条都打不出来，
+        # 只留一句看不懂的 traceback。（2026-10-05 实测踩到：录了 51 MB，
+        # 汇总全丢。）
+        if rclpy.ok():
+            rclpy.shutdown()
 
     dt = time.time() - t0
     print()

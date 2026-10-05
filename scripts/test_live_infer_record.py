@@ -210,12 +210,69 @@ def section_mutation():
           '改坏了却没被扫出来 —— 第 1 节的结构断言测不出东西')
 
 
+def _rclpy_call(node, attr):
+    """``node`` 是不是 ``rclpy.<attr>(...)`` 这个调用。"""
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == attr
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == 'rclpy')
+
+
+def _stmts_call(stmts, attr):
+    """这一串语句里（含嵌套）有没有 ``rclpy.<attr>(...)`` 调用。
+
+    ⚠️ 必须对每条语句再 ``ast.walk`` 一层：``If.body`` 里装的是**语句**
+    （``ast.Expr``），调用表达式在它的 ``.value`` 上。直接拿 body 的元素去比
+    ``ast.Call`` 永远不成立 —— 于是断言恒红（或恒绿），而看起来还挺像回事。
+    第一版就是这么写的，被自己的断言逮住。
+    """
+    for s in stmts:
+        for n in ast.walk(s):
+            if _rclpy_call(n, attr):
+                return True
+    return False
+
+
+def _shutdown_guarded(tree):
+    """源码里那处 ``rclpy.shutdown()`` 是否被 ``if rclpy.ok():`` 守卫着。"""
+    for n in ast.walk(tree):
+        if isinstance(n, ast.If) and _rclpy_call(n.test, 'ok'):
+            if _stmts_call(n.body, 'shutdown'):
+                return True
+    return False
+
+
+def section_shutdown():
+    print('\n[6] 收工不能崩：rclpy.shutdown() 必须判 ok()')
+    # 为什么值得一条断言：Ctrl-C 时 rclpy 自带的信号处理器**已经**关过一次上下文，
+    # 无守卫的第二次 shutdown 会抛 RCLError；异常从 finally 里逃出去会**跳过
+    # 紧随其后的整段汇总**。而 Ctrl-C 正是本脚本**正常**的收工方式 ⇒
+    # 「逐类累计」和「实际处理 fps」这两条判据平时一条都打不出来。
+    # 2026-10-05 实测踩到：录了 51 MB，汇总全丢、只剩一句 traceback。
+    src = open(SRC, encoding='utf-8').read()
+    tree = ast.parse(src)
+    n_shut = sum(1 for n in ast.walk(tree) if _rclpy_call(n, 'shutdown'))
+    check('源码里恰好有一处 rclpy.shutdown()', n_shut == 1,
+          '找到 %d 处' % n_shut)
+    check('它被 `if rclpy.ok():` 守卫着', _shutdown_guarded(tree),
+          '没有守卫 ⇒ Ctrl-C 收工会二次 shutdown 抛异常，'
+          '把「逐类累计 / 实际处理 fps」两条判据整段吞掉')
+
+    old = '        if rclpy.ok():\n            rclpy.shutdown()'
+    assert old in src, '变异锚点没找到 —— 断言锚点漂了，本条会空转'
+    check('变异「去掉守卫」→ 上一条会红',
+          not _shutdown_guarded(ast.parse(src.replace(old, '        rclpy.shutdown()'))),
+          '去掉守卫却没被检出 —— 上一条断言测不出东西')
+
+
 def main():
     print('=' * 68)
     section_readonly()
     section_colors()
     section_draw()
     section_model_lookup()
+    section_shutdown()
     section_mutation()
     print('\n%d PASS  %d FAIL  %d SKIP' % (N_PASS, N_FAIL, N_SKIP))
     if FAILS:
