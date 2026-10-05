@@ -122,9 +122,8 @@ def _git(*args):
     return out.stdout
 
 
-def tracked_text_files():
-    """被跟踪的文件里，能当文本读的那些（跳过二进制，见 `_looks_binary`）。"""
-    names = [n for n in _git('ls-files', '-z').split('\0') if n]
+def _text_files(names):
+    """路径名 → (相对路径, 内容)，跳过二进制（见 `_looks_binary`）。"""
     for rel in names:
         ab = os.path.join(PROJECT_ROOT, rel)
         if not os.path.isfile(ab):
@@ -141,6 +140,24 @@ def tracked_text_files():
                 yield rel, fh.read()
         except OSError:
             continue
+
+
+def tracked_text_files():
+    """被跟踪的文件里，能当文本读的那些。"""
+    return _text_files([n for n in _git('ls-files', '-z').split('\0') if n])
+
+
+def untracked_text_files():
+    """**未跟踪但未被忽略**的文件 —— 即「下一步很可能被提交」的那批。
+
+    🔴 只扫已跟踪的会留一个真实的洞：新写的文件在 `git add` 之前对
+    `ls-files` 是**隐形的**。2026-10-05 实测踩过 —— 新写的
+    `scripts/board_a1.py` 里带了现场控制柜 IP，正式自检报「干净」，
+    是靠**手工复刻判据**才发现的。威胁模型是「马上要公开的东西」，
+    所以这批必须扫。
+    """
+    return _text_files([n for n in _git(
+        'ls-files', '--others', '--exclude-standard', '-z').split('\0') if n])
 
 
 def _looks_binary(head):
@@ -181,14 +198,20 @@ def main():
 
     hits = []
 
-    # ---- 1. 工作树的文本文件 ----
-    n_files = 0
+    # ---- 1. 工作树的文本文件：已跟踪 **+ 未跟踪未忽略** ----
+    # 后者见 `untracked_text_files()` 的说明 —— 新文件在 add 之前是隐形的。
+    n_files = n_new = 0
     for rel, body in tracked_text_files():
         if rel == SELF:
             continue
         n_files += 1
         scan_text(rel, body, hits)
-    print(f'[1/4] 扫了 {n_files} 个被跟踪的文本文件')
+    for rel, body in untracked_text_files():
+        if rel == SELF:
+            continue
+        n_new += 1
+        scan_text(f'{rel} 〔未跟踪〕', body, hits)
+    print(f'[1/4] 扫了 {n_files} 个被跟踪 + {n_new} 个未跟踪（未忽略）的文本文件')
 
     # ---- 2. 提交信息 ----
     # 只列**当前分支可达**的提交（`--all` 会把已删分支一起拉进来，那些不发布）。
@@ -229,7 +252,7 @@ def main():
         with open(DENYLIST_PATH, encoding='utf-8') as fh:
             terms = [t.strip() for t in fh
                      if t.strip() and not t.startswith('#')]
-        for rel, body in tracked_text_files():
+        for rel, body in list(tracked_text_files()) + list(untracked_text_files()):
             for t in terms:
                 if t in body:
                     hits.append((rel, 0, '本机黑名单命中', t))

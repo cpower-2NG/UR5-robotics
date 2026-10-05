@@ -217,10 +217,10 @@ yolo_ros/
 
 ## 自检与验收
 
-十个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
+十一个脚本，**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
-前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py` 与
-`test_deidentified.py` 只要 Python 标准库）：
+前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
+`test_board_a1.py` 与 `test_deidentified.py` 只要 Python 标准库）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -251,10 +251,18 @@ python3 scripts/test_ag95_init_close.py  # AG-95 初始化/合拢脚本：13 项
 python3 scripts/test_ur5_fk_check.py     # UR5 正运动学 + 「示教器 Base 是不是机器人 base」
                                          #   的判决工具：20 项断言（含 3 个变异测试）
                                          #   只要 numpy，不需要 ROS / 真机 / 示教器
+python3 scripts/test_board_a1.py         # A1 真机验收的**判分逻辑 + 起栈命令**：36 项断言（含 3 个变异测试）
+                                         #   纯离线，拿真机日志原文当夹具，不碰 ROS / 臂 / 串口
+                                         #   判分错了的代价不是「测试红一下」，而是误判整轮
+                                         #   真机实验 —— 所以这里连判据本身也要测
+                                         #   第 5 节还钉住起栈命令的关键参数（漏一个不报错，
+                                         #   只会静默跑成另一回事，比如少了 start_delay）
 python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
-                                         #   扫**全部被跟踪的文本文件**与**全部提交信息**
-                                         #   （后者不是多余的：--replace-text 只改 blob、
-                                         #   不改提交信息，这条路径真的漏过）
+                                         #   扫**全部被跟踪的文本文件**、**未跟踪（未忽略）的文件**
+                                         #   与**全部提交信息**
+                                         #   （后两者都不是多余的：--replace-text 只改 blob、
+                                         #   不改提交信息；未跟踪的文件在 git add 之前对
+                                         #   ls-files 是隐形的 —— 两条路径都真的漏过）
                                          #   只要标准库；**不需要** source ROS
 ```
 
@@ -307,6 +315,43 @@ python3 scripts/board_chain_check.py     # 起无驱动 real.launch + RSP + 假 
 实测（Orin NX，2026-09-29）：相机 25.1 FPS → `/detections` **22.2 FPS** →
 `/targets_3d` **22.6 FPS**；运行中内存 **2.2 / 7.4 GiB**、GPU 73%、结温 57.6 °C、
 整板 **11.5 W**。规划器只要 1 Hz 级 ⇒ 余量十几倍。
+
+**A1 真机验收**（**在板子上跑**）—— 自己起 `carry_objects:=true` 的整栈、
+盯日志、按判据判分。**它会真的让臂动起来**：
+
+```bash
+export UR_ROBOT_IP=<控制箱IP>          # 公开仓不写现场 IP，所以没有默认值
+python3 scripts/board_a1.py --params $HOME/site_real.yaml
+#   判据 1：出现 `已放置 4/4 个`
+#   判据 2：收工原因是 `放置槽位已用尽（4 个）—— 没有地方可放了`
+#   前置检查：无残留进程 / 串口空闲 / AG-95 已初始化 / 示教器在 PLAYING
+#   `--no-launch --log <文件>` 只对已有日志判分，不起栈、不动臂
+#   `--start-delay <秒>`（默认 25）规划器推迟启动，等 UR 驱动先连上
+```
+
+**2026-10-05 真机通过**（5 块 / 4 槽）：
+
+```
+候选 5 个 | 已放置 0/4 | 连续未放置 0/10
+已放置 1/4 → 2/4 → 3/4 → 4/4            （每循环约 23 s）
+候选 1 个 ['block'] | 已放置 4/4 | 已抓 4 个
+收工：放置槽位已用尽（4 个）—— 没有地方可放了
+  已成功放置 4 个 / 槽位共 4 个；已抓取记账 4 个
+```
+
+候选数轨迹 `5(0) → 4(1) → 3(2) → 2(3) → 1(4)`；夹爪回读
+25.08 / 25.46 / 26.13 mm（全部 ≫ 0 = 真夹住）；`连续未放置 0/10`。
+
+⚠️ **判据 2 需要抓取区里摆 5 块（方块数 > 槽位数）**，见
+[`scripts/board_a1.py`](scripts/board_a1.py) 文件头的推导 —— 4 块配 4 槽时
+第 4 块放下的同一刻区里也空了，收工走的是空闲看门狗那条路。
+
+⚠️ **起栈时规划器要晚于 UR 驱动**：`start_delay` 包的是
+`[realsense, detector, perception, planner]`、**不含 UR 驱动**，所以
+`--start-delay` 的语义正是「驱动先起 → 规划器后起」。不加时规划器的启动 HOME
+会撞上 `ur_ros2_control_node` 的状态容差
+（`State tolerances failed for joint 5`、`error_code=-4`），实测开局即
+`连续未放置 2/10`；加了之后一次都没有。
 
 ⚠️ 两个要点：① 它用**占位**相机外参（相机在上方 1 m 朝下看），只为接通 TF 树，
 所以 `/targets_3d` 的**数值不可信**，它断言的是链路通不通、跑多快；真外参等手眼标定。
