@@ -1,3 +1,21 @@
+# ============================================================================
+# 真机规划器参数 —— **模板 / 草稿**，不是现行值。现行值在仓库外。
+#
+#   安装：cp docs/现场yaml草稿-真机.yaml ~/.config/ur5-vision-grasp/site_real.yaml
+#         然后逐项改成**当天实测**的值
+#   使用：python3 scripts/board_a1.py --params ~/.config/.../site_real.yaml
+#         （或写进站点配置的 planner_params，见 config/site.example.yaml）
+#
+# 为什么不能照抄当场用：
+#   · 外参会漂（俯视相机实测一天 0.945°），必须当天核对后再填 —— 站点配置里
+#     强制 `verified` + `ttl_days`，过期即拒；
+#   · 串口路径里带**硬件序列号**，属身份信息。本仓是公开副本、一切提交永久公开
+#     （AGENTS.md 红线 3），所以这里只留占位符；
+#   · `gripper_backend` / `table_scene_enabled` / `ik_group` / `trajectory_action` /
+#     `carry_objects` 这 5 个键，走全车入口（`bringup.launch.py`）时**改了不生效、
+#     也不报错**。有效值 = 本文件 ⊕ launch 参数，**以 `ros2 param get` 为准**。
+# ============================================================================
+
 grasp_planner:
   ros__parameters:
     targets_topic: /targets_3d
@@ -94,7 +112,9 @@ grasp_planner:
     sim_gripper_close: 0.8
     sim_gripper_empty_threshold: 0.75
     sim_gripper_barely_moved: 0.02
-    ag95_port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0
+    # ⚠️ **模板占位符**，不是现场值。认**符号链接**不认 /dev/ttyUSB0（插拔会变号）。
+    #    现行值放仓库外的站点配置（config/site.example.yaml 里那一项），别写回本文件。
+    ag95_port: /dev/serial/by-id/usb-<厂商>_<型号>_<序列号>-if00-port0
     ag95_baudrate: 115200
     ag95_slave_id: 1
     ag95_force: 50

@@ -6402,7 +6402,7 @@ wlP1p1s0  DOWN                     ← 板载无线已断
 | 项 | 实测 | 判定 |
 |---|---|---|
 | 设备 | `/dev/ttyUSB0`，`0403:6001`，**FT232R USB UART**，序列号 **`AB0P6UEX`** | ✅ 在 |
-| 稳定路径 | `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0` | ✅ 有（别用 `/dev/ttyUSB0`，插拔会变号） |
+| 稳定路径 | `/dev/serial/by-id/usb-FTDI_FT232R_<序列号>-if00-port0` | ✅ 有（别用 `/dev/ttyUSB0`，插拔会变号） |
 | 驱动 | `ftdi_sio` + `usbserial` 已加载 | ✅ |
 | 权限 | `root:dialout 660`；`jetson` ∈ `dialout`(20) | ✅ |
 | 能否打开 | **只读打开成功**（`O_RDONLY\|O_NONBLOCK\|O_NOCTTY`，未写一字节） | ✅ |
@@ -9419,7 +9419,7 @@ python3 scripts/topcam_drift_check.py \
 | 项 | 实测 | 判读 |
 |---|---|---|
 | 板子身份 | `/proc/device-tree/serial-number` = **`<board-serial>`** | 是我们的板子（不是 174） |
-| 串口 | `usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0` → `/dev/ttyUSB0`，`0403:6001` 在 | 与记录一致 |
+| 串口 | `usb-FTDI_FT232R_<序列号>-if00-port0` → `/dev/ttyUSB0`，`0403:6001` 在 | 与记录一致 |
 | **谁占着口** | 扫 `/proc/*/fd` → **无任何进程持有** | 总线空闲，可开 |
 | `pymodbus` | **3.15.0**（从站关键字实测是 **`device_id`**，不是 `slave`） | 与代码里的签名探测一致 |
 | `0x0100` | **0** | 未初始化 ✅ 与用户看到的红闪一致 |
@@ -13834,3 +13834,77 @@ python3 scripts/state_check.py
 三条守卫复跑全绿：`test_docs_map.py` exit 0（PASS）、`state_check.py` exit 0
 （20 行 / 2 行超期——**按设计**，磁盘那两行保质期 3 天）、`test_deidentified.py` exit 0。
 改动面 **4 个 markdown、0 行代码**。
+
+---
+
+## 第九十二轮：站点配置与 board_lib —— 判定纯函数化，顺手关掉脱敏闸门的一个洞（2026-10-06）
+
+### 1. 这一轮要关的是什么
+
+`board_a1.py` 会起真机、动臂，可它前面那层「起不起得来」全在脚本内部、**没人能离线验**：
+四个前置函数各写各的，外参硬编码在文件里且**没有时效**，串口路径写死
+`/dev/ttyUSB0`（插拔变号，违不变量 3）。
+
+### 2. 新增 `scripts/board_lib.py`（顶层不 import rclpy/launch）
+
+判定一律**纯函数**、I/O 收在薄适配器并留注入口（`leftovers(ps_out=…)`）——
+这是变异测试能离线成立的前提。四件套 `leftovers` / `port_busy` / `gripper_state`
+/ `dashboard` 搬进来，`board_a1.py` 改成 **re-export**。
+**证据**：`test_board_a1.py` 一行未改即绿（它只依赖 `grade/explain/build_cmd/CAM`）。
+
+### 3. 修掉一处「搬家即静默失效」的判据
+
+`leftovers()` 原先靠 `basename(__file__)` 排除调用方。它当时**碰巧**等于调用方脚本名
+（一条 `ps` 记录里必然含它自己的脚本名）。函数一搬进 `board_lib.py`，排除的就变成了
+**另一个文件** ⇒ 调用方只要命令行里含一个残留模式（例如 `--log ~/planner_node.log`）
+就会被误报成「有残留」、前置检查拒绝起栈。与 `pkill -f` 自杀同族。
+
+改按 **`sys.argv[0]`（入口名）+ 进程血缘**（自己与祖先 pid）排除，并补一条：
+`me` 为空/过短时**不参与子串匹配** —— 否则一条空名字就能把整条检查关掉，且关得无声。
+
+**证据**：M7 变异把 `sys.argv[0]` 改回 `__file__`，同一夹具由 `[]` 翻成「报出调用方」；
+另加反向断言「同一变异不许把真残留一起漏掉」。M8 把空名字放回子串匹配 ⇒ 一条都报不出。
+离线夹具全部走 `ps_out=` 注入，不起真进程。
+
+### 4. `config/site.example.yaml` + 时效闸门
+
+仓库外是唯一真值来源，仓内只有模板（模板里的占位符**故意**过不了 `float()` 与日期解析
+—— 一份看着像真的配置比空文件更危险）。外参强制 `verified` + `ttl_days`，判据与
+`state_check.py` **同一条线**（`age > 保质期` 才算超期），缺失/解析不了**一律 FAIL**。
+
+**证据**：M4a `>`→`>=`（刚好满期翻面）；M4b 「不知道」当成「今天核对的」（FAIL→PASS）；
+M4c `ttl_days` 缺失不再拦（FAIL→PASS）。CLI：模板退 1、**绝不能退 0**；填好的退 0
+（证明那个 1 是有理由的红、不是恒红）；三天后再跑退 1。
+
+### 5. 决策 6 落地：PLAYING 检查挪到起栈之后
+
+次序是「起栈 → 按播放 → 拉回控制器」。URCap 的 External Control 要先有对端，
+先按播放再起栈，示教器上得到的是「连接被拒绝」、程序停在 STOPPED。
+`board_a1.py` 起栈前的检查改成**只连不问 PLAYING**，起栈后新增 `wait_for_playing()`
+轮询（超时退 2）。启动器**永不发 play/power/stop**。
+
+### 6. 脱敏闸门的一个洞（本轮实测）
+
+`test_deidentified.py` **没有** by-id 串口路径的规则。udev 的 by-id 名字**就是拿芯片
+序列号生成的**，而它既不是 13 位数字也不是 32 位 hex ⇒ 三条老规则一条都盖不住，
+真序列号在**公开仓里 0 命中地躺着**（实测 3 个文件：`ag95_init_close.py`、
+`real.launch.py` 的注释、`grasp_planner.yaml` 的参数默认值，外加流水里 1 行）。
+
+处置：补规则 + **规则自检**（占位符不命中 / 编造形状必命中 —— 两个方向都钉）；
+三处**就地清掉**（yaml 草稿、`real.launch.py` 注释、流水行）；
+两处**活默认值**（改它会让现场静默少一条链路，且本轮范围不含改 `ros2_ws/` 的链路）
+按**文件**登记待决策 —— 不按命中串登记，因为那几张白名单的键就是命中串本身，
+写进去等于换个地方再泄一次。
+
+**证据**：削掉豁免后那两处**立刻变红**（豁免是吃劲的，不是摆设）；
+`test_deidentified.py` 复跑 0 命中。
+
+### 7. 本轮判据
+
+七个脚本全绿：`test_deidentified` / `test_docs_map` / `state_check` / `test_board_a1`
+/ `test_board_lib`（59 条断言）/ `test_board_gate` / `test_startup_docs`；`pyflakes` 干净。
+
+⚠️ **一件事必须记下来**：第一次做「削掉豁免」的变异时，我把
+`ALLOWED_SERIAL_FILES = {` 写成 `{} or {` —— 那是**空字典或真字典**，Python 求值成
+原字典，变异**根本没生效**。差点就把「没变红」读成「断言很结实」。
+这正是本仓变异测试要求「断言改前≠改后」而不是「改坏了会红」的原因。

@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""board_lib.py 的自检 —— **纯离线**，不起进程、不开串口、不碰臂。
+
+分六节：
+  1. 站点配置：合法性逐条说得对，缺项**不静默回落**
+  2. 外参时效：fail-closed（「不知道」不许当成「新鲜」），且与 state_check.py 同线
+  3. 残留进程：自我排除按**血缘/入口名**，不按函数住在哪个文件里
+  4. 变异检查：把判据真的改坏，断言**改前 ≠ 改后**，并钉住红的是**哪一条**
+  5. 源码钉子：顶层不许 import ROS
+  6. 命令行行为：模板**必须**被判不合法（一份看着像真的配置比空文件更危险）
+
+     python3 scripts/test_board_lib.py
+
+退出码：0 = 全过；1 = 有断言失败。
+"""
+
+import sys
+
+sys.dont_write_bytecode = True   # 防 .pyc 假绿（仓库约定）
+
+import datetime as dt            # noqa: E402
+import importlib.util            # noqa: E402
+import os                        # noqa: E402
+import subprocess                # noqa: E402
+import tempfile                  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import board_lib                 # noqa: E402
+
+_failed = []
+_n = 0
+
+
+def check(name, cond, detail=""):
+    global _n
+    _n += 1
+    print(f"  [{'PASS' if cond else 'FAIL'}] {name}"
+          + (f"  {detail}" if detail else ""))
+    if not cond:
+        _failed.append(name)
+
+
+def mentions(text, *keys):
+    return all(k in text for k in keys)
+
+
+# --------------------------------------------------------------------- 夹具
+# ⚠️ 夹具里**一律用占位符**，不写真 IP / 真序列号 —— 本文件是被提交的，
+#    而 scripts/test_deidentified.py 会扫它（红线 3：真实值放仓库外）。
+TODAY = dt.date(2026, 10, 6)
+
+PORT_PH = "/dev/serial/by-id/usb-<厂商>_<型号>_<序列号>-if00-port0"
+
+
+def site_raw(**over):
+    """一份**合法**的站点配置，再按需覆盖。"""
+    raw = {
+        "robot_ip": "<ur-controller-ip>",
+        "ros_domain_id": 99,
+        "planner_params": "~/site_real.yaml",
+        "gripper": {"port": PORT_PH},
+        "topcam": {
+            "verified": "2026-10-05",
+            "ttl_days": 1,
+            "extrinsics": {k: "0.1" for k in board_lib.CAM_KEYS},
+        },
+    }
+    for k, v in over.items():
+        if v is None:
+            raw.pop(k, None)
+        elif isinstance(v, dict) and isinstance(raw.get(k), dict):
+            raw[k].update(v)
+        else:
+            raw[k] = v
+    return raw
+
+
+def probs(raw, env=None, **over):
+    return board_lib.validate_site(board_lib.parse_site(site_raw(**over)), env=env or {})
+
+
+def one_problem(name, raw_over, *keys, **kw):
+    p = probs(None, **raw_over)
+    hit = [x for x in p if mentions(x, *keys)]
+    check(name, len(hit) == 1 and len(p) == 1,
+          f"命中 {len(hit)} 条 / 共 {len(p)} 条：{p}")
+
+
+# ------------------------------------------------------------ 1. 站点配置
+def section_site():
+    print("\n[1] 站点配置：缺项要说得出缺哪一项、会出什么症状")
+    check("合法配置 ⇒ 没有毛病", probs(None) == [], str(probs(None)))
+
+    p = probs(None, env={"ROS_DOMAIN_ID": "7"})
+    check("域号与环境下一致时才算过：99 vs 7 ⇒ 报不一致",
+          len(p) == 1 and mentions(p[0], "99", "7", "不一致"), str(p))
+
+    one_problem("缺 robot_ip ⇒ 单独一条", {"robot_ip": None}, "robot_ip")
+
+    s = board_lib.parse_site(site_raw(robot_ip=None))
+    old = os.environ.get("UR_ROBOT_IP")
+    os.environ["UR_ROBOT_IP"] = "<ur-controller-ip>"
+    try:
+        check("robot_ip 缺失但环境变量给了 ⇒ 不算毛病（现场不想写进文件是合理的）",
+              board_lib.validate_site(s, env={}) == [],
+              str(board_lib.validate_site(s, env={})))
+    finally:
+        if old is None:
+            os.environ.pop("UR_ROBOT_IP", None)
+        else:
+            os.environ["UR_ROBOT_IP"] = old
+
+    one_problem("缺 planner_params ⇒ 要说清症状是「静默用仿真几何」",
+                {"planner_params": None}, "planner_params", "仿真几何")
+
+    one_problem("缺 gripper.port ⇒ 单独一条",
+                {"gripper": {"port": None}}, "gripper.port")
+
+    p = probs(None, topcam={"extrinsics": {k: "0.1" for k in board_lib.CAM_KEYS[:-1]}})
+    check("外参缺一个键 ⇒ 点名是哪把键",
+          len(p) == 1 and mentions(p[0], board_lib.CAM_KEYS[-1]), str(p))
+
+    p = probs(None, topcam={"extrinsics": dict(
+        {k: "0.1" for k in board_lib.CAM_KEYS}, camera_qw="<四元数>")})
+    check("外参不是数（模板占位符）⇒ 报出来，不静默当成 0",
+          len(p) == 1 and mentions(p[0], "camera_qw", "不是数"), str(p))
+
+    p = probs(None, topcam={"verified": None})
+    check("缺 verified ⇒ 说出来它导致「永远不会被判过期」",
+          len(p) == 1 and mentions(p[0], "verified", "过期"), str(p))
+
+    p = probs(None, topcam={"ttl_days": None})
+    check("缺 ttl_days ⇒ 单独一条",
+          len(p) == 1 and mentions(p[0], "ttl_days"), str(p))
+
+    # 一次列全，别抛第一个就停 —— 现场来回改五行比来回改一行省事
+    p = probs(None, robot_ip=None, planner_params=None, gripper={"port": None})
+    check("三处都缺 ⇒ 一次列三条（不提前返回）", len(p) == 3, str(p))
+
+    check("Site.extrinsics() 的值一律是字符串（launch 参数就是字符串）",
+          all(isinstance(v, str) for v in
+              board_lib.parse_site(site_raw()).extrinsics().values()))
+    check("Site.missing_keys() 按 CAM_KEYS 顺序点名",
+          board_lib.parse_site(site_raw(topcam={"extrinsics": {}})).missing_keys()
+          == list(board_lib.CAM_KEYS))
+    check("顶层不是映射 ⇒ SiteError（不是静默当空配置）",
+          _raises_site_error(lambda: board_lib.parse_site(["不是", "映射"])))
+
+
+def _raises_site_error(fn):
+    try:
+        fn()
+    except board_lib.SiteError:
+        return True
+    except Exception:                             # noqa: BLE001
+        return False
+    return False
+
+
+# ------------------------------------------------------------ 2. 外参时效
+def section_freshness():
+    print("\n[2] 外参时效：fail-closed，「不知道」不许当成「新鲜」")
+    j = board_lib.judge_freshness
+
+    st, det = j("2026-10-05", 1, TODAY)
+    check("刚好满 TTL（age == 保质期）当天仍算数 —— 与 state_check.py 同一条线",
+          st == board_lib.PASS and mentions(det, "剩 0 天"), f"{st}: {det}")
+
+    st, det = j("2026-10-04", 1, TODAY)
+    check("超一天 ⇒ FAIL，且说明里给出下一步命令",
+          st == board_lib.FAIL and mentions(det, "已超期", "topcam_drift_check"), f"{st}: {det}")
+
+    st, det = j(dt.date(2026, 10, 6), 0, TODAY)
+    check("accepts date 对象；ttl=0 表示「只认当天」", st == board_lib.PASS, f"{st}: {det}")
+
+    st, det = j(dt.datetime(2026, 10, 5, 23, 59), 1, TODAY)
+    check("accepts datetime 对象（YAML 带时分会解析成它）", st == board_lib.PASS, f"{st}: {det}")
+
+    for name, args, want in (
+            ("verified 缺失", (None, 1, TODAY), "verified"),
+            ("verified 解析不出日期", ("去年某天", 1, TODAY), "verified"),
+            ("ttl_days 缺失", ("2026-10-05", None, TODAY), "ttl_days"),
+            ("ttl_days 不是整数", ("2026-10-05", "abc", TODAY), "ttl_days"),
+            ("ttl_days 是负数", ("2026-10-05", -1, TODAY), "负数"),
+    ):
+        st, det = j(*args)
+        check(f"{name} ⇒ FAIL 且点名（不是当成新鲜）",
+              st == board_lib.FAIL and want in det, f"{st}: {det}")
+
+    st, det = board_lib.freshness_gate(board_lib.parse_site(site_raw()), today=TODAY)
+    check("闸门：默认走 judge_freshness", st == board_lib.PASS, f"{st}: {det}")
+
+    st, det = board_lib.freshness_gate(board_lib.parse_site(site_raw()), today=TODAY,
+                                       override="相机刚重新标定过，值班人张三")
+    check("破例：理由被原样记下来（报告里要能看见谁破的例）",
+          st == board_lib.PASS and mentions(det, "⚠️", "重新标定过"), f"{st}: {det}")
+
+    for blank in ("", "   "):
+        st, det = board_lib.freshness_gate(board_lib.parse_site(site_raw()), today=TODAY,
+                                           override=blank)
+        check(f"破例但理由是空的（{blank!r}）⇒ FAIL：破例必须写下为什么",
+              st == board_lib.FAIL and "空理由" in det, f"{st}: {det}")
+
+
+# ------------------------------------------------------------ 3. 残留进程
+def section_leftovers():
+    print("\n[3] 残留进程：排除的是「我们这一族」，不是「名字恰好像我们的那一个」")
+
+    line_stack = "  5150 ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense"
+    line_move = "  5151 /opt/ros/humble/lib/move_group/move_group --ros-args -r __node:=move_group"
+    line_quiet = "  7000 python3 scripts/something_else.py --verbose"
+    # 调用方自己那条 `ps` 记录：**含一个残留模式**（日志名里带 planner_node）
+    line_me = ("  4242 python3 scripts/test_board_lib.py "
+               "--log ~/planner_node.log")
+    # 经 ssh 跑时的那一层 shell：命令行里带着同样的模式（ssh 直接 255 的那次）
+    line_ssh = ("  6000 bash -c cd ~ && pkill -f planner_node; "
+                "python3 scripts/board_run.py")
+    ps = [line_stack, line_move, line_quiet, line_me, line_ssh]
+
+    got = [s.strip() for s in board_lib.leftovers(ps_out=ps, own=set())]
+    check("只报真正的栈进程：不相干的、ssh 那层、以及**调用方自己**都排除掉",
+          got == [line_stack.strip(), line_move.strip()], str(got))
+
+    # 这一条是本次修复的**形状本身**：me 换成函数所在文件的名字（搬家后发生的事），
+    # 调用方那条记录立刻被误报成「有残留」⇒ 前置检查拒绝起栈。
+    # ⚠️ 这个夹具里**不能**出现 `board_lib` —— 否则 me="board_lib.py" 会靠子串
+    #    碰巧匹配上（本文件名 test_board_lib.py 就含它），演示不出失效。
+    line_caller = "  4242 python3 scripts/board_run.py --log ~/planner_node.log"
+    got2 = [s.strip() for s in board_lib.leftovers(ps_out=[line_caller], me="board_lib.py",
+                                                   own=set())]
+    check("me 用「函数所在文件」的名字（搬家后的旧形状）⇒ 误报调用方",
+          got2 == [line_caller.strip()], str(got2))
+    got2b = [s.strip() for s in board_lib.leftovers(ps_out=[line_caller],
+                                                    me="board_run.py", own=set())]
+    check("  同一行、me 换成**入口名** ⇒ 排除掉了（这就是修好的样子）",
+          got2b == [], str(got2b))
+
+    got3 = [s.strip() for s in board_lib.leftovers(ps_out=[line_stack], me="x.py",
+                                                   own={5150})]
+    check("血缘里的 pid（自己/祖先）⇒ 排除", got3 == [], str(got3))
+
+    got4 = [s.strip() for s in board_lib.leftovers(ps_out=[line_stack], me="", own=set())]
+    check("me 是空串 ⇒ **不许**变成「全部排除」（空名字会关掉整条检查）",
+          got4 == [line_stack.strip()], str(got4))
+
+    got5 = [s.strip() for s in board_lib.leftovers(ps_out=[line_stack], me="py",
+                                                   own=set())]
+    check("me 太短（当成子串会误伤）⇒ 不参与排除", got5 == [line_stack.strip()], str(got5))
+
+    own = board_lib.own_pids()
+    check("own_pids() 至少含自己，且真的在往上追",
+          os.getpid() in own and len(own) >= 2, str(own))
+    check("own_pids() 追到 init 就停（不返回 0）", 0 not in own and 1 not in own, str(own))
+
+    check("默认 me 就是本入口的名字 —— 由 sys.argv[0] 得来，与函数所在文件无关",
+          board_lib._me_default() == os.path.basename(sys.argv[0]),
+          f"{board_lib._me_default()!r} vs {os.path.basename(sys.argv[0])!r}")
+
+    check("is_own_process 是纯函数，能单独判",
+          board_lib.is_own_process("bash -c foo", "x.py", set()) is True
+          and board_lib.is_own_process("ros2 launch yolo_bringup", "x.py", set()) is False)
+
+
+# ------------------------------------------------------------ 4. 变异检查
+def load_mutant(src_text, tag):
+    d = tempfile.mkdtemp(prefix=f"libmut_{tag}_")
+    path = os.path.join(d, "board_lib_mutant.py")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(src_text)
+    spec = importlib.util.spec_from_file_location(f"board_lib_mutant_{tag}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _mutate(src, old, new, tag):
+    """找不到要改的那一行就**当场记 FAIL** —— 否则「变异没生效」会被读成
+    「断言很结实」（改前改后都没变，于是 `base != got` 那类断言就悄悄失真）。"""
+    if old not in src:
+        check(f"{tag} 找得到要改的那一行", False, old[:60])
+        return None
+    return load_mutant(src.replace(old, new, 1), tag)
+
+
+def section_mutation():
+    print("\n[4] 变异检查：把判据改坏，结论必须**真的翻面**")
+    src = open(os.path.join(HERE, "board_lib.py"), encoding="utf-8").read()
+
+    # M4a：`>` 改 `>=`。刚好满保质期那一天由此翻面。
+    m = _mutate(src, "    if age > ttl:", "    if age >= ttl:  # MUT", "m4a")
+    if m is not None:
+        base, _ = board_lib.judge_freshness("2026-10-05", 1, TODAY)
+        got, gdet = m.judge_freshness("2026-10-05", 1, TODAY)
+        check("M4a 边界从 `>` 变 `>=` ⇒ 刚好当天被判超期（与改前不同）",
+              base == board_lib.PASS and got == board_lib.FAIL,
+              f"改前={base} 改后={got} 理由={gdet}")
+
+    # M4b：`verified` 缺失 ⇒ 当作「今天刚核对过」。fail-closed 被反过来。
+    #      ⚠️ 变异点选在赋值那行、而不是下面那个 `if d is None:` —— 否则 d 仍是
+    #      None，`today - None` 会抛异常，变异体是**崩了**而不是**翻面**，
+    #      这样测出来的是「改坏了会炸」，不是「判据被拆掉了」。
+    m = _mutate(src, "    d = as_date(verified)",
+                "    d = as_date(verified) or today  # MUT", "m4b")
+    if m is not None:
+        base, bdet = board_lib.judge_freshness(None, 1, TODAY)
+        got, gdet = m.judge_freshness(None, 1, TODAY)
+        check("M4b verified 缺失当成「今天核对的」⇒「不知道」变成了「绿」（与改前不同）",
+              base == board_lib.FAIL and got == board_lib.PASS,
+              f"改前={base} 改后={got} 理由={gdet}")
+        check("  改前的红是因为 verified 缺失", "verified" in bdet, bdet)
+        check("  同一变异不许顺手把「真的超期」也放过（不是靠少报换来的绿）",
+              m.judge_freshness("2026-10-04", 1, TODAY)[0] == board_lib.FAIL)
+
+    # M4c：ttl_days 缺失 ⇒ 不再拦。
+    m = _mutate(src, "        return FAIL, MISSING_TTL",
+                '        return PASS, "MUT"', "m4c")
+    if m is not None:
+        base, _ = board_lib.judge_freshness("2026-10-05", None, TODAY)
+        got, _ = m.judge_freshness("2026-10-05", None, TODAY)
+        check("M4c ttl_days 缺失不再拦 ⇒ 一行永远无法被判过期（与改前不同）",
+              base == board_lib.FAIL and got == board_lib.PASS,
+              f"改前={base} 改后={got}")
+
+    # M7：血缘/入口名排除改回 `basename(__file__)` —— 搬家后静默失效的那个判据。
+    #     夹具是**真命令行形状**（日志名里带 planner_node），并且 me 走默认值
+    #     （正是 sys.argv[0] 那条路），所以这条变异真的会被走到。
+    m = _mutate(src, '    return os.path.basename(sys.argv[0] or "")',
+                '    return os.path.basename(__file__)  # MUT', "m7")
+    if m is not None:
+        line_me = ("  4242 python3 scripts/test_board_lib.py "
+                   "--log ~/planner_node.log")
+        base = [s.strip() for s in board_lib.leftovers(ps_out=[line_me], own=set())]
+        got = [s.strip() for s in m.leftovers(ps_out=[line_me], own=set())]
+        check("M7 改回 basename(__file__) ⇒ 调用方被误报成残留进程（与改前不同）",
+              base == [] and got == [line_me.strip()], f"改前={base} 改后={got}")
+        check("  改前之所以为空，是因为排除的是**入口名**而不是文件名",
+              board_lib._me_default() in line_me)
+        # 反向：这条变异**不许**把「别人起的栈」也漏掉
+        line_stack = "  5150 ros2 launch yolo_bringup bringup.launch.py"
+        check("  同一变异不会把真残留一起漏掉（不是靠少报换来的绿）",
+              [s.strip() for s in m.leftovers(ps_out=[line_stack], own=set())]
+              == [line_stack.strip()])
+
+    # M8：空 me 也参与排除 —— 一条空名字就把整条检查关掉，且关得无声无息。
+    m = _mutate(src, "    if me and len(me) >= 4 and me in args:",
+                "    if me in args:  # MUT", "m8")
+    if m is not None:
+        line_stack = "  5150 ros2 launch yolo_bringup bringup.launch.py"
+        base = [s.strip() for s in board_lib.leftovers(ps_out=[line_stack], me="",
+                                                       own=set())]
+        got = [s.strip() for s in m.leftovers(ps_out=[line_stack], me="", own=set())]
+        check("M8 空名字参与子串匹配 ⇒ 一条残留都报不出来（与改前不同）",
+              base == [line_stack.strip()] and got == [], f"改前={base} 改后={got}")
+
+
+# ------------------------------------------------------------ 5. 源码钉子
+def toplevel_imports(path):
+    """列出**顶层**的 import 名字（不递归进函数体）。
+
+    为什么用 AST 而不是 `"import rclpy" not in src`：本文件的说明里就得写
+    「顶层不 import rclpy」这句话，字符串判据会把**说明**当成**代码**，
+    于是钉子要么误报、要么为了不误报而写成更松的东西。
+    AST 问的是「真的有没有这条 import」，与注释怎么写无关。
+    """
+    import ast
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    out = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            out += [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            out.append(node.module or "")
+    return out
+
+
+def section_source():
+    print("\n[5] 源码钉子：顶层不 import ROS（离线可测的唯一前提）")
+    src = open(os.path.join(HERE, "board_lib.py"), encoding="utf-8").read()
+    tops = toplevel_imports(os.path.join(HERE, "board_lib.py"))
+    bad = [m for m in tops if m.split(".")[0] in ("rclpy", "launch")]
+    check("顶层没有 rclpy / launch（连 `import rclpy.x` 也不算数）",
+          bad == [], f"顶层 import：{tops}")
+    check("  懒加载确实在函数里（yaml 只在 load_site 里 import，顶层没有）",
+          "import yaml" in src and "yaml" not in tops, f"顶层 import：{tops}")
+    check("自我排除用的是 sys.argv[0]（入口），不是 __file__（函数住哪）",
+          'return os.path.basename(sys.argv[0] or "")' in src)
+    check("空/过短的 me 不参与排除（防一条空名字关掉整条检查）",
+          "len(me) >= 4" in src)
+    check("本文件不写设备：连 switch/deactivate 这类词都没有",
+          "deactivate" not in src and "switch_controller" not in src)
+    check("本文件里的串口路径只以占位符形式出现（没有真序列号）",
+          "usb-<" in src)
+
+
+# ------------------------------------------------------------ 6. 命令行行为
+def _run(*args, env=None):
+    e = {k: v for k, v in os.environ.items()
+         if k not in ("ROS_DOMAIN_ID", "UR5VG_SITE", "UR_ROBOT_IP")}
+    e.update(env or {})
+    return subprocess.run([sys.executable, os.path.join(HERE, "board_lib.py"), *args],
+                          capture_output=True, text=True, env=e)
+
+
+def section_cli():
+    print("\n[6] 命令行行为：模板必须被判**不合法**")
+    r = _run("--site", "/nonexistent/site.yaml")
+    check("站点文件不存在 ⇒ 退 2（环境不满足），并告诉人怎么建",
+          r.returncode == 2 and "site.example.yaml" in r.stdout,
+          f"rc={r.returncode} {r.stdout.strip()[:120]}")
+
+    tpl = os.path.join(REPO, "config", "site.example.yaml")
+    check("仓库里那份模板确实在", os.path.exists(tpl))
+    r = _run("--site", tpl, "--today", "2026-10-06")
+    check("模板 ⇒ 退 1（**绝不能退 0**）：占位符必须过不了校验",
+          r.returncode == 1 and "毛病" in r.stdout,
+          f"rc={r.returncode} {r.stdout.strip()[:160]}")
+    check("  且点出外参不是数 / 日期解析不了",
+          mentions(r.stdout, "camera_x", "不是数", "verified"), r.stdout.strip()[:300])
+
+    r = _run("--site", tpl, "--today", "昨天")
+    check("--today 给个解析不了的值 ⇒ 退 2，不当成今天", r.returncode == 2,
+          f"rc={r.returncode}")
+
+    # 反过来：一份**填好了**的配置必须能退 0，否则上面那条「退 1」可能只是
+    # 「这脚本永远退 1」——绿得没有理由的反面同样要排除。
+    d = tempfile.mkdtemp(prefix="libsite_")
+    good = os.path.join(d, "site.yaml")
+    with open(good, "w", encoding="utf-8") as fh:
+        fh.write(f"robot_ip: <ur-controller-ip>\n"
+                 f"ros_domain_id: 99\n"
+                 f"planner_params: ~/site_real.yaml\n"
+                 f"gripper:\n  port: {PORT_PH}\n"
+                 f"topcam:\n  verified: 2026-10-06\n  ttl_days: 1\n"
+                 f"  extrinsics: {{"
+                 + ", ".join(f"{k}: 0.1" for k in board_lib.CAM_KEYS) + "}\n")
+    r = _run("--site", good, "--today", "2026-10-06")
+    check("填好的配置 ⇒ 退 0（证明上一条的 1 是有理由的红，不是恒红）",
+          r.returncode == 0 and "可用" in r.stdout,
+          f"rc={r.returncode} {r.stdout.strip()[:160]}")
+    r = _run("--site", good, "--today", "2026-10-09")
+    check("同一份配置，三天后再跑 ⇒ 退 1（外参超期）",
+          r.returncode == 1 and "已超期" in r.stdout, f"rc={r.returncode}")
+
+
+# --------------------------------------------------------------------- main
+def main():
+    print("board_lib 自检（纯离线：不起进程、不开串口、不碰臂）")
+    section_site()
+    section_freshness()
+    section_leftovers()
+    section_mutation()
+    section_source()
+    section_cli()
+    print(f"\n{_n} 条断言，{len(_failed)} 条失败")
+    if _failed:
+        for n in _failed:
+            print(f"  ✗ {n}")
+        return 1
+    print("结果：✅ board_lib.py 全过")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,61 @@
+# 站点配置 —— **模板**。真值抄到仓库外，别改这份。
+#
+#   安装：mkdir -p ~/.config/ur5-vision-grasp
+#         cp config/site.example.yaml ~/.config/ur5-vision-grasp/site.yaml
+#         $EDITOR ~/.config/ur5-vision-grasp/site.yaml
+#   自查：python3 scripts/board_lib.py            # 打印生效的路径 + 逐条合法性 + 外参时效
+#   换位置：--site PATH 或 export UR5VG_SITE=PATH
+#
+# 为什么真值在仓库外：**本仓是公开副本，一切提交永久公开**（AGENTS.md 红线 3）。
+# 控制柜 IP、串口序列号属身份/位置信息，一律不得写进仓库。
+#
+# ⚠️ 这份模板里的取值**故意留成占位符**。占位符过不了 `float()` 与日期解析，
+#    于是配置不合法时会**大声报错**，而不是拿着一份看起来像真的配置静默跑成
+#    另一回事 —— 后者是本项目反复踩过的形状（「绿得没有理由」）。
+#
+# 校验：`python3 scripts/board_lib.py --site <这份>` 应当报 ❌ 若干条毛病。
+#       一份**合法**的站点配置才不会。
+
+# ── 控制柜 ──────────────────────────────────────────────────────────
+# 也可以完全不写这一行，改成配一次环境变量 `export UR_ROBOT_IP=<控制箱IP>`。
+robot_ip: <ur-controller-ip>
+
+# DDS 域号。现场是 99。两边不同 = 两个互不可见的网络，
+# 现象是「栈明明起着，什么话题都看不到」。
+ros_domain_id: 99
+
+# ── 规划器参数文件 ──────────────────────────────────────────────────
+# 必须给。不给的话真机上会**静默沿用仿真几何**（table_plane_z=-0.39），
+# 现象是臂完全不动、日志里看不出任何错。
+# 起点可抄 docs/现场yaml草稿-真机.yaml（那是模板，不是现行值）。
+planner_params: ~/.config/ur5-vision-grasp/site_real.yaml
+
+# ── 夹爪 ────────────────────────────────────────────────────────────
+gripper:
+  # ⚠️ 认**符号链接**，不认 /dev/ttyUSB0 —— 后者插拔会变号（AGENTS.md 不变量 3）。
+  #    `ls -l /dev/serial/by-id/` 看现场实际的名字。
+  port: /dev/serial/by-id/usb-<厂商>_<型号>_<序列号>-if00-port0
+  baudrate: 115200
+  slave_id: 1
+
+# ── 俯视相机外参 ────────────────────────────────────────────────────
+topcam:
+  # ⚠️ 两个时效字段是**强制**的，缺一个 `board_lib.py` 就判不合法：
+  #      verified  上次**现场核对**这组外参的日期（不是抄下来的日期）
+  #      ttl_days  保质期。俯视外参实测一天能漂 0.945°，所以现场值是 1。
+  #    判据与 scripts/state_check.py 同一条线：`今天 - verified > ttl_days` 才算超期。
+  #    缺失/解析不了 ⇒ 一律当作**不新鲜**（fail-closed）。
+  #    过期的症状不是报错，是点云整体偏、/targets_3d 的候选落到臂够不到的地方。
+  verified: <YYYY-MM-DD>
+  ttl_days: 1
+  # 标定流程与现行值：scripts/topcam_drift_check.py 会打印实测值；
+  # 上一次现场核对的值同时记录在 scripts/board_a1.py 的 CAM（那是仓库里的孤本记录）。
+  # 这里留占位符而不是填数：抄一份过了期的数进来，比留个明显填不了的空更危险。
+  extrinsics:
+    camera_x: <米>
+    camera_y: <米>
+    camera_z: <米>
+    camera_qx: <四元数>
+    camera_qy: <四元数>
+    camera_qz: <四元数>
+    camera_qw: <四元数>

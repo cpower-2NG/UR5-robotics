@@ -61,7 +61,6 @@
 import argparse
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -70,13 +69,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-# ⚠️ 排除 `bash -c`：经 ssh 跑时调用者那条命令行里带着同样的模式，会把自己匹配上
-#    （board_chain_check.py / board_ctrlc_check.py 都踩过，ssh 直接 255）。
-LEFTOVER_RE = re.compile(
-    r"ros2 launch yolo_bringup|move_group|robot_state_publisher"
-    r"|detector_node|projector_node|planner_node|realsense2_camera_node"
-    r"|static_transform_publisher|ur_ros2_control_node"
-    r"|ur_robot_driver/(dashboard_client|robot_state_helper|controller_stopper)")
+# 前置四件（残留进程 / 串口 / 夹爪 / 控制柜）与「谁是残留进程」的判据都搬进了
+# `board_lib.py`（那里还有站点配置）。这里 **re-export** 一次：既有调用点与
+# `test_board_a1.py` 一行都不用改，而真值只有一份。
+import board_lib                                             # noqa: E402
+from board_lib import (dashboard, gripper_state, leftovers,  # noqa: E402
+                       port_busy, teardown)
 
 # 标定过的外参（2026-10-05 现场值）。改这里之前先确认你知道自己在改什么。
 CAM = {
@@ -187,57 +185,23 @@ def explain(v, slots):
 
 
 # ---------------------------------------------------------------- 前置检查
+# `leftovers` / `port_busy` / `gripper_state` / `dashboard` 见上方 re-export
+# （实现在 `board_lib.py`，都有离线自检）。
 
-def leftovers():
-    r = subprocess.run(["ps", "-eo", "pid,args", "--no-headers"],
-                       capture_output=True, text=True)
-    me = os.path.basename(__file__)
-    return [l.strip() for l in r.stdout.splitlines()
-            if "bash -c" not in l and me not in l and LEFTOVER_RE.search(l)]
+def wait_for_playing(ip, timeout):
+    """起栈**之后**轮询示教器直到 PLAYING。返回 `(到了没, 最后一次回复)`。
 
-
-def port_busy(path="/dev/ttyUSB0"):
-    r = subprocess.run(["fuser", path], capture_output=True, text=True)
-    return r.returncode == 0
-
-
-def gripper_state():
-    """读 AG-95 的 `0x0200`。返回 (状态, 说明)；读不到返回 (None, 原因)。
-
-    **只读** —— 复用 `ag95_init_close.py` 的 `Gripper`，它唯一会写的地方是
-    `write()`，本函数一次都不调。
+    ⚠️ 次序是「**起栈 → 按播放 → 拉回控制器**」，不能倒过来：URCap 的
+    External Control 需要一个对端，先按播放再起栈，示教器上就是
+    「连接被拒绝」，程序停在 STOPPED。本函数只读查询，**不发 play/power/stop**。
     """
-    try:
-        import ag95_init_close as ag
-    except Exception as exc:                      # noqa: BLE001
-        return None, f"导入 ag95_init_close 失败：{exc}"
-    g = ag.Gripper.open_port()
-    if g is None:
-        return None, "串口打不开"
-    try:
-        # 0 = 未初始化 / 2 = 进行中 / 1 = 已完成
-        return g.read(ag.REG_INIT_STATUS), "ok"
-    finally:
-        g.close_port()
-
-
-def dashboard(ip, timeout=5.0):
-    """**只读**问一句控制柜。返回 {命令: 回复}；连不上返回 None。"""
-    try:
-        s = socket.create_connection((ip, 29999), timeout=timeout)
-    except OSError as exc:
-        return None
-    try:
-        f = s.makefile("rw")
-        f.readline()                              # 问候行，别拿来判状态
-        out = {}
-        for c in ("robotmode", "programState", "safetystatus"):
-            f.write(c + "\n")
-            f.flush()
-            out[c] = f.readline().strip()
-        return out
-    finally:
-        s.close()
+    t0, last = time.time(), None
+    while time.time() - t0 < timeout:
+        last = dashboard(ip)
+        if last and "PLAYING" in last["programState"]:
+            return True, last
+        time.sleep(2.0)
+    return False, last
 
 
 # ---------------------------------------------------------------- 起栈
@@ -259,7 +223,10 @@ def build_cmd(a):
         # `连续未放置 2/10`，加了是 0/10）。
         f"start_delay:={a.start_delay:g}",
     ]
-    args += [f"{k}:={v}" for k, v in CAM.items()]
+    # 站点配置给了外参就用站点那份（那是现场核对过的），否则退回代码里记录的
+    # `CAM`。`getattr` 是因为离线测试用 `Namespace` 造参数、不带 `cam`。
+    cam = getattr(a, "cam", None) or CAM
+    args += [f"{k}:={v}" for k, v in cam.items()]
     return args
 
 
@@ -294,7 +261,16 @@ def main(argv=None):
     # ⚠️ **没有默认值**：这是公开仓，现场控制柜 IP 不进源码。
     #    现场配一次 `export UR_ROBOT_IP=<控制箱IP>` 即可（或每次显式传）。
     ap.add_argument("--robot-ip", default=os.environ.get("UR_ROBOT_IP"))
-    ap.add_argument("--params", default=os.path.expanduser("~/site_real.yaml"))
+    ap.add_argument("--site", default=None,
+                    help="站点配置路径（默认取 $UR5VG_SITE）—— 给了它就会校验"
+                         "合法性并**判外参时效**；不给则退回代码里的 CAM 且不判时效")
+    ap.add_argument("--override-freshness", default=None, metavar="理由",
+                    help="外参超期时由人显式破例，**必须写下为什么**（原样打印出来）")
+    ap.add_argument("--play-timeout", type=float, default=300.0,
+                    help="起栈后等人在示教器按「播放」的秒数上限（默认 300）")
+    ap.add_argument("--params", default=None,
+                    help="规划器参数文件（默认：站点配置的 planner_params，"
+                         "再默认 ~/site_real.yaml）")
     ap.add_argument("--slots", type=int, default=4, help="期望的放置槽位数（place_slots 长度）")
     ap.add_argument("--log", default=os.path.expanduser("~/a1_board.log"))
     ap.add_argument("--no-launch", action="store_true", help="只对已有 --log 判分，不起栈")
@@ -304,6 +280,42 @@ def main(argv=None):
                          "5000x 连接，避免启动 HOME 被状态容差拒掉。设 0 可关掉）")
     ap.add_argument("--timeout", type=float, default=RUN_TIMEOUT)
     a = ap.parse_args(argv)
+
+    # ---- 站点配置（给了才读；读不合法**绝不放行**）----
+    site = None
+    if a.site or os.environ.get(board_lib.SITE_ENV):
+        p = board_lib.site_path(a.site)
+        try:
+            site = board_lib.load_site(path=p)
+        except board_lib.SiteError as exc:
+            print(f"❌ {exc}")
+            return 2
+        probs = board_lib.validate_site(site)
+        if probs:
+            print(f"❌ 站点配置有 {len(probs)} 条毛病（{site.path}）：")
+            for i, x in enumerate(probs, 1):
+                print(f"   {i}. {x}")
+            return 2
+        print(f"—— 站点配置 {site.path} ——")
+        st, det = board_lib.freshness_gate(site, override=a.override_freshness)
+        print(f"  外参时效：[{st}] {det}")
+        if st != board_lib.PASS:
+            print("   外参过期时点云整体偏，症状是 /targets_3d 的候选落到臂够不到的地方；")
+            print("   跑 python3 scripts/topcam_drift_check.py 重新核对，或"
+                  "--override-freshness \"理由\" 显式破例。")
+            return 2
+        print()
+    else:
+        print("⚠️ 没给站点配置（--site / $UR5VG_SITE）⇒ 用代码里记录的 CAM 外参，"
+              "**时效不判**。")
+        print("   cp config/site.example.yaml ~/.config/ur5-vision-grasp/site.yaml"
+              " 填好后 --site 指过去。\n")
+
+    a.robot_ip = a.robot_ip or (site.robot_ip if site else None)
+    a.params = (a.params or (site.planner_params if site else None)
+                or os.path.expanduser("~/site_real.yaml"))
+    a.cam = site.extrinsics() if site else None
+    gripper_port = (site.gripper_port if site else None) or "/dev/ttyUSB0"
 
     if not a.no_launch and not a.robot_ip:
         print("❌ 缺 --robot-ip（环境变量 UR_ROBOT_IP 也没设）")
@@ -322,12 +334,12 @@ def main(argv=None):
                 print("   " + s[:120])
             return 2
         print("  ✓ 无残留进程")
-        if port_busy():
-            print("❌ /dev/ttyUSB0 被占用 —— 多半就是残留的规划器，先收干净")
+        if port_busy(gripper_port):
+            print(f"❌ {gripper_port} 被占用 —— 多半就是残留的规划器，先收干净")
             return 2
-        print("  ✓ /dev/ttyUSB0 空闲")
+        print(f"  ✓ {gripper_port} 空闲")
 
-        st, why = gripper_state()
+        st, why = gripper_state(site.gripper_port if site else None)
         if st is None:
             print(f"❌ 读不到夹爪状态（{why}）—— 串口没通就别急着起栈")
             return 2
@@ -344,11 +356,10 @@ def main(argv=None):
             print(f"❌ 连不上控制柜 {a.robot_ip}:29999")
             return 2
         print(f"  · {d['robotmode']} | {d['programState']} | {d['safetystatus']}")
-        if "PLAYING" not in d["programState"]:
-            print("❌ 示教器程序不是 PLAYING —— 起栈也不会动。")
-            print("   去示教器按一下播放（URCap 的 External Control），**本脚本不发这个命令**。")
-            return 2
-        print("  ✓ 示教器在 PLAYING")
+        # ⚠️ 这里**不**要求 PLAYING。次序是「起栈 → 按播放 → 拉回控制器」：
+        #    URCap 的 External Control 要先有对端，先按播放再起栈，示教器上
+        #    会报「连接被拒绝」、程序停在 STOPPED。等播放的逻辑在起栈之后。
+        print("  · 此刻不要求 PLAYING（次序：起栈 → 按播放 → 拉回控制器）")
         print()
 
     # ---- 只判分模式 ----
@@ -365,13 +376,23 @@ def main(argv=None):
     print("—— 起栈（carry_objects:=true，**臂会动**）——")
     print("  " + " ".join(cmd[:6]) + " …")
     logf = open(a.log, "w")
-    env = dict(os.environ, ROS_DOMAIN_ID=os.environ.get("ROS_DOMAIN_ID", "99"))
-    if env["ROS_DOMAIN_ID"] != "99":
-        print(f"  ⚠️ ROS_DOMAIN_ID={env['ROS_DOMAIN_ID']}（现场是 99，确认一下）")
+    domain = str(site.ros_domain_id) if site else os.environ.get("ROS_DOMAIN_ID", "99")
+    env = dict(os.environ, ROS_DOMAIN_ID=domain, PYTHONUNBUFFERED="1")
     proc = subprocess.Popen(cmd, cwd=REPO, stdout=logf, stderr=subprocess.STDOUT,
                             env=env, start_new_session=True)
     try:
         print(f"  日志 -> {a.log}")
+        print("\n" + "=" * 62)
+        print("👉 现在去示教器按**播放**（URCap 的 External Control 程序）。")
+        print("   本脚本**不发** play / power / stop —— 那是人的动作（红线 6）。")
+        print("=" * 62)
+        ok, d = wait_for_playing(a.robot_ip, a.play_timeout)
+        if not ok:
+            got = d["programState"].strip() if d else "连不上控制柜"
+            print(f"❌ {a.play_timeout:.0f}s 内示教器没进入 PLAYING（现在是 {got}）"
+                  f" —— 收起栈，什么都没发出去")
+            return 2
+        print(f"  ✓ 示教器 PLAYING（{d['programState'].strip()}）\n")
         lines, finished = wait_for_finish(a.log, time.time() + a.timeout)
         if not finished:
             print(f"\n❌ {a.timeout:.0f}s 内没等到「收工：」—— 被超时中断")
@@ -397,35 +418,8 @@ def verdict(lines, slots, timed_out=False):
     return 1
 
 
-def teardown(proc):
-    """收栈。⚠️ 只 killpg **父进程组**；`ros2 launch` 的子节点里有一批
-    （`move_group` / `robot_state_publisher` / `static_transform_publisher` /
-    `ur_ros2_control_node`）在父进程被收后会**重新挂到 init**，
-    所以必须再按模式扫一遍（2026-10-05 实测：漏扫会留下 PPID=1 的孤儿）。"""
-    import signal
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    deadline = time.time() + 15
-    while time.time() < deadline and leftovers():
-        time.sleep(1)
-    if leftovers():
-        for line in leftovers():
-            try:
-                os.kill(int(line.split()[0]), signal.SIGKILL)
-            except (ValueError, ProcessLookupError):
-                pass
-        time.sleep(2)
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-    stale = leftovers()
-    if stale:
-        print("\n⚠️ 收尾后仍有残留（下次会被前置检查拦下）：")
-        for s in stale:
-            print("  " + s[:120])
+# `teardown` 也搬进 `board_lib.py` 了（见上方 re-export）—— 搬过去还顺手修掉了
+# 它依赖的 `leftovers()` 里那处「按文件名排除调用方」的隐疾。
 
 
 if __name__ == "__main__":

@@ -118,6 +118,17 @@ PATTERNS = [
     #   —— 精确串不看位数，这才是真序列号的正牌覆盖手段（见文件头）。
     #   本条正则只是「denylist 没配时的兜底」，故意收窄以换取零假阳性。
     #   代价：**换了机器、denylist 里没写这台设备的号**时，12 位序列号会漏。
+    # `/dev/serial/by-id/usb-<厂商>_<型号>_<序列号>-if00-port0` 里那段**芯片序列号**。
+    # 为什么单列一条、而不是靠上面那两条数字规则：udev 的 by-id 名字**就是拿序列号
+    # 生成的**，而它既不是 13 位数字也不是 32 位 hex（实测那颗是 8 位）——
+    # 于是三条老规则一条都盖不住它，**0 命中**，序列号就这么在公开仓里躺着。
+    #
+    # 又不能一刀切禁掉这类路径：不变量 3 恰恰**要求**按 by-id 认串口（不是
+    # /dev/ttyUSB0，插拔会变号）。所以判据是「路径里那段是不是占位符」——
+    # 占位符写法（`<序列号>`、`<SERIAL>`）天然不命中，因为 `<` 不在字符类里。
+    ('by-id 串口路径里的硬件序列号', re.compile(
+        r'/dev/serial/by-id/usb-[A-Za-z0-9]+_[A-Za-z0-9]+_[A-Za-z0-9_]{5,}'
+        r'-if\d+-port\d+')),
     ('13 位数字（疑似序列号）',
      re.compile(r'(?<![0-9A-Fa-f.])[0-9]{13}(?![0-9A-Fa-f])')),
     ('32 位 hex（疑似 machine-id / 秘钥指纹）',
@@ -181,7 +192,26 @@ def _looks_binary(head):
     return b'\0' in head
 
 
-def _allowlisted(kind, hit):
+# ---- 「闸门知道它存在」，而不是「假装它不存在」 ----
+# 两处**已知待决策**的真序列号，都在**活默认值**上：一处是夹爪串口的节点参数
+# 默认，一处是真机脚本的 PORT 常量。顺手换成占位符会让现场**静默少一条链路**
+# （夹爪打不开 → 初始化那一步写不进去），而本轮范围明确不含改 `ros2_ws/` 下的链路。
+# 所以在此登记，**有期限**：它们一旦改成从站点配置（`config/site.example.yaml`
+# 的 `gripper.port`）或环境变量取值，**必须删掉本表**。
+#
+# ⚠️ 为什么按**文件**放行，而不像 ALLOWED_* 那样列命中串：那几张表的键就是命中串
+#    本身 —— 把序列号抄进本文件等于换个地方再泄一次。
+ALLOWED_SERIAL_FILES = {
+    'scripts/ag95_init_close.py':
+        '真机脚本的串口默认值；改它要现场验证，待决策',
+    'ros2_ws/src/grasp_planner/config/grasp_planner.yaml':
+        'ag95_port 是节点参数默认、属活链路；本轮范围不含改 ros2_ws/，待决策',
+}
+
+
+def _allowlisted(kind, hit, label=''):
+    if kind == 'by-id 串口路径里的硬件序列号':
+        return label.split(' 〔')[0] in ALLOWED_SERIAL_FILES
     table = {
         '私网 IPv4': ALLOWED_IPV4,
         '邮箱': ALLOWED_EMAILS,
@@ -197,7 +227,7 @@ def scan_text(label, text, hits):
         for kind, rx in PATTERNS:
             for m in rx.finditer(line):
                 hit = m.group(0)
-                if _allowlisted(kind, hit):
+                if _allowlisted(kind, hit, label):
                     continue
                 hits.append((label, lineno, kind, hit))
 
@@ -253,6 +283,30 @@ def main():
                          f'应放 ~/.config/ur5-vision-grasp/ 而不是仓库'))
         else:
             print(f'       serial_no={val!r} —— 是占位符，OK')
+
+    # 反向检查之二：新增的 by-id 规则**自己**得吃劲。两个方向都要钉：
+    #   · 占位符写法**不许**命中 —— 否则合规写法反而报红，人会去关掉这条规则；
+    #   · 编造的序列号形状**必须**命中 —— 否则这条规则等于没写。
+    # 探针用**编造**值（串口版的 RFC 5737），不是任何真实设备。
+    name = 'by-id 串口路径里的硬件序列号'
+    rx = dict(PATTERNS).get(name)
+    if rx is None:
+        hits.append((SELF, 0, '缺规则', f'PATTERNS 里找不到「{name}」'))
+    else:
+        for probe, want, why in (
+                ('/dev/serial/by-id/usb-<厂商>_<型号>_<序列号>-if00-port0', False,
+                 '占位符不命中'),
+                ('/dev/serial/by-id/usb-<v>_<m>_<s>-if00-port0', False,
+                 '占位符不命中（常见简写）'),
+                ('/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_ZZ000000-if00-port0',
+                 True, '编造的序列号形状命中'),
+        ):
+            got = bool(rx.search(probe))
+            if got != want:
+                hits.append((SELF, 0, '新规则自检不过',
+                             f'期望 {want}、实得 {got}：{why} —— {probe}'))
+            else:
+                print(f'       by-id 规则：{why} ✓')
 
     # ---- 4. 本机可选黑名单（真实序列号放这里，不进仓库）----
     print('[4/4] 本机黑名单（可选，不入库）')
