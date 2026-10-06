@@ -901,20 +901,28 @@ def judge_ros_env(env, ros2_on_path, install_setup, sourced="", repo=REPO):
 
 
 def judge_domain(env, site):
-    """P0：`ROS_DOMAIN_ID` 与站点一致。**纯函数**。
+    """P0：`ROS_DOMAIN_ID` 与站点**冲不冲突**。**纯函数**。
 
-    漏了它 / 两边不同 = 两个互不可见的 DDS 网络，现象是「栈明明起着、话题列表空的」
-    —— 实测踩过，且极易误判成「栈没起来」。
+    ⚠️ 判据 2026-10-06 改过（用户拍板「按启动器方便的来」）：**没设不再算失败**。
+    理由：启动器在 P2 **自己**会把站点的域号注入它起的每一个子进程，所以栈
+    无论如何都跑在站点那个域上 —— 旧判据拦的是一个**它自己就会修**的条件，
+    代价是「每开一个新终端都得记得 export」，正是要消灭的那类摩擦。
+
+    只在**两边冲突**时才红：那时你**自己另开**的终端在另一个 DDS 域上，会看见
+    「栈明明起着、话题列表却是空的」—— 本仓实测踩过，且极易误判成「栈没起来」。
+    无论哪种情况都把**值从哪来**印清楚（要报告来源，不要只报结论）。
     """
     want = str(site.ros_domain_id)
     got = env.get("ROS_DOMAIN_ID")
     if got is None or str(got).strip() == "":
-        return FAIL, ("环境里没有 ROS_DOMAIN_ID（站点是 %s）—— 不设就是域 0，"
-                      "与站点是两个互不可见的 DDS 网络；先 `export ROS_DOMAIN_ID=%s`"
+        return PASS, ("环境里**没设** —— 启动器按站点用 %s（只为它起的子进程注入）。"
+                      "⚠️ 你**自己另开**的终端要 `export ROS_DOMAIN_ID=%s` 才看得见话题"
                       % (want, want))
     if str(got).strip() != want:
-        return FAIL, ("环境是 %s，站点是 %s —— 两边不同的域号 = 互相看不见，"
-                      "症状是「栈起着但什么话题都没有」" % (got, want))
+        return FAIL, ("你的 shell 是 %s，站点是 %s —— 启动器会按**站点**用 %s，"
+                      "于是你这个终端在**另一个** DDS 域上，会看见「栈起着、话题却是空的」。"
+                      "先 `export ROS_DOMAIN_ID=%s`（或把站点改成 %s）"
+                      % (got, want, want, want, got))
     return PASS, "ROS_DOMAIN_ID=%s（与站点一致）" % want
 
 

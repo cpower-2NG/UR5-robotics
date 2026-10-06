@@ -982,6 +982,27 @@ try:
           board_run.judge_ros_env(env2 or {}, True,
                                   os.path.join(ROSD, "没有"))[0] == board_run.FAIL)
 
+    # ---- P0.域号一致：判据 2026-10-06 改过（用户拍板「按启动器方便的来」）----
+    # 旧判据「没设 ⇒ FAIL」拦的是一个**启动器自己就会修**的条件（P2 会给它起的每
+    # 个子进程注入站点值），代价是每开一个终端都要记得 export。现在只拦**真冲突**。
+    class _Site:                 # 这里只用得上这一个字段
+        ros_domain_id = 99
+
+    st, det = board_run.judge_domain({}, _Site)
+    check("★ 环境里**没设** ROS_DOMAIN_ID ⇒ PASS（栈仍会被起在站点那个域上）",
+          st == board_run.PASS, det)
+    check("  但**必须**说清值从哪来、以及你自己另开的终端要做什么（不是只吐个绿）",
+          "启动器" in det and "export ROS_DOMAIN_ID=99" in det, det)
+    check("  空串与没设同义（`ROS_DOMAIN_ID=` 这种写过头的也放过）",
+          board_run.judge_domain({"ROS_DOMAIN_ID": ""}, _Site)[0] == board_run.PASS)
+    st, det = board_run.judge_domain({"ROS_DOMAIN_ID": "0"}, _Site)
+    check("★ 你自己的 shell 在**别的**域 ⇒ 仍然 FAIL（这才是那个「栈起着、话题空」的坑）",
+          st == board_run.FAIL, det)
+    check("  文案给出两条出路（export 成站点值 / 改站点）并点名症状",
+          "export ROS_DOMAIN_ID=99" in det and "0" in det and "话题" in det, det)
+    check("  一致就 PASS，且容忍手抄来的空格",
+          board_run.judge_domain({"ROS_DOMAIN_ID": " 99 "}, _Site)[0] == board_run.PASS)
+
     # =================================================================
     # 6. 外参
     # =================================================================
@@ -1342,20 +1363,29 @@ try:
     #    这里原来断言红的是「缺本机工作区的 install ⇒ 去 colcon build」——
     #    可**板上那份检出是编过的**，同一份代码在板上就不红了，自检当场失败。
     #    **拿环境当行为**，与 [5b] 那个「夹具猜线上格式」是同一个病。
-    #    现在钉的是 `clean_env()` 摘掉 ROS_DOMAIN_ID 造成的那条：它在**任何**机器上
-    #    都成立（见 `DROP_ENV`）；「缺 install 该怎么报」改由 [5c] 用合成夹具钉。
+    #    第一次改成钉「域号没设」，但域号判据随后也被放开了（没设 ⇒ PASS）……
+    #    两次都是**拿一个会变的现状当钉子**。
+    #    ⇒ 现在钉的这条**由夹具自己造**：把站点文件写坏（少 `topcam.ttl_days`）。
+    #      它在**任何**机器上都红、说的是同一件事，且钉住的是那条因果
+    #      「P0 不过 ⇒ 栈不起」，这正是本档要证的。
+    bad_site = os.path.join(tmpdir, "site_broken.yaml")
+    with open(bad_site, "w", encoding="utf-8") as fh:
+        fh.write(SITE_YAML.format(planner=planner_path,
+                                  today=datetime.date.today().isoformat())
+                 .replace("  ttl_days: 1\n", ""))
+
     no_ros = os.pathsep.join(
         p for p in clean_env().get("PATH", "").split(os.pathsep)
         if p and not os.path.exists(os.path.join(p, "ros2")))
 
-    r = run_cli("--task", "a1", "--site", site_path,
+    r = run_cli("--task", "a1", "--site", bad_site,
                 "--log", os.path.join(tmpdir, "a1.log"),
                 "--json-report", os.path.join(REPO, "scripts", "_never_write.json"),
                 env={"PATH": no_ros})
     check("离线整跑退 2（**绝不能退 0**：fail-closed）", r.returncode == 2,
           "rc=%s" % r.returncode)
-    check("  红的是**机器无关**的那一条：域号没设（`clean_env` 摘了 ROS_DOMAIN_ID）",
-          "[FAIL] P0.域号一致" in r.stdout and "[PASS] P0.站点配置" in r.stdout)
+    check("  红的是**夹具自己造**的那条（站点少写一个键）—— 与跑测试的机器无关",
+          "[FAIL] P0.站点配置" in r.stdout and "ttl_days" in r.stdout)
     check("  每条红都说得出名字（`[FAIL] P0.<项>`），没有无名红",
           len(re.findall(r"\[FAIL\] P0\.\S", r.stdout)) >= 1)
     check("  栈**没有起**（闸门没过就不起栈）",
