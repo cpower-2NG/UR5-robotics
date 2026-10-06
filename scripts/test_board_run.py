@@ -482,9 +482,14 @@ PLANNER_YAML = """\
 grasp_planner:
   ros__parameters:
     pick_zone: [0.30, 0.90, -0.18, 0.16, -0.45, -0.30]
-    place_slots: [
-      [0.44, 0.24], [0.60, 0.24], [0.76, 0.24], [0.44, -0.24],
-    ]
+    # ⚠️ ⚠️ **扁平**的 [x0,y0, x1,y1, …] —— **不是** [[x,y], …]。
+    #    这里原来写的是嵌套的 `[[0.44,0.24], …]`，而真机节点**明确不接受**那个形状
+    #    （planner_node.py:203 逐字写了是扁平的，:621 奇数长度直接抛）。
+    #    后果：`judge_place_slots` 数 `len(place_slots)` 时，在**夹具上恒对**
+    #    （嵌套 4 项 = 4 个槽）、在**真机上恒错**（扁平 8 项 = 4 个槽却读成 8）。
+    #    这条缺陷因此藏到 2026-10-06 第一次真读现场文件才露头，还差点让我把一个
+    #    「站点指错文件了」的错结论发给用户。**夹具必须照现场抄，不能按「显然的形状」写。**
+    place_slots: [0.44, 0.24, 0.60, 0.24, 0.76, 0.24, 0.44, -0.24]
     place_z: -0.35
     table_plane_z: -0.39
     trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
@@ -845,6 +850,11 @@ try:
           not moved and "还没到点" in note, note)
     check("没起栈 / --attach ⇒ 「有没有动过臂」明写**未判**，不含糊",
           board_run.judge_handoff_window(None, None, 120.0)[1].count("未判") == 1)
+
+    note = board_run.attach_log_missing_note("/tmp/nope.log")
+    check("--attach 找不到日志：文案要**指出路径**，并把两种情形都写出来"
+          "（「--log 指错了」与「**根本没有栈可附着**」）",
+          "/tmp/nope.log" in note and "--log" in note and "没有栈可附着" in note, note)
 
     note = board_run.candidate_margin_note(4, 4)
     check("候选 4 = 槽位 4 ⇒ 点名「拿不到收工判据」并给出该摆几块",
@@ -1228,8 +1238,14 @@ try:
           board_run.judge_place_slots(task_a1, board_lib.parse_site(
               {"planner_params": os.path.join(tmpdir, "没有这个文件.yaml")})
           ).status == board_run.FAIL)
+    # ⚠️ 加一对槽 = 在**扁平**表尾再接 **两个**数（不是再接一个 [x,y]）。
+    #    这里原来接的是 `[0.44, -0.24],`，是**嵌套**夹具时代的写法；夹具改成扁平之后
+    #    那个串匹配不上 ⇒ `.replace` 原样返回 ⇒ p5 与 4 槽的夹具逐字节相同，
+    #    「5 个槽」的用例其实在测「4 个槽」⇒ **恒假**（且看起来还是绿的？不：它会红，
+    #    但红的是「对不上」这条断言 —— 换句话说它红了，只是红的理由不是它声称的那个）。
     slots5 = open(planner_path, encoding="utf-8").read().replace(
-        "[0.44, -0.24],", "[0.44, -0.24], [0.60, -0.24],")
+        "[0.44, 0.24, 0.60, 0.24, 0.76, 0.24, 0.44, -0.24]",
+        "[0.44, 0.24, 0.60, 0.24, 0.76, 0.24, 0.44, -0.24, 0.60, -0.24]")
     p5 = os.path.join(tmpdir, "planner5.yaml")
     with open(p5, "w", encoding="utf-8") as fh:
         fh.write(slots5)
@@ -1242,6 +1258,32 @@ try:
     check("  yaml 里没有 place_slots ⇒ SKIP（没验到），不是 PASS",
           board_run.judge_place_slots(task_a1, board_lib.parse_site(
               {"planner_params": noplace})).status == board_run.SKIP)
+
+    # ★ 2026-10-06：`place_slots` 是**扁平**的 [x0,y0, x1,y1, …]
+    #   （`planner_node.py:203` 逐字写着；:213-215 就是 `[0::2]`/`[1::2]` 解回来的）。
+    #   所以**槽位数是 len//2**。这条曾经在夹具上恒对、在真机上恒错 —— 见 [11]。
+    n, why = board_run.slot_count([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+    check("★ 扁平 8 个数 ⇒ **4** 个槽（不是 8 —— 这是本轮真机那次误报的根）",
+          n == 4 and why == "", "n=%s why=%s" % (n, why))
+    n, why = board_run.slot_count([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+    check("  扁平**奇数**个数 ⇒ None，且说明里点名「奇数」（节点自己也会因此抛）",
+          n is None and "奇数" in why, "n=%s why=%s" % (n, why))
+    n, why = board_run.slot_count([[0.1, 0.2], [0.3, 0.4]])
+    check("  **嵌套** [[x,y], …] ⇒ None，且说明里点名「扁平」（真机节点明确不收这个形状）",
+          n is None and "扁平" in why and "嵌套" in why, "n=%s why=%s" % (n, why))
+    n, why = board_run.slot_count([])
+    check("  空表 / 不是列表 ⇒ None（「没验到」与「验过是 0 个」是两回事）",
+          board_run.slot_count([])[0] is None
+          and board_run.slot_count(None)[0] is None
+          and board_run.slot_count("0.44")[0] is None)
+    check("  纯函数：不读文件、不碰环境（签名只有 vals）",
+          board_run.slot_count.__code__.co_argcount == 1)
+    # 同目录候选：现场拿不到鼠标时，报告得直接说「我该指哪一份」
+    sib = dict(board_run.sibling_slots(os.path.join(tmpdir, "planner5.yaml")))
+    check("  sibling_slots 列出**同目录**的其它 yaml 及各自的槽数，且不含自己",
+          sib.get("planner.yaml") == 4 and "planner5.yaml" not in sib, str(sib)[:160])
+    check("  sibling_slots 用的是同一个 slot_count（扁平 8 个值 ⇒ 报 4，不是 8）",
+          sib.get("planner.yaml") != 8, str(sib)[:160])
 
     conflict_task = board_run.Task(dict(task_a1.raw, params=dict(
         task_a1.params, robot_ip="198.51.100.9")))
@@ -1413,6 +1455,46 @@ try:
           and "a1.yaml:params.carry_objects" in r.stdout
           and "站点" in r.stdout)
     check("  声明缺席的行明写「这一档没测」", "这一档没测" in r.stdout)
+    # ⚠️ 2026-10-06 修：`P2.槽位数` 曾经在 --dry-run 里**声明缺席**，理由是
+    #    「要读 planner_params_file，这一档留给真跑」—— **理由本身是错的**，
+    #    它只是读一个文件。代价很贵：任务描述与 planner_params_file 的槽位数不一致，
+    #    本来只有**上板起栈**那一刻才暴露（而槽位数正是判分用的量）。本轮就是这么
+    #    在板上被抓到的（站点 8 槽 / a1-noplan 期望 4 槽）。这两条钉子钉住它之后
+    #    不再退回去。
+    check("★ --dry-run **也**跑槽位数检查（纯文件读，不跑子进程 ⇒ 在合同之内）",
+          "[PASS] P2.槽位数" in r.stdout and "留给真跑" not in r.stdout)
+    # ⚠️ 判据要读**那一行**渲染成什么，不是数「声明缺席」这个词出现了几次
+    #    （2026-10-06 我自己先写错一版：那个词在 20 多条别的断言里也出现 ⇒ 恒假）。
+    check("  且它**不**被标成缺席行，而声明集与起栈**仍然**是缺席行",
+          "[缺席] P2.槽位数" not in r.stdout
+          and "[缺席] P2.声明集" in r.stdout
+          and "[缺席] P2.起栈" in r.stdout)
+
+    # 站点那份 planner 参数文件槽位数对不上 ⇒ **桌面上的 --dry-run 就该红**
+    bad_planner = os.path.join(tmpdir, "planner_slots8.yaml")
+    with open(bad_planner, "w", encoding="utf-8") as fh:
+        fh.write(PLANNER_YAML.replace(
+            "    place_slots: [0.44, 0.24, 0.60, 0.24, 0.76, 0.24, 0.44, -0.24]\n",
+            "    place_slots: [0.44, 0.24, 0.60, 0.24, 0.76, 0.24, 0.44, -0.24,\n"
+            "                  0.60, -0.24, 0.76, -0.24, 0.44, 0.0, 0.60, 0.0]\n"))
+    slots_site = os.path.join(tmpdir, "site_slots8.yaml")
+    with open(slots_site, "w", encoding="utf-8") as fh:
+        fh.write(SITE_YAML.format(planner=bad_planner,
+                                  today=datetime.date.today().isoformat()))
+    r2 = run_cli("--task", "a1", "--site", slots_site, "--dry-run",
+                 env={"PATH": no_ros})
+    check("★ 槽位数对不上 ⇒ **--dry-run 就退 2**（不必上板才暴露）",
+          r2.returncode == 2 and "[FAIL] P2.槽位数" in r2.stdout,
+          "rc=%s" % r2.returncode)
+    check("  文案让人**先看台面**、并给出两个方向（改任务 / 站点指错文件了）",
+          "先看台面再改" in r2.stdout and "expect.slots_total" in r2.stdout
+          and "指错文件" in r2.stdout)
+    check("  且把**同目录下别的** planner 参数文件连同槽位数摆出来"
+          "（「我该指哪一份」才是现场真正要回答的）",
+          "        · planner.yaml → 4 个槽" in r2.stdout
+          and "        · planner_slots8.yaml" not in r2.stdout)
+    check("  栈**没有起**（dry-run 本来就不起，但失败路径也不许漏）",
+          "起栈中" not in r2.stdout)
 
     r = run_cli("--task", "a2", "--site", site_path, "--dry-run",
                 env={"PATH": no_ros})

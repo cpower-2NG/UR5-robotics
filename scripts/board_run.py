@@ -1568,6 +1568,23 @@ def print_repair_hint(ctrl_status, repair_exercised, task_name, out=print):
     return True
 
 
+def attach_log_missing_note(log_path):
+    """`--attach` 找不到日志时那条 FAIL 的文案。**纯函数**（好让离线断言钉得住它）。
+
+    这条 FAIL 在**只读预检**用法下会稳定出现，而原文案
+    「--attach 要判分就得有日志，而 X 不存在」是**实话但不够**：它没区分
+    「`--log` 指错了地方」与「**根本没有栈可附着**」—— 后者恰恰是
+    「拿 `--attach` 当零副作用体检」时最常见的形态（栈没起，P3 的 PLAYING 本来也等不到）。
+    两种都写出来，别让现场自己猜。判据本身（找不到日志 ⇒ FAIL）**没变**。
+    """
+    return ("找不到日志 %s —— `--attach` 是**附着别人起的栈**，判分要读那份日志。"
+            "两种情形：\n"
+            "      · 栈起着、日志在别处 ⇒ 用 `--log <那份日志>` 指过去；\n"
+            "      · **你根本没起过栈**（只想拿 --attach 当零副作用体检）⇒ "
+            "这条 FAIL 就是这个意思：**没有栈可附着**，这次体检到此为止。"
+            % log_path)
+
+
 def ask_authorization(prompt_fn=input, isatty=None):
     """交棒前**再问一次**（AGENTS.md 红线 6：真机动作逐次授权）。
 
@@ -1768,16 +1785,26 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     _print_effective(site, params)
 
     if a.dry_run:
+        # ⚠️ `P2.槽位数` **不在这里缺席**（2026-10-06 修）。它只**读一个文件**
+        #    （`read_planner_yaml`），不跑子进程、不连设备 —— 完全在 `--dry-run`
+        #    的合同之内。原来写的是「要读 planner_params_file，这一档留给真跑」：
+        #    **理由本身是错的**，而代价很贵 —— 任务描述与 `planner_params_file` 的
+        #    **槽位数不一致**这件事，本来只有**上板起栈**那一刻才暴露，而槽位数正是
+        #    判分用的量（「已放置 N/N」「槽位已用尽（N 个）」）⇒ 形态是
+        #    「跑完一整轮才发现判错了」。本轮它就是这么被抓到的（站点指向 8 槽的文件、
+        #    `a1-noplan` 期望 4 槽），而那时我**人已经在板上**了。
+        #    ⇒ 现在 `--dry-run` 就会红，也就是**在桌面上、起栈之前**就能发现。
         for nm, det in (("P2.声明集",
                          "要跑 `ros2 launch … --show-args` 才拿得到声明集，"
                          "而 --dry-run 不跑任何子进程"),
-                        ("P2.槽位数", "要读 planner_params_file，这一档留给真跑"),
                         ("P2.起栈", "--dry-run 不起栈")):
             add(S2, Item(nm, SKIP, det), absent="--dry-run 只看静态（文件与命令）")
+        add(S2, judge_place_slots(task, site))
+        code, _, _ = decide(counted(report, S2), None, launched=False)
         print()
         print("  ❌ 注意：--dry-run 退 0 只表示「计划拼得出来」，**不代表**任何闸门"
               "验过 —— 上面每一项都标着「声明缺席」。")
-        return finish(0, launched=False, dry_run=True)
+        return finish(code, launched=False, dry_run=True)
 
     env = dict(ros_env or os.environ, ROS_DOMAIN_ID=str(site.ros_domain_id),
                PYTHONUNBUFFERED="1")
@@ -1810,8 +1837,7 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     t_launch = None
     if a.attach:
         if not os.path.exists(log_path):
-            add(S2, Item("P2.起栈", FAIL,
-                         "--attach 要判分就得有日志，而 %s 不存在" % log_path))
+            add(S2, Item("P2.起栈", FAIL, attach_log_missing_note(log_path)))
             return finish(2, launched=False)
         print("\n  （--attach：不起栈，只附着已起的栈；日志 %s）" % log_path)
     else:
@@ -2031,12 +2057,75 @@ def _parser():
     return ap
 
 
+def slot_count(vals):
+    """`ros__parameters` 里**有几个放置槽**。**纯函数** → `(槽数|None, 说明)`。
+
+    ⚠️⚠️ `place_slots` 是**扁平**的 `[x0, y0, x1, y1, …]`，**不是** `[[x, y], …]`
+    —— `planner_node.py:203` 逐字写着这件事，`:213-215` 就是这么解回来的。
+    所以槽位数是 **`len // 2`，不是 `len`**。
+
+    2026-10-06 之前这里写的是 `len(place_slots)`，而**离线夹具**用的是
+    `[[x,y], …]` —— 一个真机节点**明确不接受**的形状（`planner_node.py:621` 会
+    因为奇数长度直接抛）。夹具与现场差一个形状 ⇒ **判据在夹具上恒对、在真机上恒错**，
+    于是这条缺陷藏到今天第一次真读现场文件才露头。**「夹具替代码说谎」的第三次**，
+    而且这次连累了一个我差点发出去的错结论（见下面 `judge_place_slots` 的注释）。
+    """
+    if not isinstance(vals, list) or not vals:
+        return None, "没有 place_slots（或不是列表）"
+    if any(isinstance(v, (list, dict, tuple)) for v in vals):
+        return None, ("place_slots 里有**嵌套**的元素 —— 节点只接受**扁平**的 "
+                      "[x0,y0, x1,y1, …]（`planner_node.py:203`；写成 [[x,y], …] "
+                      "它会在 float() 上直接抛）")
+    if len(vals) % 2:
+        return None, ("place_slots 有 %d 个值（**奇数**）—— 它必须成对 "
+                      "[x0,y0, x1,y1, …]，节点自己也会因此抛（planner_node.py:621）"
+                      % len(vals))
+    return len(vals) // 2, ""
+
+
+def sibling_slots(path, limit=6):
+    """`path` 同目录下**别的** planner 参数文件各有多少个槽 —— 「站点指错文件了」的证据。
+
+    **纯函数**（只读文件；任何一步失败都跳过，不抛）。返回 `[(文件名, 槽位数), …]`。
+
+    为什么要有它：这台设备上**同时躺着好几份** planner 参数文件（A1 的、A2 分拣的、
+    包内那份仿真默认值），而站点只指得动一份。槽位数对不上时报「有 N 个 / 期望 M 个」
+    是**对的但不够** —— 现场要的是「我该指哪一份」。把同目录的候选连同它们的槽位数
+    摆出来，这一步就从「再查一遍」变成「看一眼」。
+    """
+    d = os.path.dirname(os.path.abspath(os.path.expanduser(path or "")))
+    me = os.path.basename(path or "")
+    out = []
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for n in names:
+        if n == me or not n.endswith((".yaml", ".yml")):
+            continue
+        vals, _ = read_planner_yaml(os.path.join(d, n))
+        n_slots, _ = slot_count((vals or {}).get("place_slots"))
+        if n_slots:
+            out.append((n, n_slots))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def judge_place_slots(task, site):
-    """P2：`planner_params_file` 里的 `place_slots` 长度要等于任务期望的槽位数。
+    """P2：`planner_params_file` 里的**槽位数**要等于任务期望的槽位数。
 
     能推导的不复述：槽位数**不作为任务描述里的唯一真值**，而是从活的那份 yaml 读出来
     对一遍 —— 两边不一致时，A1 的判据（「已放置 N/N」与「槽位已用尽（N 个）」）必然
     判错，而错误会以「判分没过」的形式出现在**跑完之后**。
+
+    ⚠️ 它是**纯文件读**，所以 `--dry-run` 也跑它（2026-10-06 起）—— 见 P2 那段的注释。
+
+    ⚠️ **这条判据 2026-10-06 修过一次实质错误**：它原来数的是 `len(place_slots)`
+    （= 值的个数 = 槽数的**两倍**）。第一次真读现场文件时报了
+    「有 8 个，期望 4 个」，我差点把它当成「站点指错了文件」发给用户 ——
+    而现场那份 `site_real.yaml` 里恰恰是 **4 个槽**（8 个数），与阶段 1 契约
+    「放置槽位留 4 个」**完全一致**。**判据错了，不是现场错了。**
     """
     path = site.planner_params
     vals, why = read_planner_yaml(path)
@@ -2044,18 +2133,29 @@ def judge_place_slots(task, site):
         return Item("P2.槽位数", FAIL,
                     "读不到 planner_params_file（%s）：%s —— 真机上不给它 / 给错路径会"
                     "**静默用仿真几何**，先修这个" % (path, why))
-    slots = vals.get("place_slots")
-    if not isinstance(slots, list) or not slots:
-        return Item("P2.槽位数", SKIP,
-                    "%s 里没有 place_slots（或不是列表）—— 没验到" % path)
-    if len(slots) != task.slots_total:
-        return Item("P2.槽位数", FAIL,
-                    "%s 的 place_slots 有 %d 个，任务描述期望 %d 个 —— 两边不一致时"
-                    "判分必然判错（改完记得同步）"
-                    % (path, len(slots), task.slots_total))
+    n_slots, bad = slot_count(vals.get("place_slots"))
+    if n_slots is None:
+        return Item("P2.槽位数", FAIL if "奇数" in bad else SKIP,
+                    "%s 的 %s —— 没验到" % (path, bad))
+    if n_slots != task.slots_total:
+        det = ("%s 的 place_slots 有 %d 个槽（%s 里 %d 个值，扁平两两成对），"
+               "任务描述期望 %d 个 —— 两边不一致时判分必然判错"
+               "（「已放置 N/N」「槽位已用尽（N 个）」都按**后者**算，而错会以"
+               "「跑完一整轮、判分没过」的形式出现）。\n"
+               "      ⚠️ **先看台面再改**：这个数不是配置偏好，是"
+               "**台面上真的有几个放料位**。\n"
+               "      · 台面确实是 %d 个 ⇒ 改任务描述的 `expect.slots_total`；\n"
+               "      · 台面是 %d 个 ⇒ 站点 `planner_params` **指错文件了**。"
+               % (path, n_slots, path, n_slots * 2, task.slots_total,
+                  n_slots, task.slots_total))
+        near = sibling_slots(path)
+        if near:
+            det += ("\n      同目录下别的 planner 参数文件（供你认哪一份是现场的）：\n"
+                    + "\n".join("        · %s → %d 个槽" % (n, c) for n, c in near))
+        return Item("P2.槽位数", FAIL, det)
     return Item("P2.槽位数", PASS,
-                "place_slots %d 个，与任务描述一致（读自 %s）"
-                % (len(slots), path))
+                "place_slots %d 个槽（%d 个值，扁平两两成对），与任务描述一致"
+                "（读自 %s）" % (n_slots, n_slots * 2, path))
 
 
 def _print_plan(params, sources, note=None):
