@@ -14002,3 +14002,92 @@ def leftovers():
 这正是本仓反复记的那类错误：**夹具通过/失败的原因不是被测的那条判据**。
 改成 `python3 /opt/ur5vg/scripts/fake_joint_states.py`（形状照
 `no_arm_stack.py:240` 真实 spawn 的那条命令），并把这句教训写进夹具上方的注释。
+
+---
+
+## 第九十四轮：统一启动器第四步 —— `board_run.py` 任务无关启动器 + 任务描述**数据文件**（2026-10-06）
+
+落地决策 1 的落法：**启动器一行都不认识 A1**。换场景 = 加一份同形状的 yaml。
+新增 4 个文件、**零改动**既有代码（`board_a1.py` / `board_lib.py` / `board_gate.py` /
+`ros2_ws/**` 一行没碰，`git diff --stat` 为空）。
+
+| 文件 | 行数 |
+|---|---|
+| `scripts/board_run.py` | 1717 |
+| `scripts/test_board_run.py` | 1278（12 节，179 条断言） |
+| `config/tasks/a1.yaml` | 82 |
+| `config/tasks/a2.yaml` | 58 |
+
+### 1. 红线 6 的落法（本轮最要紧的一条）
+
+`startup-design` 逐字核出：红线 6 的原文把「**控制器切换**」与「机械臂动作」「真机抓取」
+**并列点名**。所以控制器闸门不是「能不能写服务」的问题（它是 `/controller_manager`
+上的标准 ROS 2 服务，不手搓 RTDE、不碰 30001–30004 ⇒ 不违红线 1），**是「授权从哪来」
+的问题**。落到代码上，三轮确认：
+
+- **任务描述里没有、也不许有「允许自动切换」这类键。** 启动器代码不认识 A1，
+  profile 是仓库外可复制的**数据** —— 一条数据不能冒充一次授权（否则正是
+  「上一次的授权不覆盖这一次」）。`a1.yaml` 里 11 个顶层键逐个看过，无一是授权开关。
+- `board_run.ask_authorization()`：**非交互终端直接拒绝**，**没有无人值守模式**，
+  要人打出字面的 `yes`，提示语逐条点名「**当次**授权 / **急停在手边** / **工作区已隔离**」
+  —— 与红线 6 的三项条件一一对应。
+- 写路径只有 `--repair-controller` 一个开关，`store_true`，**不重实现**
+  （`board_run.py` 里连 `switch_controller` 这个服务名都不出现，透传给 `board_gate`）。
+
+**源码钉子**（`test_board_run.py` 第 [1] 节，16 条）把这些钉成断言，其中三条尤其吃劲：
+`play`/`power`/`stop` **没有任何一条字符串字面量**；顶层**不 import `board_a1`**
+（⇒「静默回落仓库里的 `CAM`」**在结构上就做不到**，不是靠人记得别写）；
+不 import `socket`（唯一的网络路径是 `board_lib.dashboard`，只读 29999）。
+
+### 2. 计划外但必须有的三处改动（都记下来，因为都改了判定行为）
+
+1. **声明集取三份 launch 的并集**，不是只取 `entry`。真机细分项
+   （`robot_ip`/`camera_*`/`planner_params_file`/`use_target_plane`/`target_plane_z`/
+   `start_delay`）在 `bringup.launch.py` 里**故意不声明**，靠 `launch_configurations`
+   直通。只问入口 ⇒ **14 个正确参数被误报成拼错**，M6 那条检查就废了。
+   并集 = bringup(7) ∪ real(21) ∪ pipeline(30) = **46 个唯一名**，
+   由 `test_board_run.py` 用 **AST 从 launch 源码算出来**，并断言与手抄夹具**逐字相等**
+   （源码改名 ⇒ 强制夹具跟着改，不会两边悄悄分叉）。这是**改设计**，不是改实现。
+2. **`a2.yaml` 是故意不能跑的**：它保留 `score.callable: board_a2:grade`（模块不存在），
+   用来把「点号引用解析不到就**大声报错**、不静默跳过判分」压成断言。
+   ⇒ `--task a2` 今天就该退 2。它是**下一阶段的模板**，不是能跑的档。
+   若哪天它突然能跑通了，说明「解析不到要报错」这条坏了。
+3. **`--dry-run` 的披露完备性**：它打印的是**真实会发的参数集**，
+   测试用假 `ros2` + 哨兵文件证明 `--dry-run` **一个子进程都没跑**，
+   而端到端那次哨兵才出现 —— 这才是真正的对照（只断言「dry-run 打印了东西」是空绿）。
+
+### 3. 变异（计划表 M1–M7 全部到位，另加 M12）
+
+| # | 位置 | 改前 ≠ 改后 |
+|---|---|---|
+| M1 | `test_board_gate.py` | 子串判定 ⇒ 全程 `inactive` 被判成 active |
+| M2 | `test_board_gate.py` | 去掉稳定窗口 ⇒ 被打回又回来那一瞬判 PASS |
+| M3 | `test_board_gate.py` | 只数个数 ⇒ y=1.4（臂够不到）也判 PASS |
+| M4a/b/c | `test_board_lib.py` | 满 TTL / `verified` 缺失 —— 分别翻面 |
+| M5 | `test_board_gate.py` | 去掉「已收工」⇒ 收工了的规划器判 PASS |
+| M6 | `test_board_run.py` | 拼错一个键 ⇒ **栈根本不起**（改前「栈起了、红在 P3」，改后「红在 P2」） |
+| M7 | `test_board_lib.py` | 血缘排除改回 `basename(__file__)` ⇒ 调用方被误报 |
+| M12 | `test_board_lib.py` | `pattern` 收了不用 ⇒ 本阶段残留静默漏报 |
+
+另有一条**不是变异但同等重要**：削掉「有 SKIP ⇒ 退 2」后 rc 从 2 变 0
+（fail-closed 那条是吃劲的）。SKIP 一律**不计入通过**，三态分开计数。
+
+### 4. 离线**只能 SKIP** 的清单（诚实清单，不许看起来是绿）
+
+`P1.串口` / `P1.AG-95 初始化` / `P1.控制柜` / `P1.部署前置` / `P1.板子树` /
+`P2.起栈` / `P3.控制器闸门` / `P3.示教器 PLAYING` / `P4` 全 6 项 / `P5` 真机日志判分。
+这些只验了「判据对**合成事实**的反应」，**没验过设备**。
+另外 `--repair-controller` 的写路径离线**只验到「参数存在且透传」**（2 处），
+**写路径本身没有真机验过** —— 报告里必须写 `repair exercised: no`，
+否则「没触发」会被读成「验证过了」。
+
+### 5. 交付方自己报的两条发现（我复核过，都属实）
+
+1. **`place_slots` 数目对不上**：仓库 `ros2_ws/src/grasp_planner/config/grasp_planner.yaml`
+   实测 **12 个元素 = 6 个槽位**，而 `a1.yaml`（照阶段 1 契约）要 **4**。
+   真机 `planner_params_file` 指向的那份槽位数**离线核不了**；若它真是 6，
+   `P2.槽位数` 会红。**这是闸门在按设计工作**，但要知道它会红。
+2. **共享 `/tmp` 有遗留**：早期几次跑测试在 `/tmp` 留下约 10 个 `board_run_mut_*`。
+   清理命令被权限分类器拦下（共享 /tmp 通配删除），交付方**没有**绕过去 —— 对的。
+   修好 `TMP_ROOT` 之后新跑不再产生。**交由用户处置**（`rm -rf /tmp/board_run_mut_*`），
+   本会话不代为执行一条已被拒的命令。

@@ -1,0 +1,58 @@
+# ⚠️ 这是**模板 / 起点**，不是可以现在拿去跑的任务。
+#
+# 它是**阶段 2（多类分拣）**的任务描述骨架：形状与 `a1.yaml` 完全一样，差别只在
+# 任务特有的那几项。**阶段 2 的契约还没写**（`docs/阶段/阶段2-多类分拣/契约.md`），
+# 所以这份文件里凡是需要契约才能定的值，都只能先抄阶段 1 的 —— 抄来的每一处都标了
+# 「待契约确认」。**别在阶段 2 契约落地之前拿它上真机。**
+#
+# 这份文件同时示范**一件必须故意留着的事**：`score.callable` 指向的
+# `board_a2:grade` **现在还不存在**。启动器遇到这种情况**必须大声报错**，
+# 绝不许「判分跳过、报告全绿」 —— 判分器换个名字/搬个家，是很容易发生的，
+# 而它的失效方式是「看起来一切正常」（`test_board_run.py` 钉着这一条）。
+
+task: a2
+
+launch:
+  entry: yolo_bringup/bringup.launch.py
+  camera_source: realsense
+
+  # 与 a1 同一套理由：真机细分项靠 launch_configurations 直通给这两份，入口那份
+  # 故意不声明它们（见 `a1.yaml` 里的长注释与 `bringup.launch.py` 文件头）。
+  declared_entries:
+    - yolo_bringup/bringup.launch.py
+    - yolo_bringup/real.launch.py
+    - yolo_bringup/pipeline.launch.py
+
+  start_delay: 120        # 待契约确认：多类分拣要不要更长的按播放窗口
+  trajectory_action: /scaled_joint_trajectory_controller/follow_joint_trajectory
+
+  # 例：某一档本来就没有遥测/参数回读时，在**调用方**这一侧显式声明缺哪几项
+  # （`board_gate --allow-skip` 的同名语义；controllers 不许出现在这里）。
+  # allow_skip: [telemetry]
+
+params:
+  # 值一律写成**字符串**：launch 参数只有字符串一种形态。
+  carry_objects: "true"
+  gripper_backend: "ag95"
+  use_target_plane: "true"
+  target_plane_z: "0.0285"
+  # 阶段 2 预期会多出来的：按类放置的策略/类别名映射之类。
+  # 具体键名等契约定了再写 —— 现在编一个只会让「拼错不报错」更难查。
+
+model: block_best.pt     # 待契约确认：多类要用多类权重，模型文件名会变
+
+expect:
+  slots_total: 4         # 待契约确认：现在抄的是阶段 1 的盘（4 槽）
+  min_candidates: 4      # 待契约确认：多类同场时这个下限要重定
+  finish_marker: "收工："
+  timeout: 900
+  params:
+    carry_objects: "true"
+    gripper_backend: "ag95"
+
+score:
+  # ⚠️ 这个模块**还不存在** —— 阶段 2 的判分本体属于阶段 2 的契约。
+  #    现在跑 `--task a2` 的话，P0 能过（形状是合法的），但判分那一步会
+  #    **报错**（CallableError），退 2；**不会**静默跳过判分。
+  callable: "board_a2:grade"
+  explain: "board_a2:explain"

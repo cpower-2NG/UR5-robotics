@@ -1,0 +1,82 @@
+# 阶段 1（点对点抓放）的任务描述 —— A1 真机验收
+#
+# **这是什么**：`scripts/board_run.py` 读的**数据文件**。启动器一行代码都不认识 A1；
+#   换场景 = 加一份同形状的 yaml，启动器不动。这里只写**任务特有**的东西 ——
+#   控制柜 IP、外参、参数文件路径一律从站点配置（~/.config/ur5-vision-grasp/site.yaml）
+#   推导，**不在这里复述**（复述一份就多一份会过期的真值）。
+#
+# **仓内这一份是模板/示例**：本仓是公开副本，一切提交永久公开（AGENTS.md 红线 3），
+#   所以里面不许出现真 IP / 真序列号 / 主机名 / 用户名。现场要改的话，把这份拷到
+#   `~/.config/ur5-vision-grasp/tasks/a1.yaml` 改 —— 同名时**现场那份优先**。
+#
+# 出口判据见 `docs/阶段/阶段1-点对点抓放/契约.md`；判分本体在 `scripts/board_a1.py`
+#   （`grade()`）—— 启动器只按下面 `score.callable` 的点号引用去调它，**不碰它**。
+
+task: a1
+
+launch:
+  # 真机的**唯一**入口。⚠️ 不要写成 pipeline.launch.py：只起 pipeline 时规划器
+  # 解不出任何 IK，而且**不报错**（现象是臂完全不动）。
+  entry: yolo_bringup/bringup.launch.py
+  camera_source: realsense
+
+  # 声明集要从哪几份 launch 文件取 `ros2 launch … --show-args`。
+  # ⚠️ **为什么不止 entry 一份**：真机细分项（robot_ip / camera_* /
+  #   planner_params_file / use_target_plane / target_plane_z / start_delay …）
+  #   在 bringup.launch.py 里是**故意不声明**的 —— 它们靠 launch_configurations
+  #   直通给 real.launch.py 与 pipeline.launch.py。只问入口的话，会把**正确的**
+  #   参数全报成拼错（拼错的检查就废了）。三份合起来才是「本次会发的参数」的声明集。
+  declared_entries:
+    - yolo_bringup/bringup.launch.py
+    - yolo_bringup/real.launch.py
+    - yolo_bringup/pipeline.launch.py
+
+  # 规划器推迟启动的秒数。它包的是 [realsense, detector, perception, planner]，
+  # **不含 UR 驱动** ⇒ 语义是「驱动立刻起 → 留 120 s 给人去示教器按播放 → 规划器才起」。
+  start_delay: 120
+
+  # 真机的轨迹 action。给了它就同时决定了控制器闸门盯哪个控制器
+  # （scaled_joint_trajectory_controller），以及参数回读时要核对的值。
+  trajectory_action: /scaled_joint_trajectory_controller/follow_joint_trajectory
+
+params:
+  # ⚠️ 这里全部写成**字符串**：launch 参数本来就只有字符串一种形态，
+  #    `carry_objects: true`（YAML 布尔）会被拼成 `carry_objects:=True`，
+  #    与 `:=true` 不是同一个字符串 —— 而那类差异**不报错**。
+  #
+  # carry_objects：规划器自己搬（真机必须 true；false 是给仿真/单步调试的）。
+  carry_objects: "true"
+  # gripper_backend / carry_objects 都在「全车入口下的 5 个死键」名单里 ——
+  # **命令行给的值才是有效值**（在 grasp_planner.yaml 里改它们不生效也不报错）。
+  # 这正是它们出现在这里、而不是靠 yaml 的原因。
+  gripper_backend: "ag95"
+  # 下面两个是 **projector_node** 的参数（不是规划器的）：用桌面平面假设代替 TF 求
+  # 平面法向，实测比 TF 稳。它们走同一条 launch_configurations 直通。
+  use_target_plane: "true"
+  target_plane_z: "0.0285"
+
+model: block_best.pt
+
+expect:
+  slots_total: 4          # place_slots 的个数（P2 会拿 planner_params_file 里的活值对一遍）
+  min_candidates: 4       # /targets_3d 至少要看到几个候选才肯起
+  # ⚠️ 摆件规矩：抓取区里要摆 **≥5 块**（= 槽位 4 + 1）。4 块 / 4 槽时第 4 块放下的
+  #   同一刻抓取区也空了，规划器先命中 `if best is None:`，**根本走不到**槽位闸门
+  #   ⇒ 收工走 idle_finish_timeout，「放置槽位已用尽」那行永远不会打出来（实测）。
+  #   启动器会在 P4 之后按实际候选数把这句话再喊一遍（候选 ≤ 槽位 ⇒ 本轮拿不到判据 2）。
+  finish_marker: "收工："
+  timeout: 900            # P5 盯日志的上限（秒）
+
+  # 起栈后**回读**规划器的有效参数，核对这几项（这是「参数静默失效」与「板上那份
+  # 代码树过期」的唯一活体判据）。回读的是 `/grasp_planner` 的
+  # `get_parameters`，所以键名**必须**是规划器声明过的参数名 —— 写 projector 的
+  # 参数名（use_target_plane / target_plane_z）会**假红**。
+  params:
+    carry_objects: "true"
+    gripper_backend: "ag95"
+
+score:
+  # 点号引用 ⇒ 启动器**不认识** A1 的判分实现。解不出来时**报错**，绝不静默跳过
+  # （跳过 = 没判分却报绿）。
+  callable: "board_a1:grade"
+  explain: "board_a1:explain"
