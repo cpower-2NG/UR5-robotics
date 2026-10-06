@@ -428,9 +428,19 @@ def main():
 
     print(__doc__.strip().splitlines()[1])
     ok = True
-    import rclpy
-    from rclpy.executors import SingleThreadedExecutor
-    from grasp_planner.planner_node import GraspPlanner
+    # 缺 ROS / 缺 grasp_planner = 环境不满足 = 退出码 2（见 README 的 0/1/2 约定）。
+    # 原来这里是裸 import：会抛 ModuleNotFoundError → 退出码 1，而本仓库 1 的含义
+    # 是「测到了且是坏的」—— 本自检一个字都没测到，报 1 是假警报。
+    # 报 0 更坏：会被读成「整段护栏验过了」。这里停在建节点**之前**，不发轨迹。
+    try:
+        import rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        from grasp_planner.planner_node import GraspPlanner
+    except ImportError as e:
+        print(f"[SKIP] 需要 ROS2 环境（{e}）。")
+        print("       先 source /opt/ros/humble/setup.bash 与 ros2_ws/install/setup.bash。")
+        print("       本自检什么都没测到 —— 退出码 2。")
+        return 2
 
     # 起一个**真的** GraspPlanner（`gripper_backend:=none`，不碰硬件）。
     # A/D 两段共用这一个实例 —— rclpy 在一个进程里 init 两次不可靠。

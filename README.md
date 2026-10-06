@@ -235,8 +235,8 @@ source /opt/ros/humble/setup.bash
 export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
 
 python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学（3 项）
-python3 scripts/test_perception_3d.py    # 感知单元：23 项断言
-python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言
+python3 scripts/test_perception_3d.py    # 感知单元：23 项断言（缺 ROS ⇒ 退出码 2）
+python3 scripts/test_detector_device.py  # 设备退化分支：19 项断言（缺 ROS ⇒ 退出码 2）
 python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生 + 相机序列号守卫：
                                          #   108 项（本机，另有 3 项 SKIP）
                                          #   板上是 109 项、2 SKIP（ur_robot_driver 只有板上有）
@@ -367,7 +367,7 @@ python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，
 
 > 上面这些数字是**实测**值（2026-09-28）。它们会随断言增加而变，改脚本时请顺手核对
 > —— 写错不影响运行，但会让人以为「我这边少跑了几项」。
-> ⚠️ **三个脚本缺依赖时的行为不一样，别只看退出码**：
+> ⚠️ **缺依赖时的行为不一样，别只看退出码**：
 > - `test_ag95_probe.py`：只有第 2 段要 pymodbus，所以缺了会**降级**跑其余部分，
 >   报 `26 PASS / 6 SKIP` 且**退出码 0** —— 这次运行覆盖不全，不能当「验过了」。
 > - `test_ag95_gripper.py`：每一项都走 pymodbus 的串口客户端，**没有可降级的部分**，
@@ -377,6 +377,20 @@ python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，
 >   缺了报 `1 PASS / 10 SKIP` 且**退出码 0** —— 同样**不能当「验过了」**。
 >   而它唯一的实质断言（「预演不写寄存器」）恰好就落在 SKIP 的那一段里。
 > - 全跑的办法都一样：`pip3 install "pymodbus>=3.6"`。
+>
+> ✅ **2026-10-06 修：四个要 ROS 的脚本缺 rclpy 时一律退出码 2**（此前它们各走各的，
+> 两个报 0、两个裸崩报 1）。**0 和 1 都是错的**：0 会被读成「全通过」而其实一条断言
+> 都没跑；1 在本仓库的含义是「测到了且是坏的」，那是假警报。四个都改成显式 2 + 一行
+> `[SKIP]`，与 `test_ag95_gripper.py` 的先例一致：
+> - `test_perception_3d.py`（原来 `sys.exit(0)`）、`test_detector_device.py`（原来 `return 0`）
+> - `test_guard_path.py`、`test_pipeline_e2e.py`（原来都是模块顶层/裸 `import rclpy` ⇒
+>   `ModuleNotFoundError` ⇒ 退出码 1）
+> 复现：`env -u AMENT_PREFIX_PATH -u ROS_DISTRO -u PYTHONPATH python3 scripts/test_perception_3d.py; echo $?` → `2`。
+> ⚠️ **仍在的同类项（未改，属口径选择）**：`test_minimal.py` 缺 ultralytics 时
+> `return False` ⇒ 报「YOLO 检测 ✗ FAIL」⇒ **退出码 1**，而它只是没装解释器依赖
+> （另外两个子项照跑）。要判「部分可降级」记 0（按上面 `test_ag95_probe` 的先例）
+> 还是记 2，得先定口径。`test_ag95_probe.py` 的退出码 1 则是**真结论**（场上有从站、
+> `0x0202 = 637‰` 那条断言确实没过），不要顺手改成 2。
 
 **Ctrl-C 收工验收**（**在板子上跑**，不是 WSL）——「正常收工」这件事只有真被 Ctrl-C
 一次才知道，静态检查只能保证写法对：

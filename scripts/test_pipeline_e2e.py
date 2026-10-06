@@ -49,16 +49,25 @@ v1 用「子线程 rclpy.spin」跑，结果旋起线程后立即抛异常且 tr
 import sys
 import time
 
-import numpy as np
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseStamped, TransformStamped
-from vision_msgs.msg import (
-    Detection2DArray, Detection2D, BoundingBox2D, Pose2D, Point2D,
-    Detection3DArray, ObjectHypothesisWithPose,
-)
-from tf2_ros import StaticTransformBroadcaster
+# 缺依赖 = 环境不满足 = 退出码 2（见 README 的 0/1/2 约定）。这里原来是模块顶层
+# 裸 import：缺 rclpy 时抛 ModuleNotFoundError → 退出码 1，而 1 的含义是
+# 「测到了且是坏的」—— 本脚本一条断言都没跑，报 1 是假警报。
+try:
+    import numpy as np
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import Image, CameraInfo
+    from geometry_msgs.msg import PoseStamped, TransformStamped
+    from vision_msgs.msg import (
+        Detection2DArray, Detection2D, BoundingBox2D, Pose2D, Point2D,
+        Detection3DArray, ObjectHypothesisWithPose,
+    )
+    from tf2_ros import StaticTransformBroadcaster
+except ImportError as e:
+    print(f"[SKIP] 需要 ROS2 Python 环境（{e}）。")
+    print("       先 source /opt/ros/humble/setup.bash 与 ros2_ws/install/setup.bash。")
+    print("       本脚本什么都没测到 —— 退出码 2。")
+    sys.exit(2)
 
 FX = FY = 138.5          # 554 / 4
 CX, CY = 80.0, 60.0      # 320/4, 240/4

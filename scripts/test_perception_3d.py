@@ -31,7 +31,10 @@ try:
 except ImportError as e:
     print(f"[SKIP] 未找到 ROS2 Python 环境（{e}）。")
     print("       请先 source /opt/ros/humble/setup.bash 再运行本脚本。")
-    sys.exit(0)
+    # 退出码 2 = 环境不满足、**一项都没测到**（见 README 的 0/1/2 约定）。
+    # 原来这里是 exit(0)：缺 ROS 时会被读成「23 项全通过」，而其实一条断言
+    # 都没跑 —— 正是本仓库一直在防的「假绿」。
+    sys.exit(2)
 
 sys.path.insert(0, str(PERCEPTION_SRC))
 from projector_node import Perception3D, DEPTH_SCALE_BY_ENCODING  # noqa: E402

@@ -15112,3 +15112,83 @@ python3 scripts/test_deidentified.py          rc=0
 ⚠️ 这一条**只是把打印的路指对**，没有动板子上任何东西 —— 板子上的同步/清理
 仍按原纪律由用户执行。**假设**：活检出 = `~/ur5-vision-grasp`（依据是它干净、
 HEAD 与 A2 验收一致、`install/` 最新；如果现场其实在用另一个，这两行要改回来）。
+
+### 8. 顺手逮到：四个要 ROS 的自检，缺依赖时**没有一个是 2**（两个报 0、两个报 1）
+
+**怎么发现的**：本会话在核对「B1a 的验证到底能不能信」时，把一个粗糙的判别式
+`grep -L "return 2" scripts/test_*.py` 扫了一遍全仓自检。它报出四个 import `rclpy`
+却从不按 0/1/2 约定返回的文件。
+
+⚠️ **判别式本身是粗的，别直接采信它的名单** ——「没有 `return 2`」不等于「退出码不是
+2」（有的是靠 `sys.exit(2)`，有的是靠别的路径）。下面每一条都是**实测**过的，不是
+grep 推的。
+
+**四个文件、改前实测退出码**（`env -u AMENT_PREFIX_PATH -u ROS_DISTRO -u PYTHONPATH`）：
+
+| 文件 | 缺 `rclpy` 时的原实现 | 改前 rc |
+|---|---|---|
+| `test_perception_3d.py:34` | `except ImportError` → `sys.exit(0)` | **0** |
+| `test_detector_device.py:76` | 内层 `except ImportError` → `return 0` | **0** |
+| `test_guard_path.py:431` | `main()` 里裸 `import rclpy` → 抛 `ModuleNotFoundError` | **1** |
+| `test_pipeline_e2e.py:53` | 模块顶层裸 `import rclpy` → 抛 `ModuleNotFoundError` | **1** |
+
+**为什么 0 和 1 都是错的**（不是风格问题，是两个方向相反的说谎）：
+
+- **报 0**：README 那张表写着 `test_perception_3d.py # 23 项断言`、
+  `test_detector_device.py # 19 项断言`。缺 ROS 时它打印一行 `[SKIP]` 就 `exit(0)`，
+  于是**一条断言都没跑，退出码却是「全通过」**。这正是本仓库 `sys.dont_write_bytecode`、
+  变异测试、`test_deidentified.py` 一路在防的那个东西：**假绿**。
+- **报 1**：按 README 的 0/1/2 约定，**1 的含义是「测到了且是坏的」**。裸崩报 1
+  ⇒ 读日志的人会去找一个**根本不存在的**故障。而这两个恰恰是最不该假警报的：
+  `test_guard_path.py` 起的是**一个真的 `GraspPlanner`**（它 docstring 自己警告
+  「控制器在的时候它会指挥真机回 HOME」），`test_pipeline_e2e.py` 是要真起 DDS 的
+  那个 —— 它们报「坏」，会把人往真机链条上引。
+
+**改法**：四处一律显式 **2**（环境不满足、一项都没测到），并各打一行 `[SKIP]` 说清
+要 source 什么。**依据是仓库自己的先例**，不是新立的规矩：`test_ag95_gripper.py`
+「没有可降级的部分」时就是直接退出码 2，README 原文称它「**不假装跑了一部分**」。
+这四个同样没有可降级的部分（缺 rclpy 就没有任何一条断言能跑）。
+
+`test_guard_path.py` 的 try 块刻意包住 `import rclpy` **和**
+`from grasp_planner.planner_node import GraspPlanner` 两行，并且停在**建节点之前** ——
+即「环境不满足 ⇒ return 2」这条路径永远不会走到 `rclpy.init()`/发轨迹那一步。
+
+**改后实测**（同一条命令，逐个跑）：
+
+```
+test_perception_3d.py      rc=2 | [SKIP] 未找到 ROS2 Python 环境（No module named 'rclpy'）。
+test_detector_device.py    rc=2 | [SKIP] 需要 ROS2 Python 环境（No module named 'rclpy'）。
+test_guard_path.py         rc=2 | [SKIP] 需要 ROS2 环境（No module named 'rclpy'）。
+test_pipeline_e2e.py       rc=2 | [SKIP] 需要 ROS2 Python 环境（No module named 'rclpy'）。
+```
+
+这一对「改前 / 改后」也就是这四处改动的**变异证据**本身：改前 0/0/1/1、改后 2/2/2/2，
+说明那几行确实在管退出码，不是摆设。
+
+**全仓现状**（`for f in scripts/test_*.py`，ROS 环境剥掉，47 个文件）：
+`rc=0: 34 个 / rc=1: 2 个 / rc=2: 11 个`。**要按实测读，别按上一次的（37/6/4）算差**：
+两次扫描之间 `scripts/test_place_verify.py` 等文件进出过工作区，逐文件对不上就不该
+拿总数做加减。**有意义的只有上表那四条的逐文件前后**。
+
+**刻意没改的两处**（写下来免得下一轮又被「顺手」改掉）：
+
+1. `test_minimal.py` —— 缺 `ultralytics` 时 `test_yolo_load()` `return False`，
+   最终打印「YOLO 检测 ✗ FAIL」并 **rc=1**。但它其实**只是解释器不对**
+   （README 原文：不叠 conda `PYTHONPATH` 时「看起来像项目坏了 —— 其实只是解释器不对」），
+   而且三个子项里另两个（3D 投影、深度滤波）**照跑照过**。这落在
+   「部分可降级」那一类上，仓库里有**两个相反的**先例：
+   `test_ag95_probe.py` 缺 pymodbus 时降级跑其余部分并**记 0**（README 只把它标成
+   「不能当验过了」的警告），`test_ag95_gripper.py` 无可降级部分时**记 2**。
+   到底该按哪个，是**口径选择**，不是缺陷——**留给用户定**，故未动。
+2. `test_ag95_probe.py` 的 **rc=1 是真结论**，不是同一类问题：场上有从站，
+   唯一那条失败断言是 `dump：FC3 读到 0x0202 = 637‰（含两种方向解释）`
+   —— 它是**测到了且是坏的**，1 正好是 1。**不要**把它顺手改成 2。
+
+**文档**：README「缺依赖时的行为不一样，别只看退出码」那一段原先把名单写成
+「**三个**脚本」（只列 ag95 那三个），四个 ROS 脚本一个都没提；已补成完整的
+「已修四个 + 两个仍在项」，并在 `test_perception_3d.py` / `test_detector_device.py`
+两行尾注上「缺 ROS ⇒ 退出码 2」，免得读表的人把它当成无条件 23/19 项全绿。
+
+⚠️ 这一轮**没有**碰任何真机面：四处改动都在自检脚本的**导入失败路径**上，
+板子上有 ROS 时走的是同一条老路径（try 成功、行为逐字不变）。板子同步按原纪律
+由用户执行。
