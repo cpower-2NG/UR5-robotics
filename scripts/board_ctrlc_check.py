@@ -29,6 +29,12 @@
 
 `exit code -2` 只在上面第 2 种假模拟里出现过，**不是验收对象**。
 
+## 退出码
+
+0 = 收工干净（每个节点报 `finished cleanly`、无 `Traceback`/`RCLError`、launch 退出码 0）；
+1 = 判据没过（留下了 traceback、有节点报 `died`，或报 cleanly 的节点太少）；
+2 = 环境不满足（没 source ROS，或板上还有上一轮的残留进程 —— 先清干净再测）。
+
 ## 用法（在板子上，先 source 两个 setup.bash）
 
     python3 scripts/board_ctrlc_check.py                 # 默认：不含机械臂的入口
@@ -37,6 +43,14 @@
 ⚠️ 默认入口（`pipeline.launch.py camera_source:=realsense`）**不含机械臂**：没有
 UR 驱动、没有 MoveIt、不发任何轨迹。**不要**把 `--entry` 指向 `real.launch.py`
 之类会去连机械臂的入口 —— 那个入口会真的驱动真机。
+
+> ⚠️ **这个默认入口与 D45 不矛盾，别把它读成「文档守卫判错了」。**
+> D45 禁的是把 `pipeline.launch.py` 当**成文的真机入口**去起（那会得到一个解不出
+> 任何 IK、却什么都不报错的规划器）。它由 `scripts/test_startup_docs.py` 把守，
+> 而那条守卫**只扫文档、不扫脚本**。
+> 本脚本用它恰恰是因为**它不含臂**：这里被测的是「收工干不干净」，要的是一个
+> **没有任何东西可动**的入口 —— 换成真机入口，一次 Ctrl-C 就变成一次真机动作。
+> ⇒ 这是**测试夹具**，不是给人照抄的启动方式。
 """
 
 import argparse

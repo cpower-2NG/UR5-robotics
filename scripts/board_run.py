@@ -169,6 +169,52 @@ TASK_REQUIRED = ("task", "launch.entry", "launch.camera_source",
 
 ENTRY_RX = re.compile(r"^[A-Za-z_]\w*/[A-Za-z_]\w*\.launch\.py$")
 
+# 任务描述**只认**这几个顶层键。别的键一律报红 —— 加一个键要改代码，改了才有人
+# 复核。这不是洁癖：见下面「授权不许来自数据文件」（AGENTS.md 红线 6）。
+TASK_KNOWN_TOP = ("task", "launch", "params", "model", "start_delay",
+                  "expect", "score")
+
+# 看着像「允许我自动做某个写操作」的键名。命中就红 —— **哪怕它其实不会被读到**：
+# 一份会被复制、会被沿用的数据里出现这种键，本身就是红线 6 要禁的形状。
+AUTH_ISH_RX = re.compile(r"allow|authoriz|approv|consent|repair|unattend|"
+                         r"auto|switch|bypass|force", re.I)
+
+# 唯一的例外：`launch.allow_skip`。它说的是「这一档本来就没有这一项」（**缺席**），
+# 不是「允许发写命令」。`params.*` **不**豁免 —— launch 参数是真能改变节点行为的
+# 开关，`params.repair_controller: "true"` 正是要拦的那种东西。
+AUTH_ISH_OK = ("launch.allow_skip",)
+
+
+def task_dotted_paths(raw, _prefix=""):
+    """把任务描述摊成**点号路径**列表（含中间节点）。**纯函数**。"""
+    out = []
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            p = "%s%s" % (_prefix, k)
+            out.append(p)
+            out.extend(task_dotted_paths(v, p + "."))
+    return out
+
+
+def find_authorization_keys(raw):
+    """任务描述里有没有「看着在承载授权」的键。**纯函数** → `[(路径, 为什么)]`。
+
+    空列表 = 干净。这不是风格检查：AGENTS.md 红线 6 要的是**当次**授权，它后半句
+    「上一次的授权不覆盖这一次」针对的正是「把授权写进某份文件/某个变量，之后一直
+    算数」。任务描述恰恰是最会被复制、被沿用的那种文件。
+    """
+    bad = []
+    for p in task_dotted_paths(raw):
+        if p in AUTH_ISH_OK:
+            continue
+        if AUTH_ISH_RX.search(p):
+            bad.append((p, "任务描述是**数据文件**，会被复制、会被沿用 —— 授权"
+                           "**不许**来自它（AGENTS.md 红线 6：「上一次的授权不覆盖"
+                           "这一次」）。也不许来自环境变量或上一次的记忆。要动控制器"
+                           "就用 `--repair-controller`：它先打印完整报文，再要你"
+                           "**当次**在交互终端上确认。"))
+    return bad
+
 
 def split_entry(entry):
     """`yolo_bringup/bringup.launch.py` → `("yolo_bringup", "bringup.launch.py")`。
@@ -228,6 +274,17 @@ def validate_task(raw):
     if not isinstance(raw, dict):
         return ["任务描述的顶层不是映射（是 %s）" % type(raw).__name__]
     p = []
+
+    # ---- 红线 6：授权不许来自数据文件（先查这个，免得「能跑」盖过「不该这么写」）
+    for k in sorted(raw):
+        if k not in TASK_KNOWN_TOP:
+            p.append("顶层有本启动器不认识的键 %r。任务描述只认这几项：%s —— 加键要"
+                     "**改代码**（改代码才有人复核）；用一份会被复制、会被沿用的数据"
+                     "承载行为/授权，是 AGENTS.md 红线 6 明令禁的形状"
+                     % (k, "、".join(TASK_KNOWN_TOP)))
+    for path, why in find_authorization_keys(raw):
+        p.append("%s 看着在承载授权：%s" % (path, why))
+
     for k in TASK_REQUIRED:
         v = dig(raw, k)
         if v is None or (isinstance(v, str) and not v.strip()):
@@ -439,33 +496,158 @@ def load_task_file(path):
 SITE_OWNED = ("robot_ip", "planner_params_file") + tuple(board_lib.CAM_KEYS)
 
 
+# ---- 参数集的守卫：本文件发出的键 vs 旧入口 `board_a1.build_cmd` -------------
+# 组装 launch 参数的地方**从一个变成了两个**（`board_a1.build_cmd` 与这里）。
+# 旧守卫只钉住旧的那一个 ⇒ 新入口的参数集**完全没有守卫**，而少一个键
+# （`publish_camera_tf` 就是这么漏掉的）在真机上是**静默**的。
+# 所以把「两份的差集」变成**数据 + 判据**：
+#   · 差集要逐项写出**为什么**（不许只列白名单）；
+#   · 两个方向都查（少一个 / 多一个都要红）；
+#   · 差集表**自己过时了也红**：某个键不再差 ⇒ 代码变了，理由得重写。
+#     （理由会过期的名单比没有名单更坏 —— 它会让人以为已经查过了。）
+# 判据只在 `test_board_run.py` 里跑：`board_a1` 是任务特有的，本文件**不许**
+# 顶层 import 它（那是「本文件不认识任何任务」这条不变量）。
+ENTRY_ONLY_OK = {
+    "tf_required":
+        "bringup.launch.py:227-232 按 camera_source 推导：`'false' if "
+        "camera_source == 'sim' else 'true'` ⇒ 真机入口（realsense）解析成 true。"
+        "复述一份反而多一处会跟它打架的真值。",
+}
+LAUNCHED_ONLY_OK = {
+    "model":
+        "旧入口靠 launch 的默认值给 model（解析不到时 detector 死掉而整栈其余"
+        "照跑）；本启动器把文件名写进任务描述，显式优于默认（台账 D67）。",
+}
+
+
+def judge_entry_parity(launched_keys, entry_keys,
+                       launched_only=None, entry_only=None):
+    """「本启动器发出去的键」vs「旧入口 `board_a1.build_cmd` 发的键」。**纯函数**。
+
+    → `(status, detail)`。等价 ⇒ PASS；差集**逐项有理由**且**没有过时项** ⇒ PASS
+    （detail 里把每一条理由摆出来）；否则 FAIL 并点名是哪个键、哪个方向。
+    """
+    launched_only = LAUNCHED_ONLY_OK if launched_only is None else launched_only
+    entry_only = ENTRY_ONLY_OK if entry_only is None else entry_only
+    launched, entry = set(launched_keys), set(entry_keys)
+
+    missing = sorted(entry - launched)          # 本文件**少**发的
+    extra = sorted(launched - entry)            # 本文件**多**发的
+    stale = sorted([k for k in entry_only if k not in missing]
+                   + [k for k in launched_only if k not in extra])
+
+    bad, why = [], []
+    for k in missing:
+        if k in entry_only:
+            why.append("少发 %s：%s" % (k, entry_only[k]))
+        else:
+            bad.append("**少发** %s —— 旧入口发了，本文件没发，而且没有理由"
+                       "（真机上大概是静默失效）" % k)
+    for k in extra:
+        if k in launched_only:
+            why.append("多发 %s：%s" % (k, launched_only[k]))
+        else:
+            bad.append("**多发** %s —— 本文件发了，旧入口没有，而且没有理由"
+                       "（先确认不是手滑加的）" % k)
+    for k in stale:
+        bad.append("差集表里的 %s 已经**不再差**了 —— 代码变了，这条理由得重写"
+                   "（留着一张永远对的白名单比没有更坏）" % k)
+
+    if bad:
+        return FAIL, ("%d 处对不上：\n" % len(bad)
+                      + "\n".join("      · %s" % x for x in bad))
+    head = "两份参数集：本文件 %d 个键 / 旧入口 %d 个键" % (len(launched), len(entry))
+    if not why:
+        return PASS, head + " —— **完全一致**"
+    return PASS, head + "，差集逐项有理由：\n" + "\n".join(
+        "      · %s" % x for x in why)
+
+
+def _put(params, src, k, v, s):
+    """空值不落进参数集（`None` / 空串 = 「这一项没人给」）。**纯函数**。"""
+    if v is None or str(v).strip() == "":
+        return
+    params[k] = str(v)
+    src[k] = s
+
+
+def task_params(task):
+    """**任务描述单独**能定的参数 → `({"键": "值"}, {"键": 来源})`。**纯函数**。
+
+    拆出来是为了「站点配置读不到时也能把**已经知道的那部分**摆给人看」——
+    否则披露完备性会在**最需要它**的那种失败上瞎掉（见 `_print_plan`）。
+    """
+    params, src = {}, {}
+    tsrc = "任务描述 %s" % task.rel
+    _put(params, src, "camera_source", task.camera_source,
+         "%s:launch.camera_source" % tsrc)
+    _put(params, src, "model", task.model, "%s:model" % tsrc)
+    for k, v in task.params.items():
+        _put(params, src, k, v, "%s:params.%s" % (tsrc, k))
+    if task.get("launch.start_delay") is not None:
+        _put(params, src, "start_delay", "%g" % task.start_delay,
+             "%s:launch.start_delay" % tsrc)
+    return params, src
+
+
+def _quat_is_zero(params):
+    """四元数四项是不是都是 0（= 不是一个合法的旋转）。**纯函数**。
+
+    与 `real.launch.py` 里 `publish_camera_tf:=true` 时那道自检**同一个判据**
+    （它用的是 `_is_zero`：|v| < 1e-12）；这里只判「站点那一份够不够格开发布器」。
+    """
+    q = [params.get(k) for k in ("camera_qx", "camera_qy", "camera_qz", "camera_qw")]
+    if any(v is None for v in q):
+        return True                      # 缺项也算「不够格」——别开
+    try:
+        return all(abs(float(v)) < 1e-12 for v in q)
+    except ValueError:
+        return True                      # 不是数（validate_site 会另外报）
+
+
 def resolve_launch_params(task, site):
-    """→ `({"键": "值"}, {"键": "来源"}, [冲突...])`。**纯函数**。
+    """→ `({"键": "值"}, {"键": 来源}, [冲突...])`。**纯函数**。
 
     来源逐项记下来，因为**有效值 = 站点 ⊕ 任务**，而现场最需要知道的就是「这一个值
     是谁给的」——「传了标定」不等于「两边都传了」（AGENTS.md §1 的两套几何）。
     """
-    params, src, conflicts = {}, {}, []
-
-    def put(k, v, s):
-        if v is None or str(v).strip() == "":
-            return
-        params[k] = str(v)
-        src[k] = s
-
-    tsrc = "任务描述 %s" % task.rel
-    put("camera_source", task.camera_source, "%s:launch.camera_source" % tsrc)
-    put("model", task.model, "%s:model" % tsrc)
-    for k, v in task.params.items():
-        put(k, v, "%s:params.%s" % (tsrc, k))
-    if task.get("launch.start_delay") is not None:
-        put("start_delay", "%g" % task.start_delay, "%s:launch.start_delay" % tsrc)
+    params, src = task_params(task)
+    conflicts = []
 
     ssrc = "站点 %s" % site.path
-    put("robot_ip", site.robot_ip, "%s:robot_ip（或 $UR_ROBOT_IP）" % ssrc)
-    put("planner_params_file", site.planner_params, "%s:planner_params" % ssrc)
-    for k, v in site.extrinsics().items():
-        put(k, v, "%s:topcam.extrinsics" % ssrc)
+    _put(params, src, "robot_ip", site.robot_ip, "%s:robot_ip（或 $UR_ROBOT_IP）" % ssrc)
+    _put(params, src, "planner_params_file", site.planner_params,
+         "%s:planner_params" % ssrc)
+    ex = site.extrinsics()
+    for k, v in ex.items():
+        _put(params, src, k, v, "%s:topcam.extrinsics" % ssrc)
+
+    # ---- 相机 TF 发布器：**由外参推导**，不写进任务描述 ----
+    # `real.launch.py` 的 `publish_camera_tf` 默认是 `"false"`，而它的判据是
+    # `launch_configurations.get("publish_camera_tf", "false") == "true"`
+    # —— **不传就等于 false**，launch 于是假定你有**外部** TF 源。后果是本站
+    # 发出去的那七个 `camera_*` 外参**没有任何东西消费**：外参是死的，TF 链
+    # 不存在，`tf_required` 解析为 true 之后 perception_3d 直接退出，而整栈其余
+    # 照跑 —— 正是本启动器要消灭的那类**静默失败**。
+    # 「站点给了外参 ⇒ 打开消费它们的发布器」是能推导的，所以不复述进 profile；
+    # 任务描述若**显式**写了 `params.publish_camera_tf`，以它为准（那是「我有
+    # 外部 TF 源」这类刻意选择，得让人说得出口）。
+    # 站点一个外参都没给 ⇒ 没有「消费外参」这回事：缺项由 `validate_site` 在
+    # P0.站点配置 里报，这里不重复喊（也**不**擅自打开发布器去撞 real.launch.py
+    # 的自检）。
+    if "publish_camera_tf" not in params and ex:
+        if _quat_is_zero(params):
+            conflicts.append(
+                "站点给了外参，但四元数（camera_qx..qw）不能用（**全零或缺项**）"
+                "—— 全零不是合法旋转（模长 0），缺项同理。因此**不打开**相机 TF "
+                "发布器（打开的话 real.launch.py 会当场抛错退出），本站也就没有"
+                "相机 TF 链。把标定值填进站点配置的 topcam.extrinsics；确知相机与"
+                "基座重合时才显式传 camera_qw:=1.0")
+        else:
+            _put(params, src, "publish_camera_tf", "true",
+                 "推导：站点给了相机外参（%s:topcam.extrinsics）⇒ 打开消费它们的"
+                 "发布器；不给就是 launch 默认的 false（= 假定你有外部 TF 源，"
+                 "本站那七个外参没人用）" % ssrc)
 
     # 站点权威项：任务描述里也写了同名键 ⇒ 记冲突（**不静默让后者赢**）
     for k in SITE_OWNED:
@@ -771,6 +953,17 @@ def judge_preflight(facts):
                         "没跑 check_board_deploy.py（脚本不在 / 跑不起来）"))
     elif rc == 0:
         out.append(Item("P1.部署前置", PASS, "check_board_deploy.py 退 0（依赖齐）"))
+    elif rc == 2:
+        # ⚠️ 与下面 `tree_rc` 的 2 **同样处置** —— 同一个退出码不许两种待遇。
+        # 2 在本仓的定义是「**环境不满足**，不是失败」（AGENTS.md §6）。而这个脚本
+        # 只有**一处**退 2：`check_board_deploy.py:174-175`「需要 ROS 环境」。
+        # 它**不可能**意味着「缺依赖」—— `run_helper` 继承本进程的环境，而 P0
+        # 已经查过 ROS 环境与域号并且**已经放行**才走到 P1。所以这里说「没验到」
+        # 才是实话：本项没测成，不是「看到了，而且它不对」。
+        out.append(Item("P1.部署前置", SKIP,
+                        "check_board_deploy.py 退 2 —— 它只有「需要 ROS 环境」这一处"
+                        "退 2，而 P0 已经确认环境在位，所以这一项**没验到**"
+                        "（不是缺依赖）。多半是子进程没拿到环境，先看 P0 那一行"))
     else:
         out.append(Item("P1.部署前置", FAIL,
                         "check_board_deploy.py 退 %s —— 缺依赖时症状离原因很远"
@@ -1166,6 +1359,104 @@ def wait_for_finish(log_path, deadline, marker, clock=time.time, sleep=None):
     return lines, find_marker(lines, marker)
 
 
+# =====================================================================
+# 红线 6：控制器切换（唯一的写路径）—— 报文、授权、复核
+# =====================================================================
+# 发文那一行在 board_gate.py（`Probe.switch_controllers`），本文件**不重实现**。
+# 本文件只做三件它该做的事：起栈**之前**拒绝没有当次授权的请求、把要发的报文
+# **先完整摆出来**、切完按**只读复核**判「生效 / 未生效」。三条见文件头。
+
+WRITE_PATH_ITEM = "P0.写路径授权"
+REPAIR_ITEM = "P3.控制器修复"
+SWITCH_TIMEOUT = 8.0            # 与 board_gate.Probe.switch_controllers 的默认值同
+
+
+def judge_write_path(isatty):
+    """`--repair-controller` 这一档能不能往下走。**纯函数** → `(status, detail)`。
+
+    非交互 ⇒ **FAIL**，不是 SKIP：这不是「没验到」，是「这个请求本身不成立」。
+    放在 P0，是为了**在起栈之前**就拒 —— 臂上电、栈起着的时候才发现没法授权，
+    那已经晚了。
+    """
+    if isatty():
+        return (PASS, "有交互终端 —— 到时候会**先打印完整报文**，再要你敲一次 yes；"
+                      "发文那一刻（臂已上电）还会再确认一次")
+    return (FAIL, "`--repair-controller` 要的是**当次**授权，而这里不是终端。"
+                  "授权**不许**来自任务描述 / 环境变量 / 上一次的记忆（AGENTS.md "
+                  "红线 6：「上一次的授权不覆盖这一次」）。换成交互终端再来；"
+                  "不要写路径的话去掉这个开关即可（默认只读）。")
+
+
+def _required_controllers_for(task):
+    """要激活哪几个控制器 —— 复用 `board_gate` 的**那一份**推导。**纯函数**。
+
+    ⚠️ 调的是 board_gate 的私有函数，这是**故意**的：「盯哪个控制器」只能有一处
+    真值，本文件另抄一套，就会在改一边时静默对不上 —— 而报文一旦和实际发出去的不
+    一样，比不打印更糟（人确认的是**那一条**）。前提是**本文件从不传 `--require`**
+    ⇒ 两边走同一条分支。这两件事都在 `test_board_run.py` 里钉着。
+    """
+    ns = types.SimpleNamespace(require=None,
+                               trajectory_action=task.trajectory_action)
+    return list(board_gate._required_controllers(ns))
+
+
+def switch_payload_lines(task, timeout=SWITCH_TIMEOUT, required=None):
+    """切换前要**先给人看**的完整报文。**纯函数** → 行列表。
+
+    服务名取自 `board_gate.SWITCH_SERVICE`（**不是**本文件里的字面量）；activate
+    列表取自 `board_gate._required_controllers`（同一份推导）。`strictness` 印的是
+    board_gate 实际发的那个：BEST_EFFORT(=1)。用 STRICT 的话，已经在 active 的
+    控制器会让整批 `Aborting, no controller is switched!`。
+    """
+    req = _required_controllers_for(task) if required is None else list(required)
+    return ["    ⚠️  马上要对控制器服务发一条**写**请求（红线 6 点名的「控制器切换」）：",
+            "        服务                   %s" % board_gate.SWITCH_SERVICE,
+            "        activate_controllers   %s" % (", ".join(req) or "(空)"),
+            "        deactivate_controllers []        ← 恒空，**永不** deactivate"
+            "（内容安全，与授权是两件独立的事）",
+            "        strictness             BEST_EFFORT(=1)   ← 不是 STRICT",
+            "        activate_asap          True",
+            "        timeout                %gs" % timeout,
+            "    授权只认**这一次**：任务描述 / 环境变量 / 上一次给过的，都不算。"]
+
+
+def judge_repair_outcome(repair_exercised, ctrl_status):
+    """切换**执行过**之后，只读复核的结果怎么算。**纯函数** → `(status, detail)`。
+
+    没执行过 ⇒ `(None, "")`（没有这一项）。执行过 ⇒ 必须给个说法：
+      · 复核过了 ⇒ PASS（复核走的是只读 `list_controllers`，不是「我们发成功了吗」）；
+      · 复核没过 ⇒ **FAIL**，文案直说「已执行但未生效」。
+    发出去的请求不等于结果 —— 这一项**不许**绿，也不许被当成「没验到」混过去。
+    """
+    if not repair_exercised:
+        return None, ""
+    if ctrl_status == PASS:
+        return PASS, ("切换已执行，复核**已生效**（复核走的是只读 list_controllers，"
+                      "不是「请求发成功了吗」）")
+    return FAIL, ("已执行但**未生效**（复核仍 %s）—— 发出去的请求不等于结果。"
+                  "别把这行读成绿：控制器没拉起来，规划器就驱动不了臂。"
+                  % ctrl_status)
+
+
+def repair_hint(task_name, rel=None):
+    """控制器闸门不过时该敲的**那一行**命令（纯函数，便于离线钉住）。"""
+    rel = rel or os.path.relpath(os.path.abspath(__file__), REPO)
+    return "python3 %s --task %s --repair-controller" % (rel, task_name)
+
+
+def print_repair_hint(ctrl_status, repair_exercised, task_name, out=print):
+    """不过就印**一行**修复命令；印了返回 True。**纯函数**（`out` 可注入）。
+
+    已经执行过切换的不印：那时候的问题是「未生效」，不是「没修」——
+    再喊一遍同一条命令只会让人以为没试过。
+    """
+    if ctrl_status != FAIL or repair_exercised:
+        return False
+    out("  ↳ 要修的话就这一条（先打印完整报文，再要**当次**交互确认；默认只读）：")
+    out("      %s" % repair_hint(task_name))
+    return True
+
+
 def ask_authorization(prompt_fn=input, isatty=None):
     """交棒前**再问一次**（AGENTS.md 红线 6：真机动作逐次授权）。
 
@@ -1220,6 +1511,9 @@ def stop_stack(clock=time.time):
 def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     ap = _parser()
     a = ap.parse_args(argv)
+    # 交互与否**只解析一次**：P0 的写路径闸门与 P5 的交棒确认必须看到同一件事
+    # （两处各查一次 isatty，中间被换掉的话就是自证式判据）。
+    isatty = sys.stdin.isatty if isatty is None else isatty
 
     print("=" * 74)
     print("  board_run —— 任务无关的真机启动器")
@@ -1304,6 +1598,25 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     if task is not None and site is not None:
         params, sources, conflicts = resolve_launch_params(task, site)
         add(S0, Item("P0.参数拼装", *judge_problems("参数拼装", conflicts)))
+        _print_plan(params, sources)
+    elif task is not None:
+        # 站点读不到 ⇒ 拼不出完整参数集，但**已经知道的那些**还是要摆出来：
+        # 否则「我到底会发什么」在最需要它的时候（配置没配好）反而看不见。
+        tparams, tsources = task_params(task)
+        _print_plan(tparams, tsources,
+                    note="站点配置没读到 ⇒ 下面**只有任务描述能定的那部分**；"
+                         "robot_ip / planner_params_file / camera_* 外参 / "
+                         "publish_camera_tf 都还不知道")
+
+    # 红线 6：写路径要**当次**授权 ⇒ 起栈**之前**就问清楚有没有交互终端。
+    # （要发的那条报文先完整摆出来 —— 人确认的是**那一条**；确认动作在 board_gate
+    #   里、臂已上电的那一刻再问一次。）
+    if a.repair_controller:
+        if task is not None:
+            print()
+            for ln in switch_payload_lines(task):
+                print(ln)
+        add(S0, Item(WRITE_PATH_ITEM, *judge_write_path(isatty)))
 
     code, _, _ = decide(counted(report, S0), None, launched=False)
     if code != 0:
@@ -1328,11 +1641,8 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     # ================================================== P2 起栈
     print("\n—— %s ——" % S2)
     cmd = build_launch_cmd(task.entry, params)
-    print("  命令（**这一条就是权威**）：")
+    print("  命令（**这一条就是权威**；每一项是谁给的见上面 P0 的「参数集」）：")
     print("    " + " \\\n      ".join(cmd))
-    print("\n  参数来源（能推导的不复述；有效值 = 站点 ⊕ 任务）：")
-    for k in sorted(params):
-        print("    %-22s %s" % (k, sources.get(k, "?")))
     _print_effective(site, params)
 
     if a.dry_run:
@@ -1434,8 +1744,17 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         else:
             repair_exercised = bool(rec3.get("repair_exercised"))
             try:
+                ctrl3 = None
                 for it, ab in stage_from_gate(rec3, "P3", GATE_STAGE_ITEMS["P3"]):
                     add(S3, it, absent=ab)
+                    if it.name == "P3.controllers":
+                        ctrl3 = it.status
+                # 红线 6 第三条：切换**执行过** ⇒ 必须给「生效 / 未生效」一个说法
+                # （board_gate 的复核本身就是只读的；这里只负责不许把它读成绿）。
+                st, det = judge_repair_outcome(repair_exercised, ctrl3)
+                if st is not None:
+                    add(S3, Item(REPAIR_ITEM, st, det))
+                print_repair_hint(ctrl3, repair_exercised, task.name)
             except GateError as exc:
                 add(S3, Item("P3.控制器闸门", SKIP, str(exc)))
 
@@ -1461,12 +1780,16 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                 if "repair_exercised" in rec4:
                     repair_exercised = (bool(repair_exercised)
                                         or bool(rec4["repair_exercised"]))
+                ctrl4 = None
                 try:
                     for it, ab in stage_from_gate(rec4, "P4",
                                                   GATE_STAGE_ITEMS["P4"]):
                         add(S4, it, absent=ab)
+                        if it.name == "P4.controllers":
+                            ctrl4 = it.status
                 except GateError as exc:
                     add(S4, Item("P4.体检", SKIP, str(exc)))
+                print_repair_hint(ctrl4, repair_exercised, task.name)
                 _print_margin(rec4, task)
             code, _, why4b = decide(counted(report, S4), None, launched=launched)
             if code != 0:
@@ -1554,8 +1877,12 @@ def _parser():
                     help="声明这是**当次**的真机动作授权（红线 6）。仍是逐次授权："
                          "交棒前会在终端上再问一次，**没有**无人值守模式")
     ap.add_argument("--repair-controller", action="store_true",
-                    help="⚠️ 写路径：控制器闸门不过时交给 board_gate 的收敛式修复"
-                         "（它自己要求交互确认、deactivate 恒空；本文件原样透传）")
+                    help="⚠️ 写路径：控制器闸门不过时交给 board_gate 的收敛式修复。"
+                         "红线 6 点名了「控制器切换」⇒ 这一档要**当次**授权：P0 会先"
+                         "确认有交互终端（没有就退 2，**栈都不起**），发文前把完整报文"
+                         "摆出来，臂已上电时还要再确认一次，切完按只读复核判"
+                         "「生效 / 未生效」。deactivate 恒空 —— 那一份判定在 "
+                         "board_gate 里，本文件原样透传")
     ap.add_argument("--override-freshness", default=None, metavar="理由",
                     help="外参超期时由人显式破例，**必须写下为什么**（原样进报告）")
     ap.add_argument("--timeout", type=float, default=None,
@@ -1604,6 +1931,19 @@ def judge_place_slots(task, site):
     return Item("P2.槽位数", PASS,
                 "place_slots %d 个，与任务描述一致（读自 %s）"
                 % (len(slots), path))
+
+
+def _print_plan(params, sources, note=None):
+    """把「会发哪些参数、每一个是谁给的」摆出来 —— **在 P0 就摆**。
+
+    为什么不等 P2：P0 不过的话根本走不到 P2，于是**最需要看清参数集**的那种失败
+    （站点读不到、外参过期）恰恰什么也不披露。披露完备性不许只在顺利的路径上成立。
+    """
+    print("\n  参数集（%d 项；有效值 = 站点 ⊕ 任务）：" % len(params))
+    if note:
+        print("    ⚠️ %s" % note)
+    for k in sorted(params):
+        print("    %-22s %s" % (k, sources.get(k, "?")))
 
 
 def _print_effective(site, params):

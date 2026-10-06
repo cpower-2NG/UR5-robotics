@@ -44,10 +44,12 @@ import importlib.util             # noqa: E402
 import io                         # noqa: E402
 import json                       # noqa: E402
 import os                         # noqa: E402
+import re                         # noqa: E402
 import shutil                     # noqa: E402
 import subprocess                 # noqa: E402
 import tempfile                   # noqa: E402
 import time                       # noqa: E402
+import types                      # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -546,9 +548,14 @@ def clean_env(**extra):
 
 
 def run_cli(*args, env=None):
-    """跑一次**真的** `board_run.py`（子进程）。"""
+    """跑一次**真的** `board_run.py`（子进程）。
+
+    `stdin=DEVNULL`：不这样写的话，在**真终端**上跑本文件时子进程的 stdin 是 tty，
+    「非交互 ⇒ 拒绝」那几条断言就会随「谁在跑测试」变结果（拿运气当判据）。
+    给了 DEVNULL，交互档一律拿到 EOF —— 那正是「没有人在旁边授权」的样子。
+    """
     return subprocess.run([sys.executable, RUN_PATH] + list(args),
-                          capture_output=True, text=True,
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL,
                           env=clean_env(**(env or {})))
 
 
@@ -600,7 +607,11 @@ try:
                  "judge_score_refs", "judge_problems", "judge_cabinet", "is_playing",
                  "split_entry", "parse_callable", "build_launch_cmd", "params_to_argv",
                  "resolve_launch_params", "planner_yaml_params", "path_in_repo",
-                 "find_task_file", "find_marker", "render_counts", "score_round"):
+                 "find_task_file", "find_marker", "render_counts", "score_round",
+                 "find_authorization_keys", "task_dotted_paths", "judge_write_path",
+                 "judge_repair_outcome", "switch_payload_lines", "repair_hint",
+                 "print_repair_hint", "task_params", "judge_entry_parity",
+                 "resolve_launch_params"):
         check("  纯函数 %s() 在（判定是算出来的，不是散在 if 里的）" % want,
               want in funcs)
 
@@ -741,6 +752,11 @@ try:
 
     site = board_lib.load_site(path=site_path)
     params_before, sources, conflicts = board_run.resolve_launch_params(task_a1, site)
+    # 旧入口（`board_a1.build_cmd`）会发的键集 —— [10]/[14] 的参数集守卫拿它当对照。
+    # 组装 launch 参数的地方有两个（旧脚本 + 本启动器），守卫必须同时钉住两边。
+    _ns = types.SimpleNamespace(robot_ip=site.robot_ip, params=site.planner_params,
+                                start_delay=task_a1.start_delay, cam=None)
+    entry_keys = [x.split(":=")[0] for x in board_a1.build_cmd(_ns) if ":=" in x]
     check("拼装零冲突（站点权威项没有被任务描述重复声明）", conflicts == [],
           str(conflicts))
     check("外参 7 个键全部来自站点，一个不少",
@@ -862,6 +878,43 @@ try:
           "CAM" not in func_code("resolve_launch_params"))
     check("  P0 会因此退 2（站点配置 FAIL ⇒ 不起栈）",
           board_run.decide([I("P0.站点配置", board_run.FAIL)])[0] == 2)
+
+    # ---- `publish_camera_tf`：**显式**写下时以它为准 -------------------------
+    # 推导那条本身不在这里钉 —— `board_run.judge_entry_parity` 专门管「本启动器发的
+    # 键 vs 旧入口发的键」，那一节把正反向、四元数全零/缺项、以及「删掉推导 ⇒ 守卫
+    # 当场红」的变异都钉住了，别在两处各写一份（两份断言漂开比没有更糟）。
+    # 这里只留**它没覆盖**的那一支：推导要能被**显式值**否掉。
+    # （`publish_camera_tf` 不在 `SITE_OWNED` 里，所以这不算「站点权威项被覆盖」。）
+    explicit = board_run.Task(dict(task_a1.raw, params=dict(
+        task_a1.params, publish_camera_tf="false")))
+    p_exp, _, _ = board_run.resolve_launch_params(explicit, site)
+    check("任务描述**显式**写了 publish_camera_tf ⇒ 以它为准"
+          "（「我有外部 TF 源」这种刻意选择得让人说得出口）",
+          p_exp.get("publish_camera_tf") == "false",
+          "实际：%r" % p_exp.get("publish_camera_tf"))
+
+    # ---- 退出码 2：两处必须**同待遇**（同一个码不许两种读法） ----------------
+    # 2 在本仓的定义是「**环境不满足**，不是失败」（AGENTS.md §6）。`deploy_rc` 与
+    # `tree_rc` 都只有**一处**退 2 —— `check_board_deploy.py:174`「需要 ROS 环境」、
+    # `board_tree_manifest.py` 的「没有清单」—— 含义都是「这一项**没验到**」。
+    # 曾经一个读成 FAIL、一个读成 SKIP：同一个码两种待遇，报告就没法信了。
+    def _pre(**kw):
+        f = {"leftovers": [], "port_busy": False, "deploy_rc": 0, "tree_rc": 0}
+        f.update(kw)
+        return dict((i.name, i.status) for i in board_run.judge_preflight(f))
+
+    check("部署前置退 2（= 环境不满足）⇒ SKIP「没验到」，**不是** FAIL"
+          "（它唯一那处退 2 是「需要 ROS 环境」，不可能意味着缺依赖）",
+          _pre(deploy_rc=2)["P1.部署前置"] == board_run.SKIP,
+          _pre(deploy_rc=2)["P1.部署前置"])
+    check("  板子树退 2（= 没有清单）⇒ 同样 SKIP —— 同一个退出码不许两种待遇",
+          _pre(tree_rc=2)["P1.板子树"] == board_run.SKIP)
+    check("  但 1 仍然是 FAIL（「看到了，而且它不对」）—— 别把 SKIP 那支扩过头",
+          _pre(deploy_rc=1)["P1.部署前置"] == board_run.FAIL
+          and _pre(tree_rc=1)["P1.板子树"] == board_run.FAIL)
+    check("  0 仍然是 PASS（两个方向都别改坏）",
+          _pre()["P1.部署前置"] == board_run.PASS
+          and _pre()["P1.板子树"] == board_run.PASS)
 
     old = dict(site.raw)
     old["topcam"] = dict(old["topcam"], verified="2020-01-01")
@@ -1075,6 +1128,56 @@ try:
     check("削掉「判分没过 ⇒ 退 1」⇒ 判分没过也退 0（[5] 那条是吃劲的）",
           m.decide([I("x", board_run.PASS)], verdict=False)[0] == 0)
 
+    # ---- 红线 6：授权与「未生效」这两支吃不吃劲 -------------------------
+    spy = {"launch": {"allow_auto_switch": True}}
+    m = load_mutant(_mutate(SRC, "        if AUTH_ISH_RX.search(p):", "        if False:",
+                            "authkeys"), "authkeys")
+    mut_hit, real_hit = m.find_authorization_keys(spy), board_run.find_authorization_keys(spy)
+    check("削掉「看着像授权的键 ⇒ 报红」⇒ 数据文件又能冒充授权了（[13] 吃劲）",
+          mut_hit == [] and real_hit != [],
+          "改后报 %d 条 / 改前报 %d 条（%s）"
+          % (len(mut_hit), len(real_hit),
+             real_hit[0][0] if real_hit else "—"))
+
+    m = load_mutant(_mutate(SRC, "        if k not in TASK_KNOWN_TOP:",
+                            "        if False:", "topkeys"), "topkeys")
+    probe = {"task": "x", "auto_repair": True}
+    mut_p, real_p = m.validate_task(probe), board_run.validate_task(probe)
+    check("削掉「顶层不认识的键 ⇒ 报红」⇒ 谁都能往 profile 里加键（[13] 吃劲）",
+          not any("不认识的键" in x for x in mut_p)
+          and any("不认识的键" in x for x in real_p),
+          "改后 %d 条毛病 / 改前 %d 条" % (len(mut_p), len(real_p)))
+
+    m = load_mutant(_mutate(SRC, "    if isatty():", "    if True:", "wpath"), "wpath")
+    mut_w = m.judge_write_path(lambda: False)[0]
+    real_w = board_run.judge_write_path(lambda: False)[0]
+    check("削掉「非交互 ⇒ 拒绝写路径」⇒ 没有当次授权也能发切换（[13] 吃劲）",
+          mut_w == board_run.PASS and real_w == board_run.FAIL,
+          "改后 %s / 改前 %s" % (mut_w, real_w))
+
+    m = load_mutant(_mutate(SRC, '    return FAIL, ("已执行但**未生效**（复核仍 %s）',
+                            '    return PASS, ("已执行但**未生效**（复核仍 %s）',
+                            "notify"), "notify")
+    mut_r = m.judge_repair_outcome(True, board_run.FAIL)[0]
+    real_r = board_run.judge_repair_outcome(True, board_run.FAIL)[0]
+    check("削掉「已执行但未生效 ⇒ FAIL」⇒ 复核没过也报绿（[13] 吃劲）",
+          mut_r == board_run.PASS and real_r == board_run.FAIL,
+          "改后 %s / 改前 %s" % (mut_r, real_r))
+
+    # 这条变异**就是当初那个缺陷**：站点给了外参，却不打开消费它们的发布器。
+    m = load_mutant(_mutate(SRC, '    if "publish_camera_tf" not in params and ex:',
+                            "    if False:", "camtf"), "camtf")
+    mut_p, _, _ = m.resolve_launch_params(task_a1, site)
+    mut_st, mut_det = m.judge_entry_parity(mut_p, entry_keys)
+    real_st, _ = board_run.judge_entry_parity(params_before, entry_keys)
+    check("削掉「站点给了外参 ⇒ 打开相机 TF 发布器」⇒ 参数集少一个键、**守卫当场红**"
+          "（publish_camera_tf 当初就是这么漏掉的）",
+          mut_st == board_run.FAIL and real_st == board_run.PASS
+          and "publish_camera_tf" in mut_det,
+          "改后 %s（%s） / 改前 %s"
+          % (mut_st, [x for x in mut_det.split("\n") if "publish_camera_tf" in x][:1],
+             real_st))
+
     m = load_mutant(_mutate(SRC, "    if t_launch is None or t_stop is None:",
                             "    if False:", "window"), "window")
     try:
@@ -1084,6 +1187,7 @@ try:
         window_wrong = True
     check("削掉交接窗口的「不知道就明说」⇒ 它要么崩、要么编一个数（拿不知道当知道）",
           window_wrong)
+
 
     # =================================================================
     # 11. 整跑
@@ -1264,6 +1368,231 @@ try:
     check("  改前 ≠ 改后：改前「栈起了、红在 P3」，改后「栈压根没起、红在 P2」",
           ("起栈中" in out) != ("起栈中" in out2)
           and "P3.示教器 PLAYING" in out and "P3.示教器 PLAYING" not in out2)
+
+    # =================================================================
+    # 13. 红线 6：控制器切换的授权从哪来
+    # =================================================================
+    section("[13] 红线 6：控制器切换要**当次**授权 —— 数据文件不许冒充授权")
+
+    # ---- ① 授权不许来自任务描述 --------------------------------------
+    check("a1.yaml 的每个点号路径都干净（没有看着像授权的键）",
+          board_run.find_authorization_keys(task_a1.raw) == [],
+          str(board_run.find_authorization_keys(task_a1.raw))[:200])
+    check("a2.yaml 同理（模板最会被复制、被沿用，最容易被塞这种键）",
+          board_run.find_authorization_keys(task_a2.raw) == []
+          and board_run.validate_task(task_a2.raw) == [])
+    check("  a1 仍然过 validate_task（别把闸门做成谁都过不去）",
+          board_run.validate_task(task_a1.raw) == [],
+          str(board_run.validate_task(task_a1.raw))[:200])
+
+    bad_l = {"launch": {"allow_auto_switch": True}}
+    hit = board_run.find_authorization_keys(bad_l)
+    check("`launch.allow_auto_switch` ⇒ 报红，并点名红线 6 与「当次」",
+          len(hit) == 1 and hit[0][0] == "launch.allow_auto_switch"
+          and "红线 6" in hit[0][1] and "当次" in hit[0][1], str(hit)[:200])
+    check("  `params.repair_controller: \"true\"` 也拦（launch 参数是真能改行为的开关）",
+          [p for p, _ in board_run.find_authorization_keys(
+              {"params": {"repair_controller": "true"}})] == ["params.repair_controller"])
+    check("  `expect.unattended: true` 也拦（换个体位塞进来照样红）",
+          [p for p, _ in board_run.find_authorization_keys(
+              {"expect": {"unattended": True}})] == ["expect.unattended"])
+    check("  `launch.allow_skip` **不**拦：它说的是「这一档没有它」（缺席），"
+          "不是「允许发写命令」",
+          board_run.find_authorization_keys(
+              {"launch": {"allow_skip": ["telemetry"]}}) == [])
+
+    bad_top = {"task": "x", "auto_repair": True}
+    probs = board_run.validate_task(bad_top)
+    check("顶层出现一个不认识的键 ⇒ 报红（加键必须改代码，改了才有人复核）",
+          any("auto_repair" in x and "不认识的键" in x for x in probs),
+          str(probs)[:200])
+    check("  **任意**新顶层键都拦得住，不只是名字像授权的那些",
+          any("whatever" in x for x in board_run.validate_task(
+              {"task": "x", "whatever": 1})))
+    check("  允许的顶层键就是那 7 个（多一个都要改代码）",
+          board_run.TASK_KNOWN_TOP == ("task", "launch", "params", "model",
+                                       "start_delay", "expect", "score"))
+
+    # ---- ② 当次：起栈之前就要有交互终端 ------------------------------
+    st, det = board_run.judge_write_path(lambda: False)
+    check("--repair-controller + 非交互终端 ⇒ **FAIL**（不是 SKIP：请求本身不成立）",
+          st == board_run.FAIL)
+    check("  理由里点名「当次」，并明说授权不许来自任务描述/环境变量/上次的记忆",
+          "当次" in det and "任务描述" in det and "环境变量" in det
+          and "红线 6" in det)
+    check("  有交互终端才 PASS", board_run.judge_write_path(lambda: True)[0]
+          == board_run.PASS)
+
+    # ---- ② 被告知：报文要先完整摆出来 --------------------------------
+    lines = "\n".join(board_run.switch_payload_lines(task_a1, timeout=8.0))
+    check("报文里有**服务名**（人确认的是那一条，不是「大概会切一下」）",
+          board_gate.SWITCH_SERVICE in lines)
+    req1 = board_run._required_controllers_for(task_a1)
+    check("  activate 列表 = 闸门实际会激活的那一份（同一份推导，不另抄）",
+          req1 == ["scaled_joint_trajectory_controller", "joint_state_broadcaster"]
+          and all(n in lines for n in req1), str(req1))
+    check("  deactivate_controllers 明写 `[]`（内容安全：永不 deactivate）",
+          "deactivate_controllers []" in lines)
+    check("  而且报文里**没有**任何非空的 deactivate 列表",
+          re.search(r"deactivate_controllers\s+\[(?!\])", lines) is None)
+    check("  strictness 明写 BEST_EFFORT(=1)（STRICT 会让整批 abort）",
+          "BEST_EFFORT(=1)" in lines)
+    check("  timeout 明写出来", "8s" in lines)
+    check("  并且明说授权只认这一次", "只认**这一次**" in lines)
+    func_payload = func_code("switch_payload_lines")
+    check("  服务名来自 board_gate.SWITCH_SERVICE，**不是**本文件里的字面量"
+          "（写路径不在这里重实现）",
+          "board_gate.SWITCH_SERVICE" in func_payload
+          and "/controller_manager/switch_controller" not in func_payload)
+    gate_src = open(board_gate.__file__, encoding="utf-8").read()
+    check("  deactivate 恒空的那一份判定留在 board_gate 里（本文件只透传 flag）",
+          "req.deactivate_controllers = []" in gate_src)
+    check("  印出来的 strictness 与 board_gate 实际发的是同一个（改一边要改两边）",
+          "SwitchController.Request.BEST_EFFORT" in gate_src)
+    check("  本文件从不给 board_gate 传 --require ⇒ 两边算的是同一份 activate",
+          '"--require"' not in SRC and "'--require'" not in SRC)
+    check("controller_stopper 那条**待查**线索留在注释里（是线索，不是事实；"
+          "别据此删写路径）",
+          "controller_stopper" in SRC and "待查" in SRC)
+
+    # ---- ③ 可复验：切完只读复核，未生效不许绿 -------------------------
+    check("没执行过切换 ⇒ 没有「修复」这一项（None ≠ PASS）",
+          board_run.judge_repair_outcome(False, board_run.FAIL) == (None, ""))
+    check("执行过且只读复核过了 ⇒ PASS（复核的是结果，不是「我们发成功了吗」）",
+          board_run.judge_repair_outcome(True, board_run.PASS)[0] == board_run.PASS)
+    st, det = board_run.judge_repair_outcome(True, board_run.FAIL)
+    check("执行过但复核不过 ⇒ **FAIL**，文案直说「已执行但未生效」（不许绿）",
+          st == board_run.FAIL and "已执行但**未生效**" in det)
+    check("  「未生效」不是「没验到」：复核拿到 SKIP 也算 FAIL",
+          board_run.judge_repair_outcome(True, board_run.SKIP)[0] == board_run.FAIL)
+
+    buf = io.StringIO()
+    sink = lambda *a: buf.write(" ".join(str(x) for x in a) + "\n")   # noqa: E731
+    printed = board_run.print_repair_hint(board_run.FAIL, False, "a1", out=sink)
+    check("控制器不过、又没走写路径 ⇒ 印**一行**修复命令（先报文 + 当次确认）",
+          printed and "--repair-controller" in buf.getvalue()
+          and "当次" in buf.getvalue() and "默认只读" in buf.getvalue(),
+          buf.getvalue().strip()[:120])
+    check("  那一行就是能直接粘的（含脚本路径与 --task）",
+          board_run.repair_hint("a1").endswith(
+              "scripts/board_run.py --task a1 --repair-controller"))
+    buf2 = io.StringIO()
+    sink2 = lambda *a: buf2.write(" ".join(str(x) for x in a) + "\n")  # noqa: E731
+    check("  已经执行过切换就不印修复命令（那是「未生效」，不是「没修」）",
+          not board_run.print_repair_hint(board_run.FAIL, True, "a1", out=sink2)
+          and buf2.getvalue() == "")
+    check("  闸门过的时候也不印（没什么可修的）",
+          not board_run.print_repair_hint(board_run.PASS, False, "a1", out=sink2))
+
+    # ---- 端到端：非交互 + --repair-controller ⇒ 起栈之前就退 2 --------
+    r = run_cli("--task", "a1", "--site", site_path, "--dry-run",
+                "--repair-controller", env={"PATH": no_ros})
+    check("真跑一次：--repair-controller 在非交互终端 ⇒ P0 红、退 2",
+          r.returncode == 2 and "[FAIL] %s" % board_run.WRITE_PATH_ITEM in r.stdout,
+          "rc=%s" % r.returncode)
+    check("  而且**停在 P0**：P1/P2 那两个阶段头一次都没印（拦在起栈之前）",
+          "P1 前置" not in r.stdout and "P2 起栈" not in r.stdout
+          and "起栈中" not in r.stdout)
+    check("  报文在起栈之前就摆出来了（服务名 + 恒空的 deactivate）",
+          board_gate.SWITCH_SERVICE in r.stdout
+          and "deactivate_controllers []" in r.stdout)
+    r_ro = run_cli("--task", "a1", "--site", site_path, "--dry-run",
+                   env={"PATH": no_ros})
+    check("  同一份 profile 不带这个开关时 P0 里没有这一项（只读是默认）",
+          board_run.WRITE_PATH_ITEM not in r_ro.stdout
+          and "P2 起栈" in r_ro.stdout, "rc=%s" % r_ro.returncode)
+    check("  P0 就把参数集摆出来了（P0 不过的话走不到 P2，披露不能只在顺利路径上）",
+          "参数集（" in r_ro.stdout)
+    r_ns = run_cli("--task", "a1", "--site", os.path.join(tmpdir, "没有这个站点.yaml"),
+                   "--dry-run", env={"PATH": no_ros})
+    check("  **站点读不到**时也把「已经知道的那部分」摆出来（最需要披露的失败）",
+          r_ns.returncode == 2 and "参数集（" in r_ns.stdout
+          and "只有任务描述能定的那部分" in r_ns.stdout
+          and "P2 起栈" not in r_ns.stdout, "rc=%s" % r_ns.returncode)
+    check("  并且明说站点那几项还不知道（robot_ip / 外参 / publish_camera_tf）",
+          mentions(r_ns.stdout, "robot_ip", "camera_* 外参", "publish_camera_tf"))
+
+    # =================================================================
+    # 14. 参数集守卫：本启动器发出的键 vs 旧入口 board_a1.build_cmd
+    # =================================================================
+    section("[14] 两个入口的参数集：差集逐项有理由，少一个/多一个都红")
+
+    check("旧入口 board_a1.build_cmd 解得出它的键集（对照物本身要立得住）",
+          len(entry_keys) == 17 and "tf_required" in entry_keys
+          and "publish_camera_tf" in entry_keys, str(sorted(entry_keys)))
+
+    st, det = board_run.judge_entry_parity(params_before, entry_keys)
+    check("a1 这条路径：两份参数集**差集逐项有理由** ⇒ PASS", st == board_run.PASS,
+          det.replace("\n", " / ")[:300])
+    check("  而且理由**印在结论里**（不是一张看不见的白名单）",
+          "tf_required" in det and "model" in det and "少发" in det and "多发" in det)
+
+    check("**publish_camera_tf 这个键发出来了**（当初漏的就是它：七个外参没人消费）",
+          params_before.get("publish_camera_tf") == "true",
+          "publish_camera_tf=%r" % params_before.get("publish_camera_tf"))
+    check("  来源写明是**推导**（站点给了外参 ⇒ 打开消费它们的发布器），"
+          "不是从 profile 里复述的",
+          "推导" in sources["publish_camera_tf"]
+          and "publish_camera_tf" not in task_a1.params)
+    check("  命令行里**真的有**它（纯函数说得再好，发出去的才算）",
+          "publish_camera_tf:=true" in r_ro.stdout)
+
+    check("少一个键 ⇒ **红**，并点名是哪个（这就是 publish_camera_tf 当初那种漏）",
+          board_run.judge_entry_parity(
+              set(params_before) - {"publish_camera_tf"}, entry_keys)[0]
+          == board_run.FAIL
+          and "publish_camera_tf" in board_run.judge_entry_parity(
+              set(params_before) - {"publish_camera_tf"}, entry_keys)[1])
+    check("多一个键 ⇒ **也红**（手滑加的 / 拼错的都拦得住）",
+          board_run.judge_entry_parity(
+              set(params_before) | {"hand_tuned_z"}, entry_keys)[0] == board_run.FAIL
+          and "hand_tuned_z" in board_run.judge_entry_parity(
+              set(params_before) | {"hand_tuned_z"}, entry_keys)[1])
+    st, det = board_run.judge_entry_parity(
+        params_before, entry_keys, launched_only={"model": "x", "gone": "y"})
+    check("差集表**过时** ⇒ 也红（某条理由不再成立时，不许留一张永远对的名单）",
+          st == board_run.FAIL and "gone" in det and "不再差" in det)
+    check("  理由表为空、两份又真的一致 ⇒ PASS 且写明「完全一致」",
+          board_run.judge_entry_parity(["a", "b"], ["a", "b"],
+                                       launched_only={}, entry_only={})[1]
+          .endswith("**完全一致**"))
+    check("  `tf_required` 那条理由**有出处**：bringup 按 camera_source 推导",
+          "tf_required_default" in open(LAUNCH_DIR + "/bringup.launch.py",
+                                        encoding="utf-8").read()
+          or "'false' if '" in open(LAUNCH_DIR + "/bringup.launch.py",
+                                    encoding="utf-8").read())
+
+    # 全零四元数：**不**打开发布器（打开的话 real.launch.py 当场抛）
+    real_src = open(LAUNCH_DIR + "/real.launch.py", encoding="utf-8").read()
+    check("先把平台那一侧的判据钉住：默认值是 false，判据是 == \"true\"",
+          'DeclareLaunchArgument(\n            "publish_camera_tf", default_value="false"'
+          in real_src
+          and 'launch_configurations.get("publish_camera_tf", "false") == "true"'
+          in real_src)
+    check("  且四元数全零时它**抛**（所以我们不能把全零那份也一起放过去）",
+          "这不是一个合法的旋转" in real_src and "_is_zero" in real_src)
+    zero_site = board_lib.parse_site({
+        "robot_ip": "203.0.113.9", "planner_params": planner_path,
+        "topcam": {"verified": "2026-10-06", "ttl_days": 1,
+                   "extrinsics": {k: "0.0" for k in board_lib.CAM_KEYS}}})
+    zp, zs, zc = board_run.resolve_launch_params(task_a1, zero_site)
+    check("外参四元数全零 ⇒ **不**打开相机 TF 发布器，并且当场报出这条毛病",
+          "publish_camera_tf" not in zp
+          and any("全零" in x for x in zc), str(zc)[:200])
+    part = board_lib.parse_site({
+        "robot_ip": "203.0.113.9", "planner_params": planner_path,
+        "topcam": {"verified": "2026-10-06", "ttl_days": 1,
+                   "extrinsics": {"camera_x": "0.3", "camera_y": "0.0",
+                                  "camera_z": "1.0"}}})
+    pp, _, pc = board_run.resolve_launch_params(task_a1, part)
+    check("  外参只给了一半（四元数缺项）⇒ 同样不开，不拿半份去撞 launch 的自检",
+          "publish_camera_tf" not in pp and any("四元数" in x for x in pc),
+          str(pc)[:160])
+    nos = board_lib.parse_site({"robot_ip": "203.0.113.9",
+                                "planner_params": planner_path, "topcam": {}})
+    np_, _, _ = board_run.resolve_launch_params(task_a1, nos)
+    check("  站点一个外参都没给 ⇒ 不擅自开发布器（缺项由 P0.站点配置 报，不重复喊）",
+          "publish_camera_tf" not in np_)
 
 finally:
     shutil.rmtree(tmpdir, ignore_errors=True)

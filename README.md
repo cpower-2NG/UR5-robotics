@@ -270,8 +270,9 @@ ur5-vision-grasp/
 这些脚本**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
 前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
-`test_board_a1.py`、`test_deidentified.py`、`test_docs_map.py`、`test_startup_docs.py`
-与 `state_check.py` 只要 Python 标准库）：
+`test_board_a1.py`、`test_board_lib.py`、`test_board_gate.py`、`test_board_run.py`、
+`test_board_tree_manifest.py`、`test_deidentified.py`、`test_docs_map.py`、
+`test_startup_docs.py` 与 `state_check.py` 只要 Python 标准库）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -296,6 +297,14 @@ python3 scripts/test_board_a1.py         # A1 真机验收的**判分逻辑 + �
                                          #   纯离线，拿真机日志原文当夹具，不碰 ROS / 臂 / 串口
                                          #   判分错了的代价不是「测试红一下」，而是误判整轮
                                          #   真机实验 —— 所以这里连判据本身也要测
+python3 scripts/test_board_lib.py        # 站点配置 / 外参时效 / 残留进程的判定（含变异检查）
+                                         #   纯离线；「顶层不 import ROS」本身是一条断言
+python3 scripts/test_board_gate.py       # 闸门会不会放行坏的东西（含变异检查）
+                                         #   测的是判定吃不吃劲，不是「板子现在通不通」
+python3 scripts/test_board_run.py        # 启动器的判定与参数拼装：拼错的参数拦在起栈之前
+                                         #   板端那两档用假 ros2，不替人做真机动作的主
+python3 scripts/test_board_tree_manifest.py  # 全树哈希：跳过规则 + 「多 / 少 / 改」三分类
+                                         #   半截清单不算一致（fail-closed）
 python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，1 = 有命中
                                          #   扫**全部被跟踪的文本文件**、**未跟踪（未忽略）的文件**
                                          #   与**全部提交信息**
@@ -450,6 +459,98 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 > 清理用 `pkill -9 -x <精确进程名>`，**不要用 `pkill -f`**——它会匹配到执行该命令的
 > shell 自己。
 
+### 入口脚本速查 —— 哪个命令回答哪个问题
+
+**这一节是「哪条命令回答哪个问题」的唯一索引。** 范围是**人要起起来或挂上去**的入口
+脚本；上面那批 `test_*.py` 自检**不在表里**（它们是上一段的那份清单）。
+
+每一行都写清它**动不动东西**（起栈 / 清进程 / 写硬件 / 只读）与**退出码**。本仓的常规
+是 `0/1/2`（`2` = 环境或前置不满足，fail-closed）——偏离的只有三处，表里逐个标了出来。
+
+表的读法：**第一格 = 脚本名 + 它回答的问题**；最后一格说明它是 `board_run` 的哪一段
+引擎、还是一个与它无关的**独立**入口。
+
+| 脚本 —— 它回答的问题 | 何时跑 | 动不动东西（含退出码） | 与 `board_run` 的关系 |
+|---|---|---|---|
+| **`scripts/board_run.py`** —— 这一轮能不能起、起完算不算过（任务无关的统一入口，读 `config/tasks/<名>.yaml`） | 真机跑一整轮 | **起栈 + 收栈**（跑完 `teardown` 自己的进程组；`--stop` 收掉**别人**起的栈）；起栈前发现残留则**拒绝起栈**，不替你清。默认只读，写路径只在 `--repair-controller`（要交互终端 + 当次 `--authorize-motion`）之后。**0/1/2**：`0` 只有**真跑完一轮**才拿得到，离线整跑必然 `2` | 本表的**编排者**：P1 调 `check_board_deploy` / `board_tree_manifest`，P3/P4 调 `board_gate`，P5 调 `board_a1:grade`。判定一行都不自己实现 |
+| **`scripts/board_gate.py`** —— 已经起着的那套栈健康吗（控制器 / 相机 / 目标 / 检测器 / 遥测 / 参数） | 栈起着、还没交棒 | **不起栈、不收栈**；默认一个字节不写，写路径只在 `--repair-controller`（交互终端敲 `yes`）后面。**0/1/2**（有 SKIP 就不算通过） | **就是 `board_run` 的 P3/P4 引擎** —— 子进程调用 + 读它的 JSON 记录，判定不重抄 |
+| **`scripts/board_a1.py`** —— 阶段 1 的出口判据过没过（`已放置 4/4 个` + 收工原因是「放置槽位已用尽」） | 跑 A1 验收；`--no-launch --log <文件>` 只对已有日志判分（那一档不动臂） | **自己起 `carry_objects:=true` 的整栈（臂会真的动）**，跑完收栈。**0/1/2**（`2` = 前置没过、不起栈） | **前身 / 第二个启动器** —— 作为启动器已被 `board_run --task a1` 取代；但它的 `grade()` 是 `board_run` 的 P5 判分**本体**，它本身又是阶段 1 契约点名的出口判据 ⇒ **不废**（见注三） |
+| **`scripts/check_board_deploy.py`** —— 板上缺什么（从 `package.xml` 与源码 `import` **推导**，不抄清单） | 部署完、起栈前 | **只读**：不装包、不写文件、不起节点、不要 sudo。**0/1/2** | **`board_run` 的 P1「部署前置」引擎**（子进程） |
+| **`scripts/board_tree_manifest.py`** —— 板上那份代码树和本机是不是同一份（全树哈希，不抽查） | 同步到板上前后（本机 `--write` 立清单，那边 `--check` 对） | `--write` 只写**仓库外**的清单文件；`--check` 纯只读；不碰栈。**0/1/2**（`2` = 清单不在 ⇒ fail-closed） | **`board_run` 的 P1「板子树」引擎**（子进程） |
+| **`scripts/board_lib.py`**（CLI 模式）—— 现在生效的站点配置是哪一份、合不合法、外参过没过期 | 配站点时；怀疑配置没生效时 | CLI **只读**（打印）。**0/1/2**（库里那个 `teardown()` 会 killpg，是给调用方用的，CLI 不走它） | **`board_run` 的前置层** —— 被 `import`（不是子进程）：站点配置 / 残留进程 / 串口 / 夹爪 / 控制柜只读查询只有这一份 |
+| **`scripts/state_check.py`** —— `docs/当前状态.md` 里哪些行已经超期 | 提交前；引用状态层结论之前 | **纯离线只读**（不需要 ROS）。**0/1/2** | **独立**（文档层守卫） |
+| **`scripts/real_chain_check.py`** —— 已经在跑的那套图，服务 / TF / IK / FK 通不通（`/compute_ik` 与 `/compute_fk`、`/joint_states`、`base_link→tool0` 逐跳 TF、**真解一次 IK 再用 FK 读回来**） | 栈起着、要验几何链路 | **只读；不起任何节点**；结构上不可能动臂（不建 action client）。**只有 0/2**（没有 `1` —— 没通过一律记「环境不满足」） | **独立**；与 `board_gate` / `no_arm_stack --check` 是**同一问题的三个深度**（见注一） |
+| **`scripts/board_chain_check.py`** —— 这块板子扛不扛得住真机那条链路（真相机 → 检测 → 三维目标的逐级吞吐） | 臂还没接、要验板子余量 | **自己起**无驱动真机入口 + RSP + 假关节角，跑完收栈；没有 `controller_manager` ⇒ 物理上不可能动臂。**0/1/2** | **独立** |
+| **`scripts/moveit_only_check.py`** —— MoveIt 链路通不通 + 肘 / 大臂余量（**复合问题**：加 `--envelope-z` 时**再扫一整片桌面**画「撞桌 / 够不到」的边界，给现场划区用） | 臂没接线时的预检；要划区才加 `--envelope-z` | **自己起** `real.launch.py start_ur_driver:=false` + RSP + 假关节角，跑完收栈；零运动。**0/1/2**（包线自己的结论不进退出码：图上有撞桌格是结论不是失败） | **独立**（见注四） |
+| **`scripts/no_arm_stack.py`** —— **三种模式 = 三个问题**：不带开关「起一套只读的无臂栈并留在前台」；`--stop`「清干净上一份」；`--check`「现在这套栈能不能解 IK」（不起任何东西） | 要跑探针 / 包线之前先起它 | 起栈（无驱动 + 假关节角）或清场；`--check` 纯只读。**只有 0/2** | **独立**；`--check` 与 `real_chain_check` 是同一问题的不同深度（见注一、注二） |
+| **`scripts/board_state_machine_check.py`** —— 规划器的状态机整条走不走得完（决策链、IK、肘高护栏、槽位记账、终止与收工路径、遥测） | 没有硬件但要验「运动」那一段 | **自己起**无驱动入口 + RSP + **本进程里的假臂**（假 `FollowJointTrajectory` action + 会跟着走的 `/joint_states`）；那个 action 是桩 ⇒ 零运动；不碰串口 / RTDE / 急停。**0/1/2** | **独立** |
+| **`scripts/board_ctrlc_check.py`** —— Ctrl-C 收工干不干净 | 在板子上；动过收工 / 信号相关代码之后 | **真起一个不含机械臂的 pipeline**，跑一小段后用 pty 写一次**真** Ctrl-C（默认 25 秒，`--seconds` 可改；`timeout` 与 `命令 &` 都会给假结论）。**0/1/2** | **独立** |
+| **`scripts/board_bag_record.py`** —— 把板上的画面 / 数据搬回开发机看 | 板上的链路已由别的方式起着 | **只录、不起链路**；写 bag 文件。**0/2/3**（多一个 `3` = 录完了但关键话题一条消息都没有） | **独立** |
+| **`scripts/topcam_drift_check.py`** —— 俯视外参还作不作数（相隔很久的两帧比全幅光流，分开「靶纸被碰」与「相机被碰」） | 每次要用俯视外参之前 | **纯离线比图**；不碰 ROS、不碰硬件。**0/1/2**（`1` = 外参作废，重跑 ⓪①） | **独立** |
+
+#### 注一 · 三件「已经跑着的栈能不能用」是一个问题的三个深度
+
+表里那三行（`real_chain_check` / `no_arm_stack --check` / `board_gate`）单看一句
+「看栈通不通」是分不开的。按**深度**读：
+
+| 深度 | 命令 | 问到哪一层 |
+|---|---|---|
+| 最浅 | `scripts/no_arm_stack.py --check` | 只问 `/compute_ik` 与 `/compute_fk` **在不在** |
+| 中 | `scripts/real_chain_check.py` | 上面那两个 + `/joint_states` + `base_link→tool0` 逐跳 TF + **真解一次 IK 再用 FK 读回来** |
+| 最广 | `scripts/board_gate.py` | 控制器 / 相机 / 目标 / 检测器 / 遥测 / 参数 —— 整条**运行态** |
+
+⚠️ **但最广的那个并不包含中间那个**：`board_gate` 的那几项里**没有** `/compute_ik`、
+也没有 TF ⇒ `real_chain_check` **不是**它的子集，两个都得能跑。
+反过来，`no_arm_stack --check` 是 `real_chain_check` 的**真子集**（少 TF、少 IK/FK 往返）。
+
+⇒ 口诀：「IK 解不解得出来」问 `real_chain_check`；「这一轮起栈健康吗」问 `board_gate`；
+「手上有没有一个能用的栈」问 `no_arm_stack --check`（最省，也最容易看漏）。
+
+#### 注二 · `no_arm_stack.py` 一行写不下
+
+它是本表唯一一个「一行一个问题」装不下的脚本：`--check` 是**问**，不带开关是**起**，
+`--stop` 是**清**。
+
+另外，`--check` 报「另有 N 个进程在跑」时**不替你判**那是「上一份栈」还是「没人管的
+残留」—— 两者的处置正好相反（前者别动、后者要清），所以它只报事实。这不是漏写，
+脚本自己的注释里写明了这条。
+
+#### 注三 · A1 那个问题由**两条**命令回答
+
+别靠「哪个名字短」选：
+
+| 你要的 | 用哪条 |
+|---|---|
+| 起栈 + 判分（完整一轮） | **`board_run.py --task a1`** —— 参数集来自 `config/tasks/a1.yaml`，不再手抄；闸门 / 授权 / 判分是一条链 |
+| 只判分、不动臂 | **`board_a1.py --no-launch --log <文件>`** —— `board_run` 没有这一档 |
+
+`board_a1.py` 是 `board_run` 在 A1 上的**前身**（同一套参数集写死在它自己的
+`build_cmd()` 里）。但**它不是废件**，两条理由：
+
+1. `config/tasks/a1.yaml` 的 `score.callable` 就是 `board_a1:grade` —— 判分**本体**在
+   它那儿；删了它，`board_run` 的 P5 就没有判分了。
+2. 阶段 1 的契约（[`docs/阶段/阶段1-点对点抓放/契约.md`](docs/阶段/阶段1-点对点抓放/契约.md)）
+   点名的**出口判据**就是它。
+
+⇒ **留着，别「顺手合并掉」。**
+
+#### 注四 · `moveit_only_check.py` 一行里塞了两个问题
+
+前半句（MoveIt 链路通不通 + 肘 / 大臂余量）是默认行为；`--envelope-z` 加的
+**桌面包线扫描**（「哪些 (x, y) 会把大臂压到台面下」）是另一个问题，给现场**划区**用。
+
+⚠️ 包线扫的范围比任何合理的区都大 ⇒ **它自己发现「图上有撞桌格」不算失败**（不进
+退出码）；只有「一个位姿都没量出来」才退 `2`。别看前半句就以为它只验链路。
+
+#### 退出码为什么有三处不一样（都是**故意**的，别去「统一」）
+
+- `real_chain_check.py` 与 `no_arm_stack.py` **只有 0/2，没有 1** —— 它们只回答
+  「现在能不能用」，不区分「看到了、它不对」与「我没看成」，两者一律记「环境不满足」。
+  这是自洽的，且调用方按这个判读。
+- `board_bag_record.py` 多一个 **3** = 录完了但关键话题一条消息都没有 ——「录了」
+  ≠「录到了」。
+- 其余一律 **0/1/2**。
+
 ---
 
 ## 真机部署（Orin）
@@ -535,6 +636,9 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
   > 摆件要求与收工判据，一律以
   > [`docs/待执行命令.md`](docs/待执行命令.md) 的 A1 一节为准** ——
   > 本节讲的是「板上装了什么、缺什么、怎么编」，不重复那套序列。
+  >
+  > **「哪条命令回答哪个问题」（入口脚本速查）在上一节末尾**，本节不重复那张表 ——
+  > 那份表把每个入口脚本的「动不动东西 / 退出码 / 与 `board_run` 的关系」列在一处。
 - **模型权重必须显式指定，别依赖「按目录找」**（D67）。⚠️ `block_best.pt`
   **不在仓库里**（6 MB，按规范走外链；需要它请见下面「模型权重」一节）。
   `model:=block_best.pt` 这个**相对名**是按**启动时的 CWD** 解析的 ——
@@ -600,6 +704,31 @@ python3 scripts/ag95_probe.py --port /dev/ttyTHS1 --slave 1 --watch   # 用手�
 
 详见 [`docs/archive/MIGRATION_HANDOFF.md`](docs/archive/MIGRATION_HANDOFF.md) 与
 [`docs/RESTRUCTURE_PLAN.md`](docs/RESTRUCTURE_PLAN.md)（P4/P5 组）。
+
+### 站点配置与任务描述（本机专有，不入库）
+
+真机那一轮要的东西分两份，**都在仓库外**：
+
+- **站点配置** —— 控制柜 IP、夹爪串口与波特率、俯视外参、规划器参数文件路径，
+  外加两个**强制的**外参时效字段（`verified` + `ttl_days`）。模板是
+  [`config/site.example.yaml`](config/site.example.yaml)。
+- **任务描述** —— 起哪个入口、`camera_source`、`start_delay`、轨迹 action、
+  判分函数（`score.callable`），在 [`config/tasks/`](config/tasks/) 下（如 `a1.yaml`）。
+  启动器 `board_run.py` **一行代码都不认识 A1**：换场景 = 加一份同形状的 yaml。
+
+```bash
+mkdir -p ~/.config/ur5-vision-grasp
+cp config/site.example.yaml ~/.config/ur5-vision-grasp/site.yaml
+$EDITOR ~/.config/ur5-vision-grasp/site.yaml
+python3 scripts/board_lib.py     # 自查：生效的是哪份路径、逐条合法性、外参过没过期
+```
+
+⚠️ **模板里的取值故意留成占位符** —— 占位符过不了 `float()` / 日期解析，于是配置不
+合法时**大声报错**，而不是拿着一份看起来像真的配置静默跑成另一回事。这份「故意不合法」
+本身由 `scripts/test_board_lib.py` 钉住。
+
+仓内那两份任务描述（`a1.yaml` / `a2.yaml`）也是**模板**：现场要改的话，拷到
+`~/.config/ur5-vision-grasp/tasks/` 改，**同名时现场那份优先**。
 
 ---
 

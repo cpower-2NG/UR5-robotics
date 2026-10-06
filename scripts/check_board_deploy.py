@@ -32,7 +32,9 @@
     source /opt/ros/humble/setup.bash
     python3 scripts/check_board_deploy.py
     python3 scripts/check_board_deploy.py --self-test    # 不需要 ROS，本机即可
-退出码 0 = 全部就绪；1 = 有缺失（逐条给出修法）。
+退出码 0 = 全部就绪；1 = 有缺失（逐条给出修法）；2 = 环境不满足 ——
+没有 ROS 环境（`ament_index_python` 进不来，`main()` 头一件事就是查它），
+先 `source /opt/ros/humble/setup.bash`。**这一档不是「都齐了」。**
 """
 
 import re
