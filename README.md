@@ -386,6 +386,13 @@ python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，
 > - `test_guard_path.py`、`test_pipeline_e2e.py`（原来都是模块顶层/裸 `import rclpy` ⇒
 >   `ModuleNotFoundError` ⇒ 退出码 1）
 > 复现：`env -u AMENT_PREFIX_PATH -u ROS_DISTRO -u PYTHONPATH python3 scripts/test_perception_3d.py; echo $?` → `2`。
+> ⚠️ **守卫收的是 `ImportError`，不是 `Exception` —— 宽度是刻意的，别以为
+> 「import 期什么错都退 2」**：`ModuleNotFoundError` 是 `ImportError` 的子类，
+> 缺依赖走它 → 2；但若 ROS 在场而**项目模块**在 import 期抛别的
+> （`AttributeError`/`SyntaxError` 等），它会漏出守卫 → 未捕获 → **退出码 1**，
+> 那按本仓库口径**正是**该报 1 的东西（装的东西本身有毛病），不是「环境没准备好」。
+> 已实测：`issubclass(ModuleNotFoundError, ImportError)` 为真、`AttributeError` 为假。
+> 所以四处都**不要**图省事改成 `except Exception`。
 > ⚠️ **仍在的同类项（未改，属口径选择）**：`test_minimal.py` 缺 ultralytics 时
 > `return False` ⇒ 报「YOLO 检测 ✗ FAIL」⇒ **退出码 1**，而它只是没装解释器依赖
 > （另外两个子项照跑）。要判「部分可降级」记 0（按上面 `test_ag95_probe` 的先例）

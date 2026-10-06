@@ -15123,7 +15123,8 @@ HEAD 与 A2 验收一致、`install/` 最新；如果现场其实在用另一个
 2」（有的是靠 `sys.exit(2)`，有的是靠别的路径）。下面每一条都是**实测**过的，不是
 grep 推的。
 
-**四个文件、改前实测退出码**（`env -u AMENT_PREFIX_PATH -u ROS_DISTRO -u PYTHONPATH`）：
+**四个文件、改前实测退出码**（`env -u AMENT_PREFIX_PATH -u ROS_DISTRO -u PYTHONPATH`；
+**下表行号是改前的位置**，改后注释块变长、行号会往下移）：
 
 | 文件 | 缺 `rclpy` 时的原实现 | 改前 rc |
 |---|---|---|
@@ -15192,3 +15193,19 @@ test_pipeline_e2e.py       rc=2 | [SKIP] 需要 ROS2 Python 环境（No module n
 ⚠️ 这一轮**没有**碰任何真机面：四处改动都在自检脚本的**导入失败路径**上，
 板子上有 ROS 时走的是同一条老路径（try 成功、行为逐字不变）。板子同步按原纪律
 由用户执行。
+
+**补记（同轮，回「conventions」那条边界提问）**：守卫收的是 `ImportError` 而**不是**
+`Exception`，宽度是刻意的。实测：
+`issubclass(ModuleNotFoundError, ImportError)` → `True`（缺 rclpy 走这条路 → 2，对）；
+`issubclass(AttributeError, ImportError)` → `False` ⇒ 若 ROS 在场、而**项目模块**
+（`planner_node`、`detector_node`）在 import 期抛 `AttributeError`/`SyntaxError` 之类，
+它会**漏出**守卫 → 未捕获 → **退出码 1**。那按本仓库口径**正是**该报 1 的东西
+（装的东西本身有毛病 = 测到了且是坏的），不是「环境没准备好」——所以四处都**不能**
+改成 `except Exception`，那会把真缺陷降级成「没测到」。已把这条写死进
+`test_guard_path.py:431-450`（守卫块，`return 2` 在 :450）、
+`test_detector_device.py:76-82` 两处注释（try 跨了项目代码的那两处）与 README 同一段。
+
+同轮还核过一条边界（peer 独立复跑）：四个文件剥掉 ROS 环境后全部 **rc=2**，与上表一致；
+`test_guard_path.py` 的 try 确实包到 `from grasp_planner.planner_node import GraspPlanner`
+且停在 `rclpy.init()`（**改后 :457**，不是改前的 :450 —— 守卫块加长把行号推后了）之前
+⇒「环境不满足这条路径永远不发轨迹」成立。

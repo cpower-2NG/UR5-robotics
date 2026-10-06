@@ -432,6 +432,13 @@ def main():
     # 原来这里是裸 import：会抛 ModuleNotFoundError → 退出码 1，而本仓库 1 的含义
     # 是「测到了且是坏的」—— 本自检一个字都没测到，报 1 是假警报。
     # 报 0 更坏：会被读成「整段护栏验过了」。这里停在建节点**之前**，不发轨迹。
+    #
+    # ⚠️ `except ImportError` 的**宽度**是刻意的，别以为「import 期什么错都退 2」：
+    # `ModuleNotFoundError` 是 `ImportError` 的子类（缺 rclpy 走这里 → 2，对）；
+    # 但如果 rclpy 在场、而 `planner_node` 因 API 不兼容在 import 期抛
+    # `AttributeError`/`SyntaxError` 之类，它会**漏出**这个 except → 未捕获 →
+    # 退出码 1 —— 那按本仓库口径**正是**该报 1 的东西（测到了且是坏的：装的东西
+    # 本身有问题），不是环境没准备好。所以**不要**图省事把这里改成 `except Exception`。
     try:
         import rclpy
         from rclpy.executors import SingleThreadedExecutor
