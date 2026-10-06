@@ -14205,3 +14205,118 @@ AGENTS.md §3 反过期规则 (a)。同理本轮记录**不写断言条数**。
 **仍然没做的**：板端阶梯（R0 ×3 / R1 ×1–2）**一次都没跑**，本机无板子访问权、
 且每次真机动作都要**当次**授权；`--repair-controller` 的**写路径本体**离线只验到
 「参数存在且透传」，`repair exercised: no`。
+
+---
+
+## 第九十六轮：启动器第一次上板 —— `--dry-run` 与一条**真机跑过的命令**逐键对上（2026-10-06）
+
+### 1. 上板前先撞见的事：**板子上正跑着一整套栈**
+
+`/proc` 一读就看见：`ros2 launch yolo_bringup bringup.launch.py` 及其 11 个孩子
+（`ur_ros2_control_node` / `dashboard_client` / `move_group` / `realsense2_camera_node`
+/ `detector_node` / `projector_node` / `planner_node` …），参数是 **A2 那一套**
+（7 分类模型 + `site_sort.yaml`），而且 **`carry_objects:=true`** —— 那意味着
+**臂是可以动的**。这是用户另一个会话在跑的 A2，**一个命令都没发**，先停下来问。
+
+板上有**两份检出**，都不是本轮的：`~/ur5-vision-grasp`（`a2-multiclass`，
+在跑的这套就是它）与 `~/yolo_ros_original`（`migrate/humble-orin`，
+A1 那两份 `board_a1.py` 以**未跟踪**形式躺在这里）。**记下来**：以后上板先看是哪一份。
+（路径一律写成 `~` —— 家目录名就是**用户名**，属红线 3 不得入库的东西。）
+
+用户随后明确授权停栈，并说「真机测完再把 A2 启回来」⇒ 因此**只动 `yolo_ros_original`，
+`ur5-vision-grasp` 一个字节没碰**，A2 才能原样重启。
+
+### 2. 停栈：SIGINT 被**静默吞掉**（本仓记过的坑，这次是实测复现）
+
+`/proc/171121/status` 的 `SigIgn` = `0x1001007` —— **bit 1 就是 SIGINT**。所以
+`kill -INT -171121` 打过去，父进程**纹丝不动**（5 秒后 ps 还在）。换 **SIGTERM**
+才收干净。附带观察：SIGINT 那一下**并非全无效果** —— 11 个子节点里死掉 9 个，
+活下来的正是 `ros2 launch` 父进程与 `ur_ros2_control_node`（两个都忽略 SIGINT）。
+**这正是本仓反复记的形状：「发了信号」不等于「东西停了」，必须事后查残留。**
+
+### 3. 同步范围：**只拷 `scripts/` + `config/`，`ros2_ws/` 不碰 ⇒ 不需要 `colcon build`**
+
+启动器本体是 `python3` 直跑的开发侧脚本（`board_run.py` / `board_lib.py` /
+`board_gate.py` / `task` 数据文件），**不在工作区里**。所以这一步**绕开了**
+「板端另一份检出会静默过期 ⇒ 改完必须 `colcon build`」那条不变量 —— 不是无视它，
+是这一轮的改动**根本不落在那个作用域内**。树清单（`board_tree_manifest`）的
+`DEFAULT_ROOT` 是 `ros2_ws`，因此这次同步**不使清单失效**（代码里核过）。
+
+同步前先读了板上的 `git status`：除两个未跟踪文件外干净 ⇒ **不会覆盖掉任何本地改动**。
+
+### 4. 站点配置：三项现场值**全部从板上的文件推导**，不由人手敲
+
+`robot_ip` 取自被停那次 launch 留在 `/tmp/launch_params_*` 的参数文件；
+`gripper.port` 认 `/dev/serial/by-id/`（**不是** `/dev/ttyUSB0`）；七项外参取自
+刚同步过去的 `board_a1.CAM`。**控制柜 IP 与串口序列号既没进仓库、也没由我在命令里
+手敲**（AGENTS.md 红线 3）。生成器落在板上用完即删，免得脏了检出。
+
+### 5. ⭐ 本轮最硬的一条证据：启动器拼的命令 vs **真机跑过的那条**
+
+被停的 A2 栈的 `cmdline` 是一份**真机上跑起来过**的参数集 —— 比任何文档都硬。
+把 `--task a1 --dry-run` 拼出的键集与它**机械**比对（脚本比对，不是肉眼）：
+
+- 现场命令 **18** 键 / 启动器 **17** 键；
+- **只在现场有、启动器不发**：`tf_required` —— 正是当初裁决过「由
+  `bringup.launch.py:227-232` 按 `camera_source` 推导」的那一个（源码复核：
+  `PythonExpression` 给默认值，`real.launch.py:332` 再兜一层 `"true"`）；
+- **只在启动器有、现场不发**：**无**；
+- 两边都有的 17 键，**值逐位全一致**（含七项外参、`robot_ip`、`publish_camera_tf`）。
+
+⇒ **启动器算出来的那条命令，与真实跑通过的那条，实质上是同一条。** 这条同时
+**反证**了第八、九十五轮修的 `publish_camera_tf` 缺陷是真会咬人的：手工拼命令的人
+写了它，启动器原来没拼。
+
+### 6. 修掉的缺陷：**「声明缺席」冒充 `[SKIP]`**
+
+`--dry-run` 输出里每一项都印 `[SKIP]`，而结算写「**SKIP 0**（另有 11 项声明缺席）」。
+查源码：`render_item` 对缺席项**硬编码** `[SKIP]`（第 1081 行），而真 SKIP 项在第
+1083 行印**同一个**标签 —— **两种状态共用一个标签**，一个进结算一个不进。真跑时
+`--attach` 那类项也是这个样子。
+
+判**可读性缺陷**，**不是**闸门失效（底下 `↳ 声明缺席` 那行与结算都澄清了，不会被
+读成通过）。但它是本仓「SKIP 不许看起来像绿的」**往下一层**的同一种病：读报告的人
+会数 `[SKIP]` 行，而那个数**不是**结算里的 SKIP。已改成 `[缺席]`（CJK 双宽，列对齐
+不变），并补**两侧**判据 —— 缺席必须是 `[缺席]`、真 SKIP 必须是 `[SKIP]`。
+只钉一侧的话，「改回一半」有一种改法照样绿。
+
+**变异**（本仓规矩：改前 ≠ 改后）：基线绿 → 注入 `[缺席]`→`[SKIP]` 后**恰好那一条
+FAIL**、rc 翻 1 → 恢复后绿、源码 sha **精确复原**。脚本先 `assert` 替换真的生效
+（防「锚点没匹配上、跑的还是原文件」那个老坑）。
+
+### 7. R0 的档位定案（用户拍板）：新建 `config/tasks/a1-noplan.yaml`
+
+**为什么不能直接用 `a1.yaml`**：不给 `--authorize-motion` 只保证「**不交棒**」，
+**保证不了无运动** —— 规划器照样在 `start_delay` 后启动、照样发目标。
+要真的无运动只能让规划器**根本不起**。
+
+读源码定的边界，**没猜**：`task_params` 只从 `launch:` 读 `camera_source` 与
+`start_delay` 两键、其余 `params:` 直通、`launch.allow_skip` 是保留键 ⇒
+**R0 是纯数据改动，启动器一行没改**。`skip_planner` 由 `pipeline.launch.py:702`
+的 `UnlessCondition` 挡住，且它**只挡 `planner_node` 一个节点** —— detector 与
+perception_3d 走另一个开关（`skip_detector`）**照常起**，所以 P4 的相机频率与
+`/targets_3d` 候选数仍然验得到（否则 R0 一多半是空的）。相应地 `allow_skip`
+只需 `[telemetry, params]`（`board_gate.py:66` 自己举的就是这个例子）。
+
+两条**现在**就在板上核过的静态判据：`--task a1-noplan --dry-run` **退 0**，参数集
+17→18 项且多出来的正是 `skip_planner:=true`；`skip_planner` 确实出现在
+`pipeline.launch.py --show-args` 的声明集里 ⇒ 真机跑时 `P2.声明集` 会放行。
+
+**「无运动」无到什么程度，别读多**：这一档**不是**「不碰臂」—— UR 驱动与 URCap
+External Control 照常连接、控制器闸门照常吃劲。它是「**不规划、不发目标**」。
+
+### 8. 记一笔悬着的东西：外参**卡在保质期线上**
+
+`verified=2026-10-05` / `ttl_days=1` / 今天 10-06 ⇒ 判据是 `>` 才超期，差值正好 1：
+**今天过、明天红**。所以 R1 之前必须重跑 `scripts/topcam_drift_check.py` ——
+日期**发现不了**「相机昨晚被碰了一下」，这正是这份外参保质期只有 1 天的原因。
+
+### 9. 本轮退出码（都实测过）
+
+`test_deidentified` / `test_docs_map` / `state_check` / `test_board_lib` /
+`test_board_gate` / `test_board_a1` / `test_board_run` 全 `0`；`pyflakes` 全 `0`。
+`state_check` 另有 2 行超期，是**提醒不是错误**。新标签判据的变异**吃劲**（见 §6）。
+
+**仍然没做的**：**板端阶梯一次都还没跑** —— 本轮只做到「静态计划 + 与真机命令对账」，
+`--dry-run` 自身的绿说的是**文件**不是**设备**；`repair exercised: no`。
+下一个动作是 R0 ×3（命令与判据见 `docs/待执行命令.md`）。

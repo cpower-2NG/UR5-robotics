@@ -1,0 +1,83 @@
+# R0 档（**无运动**）的任务描述 —— 板端阶梯的第一档
+#
+# **为什么单独一份**：不给 `--authorize-motion` 只能保证「**不交棒**」，它**保证不了
+#   无运动** —— 规划器照样会在 `start_delay` 之后启动、照样发目标。第九十轮那次真机
+#   失败就是这一类：同一段代码，通过轮与失败轮只差「连接 → 控制器激活」是 93 s 还是
+#   4.3 s。要真的无运动，只能让规划器**根本不起**：
+#   `params.skip_planner: "true"`（`pipeline.launch.py:560` 声明，`:702` 用
+#   `UnlessCondition` 挡住 `planner_node`）。
+#
+# **「无运动」无到什么程度 —— 别读多**：`skip_planner` 只挡 `planner_node` **一个**
+#   节点。detector / perception_3d 走的是**另一个**开关（`skip_detector`），本档
+#   **照常起** —— 所以 P4 的相机频率与 `/targets_3d` 候选数仍然验得到，这一档才有
+#   存在的意义（否则 P4 一多半都是空的）。
+#   ⚠️ UR 驱动与 URCap External Control **照常连接**，控制器闸门**照常吃劲**。
+#   所以这一档**不是**「不碰臂」，是「**不规划、不发目标**）。急停照旧放手边。
+#
+# 与 `a1.yaml` 的差别**只有两处**，其余逐字相同 —— 好让 R0 与 R1 的日志能直接对照：
+#   1. `params` 多一项 `skip_planner: "true"`
+#   2. `launch` 多一项 `allow_skip: [telemetry, params]`
+#
+# ⚠️ `allow_skip` 说的是「**这一档本来就没有这一项**」（缺席），**不是**「允许跳过」。
+#   `board_gate` 拿它把这两项改写成 SKIP，`board_run` 再算作**声明缺席**、**不计入
+#   三态** —— 否则本档会在 P4 恒定退 2（判据与理由见 `board_run.stage_from_gate`
+#   的 docstring）。它**不许**含 `controllers`：控制器闸门是这档存在的理由，挡不掉。
+#
+# 仓内这一份**不含任何现场真值**（红线 3）：控制柜 IP、外参、参数文件路径一律从站点
+#   配置推导。出口判据见 `docs/阶段/阶段1-点对点抓放/契约.md`。
+
+task: a1-noplan
+
+launch:
+  # 与 a1.yaml 同：真机的**唯一**入口。⚠️ 不要写成 pipeline.launch.py。
+  entry: yolo_bringup/bringup.launch.py
+  camera_source: realsense
+  declared_entries:
+    - yolo_bringup/bringup.launch.py
+    - yolo_bringup/real.launch.py
+    - yolo_bringup/pipeline.launch.py
+
+  # 与 a1.yaml 同：包的是 [realsense, detector, perception, planner]（**不含 UR 驱动**）。
+  # 本档规划器不起，但这一段延迟**仍然**套在 realsense/detector/perception 上 ——
+  # 保持 120 是为了让 R0 与 R1 的时序能逐行对照（差异只该有两处，见文件头）。
+  start_delay: 120
+
+  trajectory_action: /scaled_joint_trajectory_controller/follow_joint_trajectory
+
+  # 本档**没有**这两个提供方（planner_node 不起）：
+  #   telemetry —— 规划器的 /grasp_planner/telemetry
+  #   params    —— 规划器的参数回读（/grasp_planner/get_parameters）
+  # detector **不在**这里：它照常起，仍然要验。
+  allow_skip:
+    - telemetry
+    - params
+
+params:
+  # ⚠️ 一律写成**字符串**：launch 参数只有字符串一种形态，`skip_planner: true`
+  #    （YAML 布尔）会被拼成 `skip_planner:=True`，与 `:=true` 不是同一个字符串
+  #    —— 而那类差异**不报错**，只会静默跑成另一回事。
+  skip_planner: "true"
+
+  carry_objects: "true"
+  gripper_backend: "ag95"
+  use_target_plane: "true"
+  target_plane_z: "0.0285"
+
+model: block_best.pt
+
+expect:
+  slots_total: 4
+  min_candidates: 4
+  finish_marker: "收工："
+  # 本档走不到收工（没有规划器），P5 也进不去（R0 不给 --authorize-motion）。
+  # 留着是为了与 a1.yaml 逐字同形；超时本身用不到。
+  timeout: 900
+  params:
+    # ⚠️ 这两项要**规划器活着**才回读得到 ⇒ 本档由上面的 allow_skip 声明缺席。
+    #    留着是为了「哪天 R0 想开规划器时，判据不用重写」。
+    carry_objects: "true"
+    gripper_backend: "ag95"
+
+score:
+  callable: "board_a1:grade"
+  explain: "board_a1:explain"

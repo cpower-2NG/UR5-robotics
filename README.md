@@ -727,8 +727,14 @@ python3 scripts/board_lib.py     # 自查：生效的是哪份路径、逐条合
 合法时**大声报错**，而不是拿着一份看起来像真的配置静默跑成另一回事。这份「故意不合法」
 本身由 `scripts/test_board_lib.py` 钉住。
 
-仓内那两份任务描述（`a1.yaml` / `a2.yaml`）也是**模板**：现场要改的话，拷到
-`~/.config/ur5-vision-grasp/tasks/` 改，**同名时现场那份优先**。
+仓内 `config/tasks/` 下的任务描述也是**模板**（不在这里列数 —— 数量由目录决定，
+写死了必然烂）：现场要改的话，拷到 `~/.config/ur5-vision-grasp/tasks/` 改，
+**同名时现场那份优先**。
+
+其中 `a1-noplan.yaml` 是 A1 的**无运动变体**（`params.skip_planner: "true"` ＋
+`launch.allow_skip: [telemetry, params]`），给板端阶梯的 R0 档用 —— 不给
+`--authorize-motion` 只保证「不交棒」，**保证不了无运动**，规划器照样会发目标。
+它与 `a1.yaml` 只差这两处，其余逐字相同，好让两档日志能直接对照。
 
 ---
 

@@ -1019,6 +1019,15 @@ try:
     check("  缺席行也不写成 PASS / FAIL",
           "[PASS]" not in line and "[FAIL]" not in line)
 
+    # 两侧都钉。只钉一侧的话，「把缺席改回 [SKIP]」或「把真 SKIP 改成 [缺席]」
+    # 有一半改法照样绿 —— 而这两种改法都会让结算里的两个数自相矛盾。
+    skip_line = "\n".join(board_run.render_item(
+        I("P1.串口", board_run.SKIP, "没查")))
+    check("  缺席与真 SKIP **标签必须不同**：缺席 = [缺席]，真 SKIP = [SKIP]"
+          "（同一个标签盖两种状态，结算就会写「SKIP 0」而满屏 [SKIP]）",
+          "[缺席]" in line and "[SKIP]" not in line
+          and "[SKIP]" in skip_line and "[缺席]" not in skip_line)
+
     summary = "\n".join(board_run.render_summary([I("a", board_run.SKIP)], 2))
     check("退 2 的总结写「在**交棒之前**停下了」，并列出三档退出码的语义",
           "交棒之前" in summary and "1 = " in summary and "2 = " in summary)
