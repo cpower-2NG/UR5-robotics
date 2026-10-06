@@ -851,6 +851,58 @@ try:
     check("没起栈 / --attach ⇒ 「有没有动过臂」明写**未判**，不含糊",
           board_run.judge_handoff_window(None, None, 120.0)[1].count("未判") == 1)
 
+    # ---- P4 不许抢在 `start_delay` 之前跑（2026-10-06 真机第 2 次实测的缺陷丙）----
+    _G = board_run.P4_GRACE
+    check("★ 起栈 10s 就体检、start_delay=120 ⇒ **必须拦住**（不然相机/检测器/感知"
+          "本来就还没起，人按播放**按得快**反被判红）",
+          board_run.p4_wait_seconds(0.0, 10.0, 120.0) == 120.0 - 10.0 + _G,
+          str(board_run.p4_wait_seconds(0.0, 10.0, 120.0)))
+    check("  已经等够（起栈 200s，start_delay=120）⇒ 不再等，别白拖",
+          board_run.p4_wait_seconds(0.0, 200.0, 120.0) == 0.0)
+    check("  刚好卡在边界（起栈 130s，start_delay=120，宽限 10）⇒ 归零，不许等成负数",
+          board_run.p4_wait_seconds(0.0, 130.0, 120.0) == 0.0)
+    check("  start_delay=0 ⇒ 只等宽限那一小段（不是 0，也不是 120）",
+          board_run.p4_wait_seconds(0.0, 0.0, 0.0) == _G)
+    check("★ --attach / 没起栈（t_launch=None）⇒ **0**，不许假装等过 —— "
+          "没有「起栈时刻」就没有「这一段」可言",
+          board_run.p4_wait_seconds(None, 0.0, 120.0) == 0.0)
+    check("  start_delay 缺失（None）也当成 0，不是崩",
+          board_run.p4_wait_seconds(0.0, 0.0, None) == _G)
+
+    # 源码钉子：**P4 那一段真的要等**。纯函数测过 ≠ 接上了（本仓栽过这个）。
+    _p4w = [n for n in ast.walk(TREE)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "p4_wait_seconds"]
+    check("源码钉子：`p4_wait_seconds` 恰好调一次，且第 3 个实参是"
+          "`task.start_delay`（**写死常量**就等于永远不等，正是第 2 次那个坑）",
+          len(_p4w) == 1 and len(_p4w[0].args) == 3
+          and isinstance(_p4w[0].args[2], ast.Attribute)
+          and _p4w[0].args[2].attr == "start_delay"
+          and getattr(_p4w[0].args[2].value, "id", "") == "task",
+          "%d 处调用" % len(_p4w))
+    _p4i = [n for n in ast.walk(TREE)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "Item" and n.args
+            and isinstance(n.args[0], ast.Constant)
+            and n.args[0].value == "P4.等启动延迟"]
+    check("源码钉子：等出来的 `_note4` 真的进了 `P4.等启动延迟` 这一项"
+          "（等了却不写进报告 ⇒ 下次没人知道它为什么慢）",
+          len(_p4i) == 1 and len(_p4i[0].args) >= 3
+          and isinstance(_p4i[0].args[2], ast.Name)
+          and _p4i[0].args[2].id == "_note4",
+          "%d 处" % len(_p4i))
+
+    _m_p4 = load_mutant(_mutate(
+        SRC, "    if t_launch is None:\n        return 0.0\n",
+        "    if t_launch is None:\n        return 0.0\n    return 0.0  # MUTANT\n",
+        "p4w"), "p4w")
+    if _m_p4 is not None:
+        _o = board_run.p4_wait_seconds(0.0, 10.0, 120.0)
+        _n = _m_p4.p4_wait_seconds(0.0, 10.0, 120.0)
+        check("变异：让 `p4_wait_seconds` **恒返回 0**（＝第 2 次那个「P4 抢跑」）"
+              "⇒ 那条 `★` 断言**翻面**（改前 ≠ 改后）",
+              _o > 0.0 and _n == 0.0, "改前 %r / 改后 %r" % (_o, _n))
+
     note = board_run.attach_log_missing_note("/tmp/nope.log")
     check("--attach 找不到日志：文案要**指出路径**，并把两种情形都写出来"
           "（「--log 指错了」与「**根本没有栈可附着**」）",
@@ -1162,6 +1214,63 @@ try:
           "--repair-controller" not in argv4)
     check("  `--json-report` 的路径能找回来（否则读记录会读成「它没跑」）",
           board_run.argv_json_report(argv4) == "/tmp/y.json")
+
+    # ---- `--pick-zone`：**只在规划器不起的档**才递 ----------------------------
+    # 出处：2026-10-06 真机 R0 第 1 次，`P4.targets` **恒 SKIP**（「拿不到 pick_zone
+    # （规划器不在图上，也没给 --pick-zone）」），而启动器手里**有**这个值
+    # （P0「参数集」就把它印出来了）。而 `a1-noplan.yaml` 开头写明 R0 存在的意义
+    # 正是「/targets_3d 候选数仍然验得到」⇒ 那一档的 P4 有一项**结构性验不了**。
+    check("`planner_absent`：allow_skip 同时含 telemetry 与 params ⇔ 本档没有规划器",
+          board_run.planner_absent(["telemetry", "params"]) is True
+          and board_run.planner_absent(["telemetry"]) is False
+          and board_run.planner_absent([]) is False
+          and board_run.planner_absent(None) is False)
+    _pz = [0.4, 0.6, 0.0, 0.45, 0.0, 0.0485]
+    check("  规划器不起 ⇒ 递出 6 个数（不递就恒 SKIP）",
+          board_run.pick_zone_arg(["telemetry", "params"],
+                                  {"pick_zone": _pz}) == _pz)
+    check("★ 规划器活着 ⇒ **不递** —— 递了会把「活读运行中的规划器」降级成"
+          "静态 yaml（`--pick-zone` 在 board_gate 里优先于活读）",
+          board_run.pick_zone_arg(["telemetry"], {"pick_zone": _pz}) is None)
+    check("  pick_zone 读不到（文件里没这一项）⇒ 不递，让闸门自己报 SKIP",
+          board_run.pick_zone_arg(["telemetry", "params"], {}) is None)
+    check("  形状不是 6 个数 ⇒ 不递（不拿半份去撞闸门的自检）",
+          board_run.pick_zone_arg(["telemetry", "params"],
+                                  {"pick_zone": [1, 2, 3]}) is None)
+    check("  launch 命令行给的值**覆盖** yaml（与 P0「参数集」同一套算法）",
+          board_run.pick_zone_arg(["telemetry", "params"],
+                                  {"pick_zone": [9.0] * 6},
+                                  {"pick_zone": _pz}) == _pz)
+    _argv_pz = board_run.gate_argv("/tmp/z.json", pick_zone=_pz)
+    check("  `gate_argv` 拼成 `--pick-zone a,b,c,d,e,f`（闸门要的就是这个形状）",
+          _argv_pz[_argv_pz.index("--pick-zone") + 1]
+          == "0.4,0.6,0.0,0.45,0.0,0.0485", str(_argv_pz))
+    check("  不递时命令行里**没有** --pick-zone（不是给个空串）",
+          "--pick-zone" not in board_run.gate_argv("/tmp/z.json"))
+
+    # 源码钉子：**接线那一行**也要钉。纯函数测过 ≠ 接上了 —— P4 的调用点漏掉
+    # `pick_zone=` 的话，上面全绿而真机照旧恒 SKIP（正是这一轮修的那个病）。
+    _p4c = [n for n in ast.walk(TREE)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "gate_argv"
+            and any(k.arg == "slots_total" for k in n.keywords)]
+    check("源码钉子：P4 那次 `gate_argv(...)` 真的传了 `pick_zone=pick_zone_arg(...)`",
+          len(_p4c) == 1
+          and any(k.arg == "pick_zone" and isinstance(k.value, ast.Call)
+                  and getattr(k.value.func, "id", "") == "pick_zone_arg"
+                  for k in _p4c[0].keywords),
+          "%d 处带 slots_total 的 gate_argv 调用" % len(_p4c))
+
+    _m_pz = load_mutant(_mutate(
+        SRC, '    if not planner_absent(allow_skip):\n        return None',
+        "    if False:\n        return None", "pz"), "pz")
+    if _m_pz is not None:
+        check("削掉「只在规划器不起的档才递」⇒ R1 的活读判据被降级成静态值",
+              _m_pz.pick_zone_arg(["telemetry"], {"pick_zone": _pz}) == _pz
+              and board_run.pick_zone_arg(["telemetry"], {"pick_zone": _pz}) is None,
+              "mut=%r real=%r" % (_m_pz.pick_zone_arg(["telemetry"], {"pick_zone": _pz}),
+                                  board_run.pick_zone_arg(["telemetry"],
+                                                          {"pick_zone": _pz})))
 
     # =================================================================
     # 8. 渲染
@@ -1581,6 +1690,35 @@ try:
         "freshness": (board_gate.PASS, "外参核对于今天，保质期 1 天"),
     }
 
+    # ⚠️ 「板子不在线」这一档要的是闸门**连启动都走不到**（⇒ 没有记录 ⇒
+    #    `[SKIP] P3.控制器闸门`）。原来靠「本机恰好没 source ROS」来实现 ——
+    #    **靠不住**：`board_gate.py` 是 `run_gate()` 另起的**子进程**，上面那个
+    #    `board_lib.dashboard` 桩只在**本进程**生效，子进程看不见。只要调用方的
+    #    shell source 了 ROS（而本文件一直说那**就是**该有的环境），子进程就能
+    #    import rclpy、真的跑一遍闸门，于是留下记录，`[SKIP] P3.控制器闸门`
+    #    永不出现 ⇒ **断言在它自己文档指定的环境里恒红**。
+    #    2026-10-06 真机第 1 次当天实测：不 source 退 0、source 了退 1，红的正是
+    #    这一条；而板上 `sync-board.sh` 跑它时没 source，所以一直没露头。
+    #    ⇒ 把「没有 rclpy」变成**夹具自己造的事实**：`board_gate.py` 的 `argv[0]`
+    #    是 `sys.executable`（绝对路径），它唯一的 rclpy 来源就是 `PYTHONPATH`。
+    #    `ROS_DISTRO` / `AMENT_PREFIX_PATH` **必须留着** —— P0.ROS 环境 的判据查的
+    #    就是它们（`judge_ros_env`），一起摘掉会把 P0 弄红，那是**另一个**假红。
+    def _rosless_env(*a, **kw):
+        e = dict(os.environ)
+        e.pop("PYTHONPATH", None)
+        e.pop("PYTHONHOME", None)
+        return e, ("（测试桩：**故意**摘掉 PYTHONPATH —— 『板子不在线』这一档要的就是"
+                   "闸门子进程 import 不到 rclpy）")
+
+    # 先把**前提**钉住（照本文件「先确认这个『残留』真的被判据看得见」的先例）。
+    # 不钉的话，哪天本机 pip 装了 rclpy，这一档会**悄悄**变成另一回事，而下面那条
+    # 断言还绿着 —— 那就是空绿。
+    _probe = subprocess.run([sys.executable, "-c", "import rclpy"],
+                            env=_rosless_env()[0], capture_output=True, text=True)
+    check("★ 夹具前提：摘掉 PYTHONPATH 后闸门子进程**真的** import 不到 rclpy",
+          _probe.returncode != 0,
+          "rc=%s %s" % (_probe.returncode, _probe.stderr.strip()[-160:]))
+
     def end_to_end(task_path, tag):
         """跑一次真的 `run()`：P1 全绿 → P2 起（假）栈 → P3 等不到播放 ⇒ 退 2 + 收栈。"""
         old_env = {k: os.environ.get(k) for k in
@@ -1605,8 +1743,8 @@ try:
                           ROS_DOMAIN_ID="99")
         board_run.INSTALL_SETUP = os.path.join(ws_ins, "setup.bash")  # 假装 install 在
         # 换掉「自己 source」：本机没有那份工作区，而且这里要测的是闸门不是 shell。
-        board_run.build_ros_env = (
-            lambda *a, **kw: (dict(os.environ), "（测试桩：没真 source）"))
+        # 用**摘掉 PYTHONPATH**的那一份（理由见上面 `_rosless_env` 的长注释）。
+        board_run.build_ros_env = _rosless_env
         board_run.collect_preflight = (
             lambda site, do_net=True, override=None, env=None: dict(FACTS_GREEN))
         board_lib.dashboard = lambda ip, timeout=5.0: None       # 问不到控制柜

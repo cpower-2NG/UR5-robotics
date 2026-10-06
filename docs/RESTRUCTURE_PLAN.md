@@ -14951,3 +14951,250 @@ lambda s: s.replace('camera_x:=0.34694477757210807', 'camera_x:=0.34694477757210
 **永远退 1**（它读不到 A1 一节），而那个红与它要防的事毫无关系。
 ⇒ 同步脚本**点名跳过它**并写明理由 —— **跑不绿的红是噪音**，会训练人无视自检步骤。
 （它在**本机**跑，本机有 `docs/`。）
+
+
+## 第一百零三轮 —— R0 真机连跑：**三个「我这边」的缺陷**，其中一个只在「人按得快」时才现形（2026-10-06）
+
+> 用户授权：「开始第 1 次，你来跑，急停在手边」＋「我什么时候示教器点播放」。
+> 这一轮的全部产出是**启动器自己的三个缺陷**——没有一个出在现场，全部出在
+> **我怎么用它**和**它自己的时序假设**上。三次真机、每一条都留了可复核的证据。
+
+### 1. 现场结果（同一份任务描述 `config/tasks/a1-noplan.yaml`，跑了五次）
+
+命令（日志写仓库外，照 `docs/待执行命令.md`）：
+
+```
+python3 scripts/board_run.py --task a1-noplan --site ~/.config/ur5-vision-grasp/site.yaml \
+    --play-timeout 1800 --log ~/r0_runs/r0-XX.log --json-report ~/r0_runs/r0-XX.json
+```
+
+| 轮 | 结果 | 卡在哪 | 病因 |
+|---|---|---|---|
+| 1a | `exit=2` | `P3.示教器 PLAYING` FAIL | **缺陷甲**：提示语根本没落到文件里 |
+| 1b | `exit=2` | 同上 | 甲已修，但窗口没开够（300 s） |
+| 1c | `exit=2` | `P4.targets` SKIP | 见 §6：`--pick-zone` 没递（已按用户裁决修） |
+| 2 | `exit=2` | `P4.camera`/`targets`/`detector` FAIL | **缺陷丙**：P4 抢在 `start_delay` 之前跑 |
+| 2b | `exit=2`，`PASS 23 / FAIL 1` | `P4.targets` 只有 3 个候选 | 丙已修（相机/检测器**由红转绿**）；这条 FAIL 是**真事**：桌上只有 3 块 |
+
+**五次共同的部分（启动器自己的成绩）**：`P0` 全绿（含新增的 `P0.输出路径`）、
+`P1` **七项全绿**、`P2` 全绿，`P3.controllers` **PASS**，收栈干净，
+`gate_p3_exit=0`、`launched_stack=true`、`repair_exercised=false`。
+`P1.残留进程` 与 `P1.串口` 在这一轮**第一次被真正行使**（此前「只有真起一次栈才验得到」）。
+
+### 2. 缺陷甲：人在环的提示语**根本没送到**（启动器自己的 stdout 块缓冲）
+
+**现象**：1a 轮里，启动器那句 `👉 现在去示教器按**播放**` 在 18:13:16 就发出去了，
+而**同一时刻**盯着 `/tmp/r0_1.out` 的那一头读到的是**空文件**——一路空到 300 s 超时。
+
+**根因**：Python 的 `print` 写进**重定向的文件**时是**块缓冲**（攒满 8 KB 才冲）。
+栈子进程另有 `PYTHONUNBUFFERED=1`，而那一行管的是**栈**，不是启动器。
+
+**为什么这是缺陷而不是「操作者按晚了」**：P3 那一行**只有被人看见才有意义**。
+看不见 ⇒ 空等 `--play-timeout` ⇒ 退 2，而报告把它记成「你没按」，**反过来怪操作的人**。
+决策 5 把 PLAY 定成人的动作，那**送达**就是启动器的责任。
+
+**修法**（`board_run.py::main`）：入口处把 `sys.stdout`/`sys.stderr`
+`reconfigure(line_buffering=True)`；流被测试的 `StringIO` 之类接管时吞掉 `AttributeError`。
+
+**证据（板上对照实验，都在进程**还活着**时量）**：
+
+```
+变体 A（不 reconfigure，旧行为）：文件字节数 = 0     ← 提示语还在缓冲区里
+变体 B（reconfigure 后）：        文件字节数 = 20
+```
+
+**修完的真机复核（2b 轮）**：`PROMPT_SHOWN=19:23:23`，`STARTED 19:23:16` ⇒ **7 秒落盘**。
+
+### 3. 缺陷乙：`test_board_run.py` 第 [12] 节**不自洽**——在它自己文档指定的环境里恒红
+
+| 调用方环境 | 结果 |
+|---|---|
+| 不 source ROS | **退 0**（全过） |
+| `source /opt/ros/humble/setup.bash` | **退 1**：`板子不在线 ⇒ 控制器闸门是 SKIP（**没验到**），不是 PASS` |
+
+**根因**：[12] 档的夹具把 `board_lib.dashboard` 打桩成「连不上」，但
+**`board_gate.py` 是 `run_gate()` 另起的子进程**，那个桩只在**本进程**生效。只要调用方的
+shell source 了 ROS，子进程就能 `import rclpy`、真的跑一遍闸门、留下 JSON 记录
+⇒ `rec3 is not None` ⇒ 走 `P3.controllers` 那条分支，而 `[SKIP] P3.控制器闸门`
+只在 `rec3 is None` 时出现 ⇒ **永不出现**。**红只在没被跑到的那一侧**（板上同步脚本
+不 source ROS，所以那边一直绿）。
+
+**修法**：把「没有 rclpy」变成**夹具自己造的事实**——`_rosless_env()` 摘掉
+`PYTHONPATH`/`PYTHONHOME`（`board_gate.py` 的 `argv[0]` 是 `sys.executable` 绝对路径，
+rclpy 的唯一来源就是 `PYTHONPATH`；而 `ROS_DISTRO`/`AMENT_PREFIX_PATH` **必须留着**，
+`judge_ros_env` 查的就是它们，一起摘会把 P0 弄红，那是**另一个**假红）。
+`board_gate.py` 在 `import` 失败时是 **print + `return 2`、不写 JSON** ⇒ 正好造出前提。
+
+**并给前提本身加了钉子**：`★ 夹具前提：摘掉 PYTHONPATH 后闸门子进程**真的** import 不到 rclpy`
+——不钉的话，哪天本机 pip 装了 rclpy，这一档会**悄悄**变成另一回事，而断言还绿着（空绿）。
+
+**两个变异（各证一条断言有牙，之后逐字节还原）**：
+
+| 变异 | 打在 | 结果 |
+|---|---|---|
+| M1 | `_rosless_env` 不再摘 `PYTHONPATH` | 前提那条**翻红**（`rc=1`） |
+| M2 | 启动器把「没记录 ⇒ SKIP」写成 PASS | `板子不在线…` 那条**翻红**（`rc=1`） |
+
+### 4. 缺陷丙：P4 **抢在 `start_delay` 之前**跑 —— 人按得**越快**越被判红
+
+**这是这一轮最值得记的一条。**2 轮 40 秒就跑完了，报的是：
+
+```
+[FAIL] P4.camera       /camera/color/image_raw 不在图上
+[FAIL] P4.targets      /targets_3d 不在图上
+[FAIL] P4.detector     图上没有 yolo_detector
+```
+
+**根因**：`pipeline.launch.py:738` 是
+
+```python
+TimerAction(period=LaunchConfiguration('start_delay'),
+            actions=[realsense, detector, perception, planner])
+```
+
+—— `start_delay` 包住的是**整组**（相机与检测器也在里头），不只是规划器。而
+`board_run.py` 里 P4 是 `if code == 0:` 一通过就**立刻**跑的。人按播放**按得快**
+（本来就该快）⇒ P4 落进 `start_delay` **之内** ⇒ 三项记 FAIL。
+**越是照做的操作者越被判红。**
+
+**`board_gate` 那一侧的任何超时都救不了**：2 轮栈总共只活了 **32 s**，而
+`start_delay=120`；闸门默认那点等待（`--discover-timeout 25` ＋ `--targets-timeout 20`）
+**不在一个量级上**。
+
+**与 1c 的对照（这就是判据本身）**：同一份任务描述、同一套栈，1c 的 P4 是
+
+```
+[PASS] P4.camera      30.1 Hz
+[PASS] P4.detector    model=block_best.pt，/detections 21.0 Hz
+```
+
+**唯一的差别是时间**：1c 里人 **1175 s** 才按播放，无意中把 `start_delay` 那一段盖过去了。
+⇒ 这不是「相机坏了」，是**体检跑早了**。（与 §3 的「红只在没被跑到的那一侧」同形：
+两轮之间只差一个时序，缺陷就藏起来了。）
+
+**修法**：新增纯函数 `p4_wait_seconds(t_launch, now, start_delay)` ＋ 常量
+`P4_GRACE = 10.0`（`TimerAction` 是从 launch 进程起来之后才计时的，`t_launch` 量的是
+`Popen` 那一瞬，中间那段要补回来）。P4 之前先等到 `t_launch + start_delay + P4_GRACE`。
+`t_launch is None`（`--attach`/`--dry-run`）⇒ `0.0`，**不许假装等过**。
+等待写进报告：`P4.等启动延迟`。
+
+**离线钉住（全部 rc=0）**：
+
+| 断言 | 钉什么 |
+|---|---|
+| `★` 起栈 10 s、`start_delay=120` ⇒ `p4_wait_seconds == 120-10+GRACE` | 就是 2 轮那个 FAIL 的形状 |
+| 起栈 200 s、`start_delay=120` ⇒ `0.0` | 等够了别再拖 |
+| 起栈 130 s（刚好边界）⇒ `0.0` | 不许等成负数 |
+| `start_delay=0` ⇒ `== GRACE` | 不是 0、也不是 120 |
+| `★` `t_launch=None` ⇒ `0.0` | 没有「起栈时刻」就没有「这一段」 |
+| `start_delay=None` ⇒ `== GRACE` | 缺项当 0，不崩 |
+| 源码钉子：`p4_wait_seconds` 恰好调一次，第 3 实参是 `task.start_delay` | **写死常量**＝永远不等，正是那个坑 |
+| 源码钉子：`_note4` 真进了 `Item("P4.等启动延迟", …)` | 等了却不写进报告 ⇒ 下次没人知道它为什么慢 |
+| 变异：令 `p4_wait_seconds` **恒返回 0** | `★` 那条**翻面**：改前 `120.0` / 改后 `0.0` |
+
+### 5. 两次自我更正（都是「先下结论、后核对」的同类）
+
+1. **我一度判定报告里那句 🔴「规划器可能已经启动并动过臂」是误报**（理由：本轮
+   `skip_planner:=true`，规划器不起），差点去把它改松。读了 `config/tasks/a1-noplan.yaml`
+   才发现本档的**准确说法**是「**不规划、不发目标**」，**不是**「臂不会动」。那句 🔴 是
+   保守，不是错。**不改。**
+2. **我一度以为任务文件里对 `start_delay` 的两处说法互相矛盾**。读
+   `pipeline.launch.py:738` 才看清它 gate 的是**整组（含 planner）**，两处一致；
+   `judge_handoff_window` 拿它当规划器定时器的代理是**对的**。
+   —— 而**同一个 `TimerAction`** 正是 §4 那个缺陷的成因：**同一个事实，先是被我误判成
+   「文档自相矛盾」，两天后又变成「代码里没人等它」**。
+
+### 6. R0 第 1 次（1c）：闸门全绿，唯一一条 SKIP 是 `--pick-zone` 没递
+
+`exit=2`、`gate_p3_exit=0`、`gate_p4_exit=2`、`authorized_motion=False`、
+`repair_exercised=False`、`launched_stack=True`。逐项（读自板上 `r0-1c.json`）：
+
+```
+P0  ×7 全 PASS（含 P0.输出路径、P0.域号判冲突）
+P1  ×7 全 PASS：无残留（判据含自我排除）／usb-<adapter> 空闲／0x0200=1（已初始化）／
+              RUNNING|STOPPED|NORMAL／check_board_deploy 退 0／全树哈希一致／
+              外参核对 2026-10-06（剩 1 天 ⇒ **2026-10-07 到期**）
+P2  ×1 PASS：pid=194847，独立进程组
+P3  ×2 PASS：1175s 后 PLAYING；2 个控制器 active 且连续稳定 8.0s
+P4  ×2 PASS + ×1 SKIP + ×2 声明缺席：
+              controllers PASS／camera 30.1 Hz PASS／
+              targets **SKIP**「拿不到 pick_zone（规划器不在图上，也没给 --pick-zone）」／
+              detector PASS（model=block_best.pt，/detections 21.0 Hz）／
+              telemetry、params **声明缺席**
+```
+
+**两条与设计有关的实测**：
+
+1. **`P3.controllers` 在示教器程序根本没播放**（`STOPPED ur5ros.urp`）**时就已经 PASS**
+   （2 个控制器 active、连续稳定 8.0 s）⇒ **控制器闸门不能代替 PLAYING 那一项**，
+   两个都得留。这一条以前只是设计推断，现在是实测。
+2. **`P4.targets` 结构性 SKIP**：R0 档规划器不起 ⇒ 活读必然拿不到 `pick_zone`；
+   `board_gate --pick-zone` **优先于活读**，所以不能总递（总递＝把 R1 的活读判据
+   **悄悄降级**成静态值）。**用户裁决**：**只在规划器不起的档递**。
+   落成 `planner_absent()` ＋ `pick_zone_arg()`（两个纯函数）＋ P4 接线 ＋ 6 条断言
+   ＋ 1 条源码钉子 ＋ 1 个变异。
+
+### 7. R0 第 2 次（2b）：缺陷丙**在真机上修好了**，闸门随即报出一件真事
+
+`exit=2`、**`PASS 23 / FAIL 1 / SKIP 0`**（另有 2 项声明缺席）。
+`P0` ×7、`P1` ×7 全绿（`P1.外参时效` 仍剩 1 天）。与 2 轮的**逐项对照**：
+
+| 项 | 2 轮（修前） | 2b 轮（修后） |
+|---|---|---|
+| `P4.等启动延迟` | *（没有这一项）* | **PASS** `等了 88s（start_delay=120s，起栈后共 130s）` |
+| `P4.camera` | **FAIL** 不在图上 | **PASS `30.1 Hz`** |
+| `P4.detector` | **FAIL** 图上没有 | **PASS** `model=block_best.pt，/detections 21.3 Hz` |
+| `P4.targets` | **FAIL** 不在图上 | **FAIL `只有 3 个候选 < 要求 4 个`** ← 见下，这是一件**真事** |
+
+**人这一步也终于是真的**：`[PASS] P3.示教器 PLAYING  24s 后 PLAYING`（提示语 19:23:23 落盘、
+19:23:47 就按了）——与 2 轮那个 `0s 后 PLAYING` 的残状态对照，这一条才叫「人在环走通了」。
+
+#### 7.1 `P4.targets` 那条 FAIL 不是缺陷，是**场景**——而且它以前根本报不出来
+
+证据（`r0-2b.json` 的 `evidence`）：
+
+```
+points    = [[0.4443,0.2931,0.0285], [0.5003,0.392,0.0285], [0.4071,0.3527,0.0285]]
+labels    = ["block","block","block"]
+zone      = [0.4,0.6, 0.0,0.45, 0.0,0.0485]
+zone_src  = "**来自 --pick-zone，不是活读**"      ← 修法生效的签名
+targets_msgs = 381
+```
+
+三点**全部落在区内**（`judge_targets` 的两条判据：个数 ≥ 4、且每点都在区内；
+`n = len(points)` 数的是**全部**点，不是"区内的点"，所以这条不可能是过滤造成的假红）。
+⇒ **桌上真的只有 3 块**，而任务描述要 ≥4（A1 的收工判据还要 ≥5，报告里也印了这句）。
+
+**这正是修 `--pick-zone` 的价值**：同一件事在 1c 里被记成
+`[SKIP] 拿不到 pick_zone`（＝**我们不知道**），现在变成一个可执行的结论
+（＝**去摆够 5 块**）。**「不知道」与「不够」是两回事，前者不会催你动手。**
+
+#### 7.2 收栈不按 STOP ⇒ 下一轮 P3 会拿残状态假通过
+
+2 轮起栈**之前**，示教器已经是 `PLAYING ur5ros.urp`（1c 收栈留下的），于是
+`P3.示教器 PLAYING` 报 `[PASS] 0s 后 PLAYING` —— **那不是人按的**。
+启动器收的是**这套栈**，不是控制柜里的程序（报告里已明写这句）。
+这是**第 8 节悬案 1**，要用户定，本轮**没动**。
+
+### 8. 悬案（需要用户定，我没动）
+
+1. **收栈不按 STOP ⇒ 下一轮的 `P3.示教器 PLAYING` 会拿残状态自动通过。**
+   第 2 轮实测：起栈前示教器已是 `PLAYING ur5ros.urp`（1c 收栈留下的），
+   P3 报 `[PASS] 0s 后 PLAYING` —— **那不是人按的**。启动器收的是**这套栈**，
+   不是控制柜里的程序（报告里已明写这句）。三条候选：**(a)** P1 直接拒
+   （次序是「起栈→按播放」，起栈前就该是 STOPPED，fail-closed）；**(b)** P3 只在
+   报告里说清「栈起之前就已经 PLAYING，这一轮不算人按了」，仍放行；**(c)** 不动。
+   **这一项是设计，按约定交用户定。**
+2. `scripts/board_a1.py::CAM` 要不要更新到新外参，或缺 `--site` 时直接拒。
+3. A1 一节里三段 `camera_*` 命令块要不要改写成现行值。
+4. `topcam_drift_check.py` 要不要接进 P1。
+5. `board_gate.py --json-report` 要不要加同一层 P0 守卫（**本轮没碰 `board_gate.py`**，
+   悬案① 说它的改动要签核）。
+
+### 9. 守卫
+
+`test_deidentified` **0 命中** / `test_docs_map` / `test_startup_docs`（17 键）/
+`test_board_lib` / `test_board_gate` / `test_board_a1` / `test_board_run`
+（**source 与不 source ROS 两种环境都 rc=0**）全通过；`pyflakes` 对
+`board_run.py`、`test_board_run.py` 干净。
+`board_run.py`、`test_board_run.py` 已同步到板上（全树逐份复核一致 ＋ 板端自检退 0）。

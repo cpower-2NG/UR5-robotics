@@ -759,6 +759,51 @@ def effective_params(yaml_vals, launch_vals, keys,
     return out
 
 
+def planner_absent(allow_skip):
+    """这一档是不是**没有规划器**。**纯函数** → `bool`。
+
+    判据用任务描述里**已经声明过的事实**，不另猜：`launch.allow_skip` 里同时含
+    `telemetry` 与 `params` —— 这两项**只有规划器提供**（`/grasp_planner/telemetry`、
+    `/grasp_planner/get_parameters`；`board_gate.ITEM_NAMES` 里的取法同此）。
+    两项都声明缺席 ⇔ 本档没有规划器。
+    """
+    return {"telemetry", "params"} <= {str(x) for x in (allow_skip or ())}
+
+
+def pick_zone_arg(allow_skip, yaml_vals, launch_vals=()):
+    """该不该把 `pick_zone` **递给闸门** → 6 个数 | `None`。**纯函数**。
+
+    ⚠️ 为什么**只在规划器不起的档**才递（2026-10-06 用户拍板）：
+    `board_gate` 里 `--pick-zone` **优先于活读** —— 给了它，`zone_src` 会被写成
+    「**来自 --pick-zone，不是活读**」。规划器活着时，「活读运行中的规划器」是
+    **更强**的判据：它验的是**实际生效**的值，而不是我们手里那份 yaml。
+    总递等于把 R1 的判据**悄悄降级**成静态值。
+
+    可规划器不起时（R0：`skip_planner:=true`）活读必然拿不到 ⇒ `P4.targets`
+    **结构性恒 SKIP**。而 `config/tasks/a1-noplan.yaml` 开头写明这一档存在的意义
+    正是「`/targets_3d` 候选数仍然验得到（否则 P4 一多半都是空的）」——
+    2026-10-06 真机第 1 次实测到的就是这个恒 SKIP。
+
+    递下去的是**有效值**（yaml ⊕ launch），与 P0「参数集」印的是**同一套算法**。
+    另有两道自我约束：`pick_zone` 若是**死键**就不递（那时 yaml 那个值**不生效**，
+    拿它当判据是**反向**的错，比不判更坏）；值形状不是 6 个数也不递（交给闸门
+    自己去活读/报 SKIP，不拿半份去撞它的自检）。
+    """
+    if not planner_absent(allow_skip):
+        return None
+    if "pick_zone" in board_gate.DEAD_KEYS:
+        return None
+    v = effective_params(dict(yaml_vals or {}), dict(launch_vals or {}),
+                         ("pick_zone",))["pick_zone"][0]
+    if v is None:
+        return None
+    try:
+        vals = [float(x) for x in v]
+    except (TypeError, ValueError):
+        return None
+    return vals if len(vals) == 6 else None
+
+
 PLANNER_KEYS_OF_INTEREST = (
     "pick_zone", "place_slots", "place_z", "target_frame", "trajectory_action",
     "ik_group", "gripper_backend", "carry_objects", "table_scene_enabled",
@@ -1127,6 +1172,35 @@ def judge_handoff_window(t_launch, t_stop, start_delay):
                    "臂**应当**没动过" % (elapsed, start_delay))
 
 
+# P4 体检相对 `start_delay` 的宽限。`TimerAction` 是从 **launch 进程自己起来之后**
+# 才开始计时的，而我们量的 `t_launch` 是 `Popen` 那一瞬 —— 中间那段要被补回来。
+P4_GRACE = 10.0
+
+
+def p4_wait_seconds(t_launch, now, start_delay):
+    """P4 之前还得等多少秒。**纯函数** → `float`（`0.0` = 不用等）。
+
+    ⚠️ **为什么非等不可 —— 2026-10-06 真机第 2 次实测**：`pipeline.launch.py:738` 是
+    `TimerAction(period=…start_delay…, actions=[realsense, detector, perception, planner])`
+    —— `start_delay` 包住的是**整组**（相机与检测器也在里头），不只是规划器。
+    而 P4 是在 P3 一通过就**立刻**跑的（`board_run.py` 里 `if code == 0:` 紧跟其后）。
+    人按播放**按得快**（本来就该快）⇒ P4 落在 `start_delay` **之内** ⇒ 相机 / 检测器 /
+    感知**本来就还没起** ⇒ 三项记 FAIL。**越是照做的操作者越被判红。**
+    `board_gate` 那一侧的任何超时都救不了：第 2 次栈总共只活了 **32 s**，而
+    `start_delay=120`，闸门默认那点等待（discover 25 s + targets 20 s）**不在一个量级上**。
+
+    第 1 次之所以没露头，是因为人**按晚了**（1175 s 才按），无意中把这一段盖过去了 ——
+    与 `test_board_run.py` 那个「红只在没被跑到的那一侧」是同一个形状。
+
+    `t_launch is None`（`--attach` / `--dry-run` / 没起栈）⇒ `0.0`：没有「起栈时刻」，
+    这一档无从谈起，也**不许**假装等过。
+    """
+    if t_launch is None:
+        return 0.0
+    left = (t_launch + float(start_delay or 0.0) + P4_GRACE) - now
+    return left if left > 0.0 else 0.0
+
+
 def read_verdict(v):
     """判分结果字典 → `True` / `False` / `None`。**纯函数**。
 
@@ -1313,7 +1387,7 @@ def run_show_args(entry, env, timeout=120.0):
 
 def gate_argv(json_path, *, only=None, slots_total=None, min_candidates=None,
               expect_params=None, allow_skip=None, trajectory_action=None,
-              repair=False, fast=False):
+              pick_zone=None, repair=False, fast=False):
     """拼 `board_gate.py` 的命令行。**纯函数**（离线钉得住「P3 只要控制器」）。
 
     `only="controllers"` 时，其余五项交给它的 `--allow-skip` 声明缺席 —— 那正是
@@ -1332,6 +1406,9 @@ def gate_argv(json_path, *, only=None, slots_total=None, min_candidates=None,
         argv += ["--slots-total", str(slots_total)]
     if min_candidates is not None:
         argv += ["--min-candidates", str(min_candidates)]
+    # 只在**规划器不起**的档递（`pick_zone_arg` 里那节说明为什么不能总递）。
+    if pick_zone:
+        argv += ["--pick-zone", ",".join(str(float(x)) for x in pick_zone)]
     for k, v in sorted((expect_params or {}).items()):
         argv += ["--expect-param", "%s=%s" % (k, v)]
     if repair:
@@ -1956,12 +2033,45 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         # ============================================== P4 起栈后预检
         if code == 0:
             print("\n—— %s ——" % S4)
+            # ⚠️ **先等 `start_delay` 那一段过去**，再体检。不等的话，人按播放**按得快**
+            #    就会让 P4 落进那一段，把「本来就还没起」的相机/检测器/感知记成 FAIL
+            #    （2026-10-06 第 2 次实测，理由与数据见 `p4_wait_seconds`）。
+            _left = p4_wait_seconds(t_launch, clock(), task.start_delay)
+            _t_wait0 = clock()
+            if _left > 0.0:
+                print("  先等 %.0fs：`start_delay=%gs` 那一段里 realsense/detector/"
+                      "perception **本来就还没起**，抢在它前面体检会把三项记成 FAIL"
+                      % (_left, task.start_delay))
+                _end = clock() + _left
+                while True:
+                    _r = _end - clock()
+                    if _r <= 0.0:
+                        break
+                    time.sleep(min(15.0, _r))
+                    _r = _end - clock()
+                    if _r > 0.0:
+                        print("    …还差 %.0fs" % _r)
+            _waited4 = clock() - _t_wait0
+            if t_launch is None:
+                _note4 = "没有起栈时刻（--attach/--dry-run）⇒ 无从等起"
+            elif _waited4 > 0.0:
+                _note4 = ("等了 %.0fs（start_delay=%gs，起栈后共 %.0fs）"
+                          % (_waited4, task.start_delay, clock() - t_launch))
+            else:
+                _note4 = ("没等（start_delay=%gs，起栈后已经过去 %.0fs）"
+                          % (task.start_delay, clock() - t_launch))
+            add(S4, Item("P4.等启动延迟", PASS, _note4))
             j4 = os.path.join(gate_dir, "p4.json")
+            # `--pick-zone` **只在规划器不起的档**才递：那时活读必然拿不到，
+            # 不递就恒 SKIP（理由与出处见 `pick_zone_arg` 的 docstring）。
+            _pz_yaml, _ = read_planner_yaml(site.planner_params)
             argv4 = gate_argv(j4, slots_total=task.slots_total,
                               min_candidates=task.min_candidates,
                               expect_params=task.expect_params,
                               allow_skip=task.allow_skip,
-                              trajectory_action=task.trajectory_action)
+                              trajectory_action=task.trajectory_action,
+                              pick_zone=pick_zone_arg(task.allow_skip, _pz_yaml,
+                                                      params))
             rc4, rec4, why4 = run_gate(argv4, env, timeout=600.0)
             if rec4 is None:
                 add(S4, Item("P4.体检", SKIP, "board_gate 没给出记录：%s" % why4))
@@ -2339,6 +2449,19 @@ def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
 
 
 def main(argv=None):
+    # ⚠️ **人在环的提示语必须当场可见。** `print` 写进**重定向的文件**时 Python 是
+    #    块缓冲（攒满 8 KB 才冲），而 P3 那句「现在去示教器按**播放**」正是
+    #    **只有被人看见才有意义**的一行 —— 看不见 ⇒ 空等 `--play-timeout` ⇒ 退 2，
+    #    而报告把它记成「你没按」，**反过来怪操作的人**。
+    #    2026-10-06 真机第 1 次实际发生：启动器 `nohup` 到文件跑，提示语 18:13:16
+    #    就发出去了，可盯着那个文件的那一头**同一时刻读到的是空文件**，
+    #    300 s 到点，P3 记 FAIL。**这不是操作者按晚了，是提示语没送到。**
+    #    （栈子进程另有 `PYTHONUNBUFFERED=1`，与这里无关：这里管的是启动器**自己**。）
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass          # 流被别的东西接管（如测试里的 StringIO）—— 不该致命
     try:
         return run(argv)
     except KeyboardInterrupt:
