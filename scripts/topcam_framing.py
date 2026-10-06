@@ -319,7 +319,47 @@ def sensitivity_slots_y(R, t, K, slot_probes, step_cm=1.0):
 def main():
     ap = argparse.ArgumentParser(
         description="俯视相机取景收敛器（只读：读外参/内参/站点 yaml，打印）")
-    ap.add_argument("--extrinsics", required=True, help="外参 json（如 docs/calib/extrinsics-2026-10-02.json）")
+    # 两种给外参的方式，**二选一必给**。
+    #
+    # 为什么要 `--camera` 这条路：重标定的产出（`topcam_marker_calib.py --solve`）
+    # 只把 7 个数**打印**出来、不落盘。没有这条路的话，「solve 出新数 → 看还差
+    # 多少」这个环是**断的** —— 只能先把 7 个数手抄进一个 json 再跑，而那正好
+    # 造出第 N 份口径可能不一致的外参文件（本项目已经在为「三处文档口径冲突」
+    # 还债）。抄错一个数在这里是**静默**的：投影照样出数，只是取景结论错。
+    #
+    # ⚠️ 帧语义：**默认按 launch 的语义，即 `base_link ← camera_link`**。
+    #    今天（2026-10-06）刚把这件事从三方证据上钉死，三份都指向同一条：
+    #      · `real.launch.py:360-380` 自己的注释写着「手眼标定的结果必须表达在
+    #        camera_link 上」，而那个 static_transform_publisher 的
+    #        `--frame-id base_link --child-frame-id camera_link` 是硬编码的；
+    #      · `docs/calib/extrinsics-2026-10-03-base_link.json` 的 `frame_child`
+    #        就是 `camera_link` —— 也正是实机 A/B（`docs/待执行命令.md:142-158`）
+    #        定下的那一组；
+    #      · 物理自洽：那个 R 的第 1 列（link x = 视线方向，因为 opt_z = link_x）
+    #        是 (0.035, −0.583, −0.812)，**朝下** —— 相机在 base z=+0.645 往下看，
+    #        必须如此。复合到光学系后光学 z 是同一个向量 ✓。
+    #    ⛔ 所以**别**把「base_link ← 光学系」的那组直接填进来：差一个 90° 级
+    #    旋转（还差那 15 mm）。拦下它的是下面那条「**抓取区必须可见**」的物理
+    #    不变量 —— 实测错填后抓取区投到 u∈[3525,3549] 且一角落到相机背后 ⇒ rc=2。
+    #    但**不是**「光轴 vs 台面法线」那条自检：错填后是 54.33°、正确 35.95°，
+    #    两个都在宽判据 [20,70] 里（这两条轴本来就差不到 90°）。
+    g_ext = ap.add_mutually_exclusive_group(required=True)
+    g_ext.add_argument("--extrinsics",
+                       help="外参 json（如 docs/calib/extrinsics-2026-10-03-base_link.json）；"
+                            "帧语义从文件自己的 frame_child 读，认不出的帧名直接拒绝")
+    g_ext.add_argument("--camera", nargs=7, type=float,
+                       metavar=("X", "Y", "Z", "QX", "QY", "QZ", "QW"),
+                       help="直接给 7 个数，**逐字就是 launch 的 "
+                            "camera_x/y/z/qx/qy/qz/qw**（= `base_link ← camera_link`，"
+                            "见 --camera-frame）")
+    ap.add_argument("--camera-frame", choices=("camera_link", "optical"), default=None,
+                    help="上面那 7 个数的帧。默认 camera_link（= launch 的语义，"
+                         "就是要填进 camera_x..qw 的那组）。optical 只给**真正**的 "
+                         "base_link←光学系 用 —— ⛔ **不是** "
+                         "`topcam_marker_calib.py --solve` 打印的那组：实测（2026-10-06）"
+                         "它返回的是**旋转在光学系、平移仍在 camera_link 原点**的混合体，"
+                         "两个帧都不是（差一个 90° 级旋转，外加 15 mm 原点偏差）。"
+                         "那条要修是段二的事，别拿它当外参")
     ap.add_argument("--info", default=None, help="含 fx,fy,cx,cy[,width,height] 的 json；不给就用文档实测的 1280×720 内参")
     ap.add_argument("--site", default=DEFAULT_SITE, help="站点 yaml（读 place_slots/pick_zone）")
     ap.add_argument("--block-size", type=float, default=REAL_BLOCK_W, help="方块脚印边长（m）")
@@ -337,13 +377,40 @@ def main():
     args = ap.parse_args()
 
     # ---- 外参 ----
-    try:
-        with open(args.extrinsics, encoding="utf-8") as fh:
-            doc = json.load(fh)
-        R, t = dzf.compose_base_optical(doc)
-    except (OSError, ValueError, KeyError) as e:
-        print(f"!! 读不了外参 {args.extrinsics}：{e}")
-        return 2
+    if args.camera:
+        if args.camera_frame is None:
+            args.camera_frame = "camera_link"
+        x, y, z, qx, qy, qz, qw = args.camera
+        try:
+            R0 = dzf.quat_to_matrix([qx, qy, qz, qw])
+        except ValueError as e:
+            print(f"!! 四元数不合法：{e}")
+            return 2
+        # ⚠️ 走**同一段**复合代码，不在这里复制一遍换算：两份实现迟早分叉，
+        #    而分叉的症状是「--extrinsics 对、--camera 错」——最难查的一种。
+        R, t = dzf.compose_base_optical({
+            "R": R0.tolist(), "t": [x, y, z],
+            "frame_child": ("camera_color_optical_frame"
+                            if args.camera_frame == "optical" else "camera_link")})
+        ext_src = (f"--camera ({x:.6f}, {y:.6f}, {z:.6f}) "
+                   f"q=({qx:.6f},{qy:.6f},{qz:.6f},{qw:.6f})"
+                   f"   帧={args.camera_frame}")
+    else:
+        if args.camera_frame:
+            # 静默忽略是不行的：有人会以为 `--camera-frame` 能把任何一份 JSON
+            # 「解释成」别的帧，而这里帧是从文件的 frame_child 读的、认不出就拒绝。
+            print("!! --camera-frame 只对 --camera 有意义（--extrinsics 的帧"
+                  "从文件自己的 frame_child 读）")
+            return 2
+        try:
+            with open(args.extrinsics, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            R, t = dzf.compose_base_optical(doc)
+        except (OSError, ValueError, KeyError) as e:
+            print(f"!! 读不了外参 {args.extrinsics}：{e}")
+            return 2
+        ext_src = args.extrinsics
+    print(f"外参：{ext_src}")
 
     # ---- 内参 ----
     if args.info:

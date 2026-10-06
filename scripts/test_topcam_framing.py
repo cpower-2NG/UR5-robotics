@@ -84,6 +84,42 @@ REAL = load(open(SCRIPT).read(), 'real')
 import numpy as np                      # noqa: E402
 
 
+def mat_to_quat(R):
+    """3×3 → ``[x, y, z, w]``（迹法）。测试里自己带一份，是为了不依赖
+    ``topcam_marker_calib``（它 import cv2/aruco，本机不一定装得上）。
+    ⚠️ 它只用来**构造** `--camera` 的输入：算错了这条断言会直接变红
+    （两条路的投影对不上），不会静默放过。"""
+    m = np.asarray(R, dtype=float)
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2
+        q = [(m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s,
+             (m[1, 0] - m[0, 1]) / s, 0.25 * s]
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2
+        q = [0.25 * s, (m[0, 1] + m[1, 0]) / s,
+             (m[0, 2] + m[2, 0]) / s, (m[2, 1] - m[1, 2]) / s]
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2
+        q = [(m[0, 1] + m[1, 0]) / s, 0.25 * s,
+             (m[1, 2] + m[2, 1]) / s, (m[0, 2] - m[2, 0]) / s]
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2
+        q = [(m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s,
+             0.25 * s, (m[1, 0] - m[0, 1]) / s]
+    q = np.array(q)
+    return q / np.linalg.norm(q)
+
+
+def same_rows(a, b):
+    """两份 CLI 输出里的**投影表**逐行相同（表行以「槽位」「抓取区」开头）。"""
+    def rows(s):
+        return [l for l in s.splitlines()
+                if l.startswith('槽位') or l.startswith('抓取区')]
+    ra, rb = rows(a), rows(b)
+    return bool(ra) and ra == rb
+
+
 # ----------------------------------------------------------------------
 # [1] 几何：apply_move / 俯仰轴
 # ----------------------------------------------------------------------
@@ -304,6 +340,73 @@ def part4_cli():
     check('4.12 外参读不到 → rc=2（环境问题，不是「取景不满足」）', rc4 == 2,
           'rc=%d' % rc4)
 
+    # ---- `--camera`：重标定的产出（`topcam_marker_calib.py --solve`）只**打印**
+    # 数、不落盘，所以取景收敛器必须能直接吃它，否则「solve → 看还差多少」这一环
+    # 是断的（只能手抄进 json，而抄错一个数是**静默**的）。
+    # 帧语义按 launch：`base_link ← camera_link`（三方证据见实现里的注释）。
+    R_lnk, t_lnk = (lambda d: (np.array(d['R'], dtype=float),
+                               np.array(d['t'], dtype=float)))(
+        __import__('json').load(open(EXTR['10-03'], encoding='utf-8')))
+    R_opt, t_opt = REAL.dzf.compose_base_optical(
+        __import__('json').load(open(EXTR['10-03'], encoding='utf-8')))
+
+    rc5, out5 = run('--extrinsics', EXTR['10-03'])
+    cam_link = [str(v) for v in list(t_lnk) + list(mat_to_quat(R_lnk))]
+    rc6, out6 = run('--camera', *cam_link)
+    check('4.13 `--camera` 喂文件里的 (t,R→q) 与 `--extrinsics` 读同一个文件 '
+          '**逐字同结论**（证明命令行这条也做了 link→光学系的复合，不是照单全收）',
+          rc6 == rc5 and same_rows(out5, out6), 'rc=%d vs %d' % (rc6, rc5))
+    check('4.14 且打印出它用的 7 个数与假定的帧（抄错/给错帧时看得出来）',
+          '外参：--camera' in out6 and '帧=camera_link' in out6)
+
+    # 帧声明给错的**两个方向**，各自被不同的闸门拦下 —— 两条都要钉住，
+    # 因为少钉一条就会以为「反正错了会报」，而另一条其实是静默的。
+    cam_opt = [str(v) for v in list(t_opt) + list(mat_to_quat(R_opt))]
+
+    # (a) 光学系的数当 camera_link 喂 = **多复合一次** link→光学系
+    rc7, out7 = run('--camera', *cam_opt)
+    check('4.15 光学系数当 camera_link 喂（多复合一次）→ rc=2，'
+          '拦它的是**光轴夹角**（88.05°，掉出 [20,70]）',
+          rc7 == 2 and '88.05' in out7 and '帧关系搞错' in out7, 'rc=%d' % rc7)
+
+    # (b) 反过来：link 的数声明成 optical = **少复合一次**。这条夹角**拦不住**
+    #     （54.33° 仍在 [20,70] 内），靠的是「抓取区必须可见」这条物理不变量。
+    rc7b, out7b = run('--camera', *cam_link, '--camera-frame', 'optical')
+    check('4.15b link 数声明成 optical（少复合一次）→ rc=2，而拦它的是'
+          '「抓取区自己就不在画面里」',
+          rc7b == 2 and '不在画面' in out7b, 'rc=%d' % rc7b)
+    check('    且这条夹角确实**拦不住**它（54.33° 仍在 [20,70] 内）—— '
+          '两个方向的拦法不同，不能只靠夹角',
+          '54.33' in out7b and '帧语义自检通过' in out7b,
+          '\n'.join(l for l in out7b.splitlines() if '法线' in l))
+
+    rc8, out8 = run('--camera', *cam_opt, '--camera-frame', 'optical')
+    check('4.16 同一组数显式声明 `--camera-frame optical` → 与文件路同结论 '
+          '（所以两条路的差别**只**在帧声明，没有别的隐藏换算）',
+          rc8 == rc5 and same_rows(out5, out8), 'rc=%d vs %d' % (rc8, rc5))
+
+    # 文档里那组「实机 A/B 定下的」7 个数（docs/待执行命令.md:142-158）—— 现场
+    # 真正会填进 launch 的就是它。它与留档文件 10-03 的 (R,t) 是不是同一组，
+    # 此前只有文档里的一句断言；这里用投影钉住（口径统一是段二的验收项之一）。
+    doc7 = ["0.34694477757210807", "0.8693043936314018", "0.6454397556505314",
+            "-0.32913450910630504", "-0.316374655430605",
+            "0.6185281368827056", "-0.6395314661538762"]
+    rc12, out12 = run('--camera', *doc7)
+    check('4.19 文档里 A/B 定下的那组数与留档 10-03 的 (R,t) 投出**同一份画面**'
+          '（文档与文件口径一致 —— 此前只有文档里一句断言）',
+          rc12 == rc5 and same_rows(out5, out12), 'rc=%d vs %d' % (rc12, rc5))
+
+    # 互斥且必给其一；`--camera-frame` 只对 --camera 有意义（静默忽略会让人
+    # 以为它能把任意 JSON「解释成」别的帧）
+    rc9, _ = run()
+    rc10, _ = run('--extrinsics', EXTR['10-03'], '--camera', *cam_link)
+    rc11, out11 = run('--extrinsics', EXTR['10-03'], '--camera-frame', 'optical')
+    check('4.17 两种给法互斥且必给其一（都不给 / 同时给 → 都用不了）',
+          rc9 != 0 and rc10 != 0, 'rc=%d / %d' % (rc9, rc10))
+    check('4.18 `--extrinsics` + `--camera-frame` → rc=2 明说只对 --camera 有意义'
+          '（不静默忽略）',
+          rc11 == 2 and '只对 --camera 有意义' in out11, 'rc=%d' % rc11)
+
 
 # ----------------------------------------------------------------------
 # [5] 变异
@@ -378,6 +481,31 @@ def part5_mutation():
     check('  而真代码的复核结果确实变好了（不合格项数 < 8）—— '
           '所以自证那一步是有内容的',
           '仍有 8 项' not in line_real and '按升高' in line_real, line_real)
+
+    # M6：`--camera` 的四元数顺序写错（喂 [w,x,y,z] 而不是 [x,y,z,w]）——
+    #     4.13 的「两条路逐字同结论」必须失效。不钉这一条的话，4.13 可能只是
+    #     「两条路都恰好算出同一份错的投影」而看不出来。
+    m6 = load(mutate("            R0 = dzf.quat_to_matrix([qx, qy, qz, qw])",
+                     "            R0 = dzf.quat_to_matrix([qw, qx, qy, qz])"), 'm6')
+    # 这里的 R_lnk/t_lnk 是 part4 里的局部量，不跨函数 —— 就地重取一次。
+    _d = json.load(open(EXTR['10-03'], encoding='utf-8'))
+    R_lnk = np.array(_d['R'], dtype=float)
+    t_lnk = list(_d['t'])
+    q_ok = mat_to_quat(R_lnk)
+
+    def rows_of(R):
+        return m6.frame_one(*m6.dzf.compose_base_optical(
+            {"R": R.tolist(), "t": list(t_lnk),
+             "frame_child": "camera_link"}), m6.REAL_K, items)
+
+    R_right = m6.dzf.quat_to_matrix([q_ok[0], q_ok[1], q_ok[2], q_ok[3]])
+    R_wrong = m6.dzf.quat_to_matrix([q_ok[3], q_ok[0], q_ok[1], q_ok[2]])
+    check('M6 四元数顺序写错 → 投影与正确顺序**不同**（所以 4.13 不是空转）',
+          rows_of(R_right) != rows_of(R_wrong),
+          '两种顺序投出了同一份画面 —— 那 4.13 就证明不了什么')
+    check('    而正确顺序下 R→q→R 是恒等的（4.13 的两条路本该同结论）',
+          float(np.abs(R_right - R_lnk).max()) < 1e-9,
+          str(float(np.abs(R_right - R_lnk).max())))
 
     # M5：挪槽位的建议少了单位换算（cm → m）——「会把槽位推进抓取区」这条
     #     护栏就永远不会触发，而照着做会让规划器**启动就拒**。

@@ -54,11 +54,24 @@ sys.dont_write_bytecode = True
 
 import numpy as np                                                # noqa: E402
 
-#: `camera_link` → 相机光学系的固定旋转（REP-103/105）：
-#:   opt_x = −link_y, opt_y = −link_z, opt_z = link_x
-R_LINK_TO_OPTICAL = np.array([[0.0, 0.0, 1.0],
-                              [-1.0, 0.0, 0.0],
-                              [0.0, -1.0, 0.0]])
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import draw_zone_on_frame as dzf                                  # noqa: E402
+
+#: `camera_link` → 相机光学系的固定变换。
+#:
+#: ⚠️ **不在这里自己定义一份。** 2026-10-06 查实：这里原来有一份**理想**旋转
+#:    （`[[0,0,1],[-1,0,0],[0,-1,0]]`，无平移），而 `draw_zone_on_frame.py`
+#:    里那份是**实机实测**的（多了 15.0 mm 平移、旋转差 0.25°）。两份定义让两个
+#:    工具对同一份外参给出**不同**的答案，而差的那 15 mm 正好在光心上 —— 就是
+#:    `0a2ab9e` 修过的那个「检测偏左」真凶（图上约 18 px）。
+#:    在线链路走 tf2、用的是实测那份，所以离线工具也必须用实测那份。
+#:    导进来用，不复制 —— 「两边各写一份，改一处忘一处」正是本项目反复踩的坑。
+R_LINK_TO_OPTICAL = dzf.R_LINK_TO_OPTICAL
+T_LINK_TO_OPTICAL = dzf.T_LINK_TO_OPTICAL
+
+#: 存盘格式的语义版本。**2 起**才含 `camera_link→光学系` 那 15 mm 的平移
+#: （v1 的 `base←板` 少了它，而这一点从数字上看不出来）。改了链的语义就要 +1。
+STORE_VERSION = 2
 
 
 def quat_to_matrix(q):
@@ -166,26 +179,69 @@ def detect_board(image_path, board_meta, K, dist):
 
 
 def base_from_camera(doc):
-    """外参文件 → ``base←camera_link`` 的 ``(R, t)``。
+    """外参文件 → ``base←`` **光学系**的 ``(R, t)``。
 
-    接受两种 `frame_child`：已是光学系（原样用），或 `camera_link`（左乘固定旋转）。
-    其它帧名一律拒绝 —— 猜帧关系是这一类错误里最难查的一种。
+    ⚠️ 说清楚为什么是光学系而不是 camera_link：`cam_from_board` 是 cv2 给的，
+    cv2 的相机系**就是光学系**（x 右 / y 下 / z 前）。要能把两者复合起来，
+    左边那项就必须也在光学系里。所以这个函数的返回值是给**内部链**用的。
+
+    ⛔ 而 `real.launch.py` 要的是 ``base←camera_link``（它那个
+    static_transform_publisher 的 `--child-frame-id camera_link` 是硬编码的）——
+    两者**不是一个东西**，差一个 90° 级旋转外加 15 mm 的原点平移。
+    打印成 launch 参数是 `fmt_launch` 的事，转换也在那里做。
+
+    2026-10-06 之前这里写的是 ``return (R @ R_LINK_TO_OPTICAL, t)``：旋转换成
+    光学系了、平移却还是 camera_link 的原点 —— 一个**哪个帧都不是**的混合体，
+    文档字符串还自称 `base←camera_link`。它给下面整条链注入了 15 mm 的光心偏差。
     """
-    child = str(doc.get('frame_child') or doc.get('camera_frame') or '')
-    R = (np.array(doc['R'], dtype=float) if 'R' in doc
-         else quat_to_matrix(doc['q'] if 'q' in doc else doc['rotation']))
-    t = np.array([float(v) for v in (doc.get('t') or doc['translation'])], dtype=float)
-    if child in ('camera_color_optical_frame', 'camera_optical_frame'):
-        return (R, t)
-    if child == 'camera_link':
-        return (R @ R_LINK_TO_OPTICAL, t)
-    raise SystemExit(f'不认识的 frame_child={child!r}：只认 camera_link 与光学系（拒绝猜）')
+    try:
+        # 与所有别的离线工具**共用同一段**换算（含实测的 15 mm 与实测旋转）。
+        R, t = dzf.compose_base_optical(doc)
+    except (ValueError, KeyError, TypeError) as e:
+        # 认不出的帧名一律拒绝（`compose_base_optical` 也拒绝，这里只是把异常
+        # 换成这个工具的惯例）—— 猜帧关系是这一类错误里最难查的一种。
+        raise SystemExit(f'外参文件用不了：{e}')
+    return R, t
 
 
-def fmt_launch(R, t):
-    q = matrix_to_quat(R)
+def store_version_error(data):
+    """存盘能不能用？能就返回 ``None``，不能就返回**给人看的原因**。
+
+    抽成纯函数是为了测得动：`main()` 里这条闸门排在「检出角点」之后，而检出
+    要一张真照片 —— 纯函数不用照片也能把三种情形（旧 / 当前 / 未来）都试一遍。
+    """
+    have = int(data.get('store_version', 1))
+    if have == STORE_VERSION:
+        return None
+    if have < STORE_VERSION:
+        return (f"这份存盘是旧语义（store_version={have}，当前 {STORE_VERSION}）："
+                "它的 base←板 少了 camera_link→光学系 那 15 mm 的平移"
+                "（以及 0.25° 的实测旋转差）。\n"
+                "   ⇒ 重新跑一次 --init（用同一份可信外参 + 一张新图），再 --solve。\n"
+                "   直接沿用会把这 15 mm 悄悄带进新外参（图上约 18 px）。")
+    # ⚠️ 比当前**新**的存盘同样拒绝：那说明本脚本比写它的版本旧，而新语义
+    #    具体改了什么这里并不知道 —— 猜一个正是本仓库反复在修的那类错。
+    return (f"这份存盘比本脚本新（store_version={have} > {STORE_VERSION}）："
+            "本脚本读不懂它的语义，换用写它的那个版本，或重跑 --init。")
+
+
+def fmt_launch(R_opt, t_opt):
+    """``base←光学系`` → **launch 的** ``camera_x..camera_qw``（``base←camera_link``）。
+
+    ⚠️ 这一步是**必须**的转换，不是装饰：
+      · 旋转：`R_link = R_opt @ R_LINK_TO_OPTICALᵀ`
+      · 平移：`t_link = t_opt − R_link @ T_LINK_TO_OPTICAL`（差那 15 mm）
+    2026-10-06 之前直接把 ``base←光学系`` 的 R/t 当成 launch 值打印 —— 填进
+    launch 就错一个 90° 级旋转，而且**不报错**（TF 照样发出去，点只是落在
+    臂够不到的地方）。实机 A/B（`docs/待执行命令.md:142-158`）能发现它，
+    但那要动机械臂；这里是纯算术，拿来对拍零成本。
+    """
+    R_link = np.asarray(R_opt, dtype=float) @ R_LINK_TO_OPTICAL.T
+    t_link = np.asarray(t_opt, dtype=float) - R_link @ T_LINK_TO_OPTICAL
+    q = matrix_to_quat(R_link)
     return ('publish_camera_tf:=true \\\n'
-            f'  camera_x:={t[0]:.6f}  camera_y:={t[1]:.6f}  camera_z:={t[2]:.6f} \\\n'
+            f'  camera_x:={t_link[0]:.6f}  camera_y:={t_link[1]:.6f}  '
+            f'camera_z:={t_link[2]:.6f} \\\n'
             f'  camera_qx:={q[0]:.6f} camera_qy:={q[1]:.6f} '
             f'camera_qz:={q[2]:.6f} camera_qw:={q[3]:.6f}')
 
@@ -233,7 +289,8 @@ def main():
         base_from_cam = base_from_camera(json.load(open(a.extrinsics, encoding='utf-8')))
         base_from_board = compose(base_from_cam, cam_from_board)
         Rb, tb = base_from_board
-        data = {'board': a.board,
+        data = {'store_version': STORE_VERSION,
+                'board': a.board,
                 'square_mm': board_meta['square_mm'],
                 'marker_mm': board_meta['marker_mm'],
                 'dictionary': board_meta['dictionary'],
@@ -243,7 +300,7 @@ def main():
         with open(a.store, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=1)
         print(f'板在 base 系里的位置 = {np.round(tb, 4).tolist()} m')
-        print(f'已存盘：{a.store}')
+        print(f'已存盘：{a.store}（store_version={STORE_VERSION}）')
         print('⇒ 之后每次用之前跑一次 --solve 即可（一张图，不动机械臂）')
         return 0
 
@@ -252,11 +309,18 @@ def main():
         print(f'!! 没有 {a.store} —— 先跑一次 --init')
         return 2
     data = json.load(open(a.store, encoding='utf-8'))
+    # ⚠️ 版本闸门：v1 的存盘是**用带缺陷的换算**算出来的（旋转换成光学系了、
+    #    平移没跟着转，差 15 mm）。拿它 --solve 会把那 15 mm 一路带进新外参，
+    #    而且**看不出来**（数字都是像样的三位数）。宁可口令重跑一次 --init。
+    err = store_version_error(data)
+    if err:
+        print(f'!! {err}')
+        return 2
     base_from_board = (np.array(data['base_from_board_R'], dtype=float),
                        np.array(data['base_from_board_t'], dtype=float))
     base_from_cam = compose(base_from_board, invert(cam_from_board))
     Rc, tc = base_from_cam
-    print(f'相机光心在 base_link = {np.round(tc, 4).tolist()} m'
+    print(f'相机光学系原点在 base_link = {np.round(tc, 4).tolist()} m'
           f'（离基座水平 {math.hypot(tc[0], tc[1]):.3f} m，高 {tc[2]:.3f} m）')
     if 'from_extrinsics' in data:
         prev = base_from_camera(json.load(open(data['from_extrinsics'], encoding='utf-8')))
@@ -265,7 +329,7 @@ def main():
             (np.trace(Rc.T @ prev[0]) - 1.0) / 2.0))))
         print(f'与 --init 那次相比：位移 {d * 1000:.1f} mm，转角 {ang:.3f}°'
               f'（这就是这段时间相机漂掉的量）')
-    print('\n启动参数：')
+    print('\n启动参数（= base_link ← camera_link，可直接填进 launch）：')
     print(fmt_launch(Rc, tc))
     return 0
 

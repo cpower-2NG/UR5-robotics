@@ -17,15 +17,18 @@
 
 import math
 import os
+import re
 import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np                                                # noqa: E402
+import draw_zone_on_frame as dzf                                  # noqa: E402
 from topcam_marker_calib import (                                 # noqa: E402
-    R_LINK_TO_OPTICAL, base_from_camera, compose, invert,
-    matrix_to_quat, quat_to_matrix)
+    STORE_VERSION, T_LINK_TO_OPTICAL, R_LINK_TO_OPTICAL, base_from_camera,
+    compose, fmt_launch, invert, matrix_to_quat, quat_to_matrix,
+    store_version_error)
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -91,13 +94,25 @@ B = (quat_to_matrix([-0.1, 0.4, 0.2, 0.88]), np.array([-0.2, 0.1, 0.05]))
 check('复合不交换：A∘B ≠ B∘A（顺序有意义）',
       not np.allclose(compose(A, B)[1], compose(B, A)[1]))
 
-print('\n--- C. 帧名判定（拒绝猜） ---')
+print('\n--- C. 帧名判定（拒绝猜） + ★ 那 15 mm 必须跟着转 ---')
 ARCH = {'R': R_TEST.tolist(), 't': T_TEST.tolist(),
         'frame_parent': 'base_link', 'frame_child': 'camera_link'}
 Rb, tb = safe(base_from_camera, ARCH)
 check('camera_link ⇒ 左乘固定旋转',
-      np.allclose(Rb, R_TEST @ R_LINK_TO_OPTICAL) and np.allclose(tb, T_TEST))
-check('  t 不参与旋转（光心在 parent 系就是 t）', np.allclose(tb, T_TEST))
+      np.allclose(Rb, R_TEST @ R_LINK_TO_OPTICAL))
+# ★ 2026-10-06 改：原来这里断言「t 不参与旋转」，那是在**钉住缺陷**。
+#   `t` 是 camera_link 原点在 base 里的位置，而我们要的是**光学系**原点 ——
+#   两者差 R·T_LINK_TO_OPTICAL（15 mm，正好在光心上）。旋转转了、平移不转，
+#   得到的是一个**哪个帧都不是**的混合体。
+check('★ 平移也必须跟着转：光学系原点 = R·T_LINK_TO_OPTICAL + t',
+      np.allclose(tb, R_TEST @ T_LINK_TO_OPTICAL + T_TEST))
+check('  而它与原来那个（错的）t 差了 15 mm 量级 —— 不是四舍五入级别的差别',
+      abs(float(np.linalg.norm(tb - T_TEST)) * 1000 - 15.0) < 0.5,
+      '%.2f mm' % (float(np.linalg.norm(tb - T_TEST)) * 1000))
+check('★ 且与 draw_zone_on_frame.compose_base_optical 逐位一致'
+      '（两个工具共用一份定义，不再各写各的）',
+      np.allclose(Rb, dzf.compose_base_optical(ARCH)[0])
+      and np.allclose(tb, dzf.compose_base_optical(ARCH)[1]))
 Rb2, tb2 = safe(base_from_camera, {**ARCH, 'frame_child': 'camera_color_optical_frame'})
 check('★ 已是光学系 ⇒ 原样返回，不重复左乘', np.allclose(Rb2, R_TEST))
 check('  且与 camera_link 那支不相等（说明这一步真做了事）',
@@ -115,6 +130,44 @@ check('四元数形式（q）也认，且与 R 一致',
                                           't': T_TEST.tolist(),
                                           'frame_child': 'camera_link'})[0],
                   R_TEST @ R_LINK_TO_OPTICAL, atol=1e-9))
+
+print('\n--- C2. ★ fmt_launch：打印的必须是 launch 要的帧（base←camera_link）---')
+# `real.launch.py` 那个 static_transform_publisher 是硬编码的
+# `--frame-id base_link --child-frame-id camera_link`，它自己的注释也写着
+# 「手眼标定的结果必须表达在 camera_link 上」。而这条链内部算出来的是
+# **base←光学系** —— 直接打印出去就错一个 90° 级旋转，而且**不报错**。
+R_opt, t_opt = safe(base_from_camera, ARCH)
+line = fmt_launch(R_opt, t_opt)
+
+
+def _arg(name):
+    """从 launch 那几行里取 camera_<name>:= 的数值。"""
+    m = re.search(r'camera_%s:=(-?[\d.]+)' % name, line)
+    return float(m.group(1))
+
+t_launch = np.array([_arg('x'), _arg('y'), _arg('z')])
+R_launch = quat_to_matrix([_arg('qx'), _arg('qy'), _arg('qz'), _arg('qw')])
+# ⚠️ 容差按**打印精度**定：launch 那几行是 `%.6f`，所以四元数只剩 1e-6 量级，
+#    还原回来的 R 与 t 也就差 ~1e-6（不是 1e-9）。钉 1e-9 会假红。
+ang_launch = math.degrees(math.acos(min(1, max(-1,
+    (np.trace(R_launch.T @ R_TEST) - 1) / 2))))
+d_launch = float(np.linalg.norm(t_launch - T_TEST)) * 1000
+check('★ fmt_launch 还原出文件里的 camera_link 位姿（这里是构造它的那个 R,t）'
+      '（残差只来自 %.6f 的打印精度）',
+      ang_launch < 1e-3 and d_launch < 1e-2,
+      'R 差 %.6f°，t 差 %.6f mm' % (ang_launch, d_launch))
+check('  且它**不是**原样打印光学系那组（否则这一步等于没做）',
+      not np.allclose(R_launch, R_opt, atol=1e-6))
+
+print('\n--- C3. ★ 存盘版本闸门（旧语义不能悄悄沿用）---')
+check('★ 没有 store_version 字段（= v1 的旧存盘）⇒ 拒绝，并说明差 15 mm',
+      isinstance(store_version_error({'base_from_board_R': [[1, 0, 0], [0, 1, 0],
+                                                             [0, 0, 1]]}), str)
+      and '15 mm' in store_version_error({}))
+check('  当前版本 ⇒ 放行（None）', store_version_error(
+    {'store_version': STORE_VERSION}) is None)
+check('★ 比当前**新**的存盘也拒绝（本脚本读不懂它的语义，不猜）',
+      isinstance(store_version_error({'store_version': STORE_VERSION + 1}), str))
 
 print('\n--- D. ★ 整条链的闭环：init 之后再 solve，应当拿回原外参 ---')
 # 设相机真值 base←cam；由它和某次观测 cam←板 推出 base←板（--init）；
@@ -141,6 +194,81 @@ check('  位移不受纯转动漂移影响（相机光心没动）',
       np.allclose(base_from_cam_solved[1], base_from_cam_true[1], atol=1e-12))
 check('★ 反过来：板若被写错（把 cam←板 当成 base←板），闭环就崩 —— 值得显式记',
       not np.allclose(compose(A, invert(B))[0], compose(A, invert(A))[0]))
+
+print('\n--- E. 变异：改坏一处，对应断言必须失效 ---')
+
+
+def _load(src_text, tag):
+    """把一份源码文本当模块导入（临时文件，避免与真模块的 .pyc 混）。"""
+    import importlib.util
+    import tempfile
+    d = tempfile.mkdtemp(prefix='mkcalib_')
+    p = os.path.join(d, 'topcam_marker_calib_%s.py' % tag)
+    with open(p, 'w') as f:
+        f.write(src_text)
+    spec = importlib.util.spec_from_file_location('topcam_marker_calib_%s' % tag, p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _mutate(old, new):
+    """对真源码做一次文本替换；没命中就抛（防「变异其实没生效」）。"""
+    s = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'topcam_marker_calib.py')).read()
+    assert old in s, '变异锚点没找到：%r' % old
+    return s.replace(old, new)
+
+
+def _mutate_dzf(old, new):
+    s = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'draw_zone_on_frame.py')).read()
+    assert old in s, 'dzf 变异锚点没找到：%r' % old
+    return s.replace(old, new)
+
+
+# M1：那 15 mm 又被丢掉（换算只转旋转、不转平移）——这正是 2026-10-06 修掉的
+#     那个缺陷。注意换算现在住在 dzf 里（两个工具共用一份），所以变异要打在
+#     dzf 上、再把变异版塞给 marker_calib —— 这本身也证明了「共用一份」生效了。
+m1_dzf = _load(_mutate_dzf("        return (R @ R_LINK_TO_OPTICAL,\n"
+                           "                R @ T_LINK_TO_OPTICAL + t)",
+                           "        return (R @ R_LINK_TO_OPTICAL, t)"), 'dzf_m1')
+m1 = _load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'topcam_marker_calib.py')).read(), 'm1')
+m1.dzf = m1_dzf
+Rb_m1, tb_m1 = safe(m1.base_from_camera, ARCH)
+check('M1 平移不跟着转 → 光学系原点退回 t，15 mm 那三条断言全失效',
+      np.allclose(tb_m1, T_TEST) and not np.allclose(tb_m1, tb),
+      '变异后 t = %s' % np.round(tb_m1, 4).tolist())
+
+# M2：fmt_launch 不做帧转换（把 base←光学系 当 launch 值打印）——
+#     这正是改之前的行为：填进 launch 就错一个 90° 级旋转，而且不报错。
+m2 = _load(_mutate("    R_link = np.asarray(R_opt, dtype=float) @ R_LINK_TO_OPTICAL.T\n"
+                   "    t_link = np.asarray(t_opt, dtype=float) - R_link @ T_LINK_TO_OPTICAL",
+                   "    R_link = np.asarray(R_opt, dtype=float)\n"
+                   "    t_link = np.asarray(t_opt, dtype=float)"), 'm2')
+line_m2 = m2.fmt_launch(R_opt, t_opt)
+
+
+def _arg_of(line, name):
+    return float(re.search(r'camera_%s:=(-?[\d.]+)' % name, line).group(1))
+
+
+R_m2 = quat_to_matrix([_arg_of(line_m2, 'qx'), _arg_of(line_m2, 'qy'),
+                       _arg_of(line_m2, 'qz'), _arg_of(line_m2, 'qw')])
+ang_m2 = math.degrees(math.acos(min(1, max(-1,
+    (np.trace(R_m2.T @ R_TEST) - 1) / 2))))
+check('M2 fmt_launch 不转换 → 打印的与 launch 要的差一个 90° 级旋转'
+      '（所以 C2 那两条不是空转）',
+      ang_m2 > 80.0, '变异后与正确值差 %.1f°' % ang_m2)
+
+# M3：版本闸门写成「非零就放行」——未来版本的存盘会被读进来（本脚本读不懂
+#     它的语义）。这正是「不猜」原则要挡住的。
+m3 = _load(_mutate("    if have == STORE_VERSION:\n        return None",
+                   "    if have:\n        return None"), 'm3')
+check('M3 闸门写成「非零即放行」→ 比当前新的存盘也被放行（所以 C3 那条不是空转）',
+      m3.store_version_error({'store_version': STORE_VERSION + 1}) is None
+      and store_version_error({'store_version': STORE_VERSION + 1}) is not None)
 
 print('\n通过 %d，失败 %d' % (N_PASS, N_FAIL))
 if FAILS:
