@@ -1348,6 +1348,16 @@ try:
           and any("不认识的键" in x for x in real_p),
           "改后 %d 条毛病 / 改前 %d 条" % (len(mut_p), len(real_p)))
 
+    # 这条变异**就是当初那个洞**：`--log` 那一半没人判 ⇒ 栈日志直接往公开仓里写。
+    m = load_mutant(_mutate(SRC, '    if log_path and path_in_repo(log_path, repo):',
+                            "    if False:", "outpath"), "outpath")
+    mut_o = m.judge_output_paths(os.path.join(REPO, "scripts", "x.log"), None)[0]
+    real_o = board_run.judge_output_paths(
+        os.path.join(REPO, "scripts", "x.log"), None)[0]
+    check("削掉「`--log` 不许进仓库」⇒ 栈日志（含 IP/序列号）往公开仓里写",
+          mut_o == board_run.PASS and real_o == board_run.FAIL,
+          "改后 %s / 改前 %s" % (mut_o, real_o))
+
     m = load_mutant(_mutate(SRC, "    if isatty():", "    if True:", "wpath"), "wpath")
     mut_w = m.judge_write_path(lambda: False)[0]
     real_w = board_run.judge_write_path(lambda: False)[0]
@@ -1438,6 +1448,20 @@ try:
           and not os.path.exists(os.path.join(REPO, "scripts", "_never_write.json")))
     check("  报告末尾印出三档退出码的语义（0/1/2 各是什么）",
           mentions(r.stdout, "1 = ", "2 = ", "交棒"))
+
+    # ---- 红线 3：`--log` 指进仓库 ⇒ **P0 就退 2，一个字节都不写** ------------
+    # 这是 2026-10-06 抓到的洞的钉子：此前 `--log` **没有任何守卫**，起栈那一刻
+    # `open(path,"w")` 就把栈日志写进公开仓 —— 里面有控制箱 IP、相机序列号、
+    # 串口 by-id。而 `--json-report` 那句拒绝是在**跑完之后**才打印、且不翻退出码。
+    inrepo_log = os.path.join(REPO, "scripts", "_never_write_log.txt")
+    r = run_cli("--task", "a1", "--site", site_path, "--dry-run",
+                "--log", inrepo_log, env={"PATH": no_ros})
+    check("★ `--log` 指进仓库 ⇒ 退 2（P0 就拦，栈压根不起）",
+          r.returncode == 2, "rc=%s" % r.returncode)
+    check("  红的那一条叫 `P0.输出路径`，并且**真的一个字节都没写**",
+          "[FAIL] P0.输出路径" in r.stdout and not os.path.exists(inrepo_log))
+    if os.path.exists(inrepo_log):
+        os.remove(inrepo_log)     # 判据坏了的时候，别把垃圾留在仓库里
 
     bindir, sentinel = make_fake_ros2(tmpdir)
     r = run_cli("--task", "a1", "--site", site_path, "--dry-run",
@@ -1703,6 +1727,27 @@ try:
           and "红线 6" in det)
     check("  有交互终端才 PASS", board_run.judge_write_path(lambda: True)[0]
           == board_run.PASS)
+
+    # ---- ②′ 红线 3：运行记录不许落进公开仓（**P0 就拦，起栈之前**）-----------
+    # 2026-10-06 抓到的洞：`--json-report` 只在**最后**判了一下、且**不翻退出码**
+    # （拒绝了却退 0）；`--log` 则**根本没判** —— 它是 `open(path,"w")` 直接写的，
+    # 起栈那一刻就往里灌栈日志（里面有控制箱 IP、相机序列号、串口 by-id）。
+    inrepo = os.path.join(REPO, "scripts", "_never_write_log.txt")
+    out_repo = os.path.join(tmpdir, "fine.log")
+    st, det = board_run.judge_output_paths(inrepo, None)
+    check("★ `--log` 指向仓库内 ⇒ FAIL（这一半在 2026-10-06 之前**根本没人判**）",
+          st == board_run.FAIL and "--log" in det)
+    check("  理由里点名红线 3，并说清「不会写、也不会起栈」",
+          "红线 3" in det and "不会写" in det and "起栈" in det)
+    st, det = board_run.judge_output_paths(None, os.path.join(REPO, "x.json"))
+    check("`--json-report` 指向仓库内 ⇒ FAIL", st == board_run.FAIL
+          and "--json-report" in det)
+    check("  两个都在仓库外 ⇒ PASS（不是「一律拒」）",
+          board_run.judge_output_paths(out_repo, out_repo)[0] == board_run.PASS)
+    check("  两个都没给 ⇒ PASS（默认日志落在 `~/`，本来就在仓库外）",
+          board_run.judge_output_paths(None, None)[0] == board_run.PASS)
+    check("  纯函数：只按路径算，不读环境、不碰文件",
+          board_run.judge_output_paths.__code__.co_argcount <= 3)
 
     # ---- ② 被告知：报文要先完整摆出来 --------------------------------
     lines = "\n".join(board_run.switch_payload_lines(task_a1, timeout=8.0))

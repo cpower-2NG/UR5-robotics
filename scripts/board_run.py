@@ -1477,9 +1477,42 @@ def wait_for_finish(log_path, deadline, marker, clock=time.time, sleep=None):
 # 本文件只做三件它该做的事：起栈**之前**拒绝没有当次授权的请求、把要发的报文
 # **先完整摆出来**、切完按**只读复核**判「生效 / 未生效」。三条见文件头。
 
+OUTPUT_PATH_ITEM = "P0.输出路径"
 WRITE_PATH_ITEM = "P0.写路径授权"
 REPAIR_ITEM = "P3.控制器修复"
 SWITCH_TIMEOUT = 8.0            # 与 board_gate.Probe.switch_controllers 的默认值同
+
+
+def judge_output_paths(log_path, json_report, repo=REPO):
+    """`--log` / `--json-report` 必须落在**仓库外**。**纯函数** → `(status, detail)`。
+
+    ⚠️ 为什么要在 **P0** 判，而不是等要写的时候再判（这里原来只有 `--json-report`
+    在**最后**判了一下，`--log` **根本没判**）：
+
+    1. `--log` 是拿 `open(path, "w")` **直接开写**的（`open_log`）—— 起栈那一刻
+       就开始往那个文件里灌。栈的日志里有**控制箱 IP、相机序列号、串口 by-id**，
+       而**本仓是公开副本**（红线 3）⇒ 把 `--log` 指进仓库，等于一边跑一边在准备
+       一份**带真值的待提交文件**。
+    2. 原来那句 `--json-report 指向仓库内…**没有写**` 是在**跑完之后**才打印的，
+       而且**不翻退出码**（拒绝了却退 0）。后果有两层：脚本化调用者把「拒绝」
+       读成「成功」；而且**记录是在跑完一整轮之后才丢的** —— R0/R1 要的正是那份
+       JSON，等看到这一行时这一轮已经白跑了。
+
+    两件都在「**P0 不合法就不起栈**」的合同之内，所以挪到 P0：早退 2，什么都不写。
+    `--attach` 与 `--dry-run` 同样走这一关（都是静态判断，不依赖任何设备）。
+    """
+    bad = []
+    if log_path and path_in_repo(log_path, repo):
+        bad.append("--log（%s）" % log_path)
+    if json_report and path_in_repo(json_report, repo):
+        bad.append("--json-report（%s）" % json_report)
+    if not bad:
+        return (PASS, "两个输出路径都在仓库外 —— 运行记录不进公开仓")
+    return (FAIL, "、".join(bad) + " 指向**仓库内**。本仓是**公开副本，"
+                  "一切提交永久公开**（AGENTS.md 红线 3），运行记录里带着现场路径、"
+                  "IP、序列号 ⇒ 必须写在仓库外。**这一次不会写、也不会起栈**。"
+                  "改成仓库外的路径（例如 `~/r0_runs/…`）再来；"
+                  "不要为了绕开它把记录写进仓库，也不要事后 `git add` 那个文件。")
 
 
 def judge_write_path(isatty):
@@ -1746,6 +1779,11 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                     note="站点配置没读到 ⇒ 下面**只有任务描述能定的那部分**；"
                          "robot_ip / planner_params_file / camera_* 外参 / "
                          "publish_camera_tf 都还不知道")
+
+    # 红线 3：运行记录（`--log` / `--json-report`）**不许落进公开仓**。
+    # 在这里判 = **起栈之前**，`--log` 还没被 `open(path,"w")` 打开过。
+    add(S0, Item(OUTPUT_PATH_ITEM, *judge_output_paths(
+        os.path.expanduser(a.log) if a.log else None, a.json_report)))
 
     # 红线 6：写路径要**当次**授权 ⇒ 起栈**之前**就问清楚有没有交互终端。
     # （要发的那条报文先完整摆出来 —— 人确认的是**那一条**；确认动作在 board_gate
@@ -2265,6 +2303,9 @@ def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
 def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
                   t_launch, t_stop, verdict_state, log_path, launched):
     if path_in_repo(a.json_report):
+        # 第二道锁：`P0.输出路径` 已经会退 2、根本走不到这里。留着是因为这条路径
+        # 通向**红线 3**（公开仓），多一道便宜的锁值得；但它**不是**主判据 ——
+        # 主判据在 P0，那里才能做到「早退、不写、不丢记录」。
         print("  ❌ --json-report 指向仓库内（%s）—— 本仓是公开副本，运行记录必须写在"
               "仓库外。**没有写**。" % a.json_report)
         return
