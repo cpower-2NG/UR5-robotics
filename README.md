@@ -139,6 +139,12 @@ ros2 launch yolo_bringup grid_world.launch.py world:=color_objects_world.sdf
 
 ### 真机首验（相机来源三选一）
 
+> 🚀 **要真机抓取（不是只验感知）→ 只照
+> [`docs/待执行命令.md`](docs/待执行命令.md) 的「A1 · 真机『抓 4 放 4 + 槽位用尽收工』」一节。**
+> 那一节是**唯一**被真机跑通过的完整序列（参数集、次序、预检四项、收工判据都在那儿；
+> 2026-10-05 A1 验收 **4/4** 通过）。本节只回答「`camera_source` 这个枚举怎么选」，
+> **不重复那套序列** —— 本项目曾经有五份文档各讲一套启动流程，代价是十三条互相矛盾的说法。
+
 `camera_source` 决定**谁提供 `/camera/*` 话题**，也顺带决定起不起仿真：
 
 | 值 | 起相机驱动？ | 起 Gazebo？ | 用途 |
@@ -149,12 +155,30 @@ ros2 launch yolo_bringup grid_world.launch.py world:=color_objects_world.sdf
 
 ```bash
 # 真机 + RealSense，只验感知不抓取（先跑通这条再谈抓取）
+# ⚠️ robot_ip 在真机入口是**必填**：`real.launch.py` 的启动前检查（`_check`）
+#    会直接抛错 ⇒ 不给 IP 的后果是「命令失败、什么都没起」，
+#    **不是**「安静地跳过驱动」（那是很容易想反的一侧）。
+export ROS_DOMAIN_ID=99   # ⚠️ 板上现场跑在 99（`~/.bashrc` 里有，但新开的 shell 里别指望）
 ros2 launch yolo_bringup bringup.launch.py \
-    camera_source:=realsense skip_planner:=true tf_required:=true
+    camera_source:=realsense robot_ip:=<控制箱IP> \
+    skip_planner:=true tf_required:=true
 ```
+
+> ⚠️ **`ROS_DOMAIN_ID=99` 漏了不会报错**，症状是「`ros2 topic list` 空的」，
+> 极易误判成「栈没起来」——那是**查询侧**的问题，不是板子的。2026-10-05 真机踩过。
 
 `tf_required:=true` 是**真机建议值**：查不到 TF 就让 `perception_3d` 报错退出，
 而不是发一帧坐标可疑的数据下去——仿真里默认 `false`（TF 树起得慢，早几帧查不到是正常的）。
+
+> ⚠️ **这个开关有 3 个定义处，「默认值」不是一份事实。**
+> `bringup.launch.py` 按 `camera_source` **算**（sim→`false`、其余→`true`）、
+> `real.launch.py` 写死 `true`、`pipeline.launch.py` 写死 `false`；而
+> `launch_configurations` 是**整棵树共享**的、**先声明者胜** ⇒ 直接调
+> `pipeline.launch.py camera_source:=external` 时默认拿到的是 **`false`**，
+> 与「真机建议 true」正好相反。只有走 `bringup.launch.py` 的真机那两支是 `true`。
+> 三处并存是本项目的已知结构债（`scripts/test_real_launch.py` 的 D64 一条把守着
+> 其中的一半）。**别在其他文档里再写第 4 处默认值**。
+
 ⚠️ **`gripper_backend` 的默认值随入口变** —— 它在代码里**不是写死的常量**，
 而是 `'sim' if camera_source == 'sim' else 'none'`（`pipeline.launch.py`）：
 
@@ -246,8 +270,8 @@ ur5-vision-grasp/
 这些脚本**层层递进**，都不需要 Gazebo（`test_ag95_probe.py`、`test_ag95_gripper.py`、
 `test_ag95_init_close.py` 与 `test_real_launch.py` 连真夹爪、真串口都不需要 ——
 前三个用一个手写的 Modbus 从站接在 pty 上验；`test_ur5_fk_check.py`、
-`test_board_a1.py`、`test_deidentified.py`、`test_docs_map.py` 与 `state_check.py`
-只要 Python 标准库）：
+`test_board_a1.py`、`test_deidentified.py`、`test_docs_map.py`、`test_startup_docs.py`
+与 `state_check.py` 只要 Python 标准库）：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -280,6 +304,12 @@ python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，
                                          #   ls-files 是隐形的 —— 两条路径都真的漏过）
                                          #   只要标准库；**不需要** source ROS
 python3 scripts/test_docs_map.py         # 文档地图全覆盖 + 层声明一致 + 相对链接不断
+python3 scripts/test_startup_docs.py     # 真机启动文档守卫：runbook（`待执行命令.md` 的 A1
+                                         #   一节）里写的 launch 参数集，必须 == 启动器
+                                         #   `scripts/board_a1.py` 实际会传的那一套
+                                         #   内含真实的变异反例（参数少一个/多一个、
+                                         #   入口换成 pipeline.launch.py，都必须判红）
+                                         #   只要标准库；**不需要** source ROS
 python3 scripts/state_check.py           # 状态层过期检查（把「哪些行超期」算出来）
 ```
 
@@ -346,6 +376,8 @@ python3 scripts/board_a1.py --params $HOME/site_real.yaml
 #   前置检查：无残留进程 / 串口空闲 / AG-95 已初始化 / 示教器在 PLAYING
 #   `--no-launch --log <文件>` 只对已有日志判分，不起栈、不动臂
 #   `--start-delay <秒>`（默认 25）规划器推迟启动，等 UR 驱动先连上
+#     ⚠️ A1 一节手敲的那两段用的 **120**（实测「一次 State tolerances failed
+#     都没有」）。25 是够按 PLAY 的保守下限，120 是建议值 —— 见该节的说明
 ```
 
 **2026-10-05 真机通过**（5 块 / 4 槽）：
@@ -494,9 +526,15 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
   # 只想验感知链路（不碰驱动、不碰 MoveIt、不碰臂）—— 板上最安全的第一步
   ros2 launch yolo_bringup bringup.launch.py camera_source:=external
 
-  # 完整真机链路（需要控制箱 IP；臂没接上/没配好时先别跑这条）
+  # 真机链路起来（需要控制箱 IP；臂没接上/没配好时先别跑这条）
   ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense robot_ip:=<控制箱 IP>
   ```
+
+  > **上面两条只是「起得来」。**
+  > **完整抓取的参数集、次序（起栈 → 示教器按 PLAY → 拉控制器）、预检四项、
+  > 摆件要求与收工判据，一律以
+  > [`docs/待执行命令.md`](docs/待执行命令.md) 的 A1 一节为准** ——
+  > 本节讲的是「板上装了什么、缺什么、怎么编」，不重复那套序列。
 - **模型权重必须显式指定，别依赖「按目录找」**（D67）。⚠️ `block_best.pt`
   **不在仓库里**（6 MB，按规范走外链；需要它请见下面「模型权重」一节）。
   `model:=block_best.pt` 这个**相对名**是按**启动时的 CWD** 解析的 ——

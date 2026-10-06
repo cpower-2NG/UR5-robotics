@@ -240,6 +240,19 @@ sudo ufw status verbose            # 需要 sudo；权威
 
 ## 6. 联调顺序（从空跑到真机）
 
+> 📌 **本节讲的是「第一次把这台机器接上」的教学顺序**，用的是 UR 官方驱动自己的
+> `ur_control.launch.py`（**只有驱动**，没有感知、没有抓取、没有相机 TF）。
+> **它不是本项目的启动序列**，别拿它上机抓取。
+>
+> 本项目真机启动的唯一权威序列见
+> [`docs/待执行命令.md`](../待执行命令.md) 的 **A1 一节**：
+> 起栈（`yolo_bringup bringup.launch.py camera_source:=realsense` + 全套参数）
+> → 按 PLAY → 把控制器拉回来 → 预检四项。**顺序反了会「连接被拒绝」**，
+> 控制器停在 STOPPED —— 详见该节的 `switch_controller` 闸门。
+>
+> 本节仍然有用：它解释**为什么**要装 External Control URCap、切 Remote Control、
+> 标定为什么不能跳。这些前提 A1 一节默认已经满足，不会重讲。
+
 ### 第 0 步：空跑，不接机械臂
 
 ```bash
