@@ -25,9 +25,12 @@ import sys
 
 sys.dont_write_bytecode = True   # 防 .pyc 假绿（仓库约定）
 
+import ast                       # noqa: E402
 import importlib.util            # noqa: E402
+import inspect                   # noqa: E402
 import os                        # noqa: E402
 import tempfile                  # noqa: E402
+import textwrap                  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -236,6 +239,63 @@ def section_mutation():
               base == (4, 4) and got == (1, 4), f"改前={base} 改后={got}")
 
 
+def _raises(fn):
+    """`fn()` 抛了就 True。用来钉「这里必须**拒**，不是打一行警告然后照跑」。"""
+    try:
+        fn()
+    except Exception:
+        return True
+    return False
+
+
+def _cam_vals(cmd):
+    """命令列表里 `camera_*:=<值>` 那些**值**。"""
+    return {x.split(":=", 1)[1] for x in cmd
+            if x.startswith("camera_") and ":=" in x}
+
+
+# ------------------------------------- 5b. 缺 --site ⇒ 退 2（不是警告后照跑）
+def section_site_required():
+    """2026-10-06 用户拍板：**缺站点配置就退 2，绝不回落 `CAM`**。
+
+    这一段能在离线跑，是因为「拒绝」发生在**起栈之前**：`main()` 走到站点那一段
+    就返回 2 了，`build_cmd` / `Popen` / 设备一概碰不到。所以它是真验证，
+    不是读源码猜。
+    """
+    import contextlib
+    import io
+
+    print("\n[5b] 缺 --site ⇒ **退 2**（外参只许有一份真值；`CAM` 是作废的孤本）")
+
+    saved = os.environ.pop(board_a1.board_lib.SITE_ENV, None)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = board_a1.main(["--robot-ip", "203.0.113.7",
+                                "--log", os.path.join(tempfile.gettempdir(),
+                                                      "nope_a1.log")])
+        out = buf.getvalue()
+        check("★ 没给站点配置 ⇒ 退 2（不是打一行警告然后拿 CAM 起栈）", rc == 2,
+              f"得到 rc={rc}")
+        check("  并且**说清为什么拒**（外参只许有一份真值 ＋ 旧几何是静默失效）",
+              "退 2" in out and "静默" in out and "孤本" in out, out.strip()[:160])
+        check("  拒在**起栈之前**：连起栈那行都没印出来",
+              "起栈（carry_objects" not in out, out.strip()[:160])
+
+        # `--no-launch` 只对现成日志判分：不起栈、不碰外参 ⇒ **不该**被这条拒掉。
+        # （否则「拿旧日志复判分」这条路会被误伤。）
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            rc2 = board_a1.main(["--no-launch", "--log",
+                                 os.path.join(tempfile.gettempdir(), "nope_a1.log")])
+        check("  但 `--no-launch`（只判分、不起栈）**不该**被这条拒掉",
+              rc2 == 2 and "退 2" not in buf2.getvalue(),
+              f"rc={rc2}；输出={buf2.getvalue().strip()[:120]}")
+    finally:
+        if saved is not None:
+            os.environ[board_a1.board_lib.SITE_ENV] = saved
+
+
 # --------------------------------------------------- 5. 起栈命令真的带上了关键参数
 def section_launch():
     """`build_cmd` 拼错一个参数不会报错，只会**静默跑成另一回事** ——
@@ -246,12 +306,19 @@ def section_launch():
 
     print("\n[5] 起栈命令：关键参数逐项钉住（漏一个不会报错，只会静默跑成另一回事）")
 
+    # 夹具外参：**故意用编造的数**，与 `board_a1.CAM` 和现场真值都不同 ——
+    # 好让「命令里出现了 CAM 的值」这条断言真的能翻面。
+    FAKE_CAM = {"camera_x": "0.101", "camera_y": "0.202", "camera_z": "0.303",
+                "camera_qx": "0.404", "camera_qy": "0.505", "camera_qz": "0.606",
+                "camera_qw": "0.707"}
+
     def cmd(**kw):
         # ⚠️ 用 RFC 5737 文档保留地址，**不要**改成 10./192.168. 开头的
         #    —— 那是真·私网段，脱敏自检会（正确地）报红。
         a = argparse.Namespace(robot_ip="203.0.113.7",
                                params="/tmp/p.yaml",
-                               start_delay=25.0)
+                               start_delay=25.0,
+                               cam=dict(kw.pop("cam", FAKE_CAM)))
         for k, v in kw.items():
             setattr(a, k, v)
         return board_a1.build_cmd(a)
@@ -266,10 +333,42 @@ def section_launch():
     check("carry_objects:=true 在（否则只走位、不夹）",
           "carry_objects:=true" in base)
     check("--robot-ip 真的拼进去了", "robot_ip:=203.0.113.7" in base)
-    check("七个相机外参全在（少一个就是静默错标定）",
-          all(f"{k}:={v}" in base for k, v in board_a1.CAM.items())
-          and len(board_a1.CAM) == 7,
-          f"CAM 有 {len(board_a1.CAM)} 项")
+    check("七个相机外参全在（少一个就是静默错标定）—— 来自 `a.cam`，即站点那份",
+          all(f"{k}:={v}" in base for k, v in FAKE_CAM.items())
+          and len(FAKE_CAM) == 7)
+
+    # ⚠️ 这一段盯的是 2026-10-06 用户拍板的那条：**缺 `--site` 就退 2，绝不回落 `CAM`**。
+    #    为什么值得一条断言：回落是**静默**的（旧几何照样跑完一轮，只是抓不到），
+    #    而相机每动一次外参就作废一次 —— 常量只要还在兜底，迟早有人用它。
+    check("★ 没有外参（`a.cam` 缺失/为空）⇒ `build_cmd` **当场抛**，不是静默回落",
+          _raises(lambda: cmd(cam=None)) and _raises(lambda: cmd(cam={})),
+          "cam=None / cam={} 都没抛")
+    # ⚠️ 这里**不能**拿上面那个 `base` 来判：`base` 是用 `FAKE_CAM` 拼的，
+    #    它**永远**看不到 `CAM` 的值 —— 那样写出来的是一条**空断言**，为错误的
+    #    理由通过（变异注入时它不翻面，正好暴露了这一点）。
+    #    要问的是：**没给外参时**，`build_cmd` 到底吐出了什么。
+    def _cmd_nocam():
+        return board_a1.build_cmd(argparse.Namespace(
+            robot_ip="203.0.113.7", params="/tmp/p.yaml",
+            start_delay=25.0, cam=None))
+
+    try:
+        _leaked = _cam_vals(_cmd_nocam())
+    except Exception:
+        _leaked = set()          # 抛了 ⇒ 根本发不出去，正是要的
+    check("★ `board_a1.CAM` 那 7 个值**一个都发不出去**：没给外参时要么当场抛、"
+          "要么吐出来的命令里也不含它们",
+          not (_leaked & set(board_a1.CAM.values())),
+          "跑进命令的 CAM 值：%s" % sorted(_leaked & set(board_a1.CAM.values())))
+    # ⚠️ 判的是 **AST**，不是文本：`build_cmd` 的注释里**故意**写着「绝不回落 `CAM`」，
+    #    按文本扫就会把「说明自己没回落」误判成「回落了」—— 那条绿是假的。
+    #    注释不进 AST，所以这里问的是「代码里到底引用没引用过这个名字」。
+    _tree = ast.parse(textwrap.dedent(inspect.getsource(board_a1.build_cmd)))
+    _used = {n.id for n in ast.walk(_tree) if isinstance(n, ast.Name)}
+    _used |= {n.attr for n in ast.walk(_tree) if isinstance(n, ast.Attribute)}
+    check("  结构上就做不到：`build_cmd` 的**代码**里根本没引用过 `CAM`"
+          "（判 AST，注释里提它不算）",
+          "CAM" not in _used, "build_cmd 的代码里引用了 CAM：%s" % sorted(_used))
 
 
 def main():
@@ -280,6 +379,7 @@ def main():
     section_ok()
     section_others()
     section_mutation()
+    section_site_required()
     section_launch()
     print("\n" + "=" * 64)
     if _failed:

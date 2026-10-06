@@ -759,8 +759,14 @@ try:
     params_before, sources, conflicts = board_run.resolve_launch_params(task_a1, site)
     # 旧入口（`board_a1.build_cmd`）会发的键集 —— [10]/[14] 的参数集守卫拿它当对照。
     # 组装 launch 参数的地方有两个（旧脚本 + 本启动器），守卫必须同时钉住两边。
-    _ns = types.SimpleNamespace(robot_ip=site.robot_ip, params=site.planner_params,
-                                start_delay=task_a1.start_delay, cam=None)
+    # ⚠️ 这里要的是**键集**，不是值 ⇒ 外参给一组占位即可。
+    #    2026-10-06 起 `board_a1.build_cmd` **没有外参就抛**（缺 `--site` 退 2，
+    #    绝不回落那份作废的 `CAM`）—— 所以这里必须显式给一份，不能再传 `cam=None`。
+    #    给占位而不是真值，也是刻意的：**仓库里不出现第二份外参真值。**
+    _ns = types.SimpleNamespace(
+        robot_ip=site.robot_ip, params=site.planner_params,
+        start_delay=task_a1.start_delay,
+        cam={k: "0.0" for k in board_lib.CAM_KEYS})
     entry_keys = [x.split(":=")[0] for x in board_a1.build_cmd(_ns) if ":=" in x]
     check("拼装零冲突（站点权威项没有被任务描述重复声明）", conflicts == [],
           str(conflicts))

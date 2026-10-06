@@ -76,7 +76,15 @@ import board_lib                                             # noqa: E402
 from board_lib import (dashboard, gripper_state, is_playing,  # noqa: E402
                        leftovers, port_busy, teardown)
 
-# 标定过的外参（2026-10-05 现场值）。改这里之前先确认你知道自己在改什么。
+# ⚠️ **作废的孤本记录 —— 程序里一个字都不用，也不许用它兜底。**
+#
+# 这是 2026-10-05 那次验收当天敲的值，**故意不更新**。理由是一条设计决策：
+# 现行外参只许有**一份**真值，就在站点配置 `~/.config/ur5-vision-grasp/site.yaml`。
+# 在仓库里再放一份「更新的」＝造第二份真值，两份迟早对不上，而且**对不上的时候
+# 不会报错**。所以它留在这里只为一件事：让人一眼看出「仓库里的常量不可信」。
+#
+# `build_cmd` 没有外参就**抛**；`main` 没有 `--site` 就**退 2**。
+# 换句话说：**这份常量读起来像配置，其实是一块纪念碑。**
 CAM = {
     "camera_x": "0.34694477757210807",
     "camera_y": "0.8693043936314018",
@@ -229,9 +237,15 @@ def build_cmd(a):
         # `连续未放置 2/10`，加了是 0/10）。
         f"start_delay:={a.start_delay:g}",
     ]
-    # 站点配置给了外参就用站点那份（那是现场核对过的），否则退回代码里记录的
-    # `CAM`。`getattr` 是因为离线测试用 `Namespace` 造参数、不带 `cam`。
-    cam = getattr(a, "cam", None) or CAM
+    # ⚠️ **绝不回落 `CAM`**（理由见模块顶部那段注释）。没有站点外参就**当场抛**,
+    # 让调用方在**起栈之前**失败 —— 拿一份旧几何跑真机是**静默**失效：
+    # 症状是候选落到臂够不到的地方，读起来像「检测坏了」。
+    # `getattr` 是因为离线测试用 `Namespace` 造参数、可能不带 `cam`。
+    cam = getattr(a, "cam", None)
+    if not cam:
+        raise ValueError(
+            "build_cmd 没有外参：需要 a.cam（站点配置的 topcam.extrinsics）。"
+            "本函数**不会**回落到 board_a1.CAM —— 那是 2026-10-05 的作废孤本。")
     args += [f"{k}:={v}" for k, v in cam.items()]
     return args
 
@@ -268,8 +282,10 @@ def main(argv=None):
     #    现场配一次 `export UR_ROBOT_IP=<控制箱IP>` 即可（或每次显式传）。
     ap.add_argument("--robot-ip", default=os.environ.get("UR_ROBOT_IP"))
     ap.add_argument("--site", default=None,
-                    help="站点配置路径（默认取 $UR5VG_SITE）—— 给了它就会校验"
-                         "合法性并**判外参时效**；不给则退回代码里的 CAM 且不判时效")
+                    help="站点配置路径（默认取 $UR5VG_SITE）—— 起栈时**必给**，"
+                         "不给就退 2。外参只许有一份真值（站点配置的 "
+                         "topcam.extrinsics）；仓库里那份 CAM 是作废的孤本，"
+                         "**不作兜底**")
     ap.add_argument("--override-freshness", default=None, metavar="理由",
                     help="外参超期时由人显式破例，**必须写下为什么**（原样打印出来）")
     ap.add_argument("--play-timeout", type=float, default=300.0,
@@ -311,11 +327,23 @@ def main(argv=None):
                   "--override-freshness \"理由\" 显式破例。")
             return 2
         print()
+    elif not a.no_launch:
+        # ⚠️ **不给站点配置就退 2，绝不回落到 `CAM`**（2026-10-06 用户拍板）。
+        # 回落的代价是**静默**的：拿一份旧几何起栈，症状是候选落到臂够不到的地方，
+        # 读起来像「检测坏了」—— 这一轮照样能跑完，于是「外参作废了」被掩盖成
+        # 「检测不稳定」。而相机每动一次外参就作废一次 ⇒ **常量只要还在兜底，
+        # 迟早有人用它**。所以这里不是警告，是拒绝。
+        print("❌ 没给站点配置（--site / $UR5VG_SITE）⇒ **退 2，不起栈**。")
+        print("   外参只许有一份真值：站点配置的 topcam.extrinsics。")
+        print("   仓库里那份 `CAM` 是**2026-10-05 的作废孤本**，本脚本不作兜底 ——")
+        print("   拿旧几何起栈是**静默**失效（候选落到臂够不到的地方，看起来像"
+              "检测坏了）。")
+        print("   cp config/site.example.yaml ~/.config/ur5-vision-grasp/site.yaml")
+        print("   填好之后 --site 指过去（或 export UR5VG_SITE=<路径>）。")
+        return 2
     else:
-        print("⚠️ 没给站点配置（--site / $UR5VG_SITE）⇒ 用代码里记录的 CAM 外参，"
-              "**时效不判**。")
-        print("   cp config/site.example.yaml ~/.config/ur5-vision-grasp/site.yaml"
-              " 填好后 --site 指过去。\n")
+        # `--no-launch` 只对现成日志判分：不起栈、不碰外参，所以不需要站点配置。
+        print("（--no-launch：只判分，不起栈 ⇒ 不需要站点配置与外参）\n")
 
     a.robot_ip = a.robot_ip or (site.robot_ip if site else None)
     a.params = (a.params or (site.planner_params if site else None)
