@@ -97,6 +97,19 @@ from grasp_planner.gripper import make_gripper
 from grasp_planner.telemetry import SLOT_SKIPPED, SLOT_USED, PlannerTelemetry
 # 类别→槽位的路由判据（纯函数，无 ROS 依赖）。抽出去是为了能单测 ——
 # 这段逻辑错了不会报错，只会把方块放进错的格子，见 slot_routing.py。
+from grasp_planner.place_verify import (
+    DECIDED,
+    SKIPPED,
+    TIMEOUT,
+    UNAVAILABLE,
+    VERDICT_NAMES,
+    Observation,
+    Result,
+    format_slot_line,
+    judge_place,
+    place_roi,
+    summarize,
+)
 from grasp_planner.slot_routing import (
     class_histogram,
     describe_routing,
@@ -234,6 +247,20 @@ class GraspPlanner(Node):
         self.idle_finish_timeout: float = float(p["idle_finish_timeout"])
         self.carry_objects: bool = bool(p["carry_objects"])
 
+        # ---- 放置落点复核 ----
+        # ⚠️ 必须在下面 `_validate_zones(...)` **之前**赋值 —— 那里面要用
+        #    `place_verify_tol_xy` 去查「容差不能大到把邻槽算进来」。写在
+        #    _validate_zones 调用之后的话，读到的属性还不存在，节点启动即
+        #    AttributeError（`_declare_params` 只负责声明，不会变成属性）。
+        self.place_verify_enabled: bool = bool(p["place_verify_enabled"])
+        self.place_verify_timeout: float = float(p["place_verify_timeout"])
+        self.place_verify_settle: float = float(p["place_verify_settle"])
+        self.place_verify_tol_xy: float = float(p["place_verify_tol_xy"])
+        self.place_verify_z_tol: float = float(p["place_verify_z_tol"])
+        self.place_verify_min_score: float = float(p["place_verify_min_score"])
+        self.place_verify_roi_margin: float = float(p["place_verify_roi_margin"])
+        self._place_roi = place_roi(self.place_slots, self.place_verify_roi_margin)
+
         # ---- 姿态安全 ----
         self.elbow_guard_enabled: bool = bool(p["elbow_guard_enabled"])
         self.guard_links = list(p["guard_links"])
@@ -283,6 +310,27 @@ class GraspPlanner(Node):
         # 手上（或即将去抓）那个方块的类别名。放置段靠它挑槽位 ——
         # 抓取段选目标时记下，放下后清掉。
         self._holding_class: Optional[str] = None
+
+        # 放置落点复核的进行态。分**两个**字段而不是一个，是因为它们解决的是
+        # 两件不同的事：
+        #   `_verify_ctx`     = 「有一个待复核的落点」——它在 `_on_place_released`
+        #                       就建好了（那时才能读到 `_holding_class`：清掉之后
+        #                       就再也拿不到期望类别了），但**此时臂还在放置区
+        #                       上方**，读到的任何一帧都是臂。
+        #   `_verify_active`  = 「现在真的在看帧了」——只在回 HOME + settle 之后
+        #                       才置位。_targets_cb 的旁路只认它。
+        # 合成一个字段就会踩「臂还没退开就把第一帧当证据」这个坑，而且症状是
+        # **静默判错**（把臂当成方块 → NOT_FOUND），不是报错。
+        self._verify_ctx: Optional[dict] = None
+        self._verify_active = False
+        self._verify_frames_total = 0
+        self._verify_frames_stale = 0    # 时间戳没超过「回 HOME 时刻」的那些
+        self._verify_frames_nostamp = 0  # 时间戳是 0（无法比对）的那些
+        self._verify_timer = None        # 死线 Timer，保证一定收敛回 _reset_busy
+        # 台账：槽位下标 → Result。**用 dict 而不是 list**，因为复核可能
+        # 以任意顺序完成（超时的那些是最后落账的），而报告要按槽位顺序打。
+        self._verify_results: dict = {}
+        self._verify_order: List[int] = []
         # 「夹爪里可能夹着东西」——原设计**根本没有这个状态**（D53），
         # 于是放置段失败时方块留在爪里，下一次接近会带着它去撞别的目标。
         self._holding = False
@@ -589,6 +637,39 @@ class GraspPlanner(Node):
         d("close_settle", 0.5)          # 闭合后等物理沉降再判空（s）
         d("retry_delay", 0.5)           # 没有可抓目标时，多久后重新接受检测（s）
 
+        # ---- 放置落点复核（B1a）----
+        # 每放下一块、回到 HOME 之后，等一帧**新的** /targets_3d，看那个槽位
+        # 附近是不是真的躺着期望类别的东西，并把 Δ=(实测−期望) 记进收工台账。
+        # **只记账，不纠正**：这一轮的目的是先拿到真值分布。
+        #
+        # ⚠️ 为什么必须**回 HOME 之后**才复核：放置**过程中**臂必然挡着放置区
+        #    （实测 HOME 位不挡：UR5 FK 下肘在 (0,0,0.514)、tool0 在 x=-0.487，
+        #    槽位在 x=0.50~0.60，视线离臂最近 44.9 cm；而下降/抬起时臂就在槽位
+        #    正上方）。在臂还没退开的时候读，读到的是臂。
+        d("place_verify_enabled", True)
+        # 等一帧的上限（s）。False 时**逐字节退回**本轮之前的行为 —— 这是
+        # A1/A2 的验收判据能逐字保持的原因。
+        # 2.0 的来历：检测是 ~10 Hz，连续丢 20 帧才算真断流；量纲上与既有的
+        # goal_time_tolerance（轨迹到点宽限）一致。8 个槽最坏多花 16 s。
+        d("place_verify_timeout", 2.0)
+        # 回 HOME 之后先等这么久再开始看（s）。**与 retry_delay 同值** ——
+        # 那本来就是「回 HOME 后等一等」的常量，不为复核另编一个。
+        d("place_verify_settle", 0.5)
+        # 落点容差（m）。上界是「不能把邻槽的方块算成本槽的」：最近的两个同色
+        # 槽相距 0.10 m（见 place_slots 的布局注释），所以必须 < 0.05；下界是
+        # 「仍在自己那一格的脚印内」（方块约 40 mm）。取 25 mm ≈ 估计落点误差
+        # （约 3 mm）的 8 倍。启动期会硬校验 < 最近槽距的一半（见 _validate_zones）。
+        d("place_verify_tol_xy", 0.025)
+        # z 告警阈值（m）。**只告警，不参与通过/失败**：方块斜着落、两台叠在
+        # 一起、深度在物体边缘取到台面，都会让 z 失准 —— 而它们正是要测的现象。
+        d("place_verify_z_tol", 0.03)
+        # 复核用的最低分数。**与 min_score 同值**（同一个检测器、同一个物体、
+        # 同一个距离），不另编一个数字。
+        d("place_verify_min_score", 0.30)
+        # 放置区 ROI 的外扩量（m）。ROI 只用来回答「这一块相机看不看得见」，
+        # 不参与「放对没放对」的判定（见 place_verify 模块里 UNAVAILABLE 的说明）。
+        d("place_verify_roi_margin", 0.05)
+
         # ---- 夹爪 ----
         d("gripper_backend", "sim")     # sim | ag95 | none
         # 仅 backend=none 时有意义：写进启动日志的「为什么没有夹爪」。
@@ -705,17 +786,40 @@ class GraspPlanner(Node):
         # ⚠️ 这一条是**告警**不是错误：它与物体尺寸、夹爪型号都有关，
         # 是现场可判断的物理风险，不该由代码一刀切。
         min_pitch = gripper_stroke_mm / 1000.0
+        # 记录**实际**最近的一对槽距：落点复核的容差上界由它决定，而不是由
+        # 夹爪行程决定（下面那条硬校验）。
+        closest_pitch = None
         for i in range(len(self.place_slots)):
             for j in range(i + 1, len(self.place_slots)):
                 dx = self.place_slots[i][0] - self.place_slots[j][0]
                 dy = self.place_slots[i][1] - self.place_slots[j][1]
                 pitch = math.hypot(dx, dy)
+                if closest_pitch is None or pitch < closest_pitch:
+                    closest_pitch = pitch
                 if pitch < min_pitch:
                     self.get_logger().warn(
                         f"place_slots[{i}] 与 [{j}] 间距 {pitch*1000:.1f} mm "
                         f"< 夹爪行程 {gripper_stroke_mm:.1f} mm —— 张着爪子去放时"
                         "可能会压到相邻槽位里已放好的物体。"
                     )
+
+        # 落点复核的容差**必须小于最近槽距的一半**。为什么是硬错误而不是告警：
+        # 容差一旦盖到邻槽，「邻槽里躺着的那块」就会被算成本槽的落点，于是
+        # **每一格都通过、且 Δ 全是那个邻槽的偏移** —— 复核它的全部价值（判
+        # 「这块到底放哪了」）当场归零，而且输出看起来完全正常。这类「绿色但
+        # 无意义」的判据正是本项目最怕的一种（见 place_verify 的模块文档）。
+        # 取一半而不是整个槽距：两个槽各占半径 tol 的圆，相切时才会刚好碰到，
+        # 所以 tol < pitch/2 是「不可能混进邻槽」的充分条件。
+        if self.place_verify_enabled and closest_pitch is not None:
+            if self.place_verify_tol_xy >= closest_pitch / 2.0:
+                raise ValueError(
+                    f"place_verify_tol_xy={self.place_verify_tol_xy*1000:.1f} mm "
+                    f"≥ 最近两个槽距的一半（{closest_pitch*1000/2:.1f} mm，"
+                    f"最近槽距 {closest_pitch*1000:.1f} mm）——\n"
+                    "容差盖到邻槽的话，邻槽里的方块会被当成这一格的落点："
+                    "每一格都会「通过」，而 Δ 报的是**邻槽**的偏移量。\n"
+                    "请把 tol_xy 收到 20 mm 左右，或把 place_slots 拉开。"
+                )
 
         # `place_release_lift` 必须为正 —— 它守的是「指尖别插进桌面」。
         # 推导：place_z = 桌面高 + 方块高，下降位 tool0 = place_z + 指尖偏移 + lift；
@@ -1243,6 +1347,17 @@ class GraspPlanner(Node):
     # 选目标
     # ------------------------------------------------------------------
     def _targets_cb(self, msg: Detection3DArray):
+        # ---- 落点复核的旁路 ----
+        # ⚠️ 这一条必须在**「忙就早退」之前**，而且这里 `_busy` 恰好是 True：
+        #    复核期间状态机停在「一次尝试还没结束」上（_reset_busy 被推迟到
+        #    复核结束才调），所以下面那道 `if self._busy: return` 会把每一帧
+        #    都吃掉 —— 复核就永远等不到帧，只能超时。这个 bug 的症状是
+        #    「每次都超时」，看起来像相机坏了。
+        # `_verify_active`（而不是 `_verify_ctx`）才是「现在真的在看帧了」：
+        # 见它在 __init__ 里的说明 —— 从放下到回 HOME 之间臂还挡着放置区。
+        if self._verify_active:
+            self._place_verify_consume(msg)
+            return
         # 始终缓存最新一批：忙的时候也不要错过最新的世界坐标
         if msg.detections:
             self._pending_msg = msg
@@ -1336,6 +1451,9 @@ class GraspPlanner(Node):
         with self._busy_lock:
             self._busy = False
         self._pending_msg = None
+        # 收工发生在复核途中（例如超时前就因别的原因收工）→ 落成「未复核」，
+        # 别让那一格在台账里凭空消失。幂等：没有待复核的落点时什么都不做。
+        self._drop_place_verification("收工发生在复核途中")
         # 遥测：把**原因**也报出去。`reason` 只进日志的话，事后分析一个 bag
         # 就只能靠翻 /rosout 文本猜「它为什么停了」—— 而那正是最该一眼看到的。
         self._telem.note_finished(reason, ok=ok)
@@ -1360,6 +1478,10 @@ class GraspPlanner(Node):
                     f"{(n or '通配')}={used.get(n, 0)}/{c}"
                     for n, c in cap.items())
             )
+        # 落点真值台账。放在「各类占用」之后、"不再接受新目标"之前：它是这一轮
+        # **最该被保存下来的东西**（放错格/放偏了多少，此前全链路上无从回读），
+        # 所以要在收工块里，而不是只散落在运行时的日志里。
+        self._report_place_verification()
         self.get_logger().info("  **不再接受新目标**。节点仍在运行，Ctrl-C 退出。")
         if self._holding:
             self.get_logger().warn(
@@ -1788,6 +1910,11 @@ class GraspPlanner(Node):
         self._telem.mark_slot(self._place_index, SLOT_USED)
         self._place_used[self._place_index] = True
         self._place_placed += 1
+        # ⚠️ 快照**必须在 _clear_holding() 之前** —— 期望类别只能从
+        # `_holding_class` 拿，而它下一行就被清成 None 了。等到复核时再回头
+        # 读检测流是不行的：方块此刻已经在槽里，它原来那个位置早被后来的帧
+        # 改写成别的东西了（同 _on_home_with_object_done 里选槽位的那条注释）。
+        self._snapshot_place_verification()
         self._clear_holding()
         self._attempts_since_place = 0
         self.get_logger().info(
@@ -1829,7 +1956,272 @@ class GraspPlanner(Node):
         if self._traj_failed("回 HOME 轨迹", status, result):
             self._open_and_reset()
             return
+        # ---- 有一条落点等着复核吗 ----
+        # `_verify_ctx` 只在 `_on_place_released` 里建（**真的放下过东西**那一次），
+        # 所以这里就是「刚放完一块」与「失败恢复后回到 HOME」的分岔点：后者
+        # 上下文是空的，走原来的 retry_delay 分支，行为与本轮之前**逐字节相同**。
+        if self._verify_ctx is not None:
+            # ⚠️ 时间戳闸门记的是**现在**（臂到 HOME 这一刻），不是 settle 之后。
+            #    物理含义：这一刻起放置区不再被臂挡着，此后拍到的帧才作数。
+            #    所以 settle 只负责「先等一等再看」，闸门负责「哪些帧算证据」。
+            #
+            #    这个闸门成立的前提是**帧戳与节点时钟同域**：/targets_3d 的
+            #    header.stamp 来自 detector→projector 一路透传的图像采集戳
+            #    （detector_node.py:263 / projector_node.py:430,456），真机
+            #    走系统时钟（use_sim_time 只在仿真 launch 里设，见 sim.launch.py）。
+            #    万一将来域不同，症状是「每次都超时、且文案是『来了 N 帧但都不新』」
+            #    —— 那句话就是为这件事写的。
+            self._verify_ctx["after_stamp"] = self.get_clock().now()
+            # ⚠️ 三个帧计数**不在这里清** —— 它们属于「这一次复核」，所以在
+            #    `_begin_place_verification` 里清（那里才是这一次复核的起点）。
+            #    原先写在这里时，计数会**跨槽泄漏**：第 N 格的超时文案报出的是
+            #    前 N-1 格攒下的帧数（测试里实测到「槽位[6] 看了 2 帧」，
+            #    而那 2 帧来自槽位[0] 和[1]）。症状是超时文案里的帧数偏大，
+            #    于是「来了 N 帧但都不新」这条判据指向错误的原因。
+            threading.Timer(self.place_verify_settle,
+                            self._begin_place_verification).start()
+            return
         threading.Timer(self.retry_delay, self._reset_busy).start()
+
+    # ------------------------------------------------------------------
+    # 放置落点复核（B1a）
+    #
+    # 一句话：每放下一块、回 HOME 之后，等一帧**新的** /targets_3d，看那个槽位
+    # 附近是不是真的躺着期望类别的东西，把 Δ=(实测−期望) 记进收工台账。
+    # **只记账，不纠正** —— 这一轮的目的是先拿到真值分布。
+    #
+    # 为什么必须是异步的（回调 + Timer，绝不在 _on_home_done 里 sleep）：
+    # 主执行器是多线程的，`_targets_cb` 靠 `_busy` 挡住新抓取；在这里 sleep
+    # 会**同时**阻塞检测回调与本节点的一切，而且 8 个槽最多多花 16 s，正好
+    # 越过 idle_finish_timeout=20s 的量级 —— 看门狗会在复核期间误判收工。
+    # 所以：等帧期间 `_busy` 照旧为 True（挡住新抓取），`_attempt_active` 照旧
+    # 为 True（看门狗闭嘴），收工判据**一字未改**，只是 `_reset_busy` 的时刻
+    # 往后挪了 settle+复核那一下。
+    # ------------------------------------------------------------------
+    def _snapshot_place_verification(self):
+        """放下之后、清 ``_holding_class`` **之前**，把复核要用的东西拷一份。
+
+        为什么是「拷一份」而不是复核时现读 ``self._place_target`` /
+        ``_holding_class``：复核是**异步**完成的（要等一帧，还可能等到超时），
+        而那两个字段在下一次尝试里会被改写。现读的话，走得慢的那一格会拿到
+        **下一块**的期望值 —— 报出来的 Δ 看着合理，实际是另一个槽的。
+        """
+        if not self.place_verify_enabled or not self.carry_objects:
+            # 不建上下文 ⇒ `_on_home_done` 走原来的 retry_delay 分支。
+            # `carry_objects=false`（只走位）也走这条：`_on_place_released` 在
+            # 那个模式下**照样会被调**（_on_place_descend_done 里直接调它），
+            # 但并没有真的放下东西，复核无从谈起。
+            return
+        if self._place_target is None:
+            return
+        idx = self._place_index
+        self._verify_ctx = {
+            "index": idx,
+            # 期望 = **实际下发的那个槽位坐标**（就是 place_slots[i]）。
+            "expected_xy": (float(self._place_target[0]),
+                            float(self._place_target[1])),
+            # 期望类别只能从现在这一刻的 `_holding_class` 拿。空串 = 不按类别分
+            # （A1 单类别那条路），此时判据退化成「槽位附近有没有东西」。
+            "expected_class": self._holding_class or "",
+            "expected_z": self.place_z,
+            "after_stamp": None,        # 回 HOME 时填（见 _on_home_done）
+        }
+        self._verify_order.append(idx)
+
+    def _begin_place_verification(self):
+        """settle 过了，开始看帧。**非阻塞**：装一个死线 Timer 就返回。"""
+        if self._verify_ctx is None or self._finished:
+            self._verify_ctx = None
+            self._reset_busy()
+            return
+        ctx = self._verify_ctx
+        self._verify_active = True
+        # 帧计数在这里清 —— 「这一次复核」的起点就是这里。写在 `_on_home_done`
+        # 里会让计数跨槽泄漏（见那里的注释），症状是超时文案里的帧数偏大。
+        self._verify_frames_total = 0
+        self._verify_frames_stale = 0
+        self._verify_frames_nostamp = 0
+        # 死线 Timer：**唯一的保证** —— 无论帧来不来、判不判得出来，进程一定
+        # 会回到 _reset_busy。没有它，一个「相机挂了导致一帧都不来」的现场会
+        # 让 `_busy` 永久置位 = 静默死锁（连日志都没有），那正是本项目最怕的
+        # 那类收尾方式。
+        self._verify_timer = threading.Timer(self.place_verify_timeout,
+                                             self._on_place_verify_timeout)
+        self._verify_timer.daemon = True
+        self._verify_timer.start()
+        cls = ctx["expected_class"]
+        self.get_logger().info(
+            f"落点复核 槽位[{ctx['index']}]"
+            + (f"（类别 {cls}）" if cls else "（未按类别分）")
+            + f" 期望({ctx['expected_xy'][0]:.3f},{ctx['expected_xy'][1]:.3f})"
+            f" —— 等一帧新的 /targets_3d（最多 {self.place_verify_timeout:.1f}s）"
+        )
+
+    def _place_verify_consume(self, msg: Detection3DArray):
+        """复核期间**唯一**消费 /targets_3d 的地方（由 `_targets_cb` 的旁路调）。"""
+        ctx = self._verify_ctx
+        if ctx is None:                 # 理论上到不了；到了就收线，别卡住
+            self._verify_active = False
+            return
+        self._verify_frames_total += 1
+
+        stamp = msg.header.stamp
+        if stamp.sec == 0 and stamp.nanosec == 0:
+            # 没有时间戳就没法判新旧。**不能默默当成新的** —— 那会让「臂还没
+            # 退开时拍的那一帧」在戳缺失时混进来，而症状是静默判错。
+            # 单独计数，超时文案里点名（projector 自己也用 `stamp_sec > 0.0`
+            # 判「有没有有效戳」，见 projector_node.py:441，这里沿用同一约定）。
+            self._verify_frames_nostamp += 1
+            return
+        after = ctx.get("after_stamp")
+        if after is not None:
+            frame_ns = stamp.sec * 10 ** 9 + stamp.nanosec
+            if frame_ns < after.nanoseconds:
+                # 这一帧是臂还在放置区上方时拍的 —— 不算证据。**必须丢**：
+                # 那一帧里槽位多半被臂挡着，拿它判会得到 NOT_FOUND，
+                # 而现场会把它读成「方块飞了」。
+                self._verify_frames_stale += 1
+                return
+
+        result = self._judge_current_frame(msg, ctx)
+        if result.verdict in DECIDED:
+            self._end_place_verification(result)
+            return
+        # `UNAVAILABLE`（放置区里什么都没有）：**继续等**，不立刻落账 ——
+        # 后面某一帧可能就检出了（深度刚恢复、方块刚停稳）。
+
+    def _judge_current_frame(self, msg: Detection3DArray, ctx: dict):
+        """一帧 → 这一个槽位的判决。所有判据都在 place_verify 里（纯函数）。"""
+        obs = []
+        for det in msg.detections:
+            if not det.results:
+                continue
+            # ⚠️ 位置取 `results[0].pose`，与抓取段 `_select_and_approach`
+            # 完全同一个字段 —— 复核与抓取必须看同一个量，否则「复核说偏移
+            # 3 mm、抓取却说抓不到」这种分歧无从解释。
+            pos = det.results[0].pose.pose.position
+            obs.append(Observation(
+                str(det.results[0].hypothesis.class_id),
+                float(det.results[0].hypothesis.score),
+                float(pos.x), float(pos.y), float(pos.z),
+            ))
+        return judge_place(
+            obs, ctx["expected_xy"], ctx["expected_class"],
+            self.place_verify_tol_xy, self.place_verify_min_score,
+            self.place_verify_z_tol,
+            roi=self._place_roi, expected_z=ctx["expected_z"],
+        )
+
+    def _end_place_verification(self, result):
+        """落账 + 收线。**唯一的正常收敛点**：判出来了或超时都走这里回 ``_reset_busy``。"""
+        ctx = self._verify_ctx
+        self._verify_active = False
+        if self._verify_timer is not None:
+            self._verify_timer.cancel()
+            self._verify_timer = None
+        if ctx is not None:
+            self._verify_results[ctx["index"]] = (ctx, result)
+            self.get_logger().info(
+                f"落点复核 槽位[{ctx['index']}] → "
+                f"{VERDICT_NAMES.get(result.verdict, result.verdict)}"
+                + (f"：{result.detail}" if result.detail else "")
+                + (f"  ⚠️ {result.z_warn}" if result.z_warn else "")
+            )
+        self._verify_ctx = None
+        self._reset_busy()
+
+    def _on_place_verify_timeout(self):
+        """死线到了还没判出来。分**三**种情况报，因为它们的原因完全不同。"""
+        if not self._verify_active:
+            return          # 已经判出来了（Timer 与帧回调是竞态），什么都不用做
+        ctx = self._verify_ctx
+        if ctx is None:
+            self._verify_active = False
+            self._verify_timer = None
+            self._reset_busy()
+            return
+        total = self._verify_frames_total
+        fresh = total - self._verify_frames_stale - self._verify_frames_nostamp
+        if total == 0:
+            # ⚠️ 这是**最值得报**的一种：投影器从不发空数组（projector_node.py:592），
+            #    所以「相机看不见放置区」在节点侧的表现就是**一条消息都没有**，
+            #    而不是「收到一批空检测」。把它报成「没找到方块」是错的。
+            verdict, detail = TIMEOUT, (
+                f"{self.place_verify_timeout:.1f}s 内 /targets_3d "
+                "**一条新消息都没有** —— 相机可能根本没取景到放置区"
+                "（投影器从不发空数组：看不见就是一条都不发）")
+        elif fresh == 0:
+            verdict, detail = TIMEOUT, (
+                f"来了 {total} 帧，但时间戳都没超过回 HOME 的时刻"
+                f"（戳冻结？或与节点时钟不同域。丢弃 {self._verify_frames_stale} "
+                f"条旧帧 / {self._verify_frames_nostamp} 条无戳帧）")
+        else:
+            verdict, detail = UNAVAILABLE, (
+                f"看了 {fresh} 帧，放置区里一直没检出东西"
+                "（相机看得见这一块，但那里什么都没有 → 方块可能飞了）")
+        self._verify_timer = None
+        self._end_place_verification(Result(verdict, None, detail, None))
+
+    def _drop_place_verification(self, reason: str):
+        """放弃一个待复核/正在复核的落点 → 记成「未复核」并说明原因。
+
+        调用场景只有两处：失败恢复（`_open_and_reset`）与收工。那时臂的去向
+        已经不受控，再花 2 秒等帧、甚至拿恢复途中的某一帧当证据，只会把台账
+        弄脏 —— 而台账的全部价值就是「这几行字可以当证据用」。
+
+        ⚠️ 它**故意不调 `_reset_busy()`**：那两个调用方各自掌握 `_busy` 的去向
+        （恢复流程要继续走、收工要停住），在这里顺手复位会把它们的流程掰弯。
+        代价是「谁负责复位」需要记住 —— 所以测试里有一条专门钉这个契约
+        （`test_planner_place_verify.py` E5）。正常收敛的那条路走
+        `_end_place_verification`，那里**一定**复位。
+        """
+        ctx = self._verify_ctx
+        self._verify_active = False
+        if self._verify_timer is not None:
+            self._verify_timer.cancel()
+            self._verify_timer = None
+        if ctx is not None:
+            self._verify_results[ctx["index"]] = (
+                ctx, Result(SKIPPED, None, reason, None))
+        self._verify_ctx = None
+
+    def _report_place_verification(self):
+        """收工台账里的落点复核段。
+
+        ⚠️ 三种「什么都没做」各有各的话，且都**不能**打成「0/8 通过」：
+        那只会在现场制造一次假的失败复盘。
+        """
+        if not self.carry_objects:
+            self.get_logger().info(
+                "  落点复核：不适用（carry_objects=false 只走位，"
+                "没有真的放下东西）")
+            return
+        if not self.place_verify_enabled:
+            self.get_logger().info(
+                "  落点复核：关闭（place_verify_enabled=false）")
+            return
+        if not self._verify_order:
+            self.get_logger().info("  落点复核：本轮没有成功放置过，无可复核")
+            return
+        self.get_logger().info("  落点复核（Δ = 实测 − 期望）：")
+        verdicts = []
+        for idx in self._verify_order:
+            entry = self._verify_results.get(idx)
+            if entry is None:
+                # 不该发生：每个进入 _verify_order 的落点都会在
+                # _end_place_verification / _drop_place_verification 里落账。
+                # 真漏了就报「未复核」，而不是静静地少一行（少一行会让
+                # 「8 个槽」看起来只放了 7 个）。
+                self.get_logger().info(
+                    f"    槽位[{idx}] —— 未复核：内部状态缺失（请报告这个 bug）")
+                verdicts.append(SKIPPED)
+                continue
+            ctx, res = entry
+            verdicts.append(res.verdict)
+            self.get_logger().info(format_slot_line(
+                idx, ctx["expected_xy"], ctx["expected_class"],
+                res.verdict, res.obs, res.detail, res.z_warn))
+        self.get_logger().info(summarize(verdicts))
 
     def _open_and_reset(self):
         """失败/空夹的收尾：**先回 HOME、再张开夹爪**。
@@ -1851,6 +2243,11 @@ class GraspPlanner(Node):
             self._finish("失败恢复流程自身失败", ok=False)
             return
         self._recovering = True
+        # 失败恢复 = 臂的去向已经不受控。这时**不能**再去等一帧判落点：恢复
+        # 途中读到的画面里臂正挡着放置区，拿它判出来的 NOT_FOUND 会被现场
+        # 读成「方块飞了」，而真实发生的是「这一轮根本没走完」。记成未复核，
+        # 理由写清楚（台账宁可少一行，也不能有一行是错的）。
+        self._drop_place_verification("放置后回 HOME 失败，走了恢复流程，不复核")
         # 遥测：这一步很重要 —— 走失败恢复时臂在动，而「正在恢复」和「正常走
         # 流程」在外部看是一样的。诊断级别也会因此升到 WARN（见 telemetry.py）。
         self._telem.set_state("RECOVERING")
