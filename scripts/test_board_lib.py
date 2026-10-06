@@ -22,6 +22,7 @@ sys.dont_write_bytecode = True   # 防 .pyc 假绿（仓库约定）
 import datetime as dt            # noqa: E402
 import importlib.util            # noqa: E402
 import os                        # noqa: E402
+import re                        # noqa: E402
 import subprocess                # noqa: E402
 import tempfile                  # noqa: E402
 
@@ -263,6 +264,47 @@ def section_leftovers():
           board_lib.is_own_process("bash -c foo", "x.py", set()) is True
           and board_lib.is_own_process("ros2 launch yolo_bringup", "x.py", set()) is False)
 
+    # ---- pattern 参数：分阶段脚本各有各的「什么算残留」----------------------
+    # 直接钉住「不许把两个模式合并成一个」：合并**两个方向都会静默出错**，
+    # 而两个方向都不报错，只表现成「检查说没事」。
+    stage_pat = re.compile(r"fake_joint_states|move_group")
+    # ⚠️ 这一行**只许**含 `fake_joint_states` 一个模式词。第一版写的是
+    #    `.../lib/robot_state_publisher/fake_joint_states` —— 于是默认模式靠路径里的
+    #    `robot_state_publisher` **顺带**匹配上了，「默认认不出它」那条断言当场翻车。
+    #    夹具里混进别的模式词，测出来的就是那个词，不是被测的这条判据。
+    #    形状照 no_arm_stack.py:240 真实 spawn 的那条命令来。
+    line_fake = "  5300 python3 /opt/ur5vg/scripts/fake_joint_states.py"
+    line_drv = "  5301 /opt/ros/humble/lib/ur_robot_driver/dashboard_client"
+
+    check("默认 pattern=None 就是 LEFTOVER_RE（不是「另一个恰好相同的对象」）",
+          board_lib.leftovers(ps_out=[], pattern=None, own=set()) == []
+          and board_lib.LEFTOVER_RE.search("ur_ros2_control_node") is not None)
+
+    got_stage = [s.strip() for s in
+                 board_lib.leftovers(ps_out=[line_fake], pattern=stage_pat, own=set())]
+    check("给了阶段 pattern ⇒ 认得本阶段的 fake_joint_states",
+          got_stage == [line_fake.strip()], str(got_stage))
+    got_drv_stage = [s.strip() for s in
+                     board_lib.leftovers(ps_out=[line_drv], pattern=stage_pat, own=set())]
+    check("  ⚠️ 同一个阶段 pattern 认不出真驱动 —— 这正是**不能合并**的原因"
+          "（合并会让阶段检查少报一类残留）",
+          got_drv_stage == [], str(got_drv_stage))
+
+    got_fake_default = [s.strip() for s in
+                        board_lib.leftovers(ps_out=[line_fake], own=set())]
+    check("  ⚠️ 反过来也一样：默认（整车）pattern 认不出 fake_joint_states"
+          "（合并会让整车检查少报一类残留）",
+          got_fake_default == [], str(got_fake_default))
+
+    me_line = "  4242 python3 scripts/no_arm_stack.py --log ~/fake_joint_states.log"
+    got_me = [s.strip() for s in board_lib.leftovers(
+        ps_out=[me_line], me="no_arm_stack.py", pattern=stage_pat, own=set())]
+    check("换了 pattern，**自我排除照旧生效**（两件事互不牵连）",
+          got_me == [], str(got_me))
+    got_pid = [s.strip() for s in board_lib.leftovers(
+        ps_out=[line_fake], pattern=stage_pat, own={5300})]
+    check("  血缘排除在自定义 pattern 下也生效", got_pid == [], str(got_pid))
+
 
 # ------------------------------------------------------------ 4. 变异检查
 def load_mutant(src_text, tag):
@@ -354,6 +396,27 @@ def section_mutation():
         got = [s.strip() for s in m.leftovers(ps_out=[line_stack], me="", own=set())]
         check("M8 空名字参与子串匹配 ⇒ 一条残留都报不出来（与改前不同）",
               base == [line_stack.strip()] and got == [], f"改前={base} 改后={got}")
+
+    # M12：`pattern` 收了不用（永远走默认）—— 于是分阶段脚本**以为自己**在按
+    #      本阶段的模式查，实际查的是整车模式：fake_joint_states 那类残留**静默漏报**。
+    #      ⚠️ 这条与「模式该不该合并」是两件事：合并会错，收了不用**更**错
+    #      （前者是设计取舍，后者是参数根本没接上线）。
+    m = _mutate(src, "    pat = LEFTOVER_RE if pattern is None else pattern",
+                "    pat = LEFTOVER_RE  # MUT", "m12")
+    if m is not None:
+        stage_pat = re.compile(r"fake_joint_states")
+        line_fake = "  5300 /opt/ros/humble/lib/fake_joint_states"
+        base = [s.strip() for s in board_lib.leftovers(
+            ps_out=[line_fake], pattern=stage_pat, own=set())]
+        got = [s.strip() for s in m.leftovers(
+            ps_out=[line_fake], pattern=stage_pat, own=set())]
+        check("M12 收了 pattern 却不用 ⇒ 本阶段残留静默漏报（与改前不同）",
+              base == [line_fake.strip()] and got == [], f"改前={base} 改后={got}")
+        # 反向：默认路径**不许**受影响 —— 否则这个变异是靠「把默认也改坏」换来的
+        line_drv = "  5150 ros2 launch yolo_bringup bringup.launch.py"
+        check("  同一变异没动默认路径（整车模式照旧）",
+              [s.strip() for s in m.leftovers(ps_out=[line_drv], own=set())]
+              == [line_drv.strip()])
 
 
 # ------------------------------------------------------------ 5. 源码钉子

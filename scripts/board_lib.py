@@ -109,22 +109,31 @@ def is_own_process(args, me, own, pid=None):
     return pid is not None and pid in own
 
 
-def leftovers(ps_out=None, me=None, own=None):
+def leftovers(ps_out=None, me=None, own=None, pattern=None):
     """残留的栈进程。返回 `ps` 原始行（未裁剪，便于人肉辨认）。
 
     注入口：`ps_out` 直接喂 `ps -eo pid,args --no-headers` 形状的行，
     `me` / `own` 覆盖默认的自我排除 —— 变异测试靠这三个口子离线成测。
+
+    `pattern` 覆盖「什么算残留」：**默认的 `LEFTOVER_RE` 是整车的**（含
+    `ur_ros2_control_node` / `ur_robot_driver/*`）。分阶段类检查
+    （`moveit_only_check` / `no_arm_stack` / `board_chain_check` /
+    `board_state_machine_check`）跑在**驱动还没起**的时候，它们等的是
+    `fake_joint_states` 而不是真驱动 —— 硬套整车模式会让这些脚本**漏报**
+    自己那一阶段的残留，而漏报的表现是**静默变绿**。
+    所以「哪一类算残留」按阶段给，「谁是自己人」**只有这一份**。
     """
     lines = _ps_lines() if ps_out is None else ps_out
     me = _me_default() if me is None else me
     own = set(own_pids()) if own is None else set(own)
+    pat = LEFTOVER_RE if pattern is None else pattern
     out = []
     for ln in lines:
         s = ln.strip()
         if not s:
             continue
         pid_s, _, args = s.partition(" ")
-        if not LEFTOVER_RE.search(args):
+        if not pat.search(args):
             continue
         if is_own_process(args, me, own, _int(pid_s)):
             continue

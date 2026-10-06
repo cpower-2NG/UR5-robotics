@@ -13908,3 +13908,97 @@ M4c `ttl_days` 缺失不再拦（FAIL→PASS）。CLI：模板退 1、**绝不�
 `ALLOWED_SERIAL_FILES = {` 写成 `{} or {` —— 那是**空字典或真字典**，Python 求值成
 原字典，变异**根本没生效**。差点就把「没变红」读成「断言很结实」。
 这正是本仓变异测试要求「断言改前≠改后」而不是「改坏了会红」的原因。
+
+---
+
+## 第九十三轮：统一启动器第七步 —— 3 份 `leftovers()` 抄本改走 `board_lib`：**「谁是自己人」只有一份，「什么算残留」按阶段给**（2026-10-06）
+
+计划里这一步写的是「其余 4 份 `leftovers()` 抄本改 import（**机械**、最后）」。
+**动手才发现它不是机械的**，而且照字面做会造成静默回归。逐项记：
+
+### 1. 抄本有 4 份，但**不是 4 份同款**
+
+`grep -rn "def leftovers" scripts/` 得 4 处：`board_chain_check.py:74`、
+`moveit_only_check.py:85`、`board_ctrlc_check.py:93`、`board_state_machine_check.py:106`。
+
+其中**前两份与 `board_ctrlc_check.py` 的形状根本不同**：后者返回 `(pat, pids)` 元组、
+按 `pgrep -f` 逐个模式查，且**早已**用 `_self_and_ancestors()` 做血缘排除。
+⇒ 它没有本轮要修的那个隐疾，改它要重写消费方。**判定：不动**（计划里的「4 份」应改记为 3 份）。
+
+### 2. 剩下 3 份的**模式与 `board_lib` 故意不同**，合并会双向静默出错
+
+三个脚本用的是同一份**驱动还没起**时的模式：
+
+```
+ros2 launch yolo_bringup|move_group|robot_state_publisher
+|detector_node|projector_node|planner_node|realsense2_camera_node
+|fake_joint_states                                    ← 本阶段在跑的是这个
+```
+
+而 `board_lib.LEFTOVER_RE` 是**整车**的：多了 `static_transform_publisher`、
+`ur_ros2_control_node`、`ur_robot_driver/(dashboard_client|robot_state_helper|controller_stopper)`，
+**没有** `fake_joint_states`。
+
+- 阶段脚本套整车模式 ⇒ 「上一轮的 `fake_joint_states` 还活着」**漏报**；
+- 整车脚本套阶段模式 ⇒ 「`ur_ros2_control_node` 还活着」**漏报**。
+
+两个方向**都不报错**，只表现成「检查说没事」。⇒ 抄本里那句
+「其余改 import」如果照做，等于把一次**静默变绿**引进三个启动期检查脚本。
+
+### 3. 改法：把「谁是自己人」抽出来，「什么算残留」留成参数
+
+`board_lib.leftovers()` 新增 `pattern=None`（默认即 `LEFTOVER_RE`，**行为不变**）；
+排除逻辑仍只有 `is_own_process()` 一份。三个脚本各自保留 `LEFTOVER_RE` 字面量
+（附注释说明为什么**不许**与整车模式统一），`leftovers()` 改成一行委托：
+
+```python
+def leftovers():
+    return board_lib.leftovers(pattern=LEFTOVER_RE)
+```
+
+### 4. 顺手修掉两个**已存在的**隐疾（不是本轮引入的）
+
+| 脚本 | 旧写法 | 后果 |
+|---|---|---|
+| `moveit_only_check.py` | `"moveit_only_check" in line` | 文件名写死成**字符串字面量**：改名即静默失效；且 `no_arm_stack.py` 从本模块 import 它，跑 `no_arm_stack.py` 时排除的仍是 `moveit_only_check` ⇒ **排除不掉自己** |
+| `board_state_machine_check.py` | `"board_state_machine_check" in line` | 同上（写死自己的名字） |
+| `board_chain_check.py` | `me = os.path.basename(__file__)` | 对**自己**碰巧成立（ps 记录必含自己的脚本名），但经 ssh 跑时该排除的是**调用方那一族**，其命令行里未必出现本脚本名 |
+
+改后三者都走血缘排除（`own_pids()` 追到自己 + 全部祖先），**与命令行里恰好写了什么无关**。
+`no_arm_stack.py` 因为是从 `moveit_only_check` import 的，**一行未改即跟着修好**。
+
+### 5. 证据
+
+- `test_board_lib.py`：59 → **67 条断言，0 失败**。新增 8 条钉 `pattern` 参数，
+  其中两条**互为反向**：阶段模式认得出 `fake_joint_states`，整车模式认不出它；
+  且反过来整车模式认得出 `ur_robot_driver/dashboard_client` 而阶段模式认不出。
+  —— 这两条同时成立，才说明「**不能合并**」是个有依据的结论而不是我的偏好。
+- 另两条钉住「换了 `pattern` 之后自我排除与血缘排除**照旧生效**」（两件事互不牵连）。
+- 委托后实测三个脚本 `leftovers()` 均可调用、返回 0 行（本机无残留栈）；
+  `no_arm_stack.leftovers.__module__ == 'moveit_only_check'` 确认 import 链未断。
+- 回归：`test_no_arm_stack` / `test_board_a1` / `test_board_gate` /
+  `test_board_tree_manifest` / `test_startup_docs` / `test_deidentified` /
+  `test_docs_map` / `state_check` **全绿**（`test_board_a1` 未改一行即绿 ——
+  这正是抽函数时给自己定的契约）。`pyflakes` 干净。
+- `test_real_launch.py` 退 **2**＝环境不满足（要 `source /opt/ros/humble/setup.bash`，
+  本机无 rclpy），**非**本轮引起：本轮未触碰任何 launch 代码。
+
+### 6. 变异 M12：`pattern` 收了不用
+
+把 `pat = LEFTOVER_RE if pattern is None else pattern` 改成 `pat = LEFTOVER_RE`。
+夹具＝一条只含 `fake_joint_states` 的 ps 行：
+**改前 `['5300 python3 /opt/ur5vg/scripts/fake_joint_states.py']` → 改后 `[]`**，翻面成立。
+另加反向断言：同一变异**没动**默认路径（整车模式照旧命中），
+排除「靠把默认也改坏换来的翻面」。
+
+### 7. ⚠️ 本轮自己踩的坑：夹具里混进了**别的模式词**
+
+第一版夹具写的是 `"  5300 /opt/ros/humble/lib/robot_state_publisher/fake_joint_states"`，
+想用它断言「默认（整车）模式认不出 `fake_joint_states`」。
+**这条断言当场翻车** —— 因为路径里带着 `robot_state_publisher`，
+而那个词**就在**整车模式的匹配面里：默认模式靠**顺带**匹配上了，
+测出来的根本不是 `fake_joint_states` 这条判据。
+
+这正是本仓反复记的那类错误：**夹具通过/失败的原因不是被测的那条判据**。
+改成 `python3 /opt/ur5vg/scripts/fake_joint_states.py`（形状照
+`no_arm_stack.py:240` 真实 spawn 的那条命令），并把这句教训写进夹具上方的注释。

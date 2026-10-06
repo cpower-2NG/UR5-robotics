@@ -59,6 +59,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 残留守卫。⚠️ 排除 `bash -c`：经 ssh 跑时调用者那条命令行里带着同样的模式，
 # 会把**自己**匹配上（同 moveit_only_check.py / board_ctrlc_check.py 的陷阱）。
+#
+# ⚠️ 这个模式与 `board_lib.LEFTOVER_RE` **故意不同**，不要「统一」掉：
+#    本脚本跑在**驱动还没起**的阶段，那时候在跑的是 `fake_joint_states`
+#    而不是 `ur_ros2_control_node` / `ur_robot_driver/*`。套整车模式会让
+#    「上一轮的 fake_joint_states 还活着」这条**漏报**，而漏报＝静默变绿。
+#    共享的是「谁算自己人」（血缘排除，见 board_lib.is_own_process），
+#    不是「什么算残留」。
 LEFTOVER_RE = re.compile(
     r"ros2 launch yolo_bringup|move_group|robot_state_publisher"
     r"|detector_node|projector_node|planner_node|realsense2_camera_node"
@@ -70,13 +77,19 @@ GATE_CAMERA = 20.0
 GATE_DETECTIONS = 15.0
 GATE_TARGETS = 15.0
 
+sys.path.insert(0, os.path.join(REPO, "scripts"))
+import board_lib                                          # noqa: E402
+
 
 def leftovers():
-    r = subprocess.run(["ps", "-eo", "pid,args", "--no-headers"],
-                       capture_output=True, text=True)
-    me = os.path.basename(__file__)
-    return [l.strip() for l in r.stdout.splitlines()
-            if "bash -c" not in l and me not in l and LEFTOVER_RE.search(l)]
+    """本阶段的残留进程。自我排除走 `board_lib` 的血缘判据。
+
+    ⚠️ 原实现是 `me = os.path.basename(__file__)` 再做子串排除 —— 它**碰巧**
+    对，因为一条 `ps` 记录里必然含有自己的脚本名。但经 ssh 跑时真正需要排除的
+    是**调用方那一族**（`bash -c "… python3 scripts/board_chain_check.py"`），
+    命令行里未必出现本脚本名。血缘排除不依赖「命令行里恰好写了什么」。
+    """
+    return board_lib.leftovers(pattern=LEFTOVER_RE)
 
 
 def sh(cmd, timeout=60):

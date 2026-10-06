@@ -83,6 +83,13 @@ import time
 # 残留守卫：⚠️ 必须排除 `bash -c` 与我自己的行 —— 经 ssh 跑的时候，调用者那条
 # 命令行里就带着同样的模式，会把**自己**匹配上（同款陷阱见
 # scripts/moveit_only_check.py 与 scripts/board_ctrlc_check.py）。
+#
+# ⚠️ 这个模式与 `board_lib.LEFTOVER_RE` **故意不同**，不要「统一」掉：
+#    本脚本跑在**驱动还没起**的阶段，那时候在跑的是 `fake_joint_states`
+#    而不是 `ur_ros2_control_node` / `ur_robot_driver/*`。套整车模式会让
+#    「上一轮的 fake_joint_states 还活着」这条**漏报**，而漏报＝静默变绿。
+#    共享的是「谁算自己人」（血缘排除，见 board_lib.is_own_process），
+#    不是「什么算残留」。
 LEFTOVER_RE = re.compile(
     r"ros2 launch yolo_bringup|move_group|robot_state_publisher"
     r"|detector_node|projector_node|planner_node|realsense2_camera_node"
@@ -103,16 +110,19 @@ TARGET_XYZ = (0.50, 0.00, -0.35)
 REAL_ACTION = "/scaled_joint_trajectory_controller/follow_joint_trajectory"
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import board_lib                                          # noqa: E402
+
+
 def leftovers():
-    r = subprocess.run(["ps", "-eo", "pid,args", "--no-headers"],
-                       capture_output=True, text=True)
-    out = []
-    for line in r.stdout.splitlines():
-        if "bash -c" in line or "board_state_machine_check" in line:
-            continue
-        if LEFTOVER_RE.search(line):
-            out.append(line.strip())
-    return out
+    """本阶段的残留进程。自我排除走 `board_lib` 的血缘判据。
+
+    ⚠️ 原实现把**自己的文件名写成了字符串字面量**（`"board_state_machine_check"
+    in line`）—— 文件一改名就**静默**失效，而失效的表现是把自己那条 ps 记录
+    当成残留、进而拒绝起栈（同一族坑本项目已记三次）。
+    """
+    return board_lib.leftovers(pattern=LEFTOVER_RE)
 
 
 def sh(cmd):
