@@ -71,6 +71,10 @@ import subprocess
 import sys
 import time
 
+sys.dont_write_bytecode = True          # 防 .pyc 假绿（见仓库约定）：test_board_a1.py
+                                        # 会 import 本模块并跑变异副本，陈旧的 .pyc
+                                        # 会让变异"没生效"却看不出来
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
