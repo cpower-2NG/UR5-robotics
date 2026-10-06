@@ -73,8 +73,8 @@ sys.path.insert(0, HERE)
 # `board_lib.py`（那里还有站点配置）。这里 **re-export** 一次：既有调用点与
 # `test_board_a1.py` 一行都不用改，而真值只有一份。
 import board_lib                                             # noqa: E402
-from board_lib import (dashboard, gripper_state, leftovers,  # noqa: E402
-                       port_busy, teardown)
+from board_lib import (dashboard, gripper_state, is_playing,  # noqa: E402
+                       leftovers, port_busy, teardown)
 
 # 标定过的外参（2026-10-05 现场值）。改这里之前先确认你知道自己在改什么。
 CAM = {
@@ -194,11 +194,17 @@ def wait_for_playing(ip, timeout):
     ⚠️ 次序是「**起栈 → 按播放 → 拉回控制器**」，不能倒过来：URCap 的
     External Control 需要一个对端，先按播放再起栈，示教器上就是
     「连接被拒绝」，程序停在 STOPPED。本函数只读查询，**不发 play/power/stop**。
+
+    ⚠️ 判据走 `board_lib.is_playing`（剥标签 + 取首词），**不是**子串、更不是
+    与 `'PLAYING'` 精确比 —— 实测原文是 `'PLAYING ur5ros.urp'`（缀着程序名）。
+    这里原来写的是 `"PLAYING" in last["programState"]`：它对真机**碰巧**成立，
+    但同一个问题在 `board_run.py` 里被写成了精确比，于是那边恒 False
+    （2026-10-06 合并成一份）。
     """
     t0, last = time.time(), None
     while time.time() - t0 < timeout:
         last = dashboard(ip)
-        if last and "PLAYING" in last["programState"]:
+        if last and is_playing(last):
             return True, last
         time.sleep(2.0)
     return False, last

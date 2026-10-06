@@ -801,22 +801,103 @@ def read_planner_yaml(path):
 # 判定：全部纯函数（不 import ROS、不碰设备，见 test_board_run.py）
 # =====================================================================
 
-def judge_ros_env(env, ros2_on_path, install_setup_exists, repo=REPO):
-    """P0：这台机器**能不能跑 ROS 2**。**纯函数**。"""
+#: 系统 ROS 的 setup.bash（按 ROS_DISTRO 填）。
+ROS_SETUP_TMPL = "/opt/ros/%s/setup.bash"
+
+
+def ros_setup_files(distro=None, install_setup=None, repo=REPO, system_setup=None):
+    """本项目要 source 的两个 setup.bash —— **顺序有意义**。**纯函数**。
+
+    先系统、后工作区：后 source 的那个在 `AMENT_PREFIX_PATH` 前面，工作区的包
+    才盖得住同名的系统包。反过来会把工作区的包压在下面（**不报错**，只是找不到）。
+    """
+    return [system_setup or (ROS_SETUP_TMPL % (distro or "humble")),
+            install_setup or os.path.join(repo, "ros2_ws", "install", "setup.bash")]
+
+
+def build_ros_env(base=None, distro=None, install_setup=None, repo=REPO,
+                  system_setup=None, timeout=120.0):
+    """把 ROS 环境**算出来**：启动器自己 source 系统与工作区的 setup.bash。
+
+    返回 `(env | None, 说明)`。`None` = 没算成（bash 起不动 / source 报错），
+    交给 P0 判红 —— **不猜**，也不退回调用者的环境假装没事。
+
+    🔴 为什么必须自己 source（2026-10-06 实测）：板上 `~/.bashrc` 只 source 了
+    `/opt/ros/humble` 与**另一个**工作区 `~/yahboom_ws`，于是**交互式** shell 里
+    本项目的 `ros2_ws/install` **也不在** `AMENT_PREFIX_PATH` 上。而旧 P0 判据只是
+    「`AMENT_PREFIX_PATH` 非空 + `install/setup.bash` 文件存在」——两条都满足，
+    于是 P0 绿、失败推迟到 P1，报成「缺 yolo_ur_description」，**听起来像缺包、
+    其实是没 source**。人每次开终端都重演一次，正是「启动老是卡住」的一类根因。
+    """
+    e0 = dict(os.environ)
+    if base:
+        e0.update(base)
+    files = ros_setup_files(distro or e0.get("ROS_DISTRO"),
+                            install_setup, repo, system_setup)
+    have = [f for f in files if os.path.exists(f)]
+    missing = [f for f in files if f not in have]
+    script = "".join('source "%s" >/dev/null 2>&1\n' % f for f in have) + "env -0"
+    try:
+        r = subprocess.run(["bash", "-c", script], cwd=repo, env=e0,
+                           capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:     # noqa: BLE001
+        return None, "起不动 bash：%s: %s" % (type(exc).__name__, exc)
+    if r.returncode != 0:
+        tail = (r.stderr or b"").decode("utf-8", "replace").strip()[-200:]
+        return None, "source 报错（rc=%d）：%s" % (r.returncode, tail or "无 stderr")
+    out = {}
+    for chunk in r.stdout.split(b"\x00"):
+        if not chunk:
+            continue
+        k, _, v = chunk.partition(b"=")
+        out[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+    if not out:
+        return None, "`env -0` 没输出 —— 起的可能不是 bash"
+    note = "source 了 " + ("、".join(have) if have else "（一个都没有）")
+    if missing:
+        note += "；**不在**：" + "、".join(missing) + "（多半没 colcon build）"
+    return out, note
+
+
+def judge_ros_env(env, ros2_on_path, install_setup, sourced="", repo=REPO):
+    """P0：**算出来的**环境能不能跑本项目。**纯函数**。
+
+    ⚠️ 判据是**行为**，不是代理指标（2026-10-06 修）：必须**真的**在
+    `AMENT_PREFIX_PATH` 里看到本项目工作区的 install 前缀。旧判据只是
+    「非空 + setup.bash 文件存在」—— 板上 `.bashrc` 恰好只 source 了**另一个**
+    工作区，于是旧判据绿、P1 红，而红的话说的是「缺包」。同一种病：
+    **判据报的是它自己的主题，不是你关心的那个行为。**
+    """
     distro = str(env.get("ROS_DISTRO") or "").strip()
     ament = str(env.get("AMENT_PREFIX_PATH") or "").strip()
     if not ros2_on_path:
-        return FAIL, ("PATH 里没有 `ros2` —— 先 source /opt/ros/humble/setup.bash"
-                      "（本机 WSL 上 /opt/ros/humble **没装 rclpy**，只能看不能跑）")
+        return FAIL, ("PATH 里没有 `ros2` —— 启动器会自己 source %s；看到这条说明"
+                      "它没 source 成，看下面「来源」那半句"
+                      % (ROS_SETUP_TMPL % "humble"))
     if not distro:
         return FAIL, "没有 ROS_DISTRO —— 环境没 source 起来"
     if not ament:
         return FAIL, "AMENT_PREFIX_PATH 是空的 —— 环境没 source 全"
-    if not install_setup_exists:
+    if not install_setup or not os.path.exists(install_setup):
         return FAIL, ("%s 不在 —— 板子上那份检出**必须先 colcon build**"
                       "（install/ 指向 build/，不编就等于跑旧代码）"
-                      % os.path.join(repo, "ros2_ws", "install", "setup.bash"))
-    return PASS, "ROS_DISTRO=%s，ros2 在 PATH 里，install/setup.bash 在" % distro
+                      % (install_setup or "ros2_ws/install/setup.bash"))
+    want = os.path.normpath(os.path.dirname(os.path.abspath(install_setup)))
+    have = [e for e in ament.split(os.pathsep) if e.strip()]
+    norm = [os.path.normpath(os.path.expanduser(e)) for e in have]
+    # ⚠️ 判据是「**这棵工作区**在贡献」，**不是**「install 目录本身在列表里」：
+    #    colcon 的**隔离式**安装（板上就是）放进 AMENT_PREFIX_PATH 的是
+    #    `<ws>/install/<包名>` 一条条，**没有** `<ws>/install` 本身。
+    #    2026-10-06 板上实测把这条抓了出来 —— 我第一版写的正是「目录本身在
+    #    列表里」，而离线夹具里的假 setup.bash 恰好导出裸前缀，于是测试全绿、
+    #    真机恒红。**夹具跟现场长得不一样，绿就是假的。**
+    if not any(e == want or e.startswith(want + os.sep) for e in norm):
+        return FAIL, ("AMENT_PREFIX_PATH 里**没有**本项目工作区（%s）贡献的任何一条"
+                      "—— 现在是：%s\n      ⇒ 多半 source 到了**别的**工作区"
+                      "（板上 `.bashrc` 就是 source 了 ~/yahboom_ws），"
+                      "或者这份检出没 colcon build" % (want, have or "（空）"))
+    return PASS, ("ROS_DISTRO=%s，ros2 在 PATH 里，工作区 install 在搜索路径上"
+                  "（%s）" % (distro, sourced or "来源未记"))
 
 
 def judge_domain(env, site):
@@ -871,13 +952,16 @@ def judge_problems(what, problems, path=""):
 
 
 def is_playing(d):
-    """示教器在 PLAYING 吗。**精确相等**，不用子串。
+    """示教器在 PLAYING 吗。**薄转发** —— 判定实现在 `board_lib.is_playing`。
 
-    ⚠️ 子串判定的教训写在 `board_gate.is_active` 里：`inactive` 里连着含 `act`，
-    子串判定会把坏的报成好的。这里同样只认整串相等（值域就
-    `STOPPED|PLAYING|PAUSED`，没有别的）。
+    ⚠️ 这里从「本地精确相等」改成了转发（2026-10-06）。原来的
+    `str(d["programState"]).strip() == "PLAYING"` 是**恒 False**：
+    实测原文是 `'STOPPED ur5ros.urp'`，播放时是 `'PLAYING ur5ros.urp'`
+    —— 状态后面缀着**当前载入的程序名**，与 `'PLAYING'` 永不相等。
+    后果不是「误报」，是 P3 **永远等不到播放**、300 s 超时退 2，
+    而现场表现是「人明明按了播放」。全文见 `board_lib` 里那节实测记录。
     """
-    return bool(d) and str(d.get("programState", "")).strip() == "PLAYING"
+    return board_lib.is_playing(d)
 
 
 def judge_cabinet(d):
@@ -886,18 +970,24 @@ def judge_cabinet(d):
     ⚠️ 这里**不要求** PLAYING。次序是「**起栈 → 按播放 → 拉回控制器**」：URCap 的
     External Control 要先有对端，先按播放再起栈，示教器上会报「连接被拒绝」、程序
     停在 STOPPED。等播放的逻辑在 P3。
+
+    ⚠️ 判据走 `board_lib.dash_mode`（剥标签），**不是**与原文精确比：UR 的回复
+    自带标签（实测 `'Robotmode: RUNNING'`），精确比在**任何正常控制柜上恒红**
+    （2026-10-06 修，当时它正是 R0 卡在 P1 的三条之一）。
     """
     if d is None:
         return FAIL, ("连不上控制柜 29999（只读查询 robotmode / programState / "
                       "safetystatus；**不发** play/power/stop）")
-    mode = str(d.get("robotmode", "")).strip()
+    raw = str(d.get("robotmode", "")).strip()
+    mode = board_lib.dash_mode(d)
     if mode != "RUNNING":
-        return FAIL, ("robotmode=%r，不是 'RUNNING' —— 控制柜没上电 / 没使能 / "
-                      "还没连上驱动？" % mode)
+        return FAIL, ("robotmode 原文 %r 读成 %r，不是 'RUNNING' —— 控制柜没上电 / "
+                      "没使能 / 还没连上驱动？（原文带 'Robotmode: ' 标签是**正常**的，"
+                      "由 board_lib.dash_mode 剥掉，别改回去精确比）" % (raw, mode))
     return PASS, ("%s | %s | %s（此刻**不要求** PLAYING：次序是 "
                   "起栈→按播放→拉回控制器）"
-                  % (mode, str(d.get("programState", "")).strip(),
-                     str(d.get("safetystatus", "")).strip()))
+                  % (mode, board_lib.dash_program_state(d),
+                     board_lib.dash_field(d.get("safetystatus"))))
 
 
 def judge_preflight(facts):
@@ -1139,11 +1229,12 @@ def path_in_repo(path, repo=REPO):
     return p == r or p.startswith(r + os.sep)
 
 
-def collect_preflight(site, do_net=True, override=None):
+def collect_preflight(site, do_net=True, override=None, env=None):
     """把 P1 要的事实**读一遍**（全是只读查询），交给 `judge_preflight` 判。
 
     每个 `None` 都表示「这一项没测成」，由纯函数按 SKIP 处置 —— 这里**不**替它下结论。
     `do_net=False`（`--dry-run`）只读站点字段 + 判时效，不跑任何子进程。
+    `env` 是 `build_ros_env()` 算出来的那份，两个守卫脚本都用它跑。
     """
     if not do_net:
         return {"leftovers": None, "port": site.gripper_port, "port_busy": None,
@@ -1174,19 +1265,25 @@ def collect_preflight(site, do_net=True, override=None):
     except Exception:                               # noqa: BLE001
         f["cabinet"] = None
 
-    f["deploy_rc"] = run_helper(DEPLOY_SCRIPT, [], timeout=180.0)
-    f["tree_rc"] = run_helper(TREE_SCRIPT, ["--check"], timeout=300.0)
+    f["deploy_rc"] = run_helper(DEPLOY_SCRIPT, [], timeout=180.0, env=env)
+    f["tree_rc"] = run_helper(TREE_SCRIPT, ["--check"], timeout=300.0, env=env)
     f["freshness"] = board_lib.freshness_gate(site, override=override)
     return f
 
 
-def run_helper(script, args, timeout):
-    """跑一个**只读**的守卫脚本，返回退出码；跑不起来（不在/起不动）返回 `None`。"""
+def run_helper(script, args, timeout, env=None):
+    """跑一个**只读**的守卫脚本，返回退出码；跑不起来（不在/起不动）返回 `None`。
+
+    `env` 必须是 `build_ros_env()` 算出来的那份 —— 守卫脚本（`check_board_deploy.py`
+    等）要按 `package.xml` 解析依赖，**它看的就是 `AMENT_PREFIX_PATH`**。
+    继承调用者的环境曾让这一项在板上恒红（见 `build_ros_env` 的实测记录）。
+    """
     if not os.path.exists(script):
         return None
     try:
         r = subprocess.run([sys.executable, script] + list(args), cwd=REPO,
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.returncode
@@ -1589,17 +1686,28 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         st, det = judge_problems("站点配置", board_lib.validate_site(site), site.path)
         add(S0, Item("P0.站点配置", st, det))
 
+    ros_env = None
     if a.dry_run:
         add(S0, Item("P0.ROS 环境", SKIP, "没查（--dry-run 不跑任何子进程）"),
             absent="--dry-run 只看静态（文件与命令）")
         add(S0, Item("P0.域号一致", SKIP, "没查（--dry-run 不跑任何子进程）"),
             absent="--dry-run 只看静态（文件与命令）")
     else:
-        add(S0, Item("P0.ROS 环境", *judge_ros_env(
-            os.environ, shutil.which("ros2") is not None,
-            os.path.exists(INSTALL_SETUP))))
+        # 环境**算出来**，不继承调用者的。这不是洁癖：板上 `.bashrc` 只 source 了
+        # 系统 ROS 与**另一个**工作区（~/yahboom_ws），人开个正常终端跑，本项目的
+        # install 也不在搜索路径上 —— 而旧判据照样绿，失败推迟到 P1 并伪装成
+        # 「缺包」。见 build_ros_env 的实测记录。这一份 env 贯穿 P0→P1→P2。
+        ros_env, env_note = build_ros_env(install_setup=INSTALL_SETUP)
+        if ros_env is None:
+            add(S0, Item("P0.ROS 环境", FAIL, env_note))
+        else:
+            add(S0, Item("P0.ROS 环境", *judge_ros_env(
+                ros_env,
+                shutil.which("ros2", path=ros_env.get("PATH")) is not None,
+                INSTALL_SETUP, sourced=env_note)))
         if site is not None:
-            add(S0, Item("P0.域号一致", *judge_domain(os.environ, site)))
+            add(S0, Item("P0.域号一致",
+                         *judge_domain(ros_env or os.environ, site)))
 
     if task is not None and site is not None:
         params, sources, conflicts = resolve_launch_params(task, site)
@@ -1631,7 +1739,7 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     # ================================================== P1 前置（只读）
     print("\n—— %s ——" % S1)
     facts = collect_preflight(site, do_net=not a.dry_run,
-                              override=a.override_freshness)
+                              override=a.override_freshness, env=ros_env)
     for it in judge_preflight(facts):
         if a.attach and it.name in ATTACH_ABSENT:
             add(S1, it, absent="--attach：栈就是别人起的")
@@ -1663,7 +1771,7 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
               "验过 —— 上面每一项都标着「声明缺席」。")
         return finish(0, launched=False, dry_run=True)
 
-    env = dict(os.environ, ROS_DOMAIN_ID=str(site.ros_domain_id),
+    env = dict(ros_env or os.environ, ROS_DOMAIN_ID=str(site.ros_domain_id),
                PYTHONUNBUFFERED="1")
 
     declared, failed = set(), []
@@ -1731,13 +1839,16 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         ok, d, waited = wait_for_playing(site.robot_ip, a.play_timeout, clock=clock)
         if ok:
             add(S3, Item("P3.示教器 PLAYING", PASS,
-                         "%.0fs 后 PLAYING（%s）"
-                         % (waited, str(d.get("programState", "")).strip())))
+                         "%.0fs 后 %s（原文 %r）"
+                         % (waited, board_lib.dash_program_state(d),
+                            str(d.get("programState", "")).strip())))
         else:
-            got = str((d or {}).get("programState", "")).strip() or "连不上控制柜"
+            got = str((d or {}).get("programState", "")).strip()
             add(S3, Item("P3.示教器 PLAYING", FAIL,
-                         "%.0fs 内没等到 PLAYING（现在 %r）—— 次序是「起栈 → 按播放"
-                         " → 拉回控制器」" % (a.play_timeout, got)))
+                         "%.0fs 内没等到 PLAYING（原文 %r 读成 %r）—— 次序是"
+                         "「起栈 → 按播放 → 拉回控制器」"
+                         % (a.play_timeout, got,
+                            board_lib.dash_program_state(d) or "连不上控制柜")))
 
         j3 = os.path.join(gate_dir, "p3.json")
         argv3 = gate_argv(j3, only="controllers",

@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np                                                # noqa: E402
 from topcam_marker_calib import (                                 # noqa: E402
     R_LINK_TO_OPTICAL, base_from_camera, compose, invert,
-    matrix_to_quat, quat_to_matrix)
+    matrix_to_quat, optical_to_link, quat_to_matrix)
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -141,6 +141,47 @@ check('  位移不受纯转动漂移影响（相机光心没动）',
       np.allclose(base_from_cam_solved[1], base_from_cam_true[1], atol=1e-12))
 check('★ 反过来：板若被写错（把 cam←板 当成 base←板），闭环就崩 —— 值得显式记',
       not np.allclose(compose(A, invert(B))[0], compose(A, invert(A))[0]))
+
+
+def angle_deg(R1, R2):
+    """两个旋转之间的夹角（度）。"""
+    return math.degrees(math.acos(min(1.0, max(-1.0,
+        (np.trace(np.asarray(R1, float).T @ np.asarray(R2, float)) - 1.0) / 2.0))))
+
+
+print('\n--- E. ★ 约定闭环：--solve 印的必须与 --init 喂的同一个约定 ---')
+# `real.launch.py` 把相机 TF 发在 base_link → camera_link 上，站点配置的
+# camera_q* 也是这个约定；而工具内部（以及 OpenCV 的 cam←板）跑的是光学系。
+# 两者差一个**固定 120°**的轴约定旋转。漏掉换算，TF 就整体转错 120°，
+# 而**不会报任何错** —— 只让 /targets_3d 全错，表现与「标定不准」一模一样。
+#
+# ⚠️ D 段抓不到这个：D 用的是合成位姿，从没经过 base_from_camera，
+# 所以「把换算去掉」这种改动在 D 段**改前改后都绿**。
+ANG_LO = angle_deg(R_LINK_TO_OPTICAL, np.eye(3))
+check(f'前提：link↔optical 这个固定旋转就是 120°（实测 {ANG_LO:.3f}°）',
+      abs(ANG_LO - 120.0) < 1e-9)
+
+OPT = base_from_camera(ARCH)[0]          # camera_link 文件 → 工具内部的光学系
+check('★ optical_to_link(base_from_camera(文件)) 拿回文件里的 R（不差 120°）',
+      np.allclose(optical_to_link(OPT), R_TEST))
+check('  未换算的那个确实不等于文件里的 R（说明这一步真做了事）',
+      not np.allclose(OPT, R_TEST))
+check(f'  两者的夹角正是那个固定旋转（{ANG_LO:.3f}°）',
+      abs(angle_deg(OPT, R_TEST) - ANG_LO) < 1e-9)
+check('  且与源文件里明写的 q 也对得上（不只是与 R 自洽）',
+      np.allclose(matrix_to_quat(optical_to_link(OPT)),
+                  matrix_to_quat(R_TEST), atol=1e-9))
+
+# 端到端：照 --init / --solve 的实际算法走一遍（同一观测 ⇒ 应当精确还原）
+OBS = (quat_to_matrix([0.1, -0.5, 0.2, 0.83]), np.array([0.05, -0.02, 0.62]))
+STORE = compose(base_from_camera(ARCH), OBS)     # --init 存进 ~/topcam_marker.json 的
+SOLVED = compose(STORE, invert(OBS))             # --solve（板没动、同一次观测）
+check('★ 端到端：同一观测下 --solve 印回来的 == --init 喂进去的 R',
+      np.allclose(optical_to_link(SOLVED[0]), R_TEST, atol=1e-12))
+check('  不换算则差 120°（这就是「印错系」那个缺陷的签名）',
+      abs(angle_deg(SOLVED[0], R_TEST) - ANG_LO) < 1e-9)
+check('  t 不受约定影响（光心在 parent 系就是 t，与子帧朝向无关）',
+      np.allclose(SOLVED[1], T_TEST, atol=1e-12))
 
 print('\n通过 %d，失败 %d' % (N_PASS, N_FAIL))
 if FAILS:

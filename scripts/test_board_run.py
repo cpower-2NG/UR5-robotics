@@ -854,6 +854,134 @@ try:
     check("候选数读不到 ⇒ 不出声（不拿「不知道」当「不够」）",
           board_run.candidate_margin_note(None, 4) is None)
 
+    # -----------------------------------------------------------------
+    # 5b. 控制柜回复的**线上格式**（2026-10-06 实测）
+    # -----------------------------------------------------------------
+    # ⚠️ 下面三个值是**逐字原文**，不是纯值：UR 自加标签、programState 还缀
+    #    程序名。旧判据拿原文与 'RUNNING' / 'PLAYING' 精确比 ⇒ P1 恒 FAIL、
+    #    P3 恒等不到播放（R0 卡住的三条之一）。夹具曾写成猜的格式，
+    #    所以这一段是本次唯一能抓到它的地方 —— 改它之前先读 board_lib.py 那节。
+    section("[5b] 控制柜回复带标签/后缀：P1 与 P3 都得照样读懂")
+    CAB_RUN = {"robotmode": "Robotmode: RUNNING",
+               "programState": "STOPPED ur5ros.urp",
+               "safetystatus": "Safetystatus: NORMAL"}
+    st, det = board_run.judge_cabinet(CAB_RUN)
+    check("P1.控制柜：原文 'Robotmode: RUNNING' ⇒ PASS（旧的精确比在这里恒 FAIL）",
+          st == board_run.PASS, det)
+    check("  PASS 文案印的是**读出来的**值，不含线上标签（'RUNNING | STOPPED | NORMAL'）",
+          "RUNNING | STOPPED | NORMAL" in det and "Robotmode:" not in det, det)
+    st2, det2 = board_run.judge_cabinet({**CAB_RUN,
+                                         "robotmode": "Robotmode: POWER_OFF"})
+    check("P1.控制柜：真没使能仍然拦（'Robotmode: POWER_OFF' ⇒ FAIL）"
+          "—— 别为了消假红把闸门一起消掉",
+          st2 == board_run.FAIL, det2)
+    check("  FAIL 文案**同时**给出原文与读出的值（下一个人别再拿原文去比）",
+          "Robotmode: POWER_OFF" in det2 and "POWER_OFF" in det2, det2)
+    check("  连不上照旧 FAIL", board_run.judge_cabinet(None)[0] == board_run.FAIL)
+    check("P3：播放时原文 'PLAYING ur5ros.urp' ⇒ is_playing 为真"
+          "（旧的精确比在这里恒 False ⇒ 300s 超时退 2，人却按了播放）",
+          board_run.is_playing({**CAB_RUN, "programState": "PLAYING ur5ros.urp"}))
+    check("  固件若只回 'PLAYING'（无后缀）也认 —— 别把格式差异变成假红",
+          board_run.is_playing({**CAB_RUN, "programState": "PLAYING"}))
+    check("  STOPPED / PAUSED / 连不上 一律不算在播放",
+          not board_run.is_playing(CAB_RUN)
+          and not board_run.is_playing({**CAB_RUN,
+                                        "programState": "PAUSED ur5ros.urp"})
+          and not board_run.is_playing(None))
+    check("  但**不许**放宽成子串：'NOT_PLAYING x.urp' 与 'STOPPED myPLAYING.urp' "
+          "都不算在播放（这是它取代 'in' 判定的理由）",
+          not board_run.is_playing({**CAB_RUN,
+                                    "programState": "NOT_PLAYING x.urp"})
+          and not board_run.is_playing({**CAB_RUN,
+                                        "programState": "STOPPED myPLAYING.urp"}))
+
+    # -----------------------------------------------------------------
+    # 5c. P0 的 ROS 环境：启动器**自己 source**，判据是**行为**
+    # -----------------------------------------------------------------
+    section("[5c] P0.ROS 环境：自己 source；判据是「工作区 install 真在路径上」")
+    ROSD = tempfile.mkdtemp(prefix="rosenv_", dir=tmpdir)
+    sysdir = os.path.join(ROSD, "sys")
+    wsins = os.path.join(ROSD, "ws", "install")
+    os.makedirs(sysdir)
+    os.makedirs(wsins)
+    sys_setup = os.path.join(sysdir, "setup.bash")
+    ws_setup = os.path.join(wsins, "setup.bash")
+    with open(sys_setup, "w", encoding="utf-8") as fh:
+        fh.write("export ROS_DISTRO=sysdistro\n"
+                 "export AMENT_PREFIX_PATH=/opt/ros/sysdistro\n"
+                 "export WHO=系统\n")
+    with open(ws_setup, "w", encoding="utf-8") as fh:
+        # ⚠️ 夹具必须照**现场实测**的形状写（2026-10-06，板上）：
+        #    colcon 的**隔离式**安装放进 AMENT_PREFIX_PATH 的是
+        #    `<ws>/install/<包名>` 一条条，**没有** `<ws>/install` 本身。
+        #    第一版夹具写的是裸前缀，于是判据「install 目录在列表里」全绿、
+        #    真机恒红 —— **夹具跟现场长得不一样，绿就是假的。**
+        fh.write("export ROS_DISTRO=humble\n"
+                 'export AMENT_PREFIX_PATH="%s:%s:$AMENT_PREFIX_PATH"\n'
+                 "export WHO=工作区\n"
+                 % (os.path.join(wsins, "yolo_bringup"),
+                    os.path.join(wsins, "perception_3d")))
+
+    check("两个 setup.bash **先系统后工作区**（反了会把工作区压在下面，且不报错）",
+          board_run.ros_setup_files(distro="humble", install_setup="/w/install/setup.bash",
+                                    system_setup="/s/setup.bash")
+          == ["/s/setup.bash", "/w/install/setup.bash"])
+
+    env, note = board_run.build_ros_env(base={"PATH": "/usr/bin:/bin"},
+                                        system_setup=sys_setup,
+                                        install_setup=ws_setup)
+    check("build_ros_env 真的 source 了两个、拿回整份环境", env is not None, note)
+    check("  **后 source 的说了算**（WHO=工作区）—— 这就是顺序的意义",
+          bool(env) and env.get("WHO") == "工作区", str((env or {}).get("WHO")))
+    pkgs = str((env or {}).get("AMENT_PREFIX_PATH", "")).split(os.pathsep)
+    check("  工作区**逐包**前缀真的进了 AMENT_PREFIX_PATH（现场就是这个形状）",
+          os.path.join(wsins, "yolo_bringup") in pkgs, str(pkgs))
+    check("  而 `<ws>/install` 本身**不在**列表里 —— 判据不许要求它在（我第一版错在这）",
+          wsins not in pkgs, str(pkgs))
+    check("  说明里写清 source 了谁（报告里要看得见，不许藏）",
+          "source 了" in note and ws_setup in note, note)
+    check("★ 拿这份环境判 P0 ⇒ PASS（判据是行为：**这棵工作区**在贡献）",
+          board_run.judge_ros_env(env or {}, True, ws_setup, sourced=note)[0]
+          == board_run.PASS)
+    check("  说明里带上了 env_note（「来源未记」不该出现）", "来源未记" not in note)
+
+    # 合并式安装（裸 `<ws>/install`）也是合法布局 —— 两种都得认
+    wsm = os.path.join(ROSD, "wsm", "install")
+    os.makedirs(wsm)
+    merged = os.path.join(wsm, "setup.bash")
+    with open(merged, "w", encoding="utf-8") as fh:
+        fh.write('export AMENT_PREFIX_PATH="%s:$AMENT_PREFIX_PATH"\n' % wsm)
+    check("★ 合并式安装（裸 `<ws>/install`）也要 PASS —— 两种布局都合法",
+          board_run.judge_ros_env({"ROS_DISTRO": "humble", "AMENT_PREFIX_PATH": wsm},
+                                  True, merged)[0] == board_run.PASS)
+    check("  但前缀撞名的邻居不许混进来（`/ws/installX` ≠ `/ws/install`）",
+          board_run.judge_ros_env({"ROS_DISTRO": "humble",
+                                   "AMENT_PREFIX_PATH": wsm + "X"}, True,
+                                  merged)[0] == board_run.FAIL)
+
+    # 板上实测的那个形状（2026-10-06）：只 source 了**别的**工作区
+    ONLY_OTHER = {"ROS_DISTRO": "humble",
+                  "AMENT_PREFIX_PATH": ("/opt/ros/humble"
+                                        + os.pathsep + "/home/<用户>/yahboom_ws/install")}
+    st, det = board_run.judge_ros_env(ONLY_OTHER, True, ws_setup)
+    check("★ 只 source 了**别人的**工作区 ⇒ FAIL（旧的「非空」判据在这里是绿的）",
+          st == board_run.FAIL, det)
+    check("  且把「现在有什么」摆出来，点名别的那个工作区（症状离原因不远）",
+          "yahboom_ws" in det, det)
+    check("  而 P0 仍然拦得住「根本没 source」和「没有 ROS_DISTRO」",
+          board_run.judge_ros_env({}, True, ws_setup)[0] == board_run.FAIL
+          and board_run.judge_ros_env({"AMENT_PREFIX_PATH": "/x"}, True,
+                                      ws_setup)[0] == board_run.FAIL)
+
+    env2, note2 = board_run.build_ros_env(base={"PATH": "/usr/bin:/bin"},
+                                          system_setup=sys_setup,
+                                          install_setup=os.path.join(ROSD, "没有"))
+    check("工作区 setup.bash 不在 ⇒ 说明点名它、并给出 colcon 的线索",
+          "不在" in note2 and "colcon" in note2, note2)
+    check("  此时 P0 判 FAIL，文案让人去 colcon build（不伪装成「缺包」）",
+          board_run.judge_ros_env(env2 or {}, True,
+                                  os.path.join(ROSD, "没有"))[0] == board_run.FAIL)
+
     # =================================================================
     # 6. 外参
     # =================================================================
@@ -1205,6 +1333,17 @@ try:
 
     # PATH 洗成没有 ros2 的样子：这样「离线整跑退 2」是**确定**的，而不是取决于
     # 跑测试的人有没有 source 过 ROS（那个变量一进来，这条断言就变成碰运气）。
+    #
+    # ⚠️ 2026-10-06 起启动器**自己 source** `/opt/ros/humble/setup.bash`（见
+    #    `build_ros_env`），所以洗 PATH **再也造不出**「PATH 里没有 ros2」——
+    #    它会把 ros2 找回来。
+    #
+    # ⚠️⚠️ 而**红的理由必须与机器无关**（2026-10-06 板上抓到的第二次）：
+    #    这里原来断言红的是「缺本机工作区的 install ⇒ 去 colcon build」——
+    #    可**板上那份检出是编过的**，同一份代码在板上就不红了，自检当场失败。
+    #    **拿环境当行为**，与 [5b] 那个「夹具猜线上格式」是同一个病。
+    #    现在钉的是 `clean_env()` 摘掉 ROS_DOMAIN_ID 造成的那条：它在**任何**机器上
+    #    都成立（见 `DROP_ENV`）；「缺 install 该怎么报」改由 [5c] 用合成夹具钉。
     no_ros = os.pathsep.join(
         p for p in clean_env().get("PATH", "").split(os.pathsep)
         if p and not os.path.exists(os.path.join(p, "ros2")))
@@ -1215,12 +1354,12 @@ try:
                 env={"PATH": no_ros})
     check("离线整跑退 2（**绝不能退 0**：fail-closed）", r.returncode == 2,
           "rc=%s" % r.returncode)
-    check("  红的理由是**说得出名字**的那一个（PATH 里没有 ros2）",
-          "PATH 里没有 `ros2`" in r.stdout)
+    check("  红的是**机器无关**的那一条：域号没设（`clean_env` 摘了 ROS_DOMAIN_ID）",
+          "[FAIL] P0.域号一致" in r.stdout and "[PASS] P0.站点配置" in r.stdout)
+    check("  每条红都说得出名字（`[FAIL] P0.<项>`），没有无名红",
+          len(re.findall(r"\[FAIL\] P0\.\S", r.stdout)) >= 1)
     check("  栈**没有起**（闸门没过就不起栈）",
           "栈**没有起**" in r.stdout and "起栈中" not in r.stdout)
-    check("  P0 里该过的过了、该红的红了（红在上面说的那一项）",
-          "[PASS] P0.站点配置" in r.stdout and "[FAIL] P0.ROS 环境" in r.stdout)
     check("  P1 一项都没跑（P0 就没过去）", "[PASS] P1." not in r.stdout)
     check("  --json-report 指向仓库内 ⇒ 拒写，且**真的没写**",
           "指向仓库内" in r.stdout
@@ -1292,11 +1431,16 @@ try:
     # 这一档把 P1 的事实**喂**进去（不连串口、不问控制柜、不跑那两个守卫脚本），
     # 因为要测的是 P2 的声明集闸门**能不能拦住起栈**。P3 也不问真控制柜
     # （把 dashboard 换成「连不上」）—— 真 Dashboard 那条路属于板端，本文件不假装验过。
+    # ⚠️ 控制柜那三个值**逐字照抄线上原文**（2026-10-06 实测，29999 只读）。
+    #    别「顺手整理」成纯值 —— 那正是本文件里曾经发生过的事故：
+    #    夹具写的是**猜的**格式 {'robotmode': 'RUNNING'}，猜错了，
+    #    于是这里 1294 行全绿，而真机上 P1.控制柜恒 FAIL、P3 恒等不到播放。
     FACTS_GREEN = {
         "leftovers": [], "port": "/dev/serial/by-id/usb-<占位>-if00-port0",
         "port_busy": False, "gripper": (1, "ok"),
-        "cabinet": {"robotmode": "RUNNING", "programState": "STOPPED",
-                    "safetystatus": "NORMAL"},
+        "cabinet": {"robotmode": "Robotmode: RUNNING",
+                    "programState": "STOPPED ur5ros.urp",
+                    "safetystatus": "Safetystatus: NORMAL"},
         "deploy_rc": 0, "tree_rc": 0,
         "freshness": (board_gate.PASS, "外参核对于今天，保质期 1 天"),
     }
@@ -1308,12 +1452,27 @@ try:
         old_install = board_run.INSTALL_SETUP
         old_collect = board_run.collect_preflight
         old_dash = board_lib.dashboard
+        old_build = board_run.build_ros_env
         os.environ["PATH"] = bindir + os.pathsep + no_ros
-        os.environ.update(ROS_DISTRO="humble", AMENT_PREFIX_PATH="/opt/ros/humble",
+        # ⚠️ AMENT_PREFIX_PATH 里**必须**有本项目工作区（= 下面 INSTALL_SETUP 所在
+        #    那棵树）贡献的一条 —— 新判据查的就是这个**行为**，不是「非空」这个代理。
+        #    而且照现场形状：**逐包**前缀 + 裸 install 目录，两种都在（colcon 隔离式
+        #    只放逐包那条，合并式只放裸那条；两种布局都得认）。
+        ws_ins = os.path.join(bindir, "ws", "install")
+        os.makedirs(ws_ins, exist_ok=True)
+        with open(os.path.join(ws_ins, "setup.bash"), "w", encoding="utf-8") as fh:
+            fh.write("# 夹具：假装这份检出 colcon build 过了\n")
+        os.environ.update(ROS_DISTRO="humble",
+                          AMENT_PREFIX_PATH=os.pathsep.join(
+                              [os.path.join(ws_ins, "yolo_bringup"), ws_ins,
+                               "/opt/ros/humble"]),
                           ROS_DOMAIN_ID="99")
-        board_run.INSTALL_SETUP = os.path.join(bindir, "ros2")   # 假装 install 在
+        board_run.INSTALL_SETUP = os.path.join(ws_ins, "setup.bash")  # 假装 install 在
+        # 换掉「自己 source」：本机没有那份工作区，而且这里要测的是闸门不是 shell。
+        board_run.build_ros_env = (
+            lambda *a, **kw: (dict(os.environ), "（测试桩：没真 source）"))
         board_run.collect_preflight = (
-            lambda site, do_net=True, override=None: dict(FACTS_GREEN))
+            lambda site, do_net=True, override=None, env=None: dict(FACTS_GREEN))
         board_lib.dashboard = lambda ip, timeout=5.0: None       # 问不到控制柜
         buf = io.StringIO()
         try:
@@ -1326,6 +1485,7 @@ try:
         finally:
             board_run.INSTALL_SETUP = old_install
             board_run.collect_preflight = old_collect
+            board_run.build_ros_env = old_build
             board_lib.dashboard = old_dash
             for k, v in old_env.items():
                 if v is None:

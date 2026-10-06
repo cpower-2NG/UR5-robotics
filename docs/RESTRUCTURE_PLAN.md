@@ -6401,7 +6401,7 @@ wlP1p1s0  DOWN                     ← 板载无线已断
 
 | 项 | 实测 | 判定 |
 |---|---|---|
-| 设备 | `/dev/ttyUSB0`，`0403:6001`，**FT232R USB UART**，序列号 **`AB0P6UEX`** | ✅ 在 |
+| 设备 | `/dev/ttyUSB0`，`0403:6001`，**FT232R USB UART**，序列号 **`<ag95-serial>`** | ✅ 在 |
 | 稳定路径 | `/dev/serial/by-id/usb-FTDI_FT232R_<序列号>-if00-port0` | ✅ 有（别用 `/dev/ttyUSB0`，插拔会变号） |
 | 驱动 | `ftdi_sio` + `usbserial` 已加载 | ✅ |
 | 权限 | `root:dialout 660`；`jetson` ∈ `dialout`(20) | ✅ |
@@ -6642,7 +6642,7 @@ RS-485 上并出来的 A/B（结构上很像），则**板子与控制箱同时�
 
 - **当时用的从站号（slave id）和波特率**是多少？
 - **跑的是什么程序？脚本还在吗？**（有的话能直接读出寄存器映射，省掉整个扫描）
-- 用的**是不是同一个适配器**（FTDI `AB0P6UEX`）？
+- 用的**是不是同一个适配器**（FTDI `<ag95-serial>`）？
 
 ### 四、相机标定 —— 两台的路子完全不同
 
@@ -10954,7 +10954,7 @@ get_operational_mode  → success=False
 ### 三 丙-5：只读半边做完，并且捡到了判决的**前半**
 
 **前置全部满足**（比 10-02 那次好）：适配器在位（`0403:6001` FT232R，
-`SER=AB0P6UEX`，`LOCATION=1-2.3`）、`/dev/ttyUSB0` **空闲**、`jetson` 在 `dialout`、
+`SER=<ag95-serial>`，`LOCATION=1-2.3`）、`/dev/ttyUSB0` **空闲**、`jetson` 在 `dialout`、
 `pymodbus 3.15.0`（从站号参数名 `device_id`）、`pyserial 3.5`。
 `ag95_probe.py` 是**结构性只读**的（源码里只有 `read_holding_registers` /
 `read_input_registers`，还有自检扫源码钉着）。**一个寄存器都没写。**
@@ -14320,3 +14320,154 @@ External Control 照常连接、控制器闸门照常吃劲。它是「**不规�
 **仍然没做的**：**板端阶梯一次都还没跑** —— 本轮只做到「静态计划 + 与真机命令对账」，
 `--dry-run` 自身的绿说的是**文件**不是**设备**；`repair exercised: no`。
 下一个动作是 R0 ×3（命令与判据见 `docs/待执行命令.md`）。
+
+---
+
+## 第九十七轮：启动器**第一次真上板** —— 三处「判据在说它自己的主题」，两处是**夹具在替代码说谎**（2026-10-06）
+
+第九十六轮结束时的原话是「板端阶梯一次都还没跑，`--dry-run` 的绿说的是文件不是设备」。
+本轮把启动器**放到板上去跑**，第一次真跑就红了三处，**三处都不是环境问题**。
+
+### 1. 控制柜：线上格式是**带标签/带后缀**的，判据拿原文精确比 ⇒ 恒 FAIL
+
+板上实测（29999 **只读**查询，逐字）：
+
+```
+robotmode     -> 'Robotmode: RUNNING'
+programState  -> 'STOPPED ur5ros.urp'      ← 程序名当后缀，不是裸值
+safetystatus  -> 'Safetystatus: NORMAL'
+```
+
+而 `board_run.is_playing` 写的是 `== "PLAYING"`、`judge_cabinet` 写的是 `!= "RUNNING"`。
+后果是**两条路一起废**：`P1.控制柜` 在任何**健康**的控制柜上恒 FAIL；`P3` 永远看不到
+播放（300 s 超时退 2）——而操作员**明明已经按了播放**。这正是用户说的「每次启动都卡半天」
+里最贵的那一半。
+
+`board_a1.py` 用的是**子串**判定，恰好是对的 —— 同一件事**两份实现、一对一对**。
+本轮统一：`board_lib.dash_field/dash_mode/dash_program_state/is_playing` 一份，
+`board_run` 与 `board_a1` 都用它。
+
+**免疫的原因值得单独记**：`test_board_run.py` 的夹具写的是
+`{'robotmode': 'RUNNING'}` —— **猜的**格式。猜错了，于是 1294 行离线自检全绿，
+真机上恒红。夹具不是从现场抄的，绿就是假的。
+
+### 2. 「启动器自己 source」落地；**P0 判据先写错一次，被板上打回**
+
+用户拍板：**启动器自己 source**（不再依赖调用者的 shell）。`build_ros_env` 用
+`bash -c 'source …; env -0'` 拿回整份环境，顺序是**先系统后工作区**。
+
+判据从代理指标（「非空 + setup.bash 存在」）改成**行为**（本项目工作区真的在
+`AMENT_PREFIX_PATH` 上）。**改完第一版就错了**：
+
+- 我写的是「`<ws>/install` 这个**目录本身**在列表里」；
+- 板上实测列表是 **`<ws>/install/yolo_bringup`、`<ws>/install/yolo_ur_description`…**
+  —— colcon 的**隔离式**安装放进去的是**逐包**前缀，**没有**裸目录那一条。
+- 而我离线夹具里的假 `setup.bash` 恰好导出**裸前缀** ⇒ **测试全绿、真机恒红**。
+
+**同一个病在同一轮里犯了两次**（§1 是夹具猜线上格式，这里是夹具猜目录形状）。
+修法两侧一起改：判据改成「`== want` **或** `startswith(want + sep)`」（两种布局都认），
+夹具改成**照现场**写逐包前缀，并补两条反向判据 ——
+「合并式（裸前缀）也要 PASS」、「前缀撞名的邻居 `/ws/installX` 不许混进来」。
+
+### 3. `[11]` 的红依赖「**本机**没 colcon build」⇒ 自检在板上当场红
+
+`[11]` 断言离线整跑红在「缺本机工作区的 install ⇒ 去 colcon build」。**板上那份检出是编过的**，
+同一份代码在板上就不红了 —— 自检在板上失败（2 项）。**拿环境当行为**，与 §1、§2 同族。
+
+改成钉 `clean_env()` 摘掉 `ROS_DOMAIN_ID` 造成的那条 —— 它在**任何**机器上都成立；
+「缺 install 该怎么报」由 `[5c]` 用**合成夹具**钉，不靠本机碰巧没编译。
+
+### 4. 离线层：280 条断言 + 7 个变异体
+
+`test_board_run.py` **280 条断言全过**、`test_board_lib.py` **75 条 0 失败**；
+`test_board_a1` / `test_board_gate` 各**四处变异**仍全翻面。注入口 `mutate_dash.py`
+七个变异体 **7/7 被杀且逐个无损恢复**（改前断言 sha 变了、跑后断言 sha 复原）：
+
+| # | 注入 | 结果 |
+|---|---|---|
+| M-D1 | `dash_program_state` 丢掉「取首词」 | 杀 |
+| M-D2 | `_DASH_LABELS` 白名单失效 | 杀 |
+| M-D3 | `board_run.is_playing` 退回精确比 | 杀 |
+| M-D4 | `judge_cabinet` 退回拿原文比 | 杀 |
+| M-E1 | source 顺序反过来 | 杀 |
+| M-E2 | P0 判据倒回「裸目录在列表里」 | 杀 |
+| M-E3 | P0 判据退回「只看非空」 | 杀 |
+
+板上再跑一次同一份自检：`test_board_lib` **退 0**、`test_board_run` **退 0**。
+（sha 逐份核对过本地↔板上，覆盖前先备份到 `/tmp/board_sync_bak-20261006-154903/`。）
+
+### 5. 真机验证：**什么也不 source**，`--attach` 走一遍（零副作用）
+
+`--attach` 跑 P0+P1（都只读），再拿**已经起着**的栈做 P3/P4 —— 栈没起，所以到 P3 就停。
+命令前置是 `unset AMENT_PREFIX_PATH ROS_DISTRO`（以前必红的形状）：
+
+```
+[PASS] P0.任务描述 / P0.判分函数 / P0.站点配置 / P0.参数拼装
+[PASS] P0.ROS 环境   source 了 /opt/ros/humble/setup.bash、
+                     ~/yolo_ros_original/ros2_ws/install/setup.bash
+[PASS] P0.域号一致   ROS_DOMAIN_ID=99
+[PASS] P1.控制柜     RUNNING | STOPPED | NORMAL      ← 旧的精确比在这里恒 FAIL
+[PASS] P1.部署前置   check_board_deploy.py 退 0（依赖齐）  ← 用户原话里「卡半天」的那条
+[PASS] P1.外参时效   核对于 2026-10-06，保质期 1 天，剩 1 天
+[FAIL] P1.AG-95 初始化   未初始化（0x0200=0）⇒ 先跑 ag95_init_close.py --go
+[SKIP] P1.板子树     没有清单（fail-closed：没有清单 ≠ 一致）
+```
+
+### 6. 全树哈希**第一次上板**就抓到：板子的 `ros2_ws/src` 落后仓库 6 个文件
+
+`board_tree_manifest.py --write`（本机，56 个文件）→ 清单拷到板外位置 →
+板上 `--check`：**多 0 / 少 0 / 改 6**。逐份拉下来对过，**方向一致：板子是旧的那份**：
+
+| 文件 | 板上有、仓库换成占位符/新写法的 |
+|---|---|
+| `yolo_bringup/launch/real.launch.py` | 用法示例里的 `robot_ip:=` 是**真内网地址** → 仓库改成 `robot_ip:=<ip>` |
+| `yolo_ur_description/README.md` | 同上，标定命令里的 `robot_ip:=` 真值 → `<ur-controller-ip>` |
+| `arm_grasp_sim/package.xml` | `<maintainer>` 是**内网域名邮箱**真值 → `user@example.com` |
+| `yolo_bringup/config/realsense_camera.yaml` | 带**真相机序列号**的实体配置 → 「模板 + 怎么填」 |
+| `grasp_planner/config/grasp_planner.yaml` | 注释里的真**芯片序列号** → `<序列号>` |
+| `yolo_bringup/launch/pipeline.launch.py` | **缺** `USER_REALSENSE_PARAMS` 机制 |
+
+（**本表刻意不抄真值** —— 第一版写了字面量，被 `test_deidentified.py` 当场抓住
+5 处。**流水层也是仓库文件**，抄一行真值等于换个地方再泄一次。）
+
+最后一条能定时：该机制是 `e71b970`（**2026-10-05**）「公开仓：相机序列号改为
+「本机文件/环境变量」并加占位符守卫」加的 ⇒ **板子树最后一次同步早于 10-05**。
+
+**这颗地雷顺带拆了**：新 `pipeline.launch.py` 是「环境变量 → 本机文件 → 包内模板」
+三级，而包内模板的序列号是**占位符**（匹配不到任何设备，驱动每 6 秒重试、**永不退出**
+⇒「进程都在、永远没有图像」）。实测板上 `~/.config/ur5-vision-grasp/realsense_camera.yaml`
+**在**（10-05 22:05）⇒ 将来把 `ros2_ws/` 同步过去**不会**静默失明。
+清单工具还自带一条 `install/ 里的包与 src/ 对得上`，本轮它也报 ✓。
+
+⇒ 所以 `P1.板子树` 从此前的 `SKIP`（没清单）变成**如实报差异**。这是**对**的：
+板子树确实落后。**怎么处置（同步前进 / 以板子为基线重写清单）属用户的决定，本轮不动
+`ros2_ws/`** —— 计划里「不先让观测到位就不改链路」这条没破。
+
+### 7. 顺带：脱敏守卫**看不见散文里的裸序列号**（5 处，已换占位符）
+
+摸 `grasp_planner.yaml` 那处差异时发现：那颗 FTDI 芯片序列号在**文档散文里另有 5 处**
+（`机械臂系统参考.md` ×1、`待执行命令-留档.md` ×1、`RESTRUCTURE_PLAN.md` ×3），
+而 `test_deidentified.py` 报**0 命中**。原因不是漏写规则，是**规则只认
+`/dev/serial/by-id/…` 那种路径形状**，散文里的裸串既不匹配正则、也不在
+本机 denylist 里。已按 `AGENTS.md` 的占位符风格换成 `<ag95-serial>`。
+
+**两处仍然是例外，且是「登记过的例外」**：`scripts/ag95_init_close.py` 的 `PORT`
+常量与 `grasp_planner.yaml` 的 `ag95_port` 默认值 —— 源码里的 `ALLOWED_SERIAL_FILES`
+写明了理由（活链路，顺手换占位符会让现场**静默少一条链路**）**和期限**
+（改成从站点配置取值后**必须删掉本表**）。**本轮没动它们**，也不该动。
+
+**为什么不能现在把序列号塞进本机 denylist**：denylist 命中**不走文件白名单**，
+会连带扫**提交信息**——实测提交信息里有 **2 处** ⇒ 守卫会**永久变红**（除非重写历史）。
+**次序要人定**：先 `filter-repo` 清历史，还是先接受这条红。
+
+### 8. 本轮退出码
+
+`test_deidentified` / `test_docs_map` / `state_check` / `test_board_lib` /
+`test_board_gate` / `test_board_a1` / `test_board_run` 全 `0`（**本机与板上各一遍**）；
+`state_check` 另有 2 行超期，是提醒不是错误。变异的吃劲程度见 §4。
+
+**仍然没做的**：R0 ×3 **一次都没跑成**，卡在两处**都不是启动器的问题** ——
+`P1.AG-95 初始化`（要真人看着夹爪行程，属当次授权）；`P1.板子树`（要用户定处置）。
+另：`P0.域号一致` 在调用者没 export 时会 FAIL，而启动器 P2 **自己**会用站点的值
+—— 这条判据是「拦一个它自己就能修的条件」，**待用户裁决**（见报告）。
+

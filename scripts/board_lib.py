@@ -207,10 +207,13 @@ def gripper_state(port=None):
 
 
 def dashboard(ip, timeout=5.0):
-    """**只读**问一句控制柜。返回 `{命令: 回复}`；连不上返回 None。
+    """**只读**问一句控制柜。返回 `{命令: 回复}`（**原文，未解析**）；连不上返回 None。
 
     走 29999 只读查询，**不发 play/power/stop、不碰 30001–30004**
     （红线 1：手搓 RTDE 包把 URControl 打死过）。
+
+    ⚠️ 返回的是**线上原文**，不是纯值 —— 别拿它跟 `'RUNNING'` / `'PLAYING'`
+    精确比，见 :func:`dash_mode` / :func:`dash_program_state`。
     """
     try:
         s = socket.create_connection((ip, 29999), timeout=timeout)
@@ -227,6 +230,73 @@ def dashboard(ip, timeout=5.0):
         return out
     finally:
         s.close()
+
+
+# ------------------------------------------------- 控制柜回复的**线上格式**
+#
+# 🔴 2026-10-06 实测（29999 只读，一台正常在跑的控制柜）：
+#
+#     robotmode      'Robotmode: RUNNING'      ← 带**标签前缀**
+#     programState   'STOPPED ur5ros.urp'      ← 无标签，但缀着**程序名**
+#     safetystatus   'Safetystatus: NORMAL'    ← 带标签前缀
+#
+# 三条各自点自己的名 ⇒ 回复没有错行，这就是原样。
+#
+# 在此之前，`board_run` 是拿**原文**与纯值精确比的：
+#   · `judge_cabinet` 的 `!= 'RUNNING'`  ⇒ 在任何正常控制柜上**恒 FAIL**；
+#   · `is_playing` 的 `== 'PLAYING'`     ⇒ 播放时原文是 `'PLAYING ur5ros.urp'`，
+#     **永不相等** ⇒ P3 永远等不到播放，300 s 超时退 2，而现场表现是
+#     「人明明按了播放」。
+# 病根是**夹具里写的是猜的格式**（`{'robotmode': 'RUNNING'}`），猜错了，
+# 于是 1294 行离线自检全绿而真机恒红。夹具现已换成上面这三条**原文**。
+#
+# 所以：判定一律过下面这两个解析器，**永不**拿 `dashboard()` 的原文比。
+
+#: UR 自己给回复加的标签词（只认这几个；别的冒号一律当**值的一部分**，不剥）。
+#: 不剥的理由：`programState` 的程序名里可能有冒号（如 Windows 路径），
+#: 靠标签白名单才不会把值切坏。
+_DASH_LABELS = {"robotmode", "programstate", "program state",
+                "safetystatus", "safety status"}
+
+
+def dash_field(raw):
+    """Dashboard 一行回复 → 纯值（剥掉 UR 的标签前缀；无标签的原样返回）。"""
+    s = str(raw or "").strip()
+    head, sep, tail = s.partition(":")
+    if sep and head.strip().lower() in _DASH_LABELS:
+        s = tail.strip()
+    return s
+
+
+def dash_mode(d):
+    """`robotmode` → `'RUNNING'` / `'POWER_OFF'` / …（**首词**，大写）。
+
+    ⚠️ 取**首词**而不是整串：实测已证 UR 会往这些行后面缀东西
+    （`programState` 就缀了程序名）。首词不可能**造出**假绿 ——
+    `RUNNING` 仍必须是这行的第一个词。
+    """
+    f = dash_field((d or {}).get("robotmode"))
+    return f.split()[0].upper() if f.split() else ""
+
+
+def dash_program_state(d):
+    """`programState` → `'STOPPED'` / `'PLAYING'` / `'PAUSED'`（**首词**，大写）。
+
+    ⚠️ 后缀是实测的，不是防御性编程：原文 `'STOPPED ur5ros.urp'` 里
+    `ur5ros.urp` 是**当前载入的程序名**，播放时就是 `'PLAYING ur5ros.urp'`。
+    （播放那一行**尚未实测** —— 等 R1 自然产生时抓一次核对；判据不依赖它。）
+    """
+    f = dash_field((d or {}).get("programState"))
+    return f.split()[0].upper() if f.split() else ""
+
+
+def is_playing(d):
+    """示教器在 PLAYING 吗。**全仓唯一**一份判定，`board_run` 与 `board_a1` 都用它。
+
+    （曾有两份：`board_run` 精确比、`board_a1` 用子串 `"PLAYING" in …`。
+    子串那份**碰巧**是对的，精确比那份恒 False —— 两份并存正是缺陷能活下来的原因。）
+    """
+    return dash_program_state(d) == "PLAYING"
 
 
 # ============================================================ 站点配置

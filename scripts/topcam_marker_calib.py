@@ -42,6 +42,16 @@
    · 打印出来的板必须按 100% 出，且用图上那条 100 mm 校验尺量过；
      被整体缩放时，把量出的比例乘到 `--square-mm/--marker-mm` 上
      （板 JSON 里有原始值）。
+
+★ `--solve` 印的 `camera_q*` 是 **`base_link ← camera_link`** —— 与
+  `real.launch.py` 的 TF（父帧 base_link、子帧 camera_link）和站点配置
+  `topcam.extrinsics` 同一个约定，**可以直接抄**。工具内部跑的是光学系
+  （OpenCV 如此），出来时用 `optical_to_link` 换回去；这一步 2026-10-06 才补上，
+  在那之前印的是光学系，与站点配置**整整差 120.77°**，而 TF 转错不报任何错。
+
+⚠️ 板必须**整块**进画幅。只看到一角时（例如只认出 6/16 个内角点、角点挤成
+  90×35 px 的窄带）PnP 是**退化**的 —— 三帧静止画面解出的位置能差 23 mm，
+  而重投影 RMS 依旧漂亮（角点本身亚像素一致）。**别只看 RMS，先看角点数。**
 """
 
 import argparse
@@ -54,11 +64,23 @@ sys.dont_write_bytecode = True
 
 import numpy as np                                                # noqa: E402
 
-#: `camera_link` → 相机光学系的固定旋转（REP-103/105）：
+#: 相机 link 与光学系之间的固定轴约定旋转（REP-103/105）：
 #:   opt_x = −link_y, opt_y = −link_z, opt_z = link_x
+#:
+#: ⚠️ **这个常量的名字按「值」念是反的**：它的值是 ``T_link_optical``
+#: （把**光学系坐标映射到 link 坐标**）。之所以要它，是因为
+#: ``base←camera_link`` 左乘它才得到 ``base←optical``，而 OpenCV 给的
+#: ``cam←板`` 是**光学系**的 —— 整条合成链内部统一跑在光学系上。
+#: 印 launch 参数时要换回 ``camera_link``，用下面的转置。
 R_LINK_TO_OPTICAL = np.array([[0.0, 0.0, 1.0],
                               [-1.0, 0.0, 0.0],
                               [0.0, -1.0, 0.0]])
+
+#: 光学系 → camera_link（``R_LINK_TO_OPTICAL`` 的转置）。
+#: ``real.launch.py`` 把相机 TF 发在 ``base_link → camera_link`` 上，所以
+#: **印出来的 ``camera_q*`` 必须是 ``base←camera_link``**，填进站点配置之前
+#: 一定要过这一步 —— 不过这一步会整整差 120.77°，而 TF 转错不会报任何错。
+R_OPTICAL_TO_LINK = R_LINK_TO_OPTICAL.T
 
 
 def quat_to_matrix(q):
@@ -166,10 +188,12 @@ def detect_board(image_path, board_meta, K, dist):
 
 
 def base_from_camera(doc):
-    """外参文件 → ``base←camera_link`` 的 ``(R, t)``。
+    """外参文件 → ``base←optical`` 的 ``(R, t)``（**注意：不是 camera_link**）。
 
-    接受两种 `frame_child`：已是光学系（原样用），或 `camera_link`（左乘固定旋转）。
-    其它帧名一律拒绝 —— 猜帧关系是这一类错误里最难查的一种。
+    本工具内部一律跑在**光学系**上（OpenCV 的 ``cam←板`` 就是光学系的），所以
+    这个函数把两种写法**都归一到光学系**：已是光学系的原样用，``camera_link``
+    的左乘固定旋转。要拿回 ``camera_link``（``real.launch.py`` 要的那个）用
+    :func:`optical_to_link`。其它帧名一律拒绝 —— 猜帧关系是这类错误里最难查的。
     """
     child = str(doc.get('frame_child') or doc.get('camera_frame') or '')
     R = (np.array(doc['R'], dtype=float) if 'R' in doc
@@ -180,6 +204,18 @@ def base_from_camera(doc):
     if child == 'camera_link':
         return (R @ R_LINK_TO_OPTICAL, t)
     raise SystemExit(f'不认识的 frame_child={child!r}：只认 camera_link 与光学系（拒绝猜）')
+
+
+def optical_to_link(R):
+    """``base←optical`` → ``base←camera_link``。
+
+    与 :func:`base_from_camera` 是**互逆**的一对，两者合起来必须是不动点：
+    ``optical_to_link(base_from_camera(文件)[0]) == 文件里的 R``。
+    这条性质由 ``test_topcam_marker_calib.py`` 的约定闭环一节钉住 ——
+    少了它，``--solve`` 印出来的 ``camera_q*`` 与 ``site.yaml`` 差 120.77°，
+    而 TF 转错**不报任何错**，只让 ``/targets_3d`` 整体错掉。
+    """
+    return np.asarray(R, dtype=float) @ R_OPTICAL_TO_LINK
 
 
 def fmt_launch(R, t):
@@ -265,8 +301,10 @@ def main():
             (np.trace(Rc.T @ prev[0]) - 1.0) / 2.0))))
         print(f'与 --init 那次相比：位移 {d * 1000:.1f} mm，转角 {ang:.3f}°'
               f'（这就是这段时间相机漂掉的量）')
-    print('\n启动参数：')
-    print(fmt_launch(Rc, tc))
+    # 印之前换回 camera_link：`real.launch.py` 发的是 base_link → camera_link，
+    # 站点配置里的 camera_q* 也是这个约定。漏掉这一步差 120.77° 且不报错。
+    print('\n启动参数（base_link ← camera_link，即 real.launch.py 的 camera_q*）：')
+    print(fmt_launch(optical_to_link(Rc), tc))
     return 0
 
 

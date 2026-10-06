@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """board_lib.py 的自检 —— **纯离线**，不起进程、不开串口、不碰臂。
 
-分六节：
+分七节：
   1. 站点配置：合法性逐条说得对，缺项**不静默回落**
   2. 外参时效：fail-closed（「不知道」不许当成「新鲜」），且与 state_check.py 同线
   3. 残留进程：自我排除按**血缘/入口名**，不按函数住在哪个文件里
   4. 变异检查：把判据真的改坏，断言**改前 ≠ 改后**，并钉住红的是**哪一条**
   5. 源码钉子：顶层不许 import ROS
   6. 命令行行为：模板**必须**被判不合法（一份看着像真的配置比空文件更危险）
+  7. 控制柜回复的**线上格式**：带标签 / 带程序名后缀，判定不许拿原文比
 
      python3 scripts/test_board_lib.py
 
@@ -509,6 +510,43 @@ def section_cli():
 
 
 # --------------------------------------------------------------------- main
+def section_dash():
+    """控制柜回复的**线上格式**（2026-10-06 实测原文）。
+
+    这一节的存在理由：夹具里曾经写的是**猜的**格式（`{'robotmode': 'RUNNING'}`），
+    猜错了，于是真机上 `P1.控制柜` 恒 FAIL、`P3` 恒等不到播放，而离线全绿。
+    所以这里的素材一律是**线上原文**，逐字抄，不整理。
+    """
+    print("\n[7] 控制柜回复带标签/后缀：判定不许拿原文比（2026-10-06 实测）")
+    RAW_RUN = {"robotmode": "Robotmode: RUNNING",
+               "programState": "STOPPED ur5ros.urp",
+               "safetystatus": "Safetystatus: NORMAL"}
+    check("robotmode 剥掉 'Robotmode: ' 标签 ⇒ RUNNING",
+          board_lib.dash_mode(RAW_RUN) == "RUNNING")
+    check("safetystatus 同样带标签 ⇒ NORMAL",
+          board_lib.dash_field(RAW_RUN["safetystatus"]) == "NORMAL")
+    check("programState 无标签、缀着程序名 ⇒ 取首词 STOPPED（实测原文）",
+          board_lib.dash_program_state(RAW_RUN) == "STOPPED")
+    check("  播放那行 ⇒ PLAYING（线上**未实测**，由 STOPPED 那行同构推来；"
+          "判据取首词，不依赖它）",
+          board_lib.dash_program_state(
+              {"programState": "PLAYING ur5ros.urp"}) == "PLAYING")
+    check("标签白名单：值里带冒号不被切坏（'PLAYING C:\\prog.urp'）",
+          board_lib.dash_program_state(
+              {"programState": "PLAYING C:\\prog.urp"}) == "PLAYING")
+    check("  未知冒号前缀**不**当标签剥（'Whatever: PLAYING' 原样返回）",
+          board_lib.dash_field("Whatever: PLAYING") == "Whatever: PLAYING")
+    check("空 / None / 连不上 ⇒ 空串（不抛，也不编一个状态出来）",
+          board_lib.dash_program_state(None) == ""
+          and board_lib.dash_mode({}) == ""
+          and board_lib.dash_program_state({"programState": "   "}) == "")
+    check("is_playing 只认**首词** PLAYING：NOT_PLAYING / 程序名里含 PLAYING 都不算",
+          board_lib.is_playing({"programState": "PLAYING ur5ros.urp"})
+          and not board_lib.is_playing({"programState": "NOT_PLAYING x.urp"})
+          and not board_lib.is_playing({"programState": "STOPPED myPLAYING.urp"})
+          and not board_lib.is_playing(None))
+
+
 def main():
     print("board_lib 自检（纯离线：不起进程、不开串口、不碰臂）")
     section_site()
@@ -517,6 +555,7 @@ def main():
     section_mutation()
     section_source()
     section_cli()
+    section_dash()
     print(f"\n{_n} 条断言，{len(_failed)} 条失败")
     if _failed:
         for n in _failed:
