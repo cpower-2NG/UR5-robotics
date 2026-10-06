@@ -252,6 +252,13 @@ sudo ufw status verbose            # 需要 sudo；权威
 >
 > 本节仍然有用：它解释**为什么**要装 External Control URCap、切 Remote Control、
 > 标定为什么不能跳。这些前提 A1 一节默认已经满足，不会重讲。
+>
+> ⚠️ **还有一条不报错的差别：几何。** 上游 `ur_control.launch.py` 用它自己那份
+> **出厂标称** URDF；本仓的 `real.launch.py` 把 `description_package` 显式设成
+> **`yolo_ur_description`**（标定几何，`real.launch.py:104`，并在 `:210`/`:256`
+> 两处下发）—— 两条路的 `tool0` **不是同一个点**。照本节起的栈去抓取，
+> 几何是错的，而且**哪里都不报错**（AGENTS.md §1 的「两套几何」就是指这件事）。
+> 只想确认「驱动连得上」时无所谓；真要动手必须走 A1。
 
 ### 第 0 步：空跑，不接机械臂
 
