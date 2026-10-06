@@ -1043,6 +1043,34 @@ def judge_cabinet(d):
                      board_lib.dash_field(d.get("safetystatus"))))
 
 
+def residual_playing_note(cabinet):
+    """`P3.示教器 PLAYING` 通过时**追加**的那句话：这算不算「人按的」。**纯函数** → `str`。
+
+    ⚠️ **为什么要有这一条**（2026-10-06 用户裁决 **(b)**）：启动器收栈收的是**这套栈**，
+    **不是**控制柜里的程序 —— 收栈之后示教器常常仍停在 `PLAYING`。那样的话下一轮起栈时
+    P3 的轮询**第一次就命中**，报告里照样是一条 PASS，读起来像「人在环走通了」，
+    **而其实什么都没走**（人根本没动手）。第 2 次 R0 实测正是如此：
+    `[PASS] P3.示教器 PLAYING  0s 后 PLAYING`，而起栈**之前** P1 读到的已经是
+    `PLAYING ur5ros.urp`。
+
+    **用户选的是「说清 ＋ 放行」，不是「拒」**：这样一轮仍然把 P4 的体检跑完了，
+    拒掉反而什么都没验到。所以这一条**不改三态**，只把话说实。
+
+    ⚠️ 与「按得快」**无关**：判据只看**起栈之前**那个值，不看等了多久。所以
+    「起栈后 20 s 人按的」照样算人按的（第 2b 轮实测 `24s 后 PLAYING`）——
+    拿 `waited` 当判据会把「手快」误判成「残状态」，那正是缺陷丙的同一个形状。
+    """
+    if cabinet is None:
+        return ("；⚠️ 起栈前**没读到**示教器状态（Dashboard 没答话）—— "
+                "这一条「是不是人按的」**未判**")
+    if board_lib.is_playing(cabinet):
+        return ("；⚠️ **但这一条不算「人在环走通了」**：起栈**之前**它就已经是 %s 了"
+                "（上一轮收栈留下的残状态 —— 收栈收的是**这套栈**，不是控制柜里的"
+                "程序）。要让这一项真的考到人，下一轮起栈**之前**先在示教器上按 STOP。"
+                % (board_lib.dash_program_state(cabinet) or "PLAYING"))
+    return ""
+
+
 def judge_preflight(facts):
     """P1 全部前置项 → `[Item, ...]`（顺序 = `P1_NAMES`）。**纯函数**。
 
@@ -1987,10 +2015,13 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         print("=" * 66)
         ok, d, waited = wait_for_playing(site.robot_ip, a.play_timeout, clock=clock)
         if ok:
+            # `facts["cabinet"]` 是 **P1**（＝起栈**之前**）读到的那一份 —— 只有它
+            # 能回答「这一条是不是人按的」（理由见 `residual_playing_note`）。
             add(S3, Item("P3.示教器 PLAYING", PASS,
-                         "%.0fs 后 %s（原文 %r）"
+                         "%.0fs 后 %s（原文 %r）%s"
                          % (waited, board_lib.dash_program_state(d),
-                            str(d.get("programState", "")).strip())))
+                            str(d.get("programState", "")).strip(),
+                            residual_playing_note(facts.get("cabinet")))))
         else:
             got = str((d or {}).get("programState", "")).strip()
             add(S3, Item("P3.示教器 PLAYING", FAIL,

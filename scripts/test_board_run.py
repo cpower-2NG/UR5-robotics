@@ -1065,6 +1065,56 @@ try:
     check("  一致就 PASS，且容忍手抄来的空格",
           board_run.judge_domain({"ROS_DOMAIN_ID": " 99 "}, _Site)[0] == board_run.PASS)
 
+    # -----------------------------------------------------------------
+    # 5d. 残状态：起栈**之前**就在 PLAYING —— 排在 [5c] 之后是为了不打乱台账
+    #     对 `[5c]`＝P0 ROS 环境的引用（RESTRUCTURE_PLAN 第 14378 行）。
+    # -----------------------------------------------------------------
+    section("[5d] 残状态：起栈**之前**就在 PLAYING ⇒ 这条 PASS 不算「人按了」"
+            "（用户裁决 b：说清 + 放行，不是拒）")
+    _resid = board_run.residual_playing_note({**CAB_RUN,
+                                              "programState": "PLAYING ur5ros.urp"})
+    check("★ 起栈前已是 PLAYING ⇒ 明说**不算「人在环走通了」**，并点名是残状态"
+          "（第 2 次 R0 实测 '0s 后 PLAYING'，读起来却像人按了）",
+          "不算" in _resid and "残状态" in _resid and "STOP" in _resid, _resid)
+    check("  且指出**收栈收的是这套栈、不是控制柜里的程序**（下一步才知道该干什么）",
+          "这套栈" in _resid and "控制柜" in _resid, _resid)
+    check("★ 起栈前 STOPPED ⇒ **不追加任何话**（正常的一轮别被噪声淹没）",
+          board_run.residual_playing_note(CAB_RUN) == "",
+          repr(board_run.residual_playing_note(CAB_RUN)))
+    check("  Dashboard 没答话（None）⇒ 明写**未判**，不许默认成「人按了」也不许"
+          "默认成「残状态」",
+          "未判" in board_run.residual_playing_note(None),
+          board_run.residual_playing_note(None))
+    check("  PAUSED 不算 PLAYING（沿 is_playing 的那一条，不另立一套判据）",
+          board_run.residual_playing_note({**CAB_RUN,
+                                           "programState": "PAUSED ur5ros.urp"}) == "")
+
+    # 源码钉子：判据只能是**起栈之前**那个值。若哪天有人把 `waited` 塞进来
+    # （「等得久才算人按的」），就把「手快」误判成「残状态」—— 与缺陷丙同一个形状。
+    _rp = [n for n in ast.walk(TREE)
+           if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+           and n.func.id == "residual_playing_note"]
+    check("源码钉子：`residual_playing_note` 取的是 `facts.get(\"cabinet\")`"
+          "（＝**P1、起栈之前**读的那一份），且**只传这一个**实参 —— "
+          "塞进 `waited` 就等于拿「按得快慢」当判据",
+          len(_rp) == 1 and len(_rp[0].args) == 1
+          and isinstance(_rp[0].args[0], ast.Call)
+          and getattr(_rp[0].args[0].func, "attr", "") == "get"
+          and isinstance(_rp[0].args[0].args[0], ast.Constant)
+          and _rp[0].args[0].args[0].value == "cabinet",
+          "%d 处调用" % len(_rp))
+
+    _m_rp = load_mutant(_mutate(
+        SRC, "    if board_lib.is_playing(cabinet):\n",
+        "    if False:\n", "rp"), "rp")
+    if _m_rp is not None:
+        check("变异：把残状态这一条**掐掉**（恒不追加）⇒ 那条 `★` 断言**翻面**，"
+              "报告又变回「0s 后 PLAYING」那种读起来像人按了的 PASS",
+              board_run.residual_playing_note(
+                  {**CAB_RUN, "programState": "PLAYING ur5ros.urp"}) != ""
+              and _m_rp.residual_playing_note(
+                  {**CAB_RUN, "programState": "PLAYING ur5ros.urp"}) == "")
+
     # =================================================================
     # 6. 外参
     # =================================================================
