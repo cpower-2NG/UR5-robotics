@@ -289,9 +289,14 @@ MUTATIONS = [
     ('多一个参数（加 foo:=1）',
      lambda s: s.replace('publish_camera_tf:=true',
                          'publish_camera_tf:=true foo:=1', 1)),
+    # ⚠️ 这一条**故意不带 `count=1`**：那个字面量在 A1 一节的**文案里也被引用**
+    # （2026-10-06 新增的那条「下面三处 `camera_x:=…` 已作废」的提醒就引了它）。
+    # 按「第一处」替换会打在**文案**上、三个命令块一字不动 ⇒ 变异体存活，
+    # 而报告会把它说成「判据没在看这件事」——**反过来诬告判据**。
+    # 2026-10-06 实际发生了一次。替换全部出现处，保证变异落在命令块上。
     ('值改了（camera_x 少一位）',
      lambda s: s.replace('camera_x:=0.34694477757210807',
-                         'camera_x:=0.3469447775721081', 1)),
+                         'camera_x:=0.3469447775721081')),
     ('入口换成 pipeline.launch.py',
      lambda s: s.replace('ros2 launch yolo_bringup bringup.launch.py',
                          'ros2 launch yolo_bringup pipeline.launch.py', 1)),
@@ -353,11 +358,23 @@ def mutation_selftest(section, offset, entry, keys, values, n_cmds):
         return ok
     print(f'  ✓ 对照组：未改坏的原文判绿（解析出 {n_cmds} 条 launch 命令）')
 
+    base_cmds = launch_cmds(section, offset)
     for name, mutate in MUTATIONS:
         mutated = mutate(section)
         if mutated == section:
             ok = False
             print(f'  ✗ {name}：**这次改坏根本没生效**（文本没变）—— 变异无效')
+            continue
+        # 「文本变了」还不够，还要**打在 launch 命令上**。命令块与命令块之间夹着
+        # 大段文案，而文案里引用了同一个字面量时，按第一处替换的变异会去改文案、
+        # 命令块一字不动 —— 变异体因此存活，报告却写成「判据没在看这件事」，
+        # **把守卫自己的失手说成判据的缺陷**。2026-10-06 的 `camera_x` 那条就这么
+        # 假死过一次。这条断言专防它：变异没落到命令上，就报「变异无效」，
+        # 既不放过它、也不诬告判据。
+        if launch_cmds(mutated, offset) == base_cmds:
+            ok = False
+            print(f'  ✗ {name}：**变异没打在 launch 命令上**（解析出的命令一字未变，'
+                  f'多半打在文案里了）—— 这次变异无效，别读成判据通过')
             continue
         problems = check_runbook(mutated, offset, entry, keys, values)
         if problems:
