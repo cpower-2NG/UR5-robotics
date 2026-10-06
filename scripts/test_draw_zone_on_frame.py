@@ -16,6 +16,7 @@
 退出码 0 = 全通过。
 """
 
+import json
 import math
 import os
 import sys
@@ -25,8 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np                                                   # noqa: E402
 from draw_zone_on_frame import (                                     # noqa: E402
-    R_LINK_TO_OPTICAL, T_LINK_TO_OPTICAL, axis_angles, compose_base_optical,
-    parse_zone, project)
+    RC_PARENT, RQ_TOL_DEG, R_LINK_TO_OPTICAL, T_LINK_TO_OPTICAL, axis_angles,
+    compose_base_optical, parse_zone, project, quat_to_matrix,
+    validate_extrinsics)
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -43,13 +45,17 @@ def check(name, cond, detail=''):
         print('  FAIL  %s%s' % (name, ('\n        ' + detail) if detail else ''))
 
 
-# 留档那份（docs/calib/extrinsics-2026-10-02.json）的逐字数值
+# 留档那份（docs/calib/extrinsics-2026-10-02.json）的逐字数值。
+# ⚠️ 那份文件的 `frame_parent` 是 **`base`**（UR 控制器帧，2026-10-06 才改对）；
+#    它自称 `base_link` 的那段时间整条链是镜像的，臂跑到反侧（台账 §10.2）。
+#    这里**故意不写 frame_parent** —— 这组数当「一组真实量级的矩阵」用就够了，
+#    把那个谎字段再抄进测试，等于让它换个地方继续活着。
 ARCHIVE = {
     "R": [[-0.034660042571149956, -0.999396046293701, 0.0024948149197288206],
           [0.5828767786583874, -0.0181868375995216, 0.8123570027019832],
           [-0.8118210038855782, 0.02961049798038296, 0.5831551046330354]],
     "t": [-0.34694477757210807, -0.8693043936314018, 0.6454397556505314],
-    "frame_parent": "base_link", "frame_child": "camera_link",
+    "frame_child": "camera_link",
 }
 K = (917.6205444335938, 916.4271240234375, 649.554931640625, 344.9062805175781)
 
@@ -204,6 +210,147 @@ check("第五个数是 z", safe(parse_zone, "z:-0.75,-0.40,-0.45,0.45,0.03")[2] 
 check("上下界反了 ⇒ 拒绝", isinstance(safe(parse_zone, "p:0.75,0.40,-0.45,0.45"), str))
 check("少给数 ⇒ 拒绝", isinstance(safe(parse_zone, "p:0.40,0.75,-0.45"), str))
 check("没有冒号 ⇒ 拒绝", isinstance(safe(parse_zone, "0.40,0.75,-0.45,0.45"), str))
+
+def _q_from_R(R):
+    """R → 四元数（只在本测试里用，所以不引 topcam_marker_calib —— 它要 cv2/aruco）。"""
+    R = np.array(R, dtype=float)
+    tr = float(np.trace(R))
+    if tr > 0:
+        s = math.sqrt(tr + 1.0) * 2
+        return np.array([(R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s,
+                         (R[1, 0] - R[0, 1]) / s, 0.25 * s])
+    i = int(np.argmax([R[0, 0], R[1, 1], R[2, 2]]))
+    j, k = (i + 1) % 3, (i + 2) % 3
+    s = math.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k]) * 2
+    q = np.zeros(4)
+    q[i] = 0.25 * s
+    q[j] = (R[j, i] + R[i, j]) / s
+    q[k] = (R[k, i] + R[i, k]) / s
+    q[3] = (R[k, j] - R[j, k]) / s
+    return np.array([q[0], q[1], q[2], q[3]])
+
+
+def _rot_nudged(R, deg):
+    """把 R 绕某个斜轴转 deg 度，返回它的四元数（用来试容差的边界）。"""
+    th = math.radians(deg)
+    ax = np.array([0.3, -0.5, 0.81])
+    ax = ax / np.linalg.norm(ax)
+    K = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+    Rn = (np.eye(3) + math.sin(th) * K + (1 - math.cos(th)) * (K @ K)) @ np.array(R, float)
+    return [float(v) for v in _q_from_R(Rn)]
+
+
+# ----------------------------------------------------------------------
+# G. validate_extrinsics —— 一份看着正常的 JSON 给出一个静默错的相机位姿
+# ----------------------------------------------------------------------
+# 这一层要挡的三件事，在**正常文件上都不会出现**，所以只有喂合成字典才验得动。
+# 它们共同的特征：数值都是三位数、量纲也对，症状却是「臂抓偏」—— 与坐标系错
+# 的表现一模一样，倒推不出来。
+print("\n--- G. validate_extrinsics（外参文件能不能用）---")
+_real = lambda n: json.load(open(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'docs', 'calib', n),
+    encoding='utf-8'))
+_10_03 = _real('extrinsics-2026-10-03-base_link.json')
+_10_02 = _real('extrinsics-2026-10-02.json')
+
+check('干净的一份（只有 R/t、没写 frame_parent）⇒ 放行',
+      validate_extrinsics(ARCHIVE) is None,
+      str(validate_extrinsics(ARCHIVE)))
+check('父帧如实写 base_link ⇒ 放行',
+      validate_extrinsics({**ARCHIVE, 'frame_parent': RC_PARENT}) is None)
+check('★ 父帧是 `base` ⇒ **拒绝**，且点出「绕 z 的 π / 镜像 / 臂跑到反侧」',
+      isinstance(validate_extrinsics({**ARCHIVE, 'frame_parent': 'base'}), str)
+      and 'π' in validate_extrinsics({**ARCHIVE, 'frame_parent': 'base'})
+      and '镜像' in validate_extrinsics({**ARCHIVE, 'frame_parent': 'base'}),
+      str(validate_extrinsics({**ARCHIVE, 'frame_parent': 'base'}))[:200])
+check('   `base_link_inertia`（同一个帧的 URDF 名字）也拒',
+      isinstance(validate_extrinsics({**ARCHIVE, 'frame_parent': 'base_link_inertia'}), str))
+check('★ 认不出的父帧名一律拒（不猜帧关系）',
+      isinstance(validate_extrinsics({**ARCHIVE, 'frame_parent': 'world'}), str))
+check('★ 真实文件回归：10-03 那份现在**过**（它的 R 与 q 已改自洽）',
+      validate_extrinsics(_10_03) is None, str(validate_extrinsics(_10_03)))
+check('★ 真实文件回归：10-02 留档那份现在**拒**，原因是父帧（它其实在 base 帧）',
+      isinstance(validate_extrinsics(_10_02), str)
+      and 'base' in validate_extrinsics(_10_02),
+      str(validate_extrinsics(_10_02))[:200])
+check('   而这条拒绝不是空转：把它的父帧改成 base_link 就放行（R/t 本身没问题）',
+      validate_extrinsics({**_10_02, 'frame_parent': 'base_link'}) is None)
+
+# ★ R 与 q 对不上：2026-10-06 实际发生的形态 —— 整体绕 z 转 180° 时改了 R/t，
+#   q 是上一份抄过来的。这类错**不会**被父帧检查、也不会被正交性检查拦住。
+_q_wrong = {**_10_03, 'q': _10_02['q']}                       # 抄错的那版
+_m = validate_extrinsics(_q_wrong)
+check('★ R 与 q 差 180°（q 是从上一份抄来的）⇒ 拒绝，且说明自相矛盾',
+      isinstance(_m, str) and '180' in _m and '自相矛盾' in _m, str(_m)[:240])
+check('   对照：把 q 换成由自己的 R 反解的 ⇒ 放行（说明上面拒的是 q，不是别的）',
+      validate_extrinsics({**_10_03, 'q': (-np.array(_10_03['q'])).tolist()}) is None
+      and validate_extrinsics(
+          {**_10_03, 'q': [float(v) for v in
+                           np.round(_q_from_R(_10_03['R']), 9)]}) is None)
+check('   容差确实是 %g°：差 0.4° 放行、差 0.6° 拒绝' % RQ_TOL_DEG,
+      validate_extrinsics({**_10_03, 'q': _rot_nudged(_10_03['R'], 0.4)}) is None
+      and isinstance(validate_extrinsics({**_10_03, 'q': _rot_nudged(_10_03['R'], 0.6)}),
+                     str),
+      '容差 %g' % RQ_TOL_DEG)
+
+check('★ det = −1（镜像）⇒ 拒绝（「父帧标反」的典型形态就是整体镜像）',
+      isinstance(validate_extrinsics({**ARCHIVE, 'R': (-np.array(ARCHIVE['R'])).tolist()}), str))
+check('R 不正交 ⇒ 拒绝',
+      isinstance(validate_extrinsics(
+          {**ARCHIVE, 'R': (np.array(ARCHIVE['R']) * np.array([1.0, 1.0, 1.5])).tolist()}), str))
+check('R 不是 3×3 ⇒ 拒绝',
+      isinstance(validate_extrinsics({**ARCHIVE, 'R': [[1, 0], [0, 1]]}), str))
+check('只有 q、没有 R ⇒ 放行（不强行要 R，两份来源本来就只写一种）',
+      validate_extrinsics({'q': _10_03['q'], 't': _10_03['t'],
+                           'frame_child': 'camera_link'}) is None)
+check('既没 R 也没 q ⇒ 拒绝', isinstance(validate_extrinsics({'t': [0, 0, 1]}), str))
+check('没有 t ⇒ 拒绝', isinstance(validate_extrinsics({'R': ARCHIVE['R']}), str))
+check('根本不是字典 ⇒ 拒绝', isinstance(validate_extrinsics(['R']), str))
+check('★ 而且它真的挂在路上：compose_base_optical 会抛，不是写了个没人调的函数',
+      isinstance(safe(compose_base_optical, {**ARCHIVE, 'frame_parent': 'base'}), str)
+      and isinstance(safe(compose_base_optical, _10_02), str))
+
+# ---- 变异：每一条闸门拿掉之后，上面哪条断言会红 ----
+print("\n--- G2. 变异（闸门拿掉之后必须变红）---")
+
+
+def _load(src_text, tag):
+    """把一份源码文本当模块导入（临时文件，避免与真模块的 .pyc 混）。"""
+    import importlib.util
+    import tempfile
+    d = tempfile.mkdtemp(prefix='dzf_')
+    p = os.path.join(d, 'draw_zone_on_frame_%s.py' % tag)
+    with open(p, 'w') as f:
+        f.write(src_text)
+    spec = importlib.util.spec_from_file_location('draw_zone_on_frame_%s' % tag, p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _mutate(old, new):
+    s = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'draw_zone_on_frame.py')).read()
+    assert old in s, '变异锚点没找到：%r' % old
+    return s.replace(old, new)
+
+
+_g1 = _load(_mutate('    if parent and parent != RC_PARENT:',
+                    '    if False and parent and parent != RC_PARENT:'), 'g1')
+check('G1 去掉父帧闸门 → `base` 也被放行（所以「父帧」那三条不是空转）',
+      _g1.validate_extrinsics({**ARCHIVE, 'frame_parent': 'base'}) is None
+      and validate_extrinsics({**ARCHIVE, 'frame_parent': 'base'}) is not None)
+
+_g2 = _load(_mutate('RQ_TOL_DEG = 0.5', 'RQ_TOL_DEG = 200.0'), 'g2')
+check('G2 容差放到 200° → R/q 差 180° 也被放行（所以「抄错 q」那条不是空转）',
+      _g2.validate_extrinsics(_q_wrong) is None
+      and validate_extrinsics(_q_wrong) is not None)
+
+_g3 = _load(_mutate('        if abs(float(np.linalg.det(R)) - 1.0) > 1e-6:',
+                    '        if False:'), 'g3')
+check('G3 去掉 det 检查 → 镜像被放行（所以 det 那条不是空转）',
+      _g3.validate_extrinsics(
+          {**ARCHIVE, 'R': (-np.array(ARCHIVE['R'])).tolist()}) is None)
 
 print("\n通过 %d，失败 %d" % (N_PASS, N_FAIL))
 if FAILS:

@@ -35,7 +35,10 @@ A2 跑完才发现放置区**根本不在画面里**（8 个槽投影到 v∈[-1
 ====
     # 看当前取景
     python3 scripts/topcam_framing.py \\
-        --extrinsics docs/calib/extrinsics-2026-10-02.json
+        --extrinsics docs/calib/extrinsics-2026-10-03-base_link.json
+
+    # 还没落盘、只是刚从 `topcam_marker_calib.py --solve` 抄来的 7 个数
+    python3 scripts/topcam_framing.py --camera X Y Z QX QY QZ QW
 
     # 「我打算再升高 10 cm」—— 先看结果再动手
     python3 scripts/topcam_framing.py --extrinsics ... --sim-raise-cm 10
@@ -388,10 +391,16 @@ def main():
             return 2
         # ⚠️ 走**同一段**复合代码，不在这里复制一遍换算：两份实现迟早分叉，
         #    而分叉的症状是「--extrinsics 对、--camera 错」——最难查的一种。
-        R, t = dzf.compose_base_optical({
-            "R": R0.tolist(), "t": [x, y, z],
-            "frame_child": ("camera_color_optical_frame"
-                            if args.camera_frame == "optical" else "camera_link")})
+        try:
+            R, t = dzf.compose_base_optical({
+                "R": R0.tolist(), "t": [x, y, z],
+                "frame_child": ("camera_color_optical_frame"
+                                if args.camera_frame == "optical" else "camera_link")})
+        except ValueError as e:
+            # 这一支现在还不该出事（上面刚构造的字典只有 R/t），但**不能因此不设防**：
+            # 哪天给构造里补一个 q，这份 try 就是唯一拦住「自相矛盾的输入」的地方。
+            print(f"!! --camera 这几个数用不了：{e}")
+            return 2
         ext_src = (f"--camera ({x:.6f}, {y:.6f}, {z:.6f}) "
                    f"q=({qx:.6f},{qy:.6f},{qz:.6f},{qw:.6f})"
                    f"   帧={args.camera_frame}")
@@ -480,12 +489,16 @@ def main():
     # 此时下面关于放置区的任何结论都没有意义 ⇒ 退出码 **2**（环境不满足），
     # 不是 1（取景不满足）。
     #
-    # 实测价值：这条能把 docs/calib 里两份外参**立刻**分开。
-    #   extrinsics-2026-10-02.json 的 x/y 是镜像的（t=(-0.347,-0.869,…)），
+    # 实测价值：这条能把「**自称 base_link 却整体镜像**」的外参挑出来。
+    #   典型来源是「base 帧的数字被当成 base_link」（t=(-0.347,-0.869,…)）：
     #   它把 8 个槽投到 u∈[1492,1922]、抓取区投到 u∈[1234,1568] —— 整块区域
-    #   跑到画面右侧 300~650 px 外面，而且**它的「光轴 vs 台面法线」照样是
+    #   跑到画面右侧 300~650 px 外面，而**它的「光轴 vs 台面法线」照样是
     #   35.95°**（那个角对「绕 z 转 180°」是不变的），所以只靠那条不变式
     #   分不出来，必须靠这条物理前提。
+    #   ⚠️ 2026-10-06 起，那种文件**多半更早就被拦住了**：留档那份已把
+    #   `frame_parent` 如实改成 `base`，`dzf.validate_extrinsics` 直接拒收
+    #   （rc=2）。这条不变式现在守的是**标签也对、数却是镜像**的形态 ——
+    #   手工改过 R 的符号、或 R 与 q 只改了一处之后又对上了标签，都属于这一类。
     if pick:
         pick_rows = frame_one(R, t, K, [items[-1]])
         ok_pick, _, why_pick = check_one(pick_rows[0], W, H, args.margin)

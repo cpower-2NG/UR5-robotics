@@ -22,6 +22,7 @@
 带绝对数字的那几条要跟着改 —— 它们钉的是「几何算对了」，不是「永远是这些数」。
 """
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -316,15 +317,37 @@ def part4_cli():
     check('4.5 给出了等效调整量（升高 / 平移 / 挪槽位三条路）',
           '升高' in out and 'place_slots 沿 y' in out)
 
-    # 10-02 是**镜像**的那一份：它把抓取区自己投到画面外 —— 这就是判它的依据
+    # 10-02 那份活在 **UR 的 `base` 帧**里（它给的 t=(-0.347,-0.869,…) 是那一帧的
+    # 数字）。它的 `frame_parent` 2026-10-06 才如实从 base_link 改成 base ⇒
+    # 现在**在更早的一层**就被拒了，根本走不到投影。
     rc2, out2 = run('--extrinsics', EXTR['10-02'])
-    check('4.6 10-02（镜像版）→ rc=2，而不是 rc=1', rc2 == 2, 'rc=%d' % rc2)
-    check('4.7 且给出的理由是「抓取区自己就不在画面里」'
-          '（不是「取景不满足」—— 那是两件事）',
-          '抓取区' in out2 and '不在画面' in out2,
-          '\n'.join(l for l in out2.splitlines() if '抓取区' in l)[:300])
-    check('4.8 这条不变量确实能分开两份外参（不是靠 35.95° 那种两边都成立的判据）',
-          '35.95' in out2, '两份外参的光轴夹角确实都是 35.95°')
+    check('4.6 10-02 留档（base 帧那份）→ rc=2，而不是 rc=1', rc2 == 2, 'rc=%d' % rc2)
+    check('4.7 拒的理由是**父帧**（它活在 base 帧里、与 base_link 差绕 z 的 π），'
+          '并点明照用会镜像',
+          'base' in out2 and '镜像' in out2,
+          '\n'.join(l for l in out2.splitlines() if l.strip())[-300:])
+    check('4.7b 而且**没进到投影那一步**：一句取景结论都不该打出来'
+          '（早一层拦住 = 不会被当成「取景不满足」）',
+          '取景结论' not in out2)
+
+    # ★ 那条「抓取区必须可见」的不变量现在守的是**标签也对、数却是镜像**的形态：
+    #   把同样的 R/t 贴上 `base_link` 的标签再喂进去 —— 这正是 §10.2 那次事故
+    #   的原始形态（文件自称 base_link）。光轴夹角判据对它无效（两份都是 35.95°），
+    #   唯一分得开的就是这条物理前提。
+    _mirror = dict(json.load(open(EXTR['10-02'], encoding='utf-8')),
+                   frame_parent='base_link')
+    _mdir = tempfile.mkdtemp(prefix='framing_mirror_')
+    _mpath = os.path.join(_mdir, 'mirror_claims_base_link.json')
+    with open(_mpath, 'w', encoding='utf-8') as _fh:
+        json.dump(_mirror, _fh)
+    rc2b, out2b = run('--extrinsics', _mpath)
+    check('4.8 标签写 base_link、数却是镜像 ⇒ 仍是 rc=2，'
+          '理由换成「抓取区自己就不在画面里」',
+          rc2b == 2 and '抓取区' in out2b and '不在画面' in out2b,
+          'rc=%d\n%s' % (rc2b, '\n'.join(l for l in out2b.splitlines()
+                                         if '抓取区' in l)[:300]))
+    check('4.8b 这条不变量不是靠 35.95° 那种**两边都成立**的判据分开的',
+          '35.95' in out2b, '镜像那份的光轴夹角同样是 35.95°')
 
     # 计划中的挪动：模拟 +34 cm 后应当全部进框
     rc3, out3 = run('--extrinsics', EXTR['10-03'], '--sim-raise-cm', '34')

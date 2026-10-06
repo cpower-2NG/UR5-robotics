@@ -12,9 +12,10 @@
 
 方向怎么来的（这是最容易错的一步）
 ==================================
-留档 `docs/calib/extrinsics-2026-10-02.json` 是 **`base_link ← camera_link`**，
+留档 `docs/calib/extrinsics-2026-10-03-base_link.json` 是 **`base_link ← camera_link`**，
 而针孔投影要的是**光学系**（`camera_color_optical_frame`：z 朝前、x 朝右、y 朝下）。
-两者差一个**固定**旋转（REP-103/105）：`opt_z=link_x`、`opt_x=−link_y`、`opt_y=−link_z`。
+两者差一个**固定**旋转（REP-103/105）：`opt_z=link_x`、`opt_x=−link_y`、`opt_y=−link_z`
+—— 外加 **15 mm 的平移**（实测，落在光心上；见 `R_LINK_TO_OPTICAL` 上面那段）。
 
 ⚠️ 直接用 `camera_link` 的 R/t 去套针孔公式会画出一个**看着像样但整个歪掉**的框。
 所以本脚本带一条**可检验的不变式**（每次运行都打印）：
@@ -24,12 +25,16 @@
 
 对不上就说明系搞错了，**不是**「差一点点」。退出码 2。
 
+⚠️ 进来先过 `validate_extrinsics`：**父帧必须真是 `base_link`**，且 `R` 与 `q`
+不能互相矛盾。同目录 `extrinsics-2026-10-02.json` 活在 UR 的 `base` 帧里
+（差绕 z 的 π），现在会**直接被拒**而不是静默画一张镜像的图。
+
 跑法
 ====
     python3 scripts/draw_zone_on_frame.py \\
         --image docs/calib/清场示意-2026-10-02.png \\
         --info .scratch/rounds/r00/info.json \\
-        --extrinsics docs/calib/extrinsics-2026-10-02.json \\
+        --extrinsics docs/calib/extrinsics-2026-10-03-base_link.json \\
         --zone pick:0.40,0.75,-0.45,0.45 \\
         --zone place:0.60,0.75,0.20,0.40 \\
         --axes 0.15 --out /tmp/zone_overlay.png
@@ -70,6 +75,87 @@ T_LINK_TO_OPTICAL = np.array([0.000167, 0.014957, 0.000243])
 
 OPTICAL_FRAMES = ("camera_color_optical_frame", "camera_optical_frame")
 
+#: 本函数返回值所在的**父**帧。只认这一个，别的都拒绝 —— 见 `validate_extrinsics`。
+#: ⚠️ UR 控制器自报的位姿活在 `base`（URDF 里叫 `base_link_inertia`）里，与
+#:    `base_link` **差绕 z 的 π**：装机 `ur_description/urdf/ur_macro.xacro:346-354`
+#:    那个固定关节写死 `rpy="0 0 ${pi}"`，注释原话是「`base_link` 是 REP-103 对齐
+#:    （X+ 朝前），而机器人/控制器内部帧的 X+ 朝后」。这一条**已经造成过一次真事故**
+#:    （台账 §10.2：臂跑到镜像位），而当时那份文件的 `frame_parent` 正写着
+#:    `base_link` —— **字段说谎比字段缺失危险得多**。
+RC_PARENT = "base_link"
+#: `R` 与 `q` 都给了却对不上，差多少度就不认。取 0.5：真文件里两者是同一个旋转的
+#: 两种写法，差只可能来自手抄精度（1e-6 量级）；0.5° 能挡住 90°/180° 这类**换帧
+#: 忘改一处**，又不会因四舍五入假红。
+RQ_TOL_DEG = 0.5
+
+
+def _rot_angle_deg(Ra, Rb):
+    """两个旋转之间差多少度。"""
+    c = (np.trace(np.asarray(Ra).T @ np.asarray(Rb)) - 1.0) / 2.0
+    return math.degrees(math.acos(min(1.0, max(-1.0, float(c)))))
+
+
+def validate_extrinsics(doc):
+    """外参文件能不能用？能就返回 ``None``，不能就返回**给人看的原因**。
+
+    纯函数（不改入参、不抛异常），与 `topcam_marker_calib.store_version_error`
+    同套路：它要挡的三件事在**正常文件上都不会出现**，只有喂合成字典才验得动。
+
+    要挡的是「一份看着完全正常的 JSON 给出一个静默错的相机位姿」：
+    数值都是三位数、量纲也对，症状却是「臂抓偏」——与坐标系错的表现一模一样。
+    """
+    if not isinstance(doc, dict):
+        return f"外参不是一份字典：{type(doc).__name__}"
+
+    has_R, has_q = "R" in doc, "q" in doc
+    if not (has_R or has_q):
+        return "既没有 `R` 也没有 `q` —— 认不出旋转（拒绝猜）"
+    if "t" not in doc and "translation" not in doc:
+        return "没有 `t`（或 `translation`）—— 认不出平移"
+
+    R = None
+    if has_R:
+        R = np.array(doc["R"], dtype=float)
+        if R.shape != (3, 3):
+            return f"`R` 不是 3×3：{R.shape}"
+        # 镜像（det = −1）不是旋转。「父帧标反」的典型表现正是整体镜像，
+        # 而它在图上看起来只是一个「歪了点」的框。
+        if abs(float(np.linalg.det(R)) - 1.0) > 1e-6:
+            return (f"`R` 的 det = {float(np.linalg.det(R)):.6f}，不是 +1 "
+                    f"—— 这是镜像不是旋转（多半是某两个轴写反/漏了个负号）")
+        if float(np.abs(R.T @ R - np.eye(3)).max()) > 1e-6:
+            return f"`R` 不正交（|RᵀR − I| 最大 {float(np.abs(R.T @ R - np.eye(3)).max()):.2e}）"
+
+    if has_R and has_q:
+        q = np.array([float(v) for v in doc["q"]], dtype=float)
+        if q.shape != (4,):
+            return f"`q` 不是 4 个数：{q.shape}"
+        try:
+            Rq = quat_to_matrix(q)
+        except ValueError as e:
+            return f"`q` 不合法：{e}"
+        d = _rot_angle_deg(R, Rq)
+        if d > RQ_TOL_DEG:
+            return (f"★ `R` 与 `q` 说的**不是同一个旋转**（差 {d:.3f}°）："
+                    f"这份文件自相矛盾，谁都不知道该信哪个。"
+                    f"（2026-10-06 实际发生过：`extrinsics-2026-10-03-base_link.json` "
+                    f"整体绕 z 转 180° 时改了 `R`/`t`、`q` 是上一份抄过来的，"
+                    f"差 180°。两处都是写「同一件事」，改一处忘了另一处正是这种形态。）")
+
+    parent = str(doc.get("frame_parent") or doc.get("parent_frame") or "").strip()
+    if parent and parent != RC_PARENT:
+        extra = ""
+        if parent in ("base", "base_link_inertia"):
+            extra = ("\n     ⛔ 这是 **UR 控制器帧**，它与 `base_link` 差**绕 z 的 π**"
+                     "（装机 ur_description 的 `base_link-base_link_inertia` 关节）。"
+                     "\n        照 `base_link` 用会让整条链**镜像** ⇒ 臂跑到反侧 "
+                     "（台账 §10.2 就是这么炸的）。"
+                     "\n        真要换算成 base_link：R' = diag(−1,−1,1)·R、"
+                     "t' = diag(−1,−1,1)·t（本仓库不做隐式换算 —— 帧名认不出就拒绝）")
+        return (f"这份外参的父帧是 `{parent}`，而本工具按 `{RC_PARENT}` 读它。{extra}")
+
+    return None
+
 
 def quat_to_matrix(q):
     """``[x, y, z, w]`` → 3×3。与 `auto_label_grid.quat_to_matrix` 同一约定。"""
@@ -91,7 +177,12 @@ def compose_base_optical(doc):
     接受两种 `frame_child`：已经是光学系（原样用），或者是 `camera_link`
     （左乘那个固定旋转）。**别的帧名一律拒绝** —— 猜一个帧关系正是本仓库
     反复在修的那一类「话说了没查过的事」。
+
+    进来先过 `validate_extrinsics`：父帧自称、`R` 与 `q` 是否自洽，先判了再说。
     """
+    reason = validate_extrinsics(doc)
+    if reason:
+        raise ValueError(reason)
     # ⚠️ 键名有两种：留档那份写 `frame_child`，标注那份写 `camera_frame`。
     #    两个都认；都没有就拒绝（猜帧关系是本仓库反复在修的那一类）。
     child = str(doc.get("frame_child") or doc.get("camera_frame") or "")
@@ -181,7 +272,13 @@ def main():
     K = (float(info["fx"]), float(info["fy"]), float(info["cx"]), float(info["cy"]))
     W, H = int(info["width"]), int(info["height"])
 
-    R, t = compose_base_optical(doc)
+    try:
+        R, t = compose_base_optical(doc)
+    except ValueError as e:
+        # 校验不通过就**别出图**：这个脚本的产物是给人看的叠加图，一张「框歪了
+        # 但看着像样」的图比不出一张危险得多 —— 它会被人当成证据贴进台账。
+        print(f"!! 这份外参用不了：{e}")
+        return 2
     to_normal, to_plane = axis_angles(R)
 
     print("=" * 74)

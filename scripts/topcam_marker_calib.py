@@ -27,7 +27,7 @@
     python3 scripts/topcam_marker_calib.py --init \\
         --image /tmp/mk/img_0000.png --info /tmp/mk/info.json \\
         --board docs/calib/charuco_A4_30mm_5x5.json \\
-        --extrinsics docs/calib/extrinsics-2026-10-02.json \\
+        --extrinsics docs/calib/extrinsics-2026-10-03-base_link.json \\
         --store ~/topcam_marker.json
 
     # ② 每次要用之前：重算，并把启动参数打出来
@@ -39,6 +39,9 @@
 ⚠️ 两条前提：
    · `--init` 用的那份外参必须是**当前可信**的 —— 它是这条链的基准。
      基准错了，之后每次重算都会忠实地复现同一个错。
+     ⛔ 而且必须是 **`base_link` 帧**的：`docs/calib/extrinsics-2026-10-02.json`
+     那份活在 UR 的 `base` 帧里（两者差绕 z 的 π），喂进来会被
+     `draw_zone_on_frame.validate_extrinsics` 拒掉 —— 用 10-03 那份。
    · 打印出来的板必须按 100% 出，且用图上那条 100 mm 校验尺量过；
      被整体缩放时，把量出的比例乘到 `--square-mm/--marker-mm` 上
      （板 JSON 里有原始值）。

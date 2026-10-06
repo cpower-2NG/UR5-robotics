@@ -28,8 +28,9 @@
     0.6185281368827056
   ],
   "unit": "m",
-  "frame_parent": "base_link",
+  "frame_parent": "base",
   "frame_child": "camera_link",
   "rms_touch_m": 0.0011199509226587341,
-  "reproj_px": 0.18306370453378845
+  "reproj_px": 0.18306370453378845,
+  "note": "⚠️ 2026-10-06 更正 `frame_parent`：原先写的是 base_link，**那是错的**。碰点读自示教器 ⇒ 这些坐标活在 UR 控制器自报的 base 帧里（URDF 里叫 base_link_inertia），它与真正的 base_link 差**绕 z 的 π**（装机 ur_description 的 base_link-base_link_inertia 关节写死 rpy=\"0 0 pi\"）。这个错标签**已经造成过一次真事故**（台账 §10.2：整条感知链镜像 ⇒ 臂跑到反侧）。base_link 版见同目录 extrinsics-2026-10-03-base_link.json，两份的 R、t 逐位差一个 diag(-1,-1,1)。本份是**留档**，不能直接粘进 real.launch.py。"
 }

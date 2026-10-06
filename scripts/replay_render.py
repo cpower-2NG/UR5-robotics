@@ -85,7 +85,13 @@ def main():
 
     # 外参：投影要用它把 base_link 的点画回像素
     ext = json.load(open(os.path.expanduser(info['extrinsics_file']), encoding='utf-8'))
-    R, t = compose_base_optical(ext)
+    try:
+        R, t = compose_base_optical(ext)
+    except ValueError as e:
+        # 回放图是用来判「检测偏不偏」的 —— 外参本身有问题时，图上一切偏移都
+        # 会被归因到检测器头上。宁可不出片。
+        print('!! 这份外参用不了，回放不再继续：%s' % e)
+        return 2
 
     zone = None
     if a.zone:

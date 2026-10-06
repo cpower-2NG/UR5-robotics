@@ -45,8 +45,12 @@ def main():
     ap.add_argument("--fps", type=float, default=4.0,
                     help="录制帧率。彩色约 100 KB/帧、深度约 400 KB/帧，"
                          "4 fps × 90 s ≈ 180 MB")
-    ap.add_argument("--extrinsics", default=os.path.expanduser(
-        '~/yolo_ros_original/docs/calib/extrinsics-2026-10-03-base_link.json'))
+    ap.add_argument("--extrinsics", default=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'docs/calib/extrinsics-2026-10-03-base_link.json'),
+        help="默认取**本检出**里的那一份：路径按脚本自身位置推，不写死家目录"
+             "（板上是 ~/ur5-vision-grasp、本机是 ~/robotics/repos/ur5-vision-grasp，"
+             "写死哪一个都会在另一处静默读不到）")
     ap.add_argument("--jpeg-quality", type=int, default=92)
     ap.add_argument("--pair-tol", type=float, default=0.15,
                     help="画面与深度/关节/检测的**最大时间差**（秒）；超了这一帧不录"

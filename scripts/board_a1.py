@@ -44,7 +44,12 @@
 
 用法
 ====
-    cd ~/yolo_ros_original && source /opt/ros/humble/setup.bash \\
+    # ⚠️ 用**新检出** `~/ur5-vision-grasp`（2026-10-06 实测板上两个检出都在：
+    #    ~/yolo_ros_original 停在 migrate/humble-orin cd10fc8、install/ 是 10-03 编的；
+    #    ~/ur5-vision-grasp 在 a2-multiclass、install/ 是 10-05 编的 —— 后者才是活的那个，
+    #    见 docs/待执行命令.md「另 clone 一份到 ~/ur5-vision-grasp，旧检出一个字都不动」。
+    #    写成旧名字不会报错，只会**跑一份过期的树**。)
+    cd ~/ur5-vision-grasp && source /opt/ros/humble/setup.bash \\
         && source ros2_ws/install/setup.bash
     ROS_DOMAIN_ID=99 python3 scripts/board_a1.py \\
         --robot-ip <控制箱IP> --params $HOME/site_real.yaml
