@@ -158,7 +158,11 @@ def load_launcher():
 
 
 class _LauncherArgs(object):
-    """喂给 `build_cmd()` 的站位参数。值只影响 FREE_KEYS，故随便取。"""
+    """喂给 `build_cmd()` 的站位参数。值只影响 FREE_KEYS，故随便取。
+
+    `cam` 不在这里写 —— 见 `launcher_param_set()`：它从**模块自己的** `CAM` 取，
+    免得多出一份会烂的外参副本。
+    """
     robot_ip = '<IP>'
     params = '~/site_real.yaml'
     start_delay = 120.0
@@ -166,7 +170,17 @@ class _LauncherArgs(object):
 
 def launcher_param_set(mod):
     """启动器实际会下发的 (入口文件, 键集合, {键: 归一值})。"""
-    cmd = mod.build_cmd(_LauncherArgs())
+    args = _LauncherArgs()
+    # 七个 `camera_*` 必须给 —— `build_cmd()` 现在**没有 `a.cam` 就当场抛**
+    # （2026-10-06：不再回落作废的 `CAM`，理由见 `board_a1.py` 模块顶部）。
+    # ⚠️ 这里**从模块的 `CAM` 取**，不把七个值抄进本文件：抄一份就是给自己再造
+    #   一个会烂的真值来源，而这份守卫的全部意义就是防那件事。
+    #   于是本判据实际钉住的是「**A1 一节记的那组外参 == 旧入口 `CAM` 记的那组**」
+    #   —— 两组都是 2026-10-05 那次验收的**同一条历史记录**（A1 一节自带横幅说
+    #   它已作废、别照抄），一致才是对的。若哪天更新 A1 一节的值，这里会红：
+    #   那正是要的 —— 权威序列动了，守卫必须跟着过一遍。
+    args.cam = dict(mod.CAM)
+    cmd = mod.build_cmd(args)
     text = ' '.join(cmd)
     m = LAUNCH_RX.search(text)
     params = dict(ARG_RX.findall(text))

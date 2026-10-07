@@ -15769,3 +15769,129 @@ run 日志：`~/r0_runs/r0-1…r0-6.{log,out,json}`。
 4. 沿用：`topcam_drift_check.py` 接 P1；`board_gate.py --json-report` 的 P0 守卫；
    R0 的 `min_candidates: 4` 是否合适；run 6 「起栈到停下 273 s ≥ start_delay=120 s」的假警报
    （那一档 `skip_planner:=true`，规划器根本没起）。
+
+---
+
+## 第一百零九轮：容差 0.06 落进 profile；启动器的六道离线守卫里**有一道早已崩死**，另一道逮住了我加的键（2026-10-07）
+
+> 承接第一百零八轮的 A/B/C 三个修法。**用户裁决：三个都可以，直接上 C 也行；
+> 但现在的主任务是「把启动器改完善」** —— 俯视相机的物理限制使内参不稳，
+> **能容忍的误差应该容忍**，精度升级以后以腕部相机为主。
+
+### 0. 一句话
+
+C 方案落进两份 profile（**标注为「容忍」不是「修好了」**）；为了让 R0 下一轮别再
+被同一个坑绊住，把**启动器自己的六道离线守卫**全跑了一遍 —— 两道红：一道是
+**我刚加的键**被 `test_board_run` 的差集守卫逮住（守卫是对的，补理由），另一道
+`test_startup_docs` **不是判红、是崩死**：它在 `[0/3]` 之前就抛 `ValueError`，
+**什么都没判**，**已经这样过了约 13.5 小时**。顺手把 run 6 那条假警报与
+`docs/当前状态.md` §4 三行跑不出来的取值命令一并修掉。
+
+### 1. 容差 0.06 放在哪 —— 放 profile，不放站点（及其代价）
+
+两份 profile 的 `params:` 里各加一行 `plane_depth_tol: "0.06"`，紧挨着已有的
+`target_plane_z`（同一类东西：`target_plane_z` 也是随现场变的量，早就住在那里）。
+写法照该文件自己的规矩 —— **字符串**。
+
+**没做的事**：没有把它做成站点配置的键（那才是「随相机变、带 `verified`/`ttl_days`
+的现场量」的正确归属，外参就在那儿）。理由是那是**改站点 schema**，属设计；
+本条走的是 profile 已有的机制，零 schema 改动。⚠️ 代价写清楚：**它现在没有
+日期闸门** —— 相机一挪，`site.yaml` 的外参会让 P1 报「超期」，而这一项**不会**
+报任何东西，只会静静地把门槛留在原地。已在 `docs/当前状态.md` 里记成
+「保质期 1 天、与俯视外参同命」。
+
+**为什么必须是「容忍」**：这个 0.06 不是修好了深度，是**把门槛挪到偏置之外**。
+它**随相机高度线性变**（残差 ≈ k·H）。相机再抬高，它会重新不够用 —— 而那时的
+症状与这次**一模一样**（`/targets_3d` 塌成 1），所以「先量深度、别先量外参」
+这条判据（第一百零八轮）要留着。
+
+### 2. 六道守卫跑一遍：两红，其中一道**从来没在判**
+
+| 守卫 | 跑前 | 根因 |
+|---|---|---|
+| `test_board_lib` / `test_board_gate` / `test_board_a1` / `test_board_tree_manifest` | rc=0 | — |
+| `test_board_run` | **rc=1** | [14] 差集守卫：`plane_depth_tol` **多发**且没有理由 —— **是本轮新加的键**，守卫没错 |
+| `test_startup_docs` | **rc=1（崩）** | `board_a1.build_cmd()` 没有 `a.cam` 就抛；测试夹具 `_LauncherArgs` 还是老形状 |
+
+**② 是这一轮最值钱的发现，而且它不是「判红」**：`test_startup_docs.py` 连
+`[0/3] 启动器真值` 都没印出来就抛了 —— 它**一条判据都没跑**。上一次它真跑，
+是 **10-06 22:48 之前**（`board_a1.py` 加那道「没有外参就抛」的提交），
+**到本轮 12:20 约 13.5 小时**。中间它被跑了**至少一次**（第一百零六轮的守卫一节），
+但那次列的是**七项**：
+
+```
+test_board_a1 / test_board_lib / test_board_gate / test_board_run /
+test_docs_map / test_deidentified / state_check   ← 没有 test_startup_docs
+```
+
+所以**它从来没被报成绿**（不算假绿），但它**被漏掉了** —— 而它正是
+「启动器的参数集 = runbook 的参数集」那一条唯一守卫。**守卫清单是手工维护的**，
+这次是**清单本身过期**，与 `test_docs_map.py` 要治的是同一个病，只是高了一层。
+
+**修法**：夹具的 `cam` **从模块自己的 `CAM` 取**（`args.cam = dict(mod.CAM)`），
+不在测试里再抄七个值 —— 抄一份就是给「防第二份真值」的守卫自己再造第二份真值。
+于是它钉住的其实是「A1 一节记的那组外参 == 旧入口 `CAM` 记的那组」，两者都是
+2026-10-05 那次验收的**同一条历史记录**。**变异仍然吃劲**：`camera_x` 少一位那条
+照旧判红（这条要单独确认，否则「修好」可能只是把变异弄哑了）。
+
+### 3. 顺手修掉的：run 6 那条**假警报**（R0 档说「规划器可能已经动过臂」）
+
+```
+🔴 起栈到停下已经 273s ≥ start_delay=120s ⇒ **规划器可能已经启动并动过臂** ——
+   这一轮**不能**自称「什么都没发出去」
+```
+
+那一档是 `a1-noplan`，**`skip_planner: "true"`** —— `pipeline.launch.py:702` 用
+`UnlessCondition` 把 `planner_node` 整个挡住，**这套栈里没有任何东西会发轨迹**。
+于是这句话里的两个断言**都是假的**，而它长着一副「发现了问题」的样子（🔴 + 红字）。
+更坏的是方向：R0 档**存在的目的就是证明「无运动」**，这条红字恰好把这一档最该立的
+结论说反了。
+
+判据 `judge_handoff_window(t_launch, t_stop, start_delay, planner_alive=True)` 新增
+一维：**规划器不起 ⇒ 那套按 `start_delay` 的时间推断整条不适用**，返回
+`(False, "本档的规划器根本不会起……与起栈活了多久无关")`。
+
+`planner_alive(task)` 读的是**因**（`params.skip_planner`），不是**果**
+（`launch.allow_skip` 含 `telemetry`+`params`，`planner_absent()` 的判据）。
+两个判据在不同的地方吃劲（`pick_zone_arg()` 吃「果」、本条吃「因」），所以**不能
+只留一个**；但它们**一旦打架是静默的**：声明了缺席而规划器其实活着 ⇒
+`/grasp_planner/telemetry` **永远不被验**（规划器坏了也看不出来）。所以
+**在 P0 把这对不一致当场拦下**（`validate_task` 新增一条，退 2）——
+同一个事实写两遍可以，**两遍必须同向**，不许靠自觉。
+
+### 4. 顺手修掉的：`docs/当前状态.md` §4 三行的**取值命令跑不出来**
+
+原写 `ros2 param get /planner_node …`。规划器的节点名是 **`grasp_planner`**
+（`pipeline.launch.py:700` 的 `name='grasp_planner'`），而 `target_plane_z` /
+`use_target_plane` / `plane_depth_tol` 三项**都是投影节点** `/perception_3d` 的参数
+（`projector_node.py:85`、`pipeline.launch.py:643`）。照原文核对**必然失败** ——
+而状态层的全部用处就是「跑一条命令看它现在是多少」。判据取自**代码**（本仓
+「代码 > 任何文档」），不是实测：跑实测要把栈起起来 ＋ 吃当次授权（红线 6）。
+
+### 5. 本轮改了哪些文件
+
+| 文件 | 改了什么 |
+|---|---|
+| `config/tasks/a1.yaml` / `a1-noplan.yaml` | `params` 各加 `plane_depth_tol: "0.06"` ＋ 「容忍非修复、相机一动要重测」的注释 |
+| `scripts/board_run.py` | `LAUNCHED_ONLY_OK` 加 `plane_depth_tol` 的理由；新增 `planner_alive()`；`judge_handoff_window()` 加一维；`validate_task()` 加「因/果同向」判据；两处调用点传参 |
+| `scripts/test_board_run.py` | `task_noplan` 真夹具提到 [2]；新增 6 条断言（含 2 条 ★ 双向）；新增 1 条变异（削掉新维度 ⇒ run 6 假警报原样回来，实测**改前 False / 改后 True**） |
+| `scripts/test_startup_docs.py` | `_LauncherArgs` 的 `cam` 从 `mod.CAM` 取 |
+| `docs/当前状态.md` | §4 加 `plane_depth_tol` 一行（日期＋命令＋保质期）；三行节点名勘误 |
+
+**守卫**：启动器六道 ＋ `test_deidentified` / `test_docs_map` / `state_check`
+**全 rc=0**；`test_board_run` 的变异全过（含本轮新加那条）；
+`test_startup_docs` 变异 **8/8 判红**（`camera_x` 那条仍在）。
+
+### 6. 悬案
+
+1. **守卫清单该由谁维护。** 这一轮暴露的是「八大金刚全靠人记」。可选：加一个
+   `scripts/run_all_guards.sh`（一条命令跑全部离线守卫）。**这是新增入口**，
+   而本仓已有七个功能重叠的入口（见本计划《风险》一节），**留给用户定**。
+2. 沿用：`topcam_drift_check.py` 接 P1；`board_gate.py --json-report` 的 P0 守卫；
+   R0 的 `min_candidates: 4` 是否合适。
+3. **R0 ×3 阶梯**（计划第 6 步）仍是**一次都没跑过**（起栈吃当次授权，红线 6）。
+   run 1–6 是**排障**，不是阶梯：没有按「同一份 profile 连跑 3 次、每轮记
+   JSON」的规格跑过。
+4. 计划第 7 步（其余 4 份 `leftovers()` 抄本改 import）仍未做；那 4 个脚本
+   （`board_ctrlc_check` / `board_chain_check` / `board_state_machine_check` /
+   `moveit_only_check`）**一个离线测试都没有** ⇒ 动手前得先有守卫。

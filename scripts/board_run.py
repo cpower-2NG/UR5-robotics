@@ -345,6 +345,30 @@ def validate_task(raw):
                          % (bad, ", ".join(board_gate.ITEM_NAMES)))
             if "controllers" in a:
                 p.append("launch.allow_skip 不许含 controllers —— 它是闸门存在的理由")
+
+    # 「这一档有没有规划器」在任务描述里被写了**两遍**，两遍必须一致：
+    #   · `params.skip_planner`   —— **因**（`pipeline.launch.py:702` 的
+    #     `UnlessCondition` 就是拿它挡 `planner_node` 的）；
+    #   · `launch.allow_skip` 含 `telemetry`+`params` —— **果**（这两项只有规划器
+    #     提供，`planner_absent()` 的判据）。
+    # 两个判据在不同的地方吃劲（`pick_zone_arg()` 吃「果」、`planner_alive()` 吃「因」），
+    # 所以不能只留一个；但**它俩一旦打架就是静默的**：声明了缺席而规划器其实活着
+    # ⇒ `/grasp_planner/telemetry` 永远不会被验，规划器真坏了也看不出来。
+    # 与其在两处各猜，不如在 P0 把这对不一致**当场拦下**（退 2，人来看）。
+    if isinstance(params, dict):
+        _sp = params.get("skip_planner")
+        _cause = (_sp is not None
+                  and str(_sp).strip().lower() in ("true", "1", "yes", "on"))
+        _decl = planner_absent(a) if isinstance(a, list) else False
+        if _cause != _decl:
+            p.append(
+                "`params.skip_planner`=%r（⇒ 规划器**%s**）与 `launch.allow_skip`=%r"
+                "（⇒ 规划器**%s**）**互相矛盾** —— 同一个事实在任务描述里写了两遍，"
+                "两遍必须同向。声明了缺席而规划器其实活着，会让 "
+                "`/grasp_planner/telemetry` **永远不被验**（规划器坏了也看不出来）；"
+                "反过来则会让 P4 恒定退 2。改到一致（见 `config/tasks/a1-noplan.yaml`）"
+                % (_sp, "不起" if _cause else "会起", a,
+                   "不起" if _decl else "会起"))
     return p
 
 
@@ -517,6 +541,17 @@ LAUNCHED_ONLY_OK = {
     "model":
         "旧入口靠 launch 的默认值给 model（解析不到时 detector 死掉而整栈其余"
         "照跑）；本启动器把文件名写进任务描述，显式优于默认（台账 D67）。",
+    "plane_depth_tol":
+        "平面闸门比的是**绝对** base z，而俯视 D435i 的深度**系统性读远 ~1.9%**"
+        "（2026-10-07 量定：靶纸 PnP +1.96%、臂定标相机高度 +3.45%）。相机在 "
+        "830 mm 高处时台面被重建到 −30.0 mm，8 个真方块的残差是 30–52 mm ⇒ 默认的 "
+        "30 mm 把真方块**全判死**（`/targets_3d` 塌成 1），而那个一直在的假阳性框是 "
+        "258–264 mm。放宽到 0.06 实测 2006/2006 批「发布 8 个候选」、假阳性仍被挡。"
+        "旧入口没有这个键，是因为它写死在 **2026-10-06 相机抬高之前**的几何"
+        "（H≈630 mm ⇒ 绝对误差 ~12 mm，默认容差刚好够）—— 不是它不需要，是它当时"
+        "碰巧没越线。⚠️ 它随相机高度线性变，属**任务+现场**参数：相机一动必须重测"
+        "（见 RESTRUCTURE_PLAN 第一百零八轮）。只有显式传了它的 profile 才算「多发」，"
+        "别的 profile 不带它时本表不适用（本判据当前只在 a1 这条路径上跑）。",
 }
 
 
@@ -1180,14 +1215,45 @@ def candidate_margin_note(n_candidates, slots_total):
             % (n_candidates, slots_total, slots_total + 1))
 
 
-def judge_handoff_window(t_launch, t_stop, start_delay):
+def planner_alive(task):
+    """本档的规划器**会不会起来**。**纯函数** → `bool`。
+
+    `skip_planner:=true` 时 `pipeline.launch.py:702` 用 `UnlessCondition` 把
+    `planner_node` **整个**挡住 ⇒ 本档**没有任何东西会发轨迹**（detector 与
+    perception 照常起，但它们只发话题，不发目标）。R0 档存在的意义就是这个。
+
+    ⚠️ 判据只认任务描述里**显式写的那一项**，不去猜 launch 的默认值：这个键的
+    默认是 false（规划器起），而「没写」就是「没声明不起」—— 拿默认值当依据，
+    哪天 launch 改了默认值，这里会**静默**跟着变。
+    """
+    if task is None:
+        return True
+    v = task.params.get("skip_planner")
+    return not (v is not None and str(v).strip().lower() in ("true", "1", "yes", "on"))
+
+
+def judge_handoff_window(t_launch, t_stop, start_delay, planner_alive=True):
     """停下时，规划器**是不是已经起来了**。**纯函数** → `(bool, 说明)`。
 
     这一条是为了不把话说过头：退出码 2 的官方说法是「**我拒绝了、什么都没发出去**」。
     但 `start_delay` 是**可配**的（A1 用 120 s），如果这一轮按播放按晚了、或者
     `start_delay` 很小，规划器可能**已经启动并动过臂** —— 那时再收栈就不是
     「什么都没发出去」了。与其含混，不如把时间摆出来让人自己看。
+
+    ⚠️ `planner_alive=False`（`skip_planner:=true` 的档，见 `planner_alive()`）时
+    上面那套时间推断**整条不适用**：规划器根本没起，臂不可能被这套栈动过，
+    与起栈活了 273 s 还是 3 s 无关。**2026-10-07 R0 run 6 实测**：那一档
+    `skip_planner:=true`，起栈活了 273 s，于是这条按 `start_delay` 判的判据
+    印出「🔴 规划器**可能已经启动并动过臂**……**不能**自称什么都没发出去」——
+    **两个断言都是假的**，而它长着一副「发现了问题」的样子（红字 + 🔴）。
+    这一档本来就是要证明「无运动」的，红字恰好把它最该立的结论说反了。
     """
+    if not planner_alive:
+        return False, ("本档的规划器**根本不会起**（任务描述里 `skip_planner` 为真 ⇒ "
+                       "`pipeline.launch.py:702` 用 `UnlessCondition` 挡住 "
+                       "`planner_node`）⇒ 这套栈**没有任何东西会发轨迹**，与起栈活了"
+                       "多久无关。所以这一轮**可以**自称「什么都没发出去」——"
+                       "这比「臂应当没动过」更强")
     if t_launch is None or t_stop is None:
         return False, ("没有起栈时间戳（--attach / --dry-run / 没起栈）—— "
                        "「有没有动过臂」**未判**")
@@ -2426,7 +2492,8 @@ def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
              "   ← 没被绊倒时的绿是**空的**，别读成「验证过了」"))
     if launched:
         moved, note = judge_handoff_window(
-            t_launch, t_stop, task.start_delay if task else 0.0)
+            t_launch, t_stop, task.start_delay if task else 0.0,
+            planner_alive(task))
         print("  " + ("🔴 " if moved else "• ") + note)
         print("  收栈不代替在示教器上按 STOP —— 收的是这套栈，不是控制柜里的程序。")
     elif dry_run and code == 0:
@@ -2451,7 +2518,8 @@ def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
               "仓库外。**没有写**。" % a.json_report)
         return
     moved, note = judge_handoff_window(t_launch, t_stop,
-                                       task.start_delay if task else 0.0)
+                                       task.start_delay if task else 0.0,
+                                       planner_alive(task))
     rec = {
         "script": "board_run.py",
         "when": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),

@@ -627,8 +627,10 @@ try:
 
     a1_path = os.path.join(REPO, "config", "tasks", "a1.yaml")
     a2_path = os.path.join(REPO, "config", "tasks", "a2.yaml")
+    noplan_path = os.path.join(REPO, "config", "tasks", "a1-noplan.yaml")
     task_a1 = board_run.load_task_file(a1_path)
     task_a2 = board_run.load_task_file(a2_path)
+    task_noplan = board_run.load_task_file(noplan_path)
     a1_text = open(a1_path, encoding="utf-8").read()
     a2_text = open(a2_path, encoding="utf-8").read()
 
@@ -638,6 +640,31 @@ try:
           task_a1.entry == "yolo_bringup/bringup.launch.py", task_a1.entry)
     check("a1 的槽位数 = planner_params 里 place_slots 的个数（能推导的不复述）",
           task_a1.slots_total == 4, str(task_a1.slots_total))
+
+    # ---- 「这一档有没有规划器」写了两遍，两遍必须同向（2026-10-07 新增的 P0 判据）----
+    # 真夹具仍然是仓库里那三份 profile。
+    def _prof(raw, **params):
+        """同一份真 profile，只改 `params` 里的几项（造矛盾用）。"""
+        return dict(raw, params=dict(raw.get("params") or {}, **params))
+
+    check("★ 三份真 profile 的「因/果」都同向 ⇒ 一份都不许被这条判据冤枉",
+          all(board_run.validate_task(t.raw) == []
+              for t in (task_a1, task_a2, task_noplan)),
+          str({t.name: board_run.validate_task(t.raw)
+               for t in (task_a1, task_a2, task_noplan)}))
+    _contra = [x for x in board_run.validate_task(
+        _prof(task_a1.raw, skip_planner="true")) if "互相矛盾" in x]
+    check("★ `skip_planner: true` 而 **没**声明 allow_skip ⇒ P0 报「互相矛盾」"
+          "（规划器其实不起，却没人声明 ⇒ P4 恒定退 2）", len(_contra) == 1,
+          str(_contra))
+    check("★ 声明了 allow_skip 而 **没**开 skip_planner ⇒ 也报（这个方向更危险："
+          "规划器活着，`/grasp_planner/telemetry` 却**永远不被验**）",
+          any("互相矛盾" in x for x in board_run.validate_task(
+              dict(task_noplan.raw,
+                   params={k: v for k, v in task_noplan.params.items()
+                           if k != "skip_planner"}))))
+    check("  矛盾时把**两边**的现状都印出来（不是只说「不一致」）",
+          _contra and "不起" in _contra[0] and "会起" in _contra[0])
     check("a1 的声明集不止 entry 一份（真机细分项是在 real/pipeline 里声明的）",
           len(task_a1.declared_entries) == 3, str(task_a1.declared_entries))
     # ⚠️ 只管 `params:` 里那几项：`launch.start_delay: 120` 是**任务字段**
@@ -856,6 +883,40 @@ try:
           not moved and "还没到点" in note, note)
     check("没起栈 / --attach ⇒ 「有没有动过臂」明写**未判**，不含糊",
           board_run.judge_handoff_window(None, None, 120.0)[1].count("未判") == 1)
+
+    # ---- 无运动档：时间推断**整条不适用**（2026-10-07 R0 run 6 实测的假警报）----
+    # 真夹具 `task_noplan` 见 [2]（仓库里那份 a1-noplan.yaml，不是现造的 dict）。
+    check("★ R0 档（a1-noplan.yaml）的 `skip_planner` 判成「规划器不起」"
+          "（真夹具，不是现造的 dict）",
+          board_run.planner_alive(task_noplan) is False,
+          "skip_planner=%r" % task_noplan.params.get("skip_planner"))
+    check("  A1 档（有运动）判成「规划器会起」—— 这是这条判据的另一半",
+          board_run.planner_alive(task_a1) is True,
+          "a1 的 params=%r" % sorted(task_a1.params))
+    check("  规划器不起 ⇒ 起栈活了 273s 也**不许**说「可能已经启动并动过臂」"
+          "（run 6 原话，🔴 + 红字，把这一档最该立的结论说反了）",
+          board_run.judge_handoff_window(0.0, 273.0, 120.0,
+                                         planner_alive=False)[0] is False
+          and "根本不会起" in board_run.judge_handoff_window(
+              0.0, 273.0, 120.0, planner_alive=False)[1]
+          and "可能已经启动" not in board_run.judge_handoff_window(
+              0.0, 273.0, 120.0, planner_alive=False)[1])
+    check("  而且它说得出**为什么**不适用（引到 UnlessCondition 那一行，不是空口）",
+          "UnlessCondition" in board_run.judge_handoff_window(
+              0.0, 273.0, 120.0, planner_alive=False)[1])
+    check("  规划器不起时，`--attach` 那一路也不许退回「未判」（不适用 ≠ 没验到）",
+          board_run.judge_handoff_window(None, None, 120.0,
+                                         planner_alive=False)[1].count("未判") == 0)
+    check("  默认仍按「规划器会起」判（新增的这一维**不许**悄悄改掉老行为）",
+          board_run.judge_handoff_window(0.0, 200.0, 120.0)[0] is True)
+    check("  `skip_planner` 是**大写/带空格**也认（launch 参数是字符串，来自 yaml）",
+          board_run.planner_alive(
+              board_run.Task({"params": {"skip_planner": " True "}})) is False
+          and board_run.planner_alive(
+              board_run.Task({"params": {"skip_planner": "false"}})) is True
+          and board_run.planner_alive(
+              board_run.Task({"params": {}})) is True,
+          "「没写」= 没声明不起 ⇒ 规划器会起")
 
     # ---- P4 不许抢在 `start_delay` 之前跑（2026-10-06 真机第 2 次实测的缺陷丙）----
     _G = board_run.P4_GRACE
@@ -1562,6 +1623,19 @@ try:
         window_wrong = True
     check("削掉交接窗口的「不知道就明说」⇒ 它要么崩、要么编一个数（拿不知道当知道）",
           window_wrong)
+
+    # 变异：把「无运动档 ⇒ 时间推断不适用」整个削掉 —— run 6 那条假警报必须原样回来。
+    m = load_mutant(_mutate(SRC, "    if not planner_alive:",
+                            "    if False:", "palive"), "palive")
+    mut_moved, mut_note = m.judge_handoff_window(0.0, 273.0, 120.0,
+                                                 planner_alive=False)
+    real_moved, _ = board_run.judge_handoff_window(0.0, 273.0, 120.0,
+                                                   planner_alive=False)
+    check("变异：削掉「规划器不起 ⇒ 时间推断不适用」⇒ R0 档那条假警报**原样回来**"
+          "（★ 断言吃劲：改前 ≠ 改后）",
+          bool(mut_moved) and real_moved is False
+          and "可能已经启动" in mut_note,
+          "变异后 moved=%s；改前 moved=%s" % (mut_moved, real_moved))
 
 
     # =================================================================
