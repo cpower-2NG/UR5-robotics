@@ -39,6 +39,11 @@
 ⚠️ 两条前提：
    · `--init` 用的那份外参必须是**当前可信**的 —— 它是这条链的基准。
      基准错了，之后每次重算都会忠实地复现同一个错。
+     ⇒ **基准换了要一起重写**：任何一次重新标定（碰点 / `compose`）产出的新外参，
+       都必须拿它**重跑一次 `--init`**。这一条**已有闸门**（2026-10-07）：
+       `--init` 把当时那份外参的**值**记进 store，`--solve` 每次都回头比一次，
+       对不上就**拒绝算、退 2**（见 `baseline_state()`）—— 不是警告，因为算出来的
+       那个数会被人直接抄进站点配置。
    · 打印出来的板必须按 100% 出，且用图上那条 100 mm 校验尺量过；
      被整体缩放时，把量出的比例乘到 `--square-mm/--marker-mm` 上
      （板 JSON 里有原始值）。
@@ -218,6 +223,74 @@ def optical_to_link(R):
     return np.asarray(R, dtype=float) @ R_OPTICAL_TO_LINK
 
 
+def baseline_fingerprint(doc):
+    """外参文件 → 基准指纹（**内部光学系**的 R/t，两串普通浮点表）。
+
+    只存**值**，**不存路径** —— 路径一个字没改、内容被重写，正是要抓的那个形状
+    （重标一次外参写回同一个 `extrinsics.json` / 站点配置被更新，文件名照旧）。
+    """
+    R, t = base_from_camera(doc)
+    return {'R': np.asarray(R, dtype=float).tolist(),
+            't': np.asarray(t, dtype=float).tolist()}
+
+
+def baseline_state(store_data, current_doc, load_error=None):
+    """`--solve` 之前：store 里那份基准**还站不站得住**。**纯函数** → `(状态, 说明)`。
+
+    为什么必须有这一条 —— `--solve` 是**相对的**：
+
+        base←cam = (base←板) ∘ (cam←板)^-1
+
+    而 `base←板` 是 `--init` 那一刻、用**当时那份外参**推出来的。于是「外参已经
+    重新标定过了」这件事**不会自己反映到这里**：store 会忠实地把**旧基准的误差**
+    当成「相机的真实位姿」一遍遍印出来，并且把「与 `--init` 那次相比」印成一个
+    **看着就像漂移**的数 —— 而它其实是「旧基准 vs 新真值」的差。两个都是正常数字，
+    没有任何一行会报错。
+
+    这就是本项目恒久层记过的那条：「**基准要一起重写**」。字面写在文档里没人执行，
+    所以做成闸门：`--init` 把当时那份外参的**值**记进 store，`--solve` 每次都回头
+    比一次；对不上就**拒绝算**（不是警告 —— 算出来的那个数会被人当依据用）。
+
+    状态：`ok` / `no_fingerprint`（旧格式 store）/ `missing`（文件读不到）/
+    `changed`（文件还在、值变了）。后三种一律**不许往下走**。
+    """
+    fp = store_data.get('from_extrinsics_R'), store_data.get('from_extrinsics_t')
+    if fp[0] is None or fp[1] is None:
+        return ('no_fingerprint',
+                '这份 store 里没记**基准指纹**（`from_extrinsics_R/T`）—— 它是本闸门'
+                '加上之前存的。**不敢当成还对**：这个 store 描述的基准是哪一份外参，'
+                '已经无从查起。\n'
+                '    重跑一次 `--init`（用一份你**现在**信得过的外参）即可，'
+                '它会把指纹补上。')
+    path = store_data.get('from_extrinsics') or '(store 里没记路径)'
+    if current_doc is None:
+        return ('missing',
+                '基准那一份外参读不到了：%s\n    %s\n'
+                '    **拒绝算** —— 唯一的自检（「这段时间漂了多少」）正是拿它比的，'
+                '读不到就只剩一个没有对照的数字。找回那个文件，'
+                '或用一份现在信得过的外参重跑 `--init`。'
+                % (path, load_error or '（文件不存在）'))
+    cur = baseline_fingerprint(current_doc)
+    if (cur['R'] != fp[0]) or (cur['t'] != fp[1]):
+        # 差多少也印出来：这是「旧基准 vs 新真值」，**不是漂移**。
+        dt = np.array(cur['t'], dtype=float) - np.array(fp[1], dtype=float)
+        Rold = np.array(fp[0], dtype=float)
+        Rnew = np.array(cur['R'], dtype=float)
+        ang = math.degrees(math.acos(min(1.0, max(-1.0,
+                  (np.trace(Rold.T @ Rnew) - 1.0) / 2.0))))
+        return ('changed',
+                '**基准被换过了**：`--init` 时用的是 %s 的**当时那一份内容**，'
+                '现在同一个路径下的**值已经不同**\n'
+                '    （位移 %.1f mm、转角 %.3f° —— 这**不是**相机漂移，'
+                '是「旧基准 vs 新真值」的差）。\n'
+                '    **拒绝算**：store 里的 `base←板` 是拿旧外参推的，'
+                '再往下算只会把**旧基准的误差**当成相机的真实位姿印出来，'
+                '而且会把上面那个差印成「漂移了几个毫米」，看着完全正常。\n'
+                '    用**新的**那份外参重跑一次 `--init`（基准要一起重写）。'
+                % (path, float(np.linalg.norm(dt)), ang))
+    return ('ok', '')
+
+
 def fmt_launch(R, t):
     q = matrix_to_quat(R)
     return ('publish_camera_tf:=true \\\n'
@@ -274,13 +347,23 @@ def main():
                 'marker_mm': board_meta['marker_mm'],
                 'dictionary': board_meta['dictionary'],
                 'base_from_board_R': Rb.tolist(), 'base_from_board_t': tb.tolist(),
-                'from_extrinsics': a.extrinsics, 'reproj_rms_px': rms,
-                'n_corners': n_pts}
+                'from_extrinsics': a.extrinsics,
+                # ★ 基准**指纹**：把当时那份外参的**值**记下来，`--solve` 每次都
+                #   回头比一次。只记路径挡不住「路径没变、内容被重写」——
+                #   而那正是「重标一次外参」的样子。见 baseline_state()。
+                'from_extrinsics_R': base_from_cam[0].tolist(),
+                'from_extrinsics_t': base_from_cam[1].tolist(),
+                'reproj_rms_px': rms, 'n_corners': n_pts}
         with open(a.store, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=1)
         print(f'板在 base 系里的位置 = {np.round(tb, 4).tolist()} m')
-        print(f'已存盘：{a.store}')
+        print(f'已存盘：{a.store}（基准记的是 %s 的**当时那一份值**）' % a.extrinsics)
         print('⇒ 之后每次用之前跑一次 --solve 即可（一张图，不动机械臂）')
+        print('⚠️ 但**基准换了要一起重写**：以后任何一次重新标定（碰点 / compose）'
+              '产出的新外参，\n'
+              '   都必须拿它**重跑一次 --init**。否则 --solve 会把旧基准的误差'
+              '当成相机的真实位姿印出来。\n'
+              '   （这一条现在有闸门管着：--solve 会发现基准被换过并**拒绝算**。）')
         return 0
 
     # ---- --solve ----
@@ -288,19 +371,35 @@ def main():
         print(f'!! 没有 {a.store} —— 先跑一次 --init')
         return 2
     data = json.load(open(a.store, encoding='utf-8'))
+
+    # ★ 先问「基准还站不站得住」——**在算任何东西之前**。
+    #   反过来（先算再警告）就是本闸门要防的形状：那个数会被人当依据用。
+    cur_doc, load_err = None, None
+    _p = data.get('from_extrinsics')
+    if _p:
+        try:
+            cur_doc = json.load(open(_p, encoding='utf-8'))
+        except Exception as exc:                              # noqa: BLE001
+            load_err = '%s: %s' % (type(exc).__name__, exc)
+    state, why = baseline_state(data, cur_doc, load_err)
+    if state != 'ok':
+        print('!! %s' % why)
+        print('   **没有打印任何启动参数** —— 打出来的数字会被人直接抄进站点配置。')
+        return 2
+
     base_from_board = (np.array(data['base_from_board_R'], dtype=float),
                        np.array(data['base_from_board_t'], dtype=float))
     base_from_cam = compose(base_from_board, invert(cam_from_board))
     Rc, tc = base_from_cam
     print(f'相机光心在 base_link = {np.round(tc, 4).tolist()} m'
           f'（离基座水平 {math.hypot(tc[0], tc[1]):.3f} m，高 {tc[2]:.3f} m）')
-    if 'from_extrinsics' in data:
-        prev = base_from_camera(json.load(open(data['from_extrinsics'], encoding='utf-8')))
-        d = float(np.linalg.norm(tc - prev[1]))
-        ang = math.degrees(math.acos(min(1.0, max(-1.0,
-            (np.trace(Rc.T @ prev[0]) - 1.0) / 2.0))))
-        print(f'与 --init 那次相比：位移 {d * 1000:.1f} mm，转角 {ang:.3f}°'
-              f'（这就是这段时间相机漂掉的量）')
+    # 走到这里 = 基准那一份外参**逐值没变** ⇒ 下面这个差才真的是「相机漂了多少」。
+    prev = base_from_camera(cur_doc)
+    d = float(np.linalg.norm(tc - prev[1]))
+    ang = math.degrees(math.acos(min(1.0, max(-1.0,
+        (np.trace(Rc.T @ prev[0]) - 1.0) / 2.0))))
+    print(f'与 --init 那次相比：位移 {d * 1000:.1f} mm，转角 {ang:.3f}°'
+          f'（基准那份外参逐值未变 ⇒ 这就是这段时间相机漂掉的量）')
     # 印之前换回 camera_link：`real.launch.py` 发的是 base_link → camera_link，
     # 站点配置里的 camera_q* 也是这个约定。漏掉这一步差 120.77° 且不报错。
     print('\n启动参数（base_link ← camera_link，即 real.launch.py 的 camera_q*）：')

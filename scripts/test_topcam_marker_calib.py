@@ -15,17 +15,21 @@
 退出码 0 = 全通过。
 """
 
+import importlib.util
 import math
 import os
+import shutil
 import sys
+import tempfile
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 
 import numpy as np                                                # noqa: E402
 from topcam_marker_calib import (                                 # noqa: E402
-    R_LINK_TO_OPTICAL, base_from_camera, compose, invert,
-    matrix_to_quat, optical_to_link, quat_to_matrix)
+    R_LINK_TO_OPTICAL, base_from_camera, baseline_fingerprint, baseline_state,
+    compose, invert, matrix_to_quat, optical_to_link, quat_to_matrix)
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -182,6 +186,83 @@ check('  不换算则差 120°（这就是「印错系」那个缺陷的签名�
       abs(angle_deg(SOLVED[0], R_TEST) - ANG_LO) < 1e-9)
 check('  t 不受约定影响（光心在 parent 系就是 t，与子帧朝向无关）',
       np.allclose(SOLVED[1], T_TEST, atol=1e-12))
+
+print('\n--- F. ★ 基准闸门：`--solve` 是**相对的**，基准换了必须拒绝算 ---')
+# 这一节防的是恒久层记过的那条「**基准要一起重写**」。它原来的形状是文档里的一句
+# 前提 —— 而前提没人执行。现在做成闸门，这里就钉住「闸门真的拦得住」。
+
+ARCH_DOC = {'frame_child': 'camera_link',
+            'R': R_TEST.tolist(), 't': T_TEST.tolist()}
+OTHER_DOC = {'frame_child': 'camera_link',
+             'R': quat_to_matrix([0.2, 0.4, -0.1, 0.89]).tolist(),
+             't': [0.36, 0.87, 0.65]}
+
+
+def _store_of(doc, with_fp=True):
+    """照 `--init` 实际写进去的形状造一份 store。"""
+    d = {'from_extrinsics': '/tmp/某一份外参.json'}
+    if with_fp:
+        fp = baseline_fingerprint(doc)
+        d['from_extrinsics_R'], d['from_extrinsics_t'] = fp['R'], fp['t']
+    return d
+
+
+ST_OK = _store_of(ARCH_DOC)
+check('基准那份外参照旧 ⇒ ok（放行）',
+      baseline_state(ST_OK, ARCH_DOC)[0] == 'ok')
+st_changed, why = baseline_state(ST_OK, OTHER_DOC)
+check('★ 基准那份外参**被换过了** ⇒ changed，且**拒绝**（不是警告）',
+      st_changed == 'changed', '%s / %s' % (st_changed, why[:60]))
+check('  文案说清「这**不是**相机漂移，是旧基准 vs 新真值的差」'
+      '（不然那个数会被读成「漂了多少」）',
+      '不是**相机漂移' in why, why[:200])
+check('  并且给出**下一步**（用新外参重跑 --init），不是只喊一句错',
+      '重跑一次 `--init`' in why, why[-140:])
+st, why = baseline_state(ST_OK, None, load_error='FileNotFoundError: 没有那个文件')
+check('基准文件读不到了 ⇒ missing、拒绝（唯一的自检正是拿它比的）',
+      st == 'missing' and '拒绝算' in why, '%s / %s' % (st, why[:80]))
+st, why = baseline_state(_store_of(ARCH_DOC, with_fp=False), ARCH_DOC)
+check('旧格式 store（没记指纹）⇒ no_fingerprint、拒绝（**不假装还对**）',
+      st == 'no_fingerprint' and '重跑' in why, '%s / %s' % (st, why[:80]))
+check('  fail-closed：这一档**不是** ok（宁可当作不知道，不可当作还对）',
+      baseline_state(_store_of(ARCH_DOC, with_fp=False), ARCH_DOC)[0] != 'ok')
+check('路径不变、内容变了 ⇒ 也抓得住（这正是「重标一次写回同一个文件」的形状）',
+      _store_of(ARCH_DOC)['from_extrinsics']
+      == _store_of(OTHER_DOC)['from_extrinsics']
+      and baseline_state(ST_OK, OTHER_DOC)[0] == 'changed')
+
+# 指纹本身：约定要跟着 `base_from_camera` 走（内部光学系），否则同一份外参
+# 换个写法就会被判成「变了」—— 那会让闸门变成噪声源，人就开始绕过它。
+check('指纹记的是**内部光学系**的值（与 base_from_camera 同源）',
+      np.allclose(np.array(baseline_fingerprint(ARCH_DOC)['t']), T_TEST))
+_opt_doc = {'frame_child': 'camera_color_optical_frame',
+            'R': (R_TEST @ R_LINK_TO_OPTICAL).tolist(), 't': T_TEST.tolist()}
+check('同一份外参写成光学系 ⇒ 指纹**相同**（两种写法是同一件事）',
+      baseline_fingerprint(ARCH_DOC) == baseline_fingerprint(_opt_doc))
+
+# ---- 变异：把闸门拆掉（当它永远 ok）⇒ 上面那几条必须翻面 ----
+# 临时文件写到**仓库外**的临时目录：写进仓库根会污染 `git status`，
+# 而崩在中途时 `finally` 也保不住它（本仓是公开副本，红线 3）。
+_SRC = open(os.path.join(HERE, 'topcam_marker_calib.py'), encoding='utf-8').read()
+_ANCHOR = "    if (cur['R'] != fp[0]) or (cur['t'] != fp[1]):"
+if _ANCHOR not in _SRC:
+    check('变异锚点还在（baseline_state 里那次比较）', False, _ANCHOR)
+else:
+    _tmp = tempfile.mkdtemp(prefix='mut_topcam_marker_calib_')
+    _d = os.path.join(_tmp, 'mut_topcam_marker_calib.py')
+    with open(_d, 'w', encoding='utf-8') as _fh:
+        _fh.write(_SRC.replace(_ANCHOR, "    if False:", 1))
+    try:
+        _spec = importlib.util.spec_from_file_location('mut_topcam_marker_calib', _d)
+        _m = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_m)
+        _mst, _mwhy = _m.baseline_state(ST_OK, OTHER_DOC)
+        check('变异：拆掉「基准被换过」那一档 ⇒ 它照样 ok，于是上面那个差会被印成'
+              '「漂移了几个毫米」（★ 断言吃劲：改前 ≠ 改后）',
+              _mst == 'ok' and st_changed != 'ok',
+              '变异后 %s（%r）；改前 %s' % (_mst, _mwhy, st_changed))
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
 
 print('\n通过 %d，失败 %d' % (N_PASS, N_FAIL))
 if FAILS:
