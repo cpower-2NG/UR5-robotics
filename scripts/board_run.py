@@ -27,26 +27,33 @@
 按示教器 PLAY 是**人的动作**（AGENTS.md 红线 6）。P3 只**轮询只读** `dashboard()`
 等 PLAYING。
 
-「控制器切换」的授权从哪来（红线 6 **逐字**点名了它）
-==================================================
+两条写路径的授权从哪来（红线 6 点名了「控制器切换」与「初始化 / 开合」）
+====================================================================
+**两条**：`--repair-controller`（控制器切换）与 `--init-gripper`（夹爪寄存器）。
 切换控制器是 `/controller_manager` 上的标准 ROS 2 服务 —— 不手搓 RTDE、不碰
-30001–30004，所以它**不违红线 1**。问题**不在「能不能发」，在「授权从哪来」**。
-三条落在这份文件里：
+30001–30004，所以它**不违红线 1**；夹爪走 Modbus RTU，是**独立设备**（不变量 3）。
+两条的共同点：问题**不在「能不能发」，在「授权从哪来」**。三条落在这份文件里：
 
   ① **数据文件不许冒充授权**。任务描述里出现看着像授权的键 ⇒ `validate_task` 报红
      （`find_authorization_keys`）。授权也不来自环境变量 / 上一次的记忆 / shell
      别名 —— 红线 6 后半句「上一次的授权不覆盖这一次」禁的就是这个形状：一条会被
      复制、会被沿用的**数据**，不能冒充**一次**授权。
-  ② **当次 + 被告知**。`--repair-controller` 在**起栈之前**就要一个交互终端
-     （P0.写路径授权；非交互 ⇒ FAIL、退 2，**栈都不起**）；真发文之前先把**完整
-     报文**摆出来（服务名 / activate 列表 / `deactivate_controllers` 恒空 /
-     strictness / timeout），人确认的是**那一条**。确认动作在
-     `board_gate._run_repair` 里，它在**臂已上电**的那一刻再问一次。
+  ② **当次 + 被告知**。两个开关在**起栈之前**都要一个交互终端（P0.写路径授权 /
+     P0.夹爪初始化授权；非交互 ⇒ FAIL、退 2，**栈都不起**，两条共用一个
+     `judge_write_path`）；真写之前先把**完整报文**摆出来。控制器那份是服务名 /
+     activate 列表 / `deactivate_controllers` 恒空 / strictness / timeout，确认
+     动作在 `board_gate._run_repair` 里（**臂已上电**那一刻）；夹爪那份是**哪几个
+     寄存器、走多少行程**，并**按读到的 `0x0200` 选最小的一档**（已初始化就只合拢，
+     不重走全行程自检）—— 人确认的是**那一条**，所以两档印出来必须不是同一份。
   ③ **可复验**。切换执行过之后，按**只读复核**的结果判「已生效 / 已执行但未生效」
      （P3.控制器修复）。发出去的请求 ≠ 结果：未生效是 **FAIL**，不是绿。
+     夹爪那一条对应的是 `gripper init exercised: yes/no` —— 而且它排在 P1 **之前**，
+     于是 P1 那次只读读数（`0x0200==1`）说的就是**做完之后**的状态，一个读数同时
+     回答「写成了吗」与「合规吗」，不需要第二处判定。
 
-写路径的**本体**（那个服务调用、`deactivate_controllers` 恒空）在 `board_gate.py`
-里，本文件原样透传、**不重实现**；本文件里连那个服务的全名都不出现。
+写路径的**本体**不在这份文件里，本文件原样透传 / 起子进程、**不重实现**：
+  · 控制器切换 → `board_gate.py`（本文件里连那个服务的全名都不出现）；
+  · 夹爪寄存器 → `scripts/ag95_init_close.py`（**全仓唯一**会驱动夹爪的脚本）。
 
 待查（**别据此删掉写路径**）：本部署已经在跑 `ur_robot_driver/controller_stopper`。
   如果那次 STRICT 绊倒能在**配置源头**避免，控制器闸门就永远只需只读，
@@ -96,6 +103,7 @@
     python3 scripts/board_run.py --task a1 --dry-run      # 只看会发什么命令、值从哪来
     python3 scripts/board_run.py --task a1                # 全流程（P5 还要 --authorize-motion）
     python3 scripts/board_run.py --task a1 --attach --log ~/a1_board.log
+    python3 scripts/board_run.py --task a1 --init-gripper  # 先把夹爪弄到「已初始化」
     python3 scripts/board_run.py --stop                   # 收掉别人起的栈（不发运动命令）
     python3 scripts/board_run.py --help                   # 本文件是真相源，--help 即权威
 """
@@ -127,6 +135,12 @@ sys.path.insert(0, HERE)
 #    东西**唯一**能成测的地方（`board_gate.py` 里有同样的先例与理由）。
 import board_gate                                               # noqa: E402
 import board_lib                                                # noqa: E402
+# ⚠️ 导入它是为了**拿常量**（`FORCE_N` / 寄存器号），不是要在这里驱动夹爪 —— 它是
+#    **全仓唯一**会写夹爪寄存器的脚本，报文里写的值必须与它实际发的**同源**
+#    （同 `_required_controllers_for` 调 board_gate 私有函数的理由：抄一份会静默分叉，
+#    而人确认的是**那一条**）。它顶层只 import argparse/inspect/sys/time，
+#    pymodbus 是**函数内**才导的 ⇒ 本机（无 pymodbus、无 ROS）也 import 得动。
+import ag95_init_close                                          # noqa: E402
 
 PASS, FAIL, SKIP = board_gate.PASS, board_gate.FAIL, board_gate.SKIP
 Item = board_gate.Item          # 复用三态项的载体，JSON 形状也一致
@@ -1807,16 +1821,23 @@ def wait_for_finish(log_path, deadline, marker, clock=time.time, sleep=None):
 
 
 # =====================================================================
-# 红线 6：控制器切换（唯一的写路径）—— 报文、授权、复核
+# 红线 6：两条写路径（控制器切换 / 夹爪寄存器）—— 报文、授权、复核
 # =====================================================================
 # 发文那一行在 board_gate.py（`Probe.switch_controllers`），本文件**不重实现**。
 # 本文件只做三件它该做的事：起栈**之前**拒绝没有当次授权的请求、把要发的报文
 # **先完整摆出来**、切完按**只读复核**判「生效 / 未生效」。三条见文件头。
+#
+# 夹爪那一条（`--init-gripper`）**照抄同一套纪律**，理由见 `gripper_init_plan`。
+# 发文那一行在 `scripts/ag95_init_close.py`（**全仓唯一**会驱动夹爪的脚本），
+# 同样是**子进程跑它**、本文件不重实现。
 
 OUTPUT_PATH_ITEM = "P0.输出路径"
 WRITE_PATH_ITEM = "P0.写路径授权"
+GRIPPER_INIT_ITEM = "P0.夹爪初始化授权"
 REPAIR_ITEM = "P3.控制器修复"
 SWITCH_TIMEOUT = 8.0            # 与 board_gate.Probe.switch_controllers 的默认值同
+GRIPPER_SCRIPT = os.path.join("scripts", "ag95_init_close.py")
+GRIPPER_INIT_TIMEOUT = 90.0     # 初始化要跑一次全行程（张开再合上），给足
 
 
 def judge_output_paths(log_path, json_report, repo=REPO):
@@ -1851,8 +1872,12 @@ def judge_output_paths(log_path, json_report, repo=REPO):
                   "不要为了绕开它把记录写进仓库，也不要事后 `git add` 那个文件。")
 
 
-def judge_write_path(isatty):
-    """`--repair-controller` 这一档能不能往下走。**纯函数** → `(status, detail)`。
+def judge_write_path(isatty, flag="--repair-controller", fire_note=None):
+    """写路径那一档能不能往下走。**纯函数** → `(status, detail)`。
+
+    两条写路径（`--repair-controller` 控制器切换、`--init-gripper` 夹爪寄存器）
+    **共用本函数** —— 纪律是同一条，两处各写一份迟早会分叉，而分叉的那一份会给出
+    假的授权。`flag` 与 `fire_note` 只影响文案。
 
     非交互 ⇒ **FAIL**，不是 SKIP：这不是「没验到」，是「这个请求本身不成立」。
     放在 P0，是为了**在起栈之前**就拒 —— 臂上电、栈起着的时候才发现没法授权，
@@ -1860,11 +1885,11 @@ def judge_write_path(isatty):
     """
     if isatty():
         return (PASS, "有交互终端 —— 到时候会**先打印完整报文**，再要你敲一次 yes；"
-                      "发文那一刻（臂已上电）还会再确认一次")
-    return (FAIL, "`--repair-controller` 要的是**当次**授权，而这里不是终端。"
+                      + (fire_note or "发文那一刻（臂已上电）还会再确认一次"))
+    return (FAIL, "`%s` 要的是**当次**授权，而这里不是终端。"
                   "授权**不许**来自任务描述 / 环境变量 / 上一次的记忆（AGENTS.md "
                   "红线 6：「上一次的授权不覆盖这一次」）。换成交互终端再来；"
-                  "不要写路径的话去掉这个开关即可（默认只读）。")
+                  "不要写路径的话去掉这个开关即可（默认只读）。" % flag)
 
 
 def _required_controllers_for(task):
@@ -1935,6 +1960,174 @@ def print_repair_hint(ctrl_status, repair_exercised, task_name, out=print):
     out("  ↳ 要修的话就这一条（先打印完整报文，再要**当次**交互确认；默认只读）：")
     out("      %s" % repair_hint(task_name))
     return True
+
+
+# =====================================================================
+# 红线 6 第二条写路径：夹爪初始化 / 合拢（`--init-gripper`）
+# =====================================================================
+# 为什么值得并进启动器（而不是继续让人自己记得跑那条命令）：
+#
+#   未初始化时 `0x0202` **恒 0**、`close()` 会「报成功但手指一步没动」，**没有任何
+#   日志说得出来**。而 P1 的闸门（`0x0200==1`）**只能拦**，拦下之后人得自己去跑那条
+#   命令 —— 于是「记住跑哪一档」就成了启动流程里最后一个靠人记的环节，而它恰好是
+#   **会动手指**的那一步。并进来 = 把「读状态 → 选最小的一档 → 摆出报文 → 当次确认」
+#   变成计算（本启动器的整条思路）。
+#
+# 纪律与 `--repair-controller` **逐条相同**（同一个 `judge_write_path`）：显式开关、
+# 报文**先完整摆出来**、交互终端没了就退 2（**没有无人值守模式**）、报告里写
+# `gripper init exercised: yes/no` —— 没被绊倒时的绿是**空的**。
+#
+# 两条硬约束：
+#   · 只在 **P1 之前**跑：这样 P1 自己那次只读读数反映的就是**做完之后**的状态，
+#     「刚写完」与「合规」是同一个读数说的，不需要第二处判定。
+#   · 走**子进程**跑 `ag95_init_close.py`，本文件不重实现写寄存器 —— 写路径只有一处。
+
+def gripper_init_plan(status):
+    """读到的 `0x0200` → 该跑哪一档。**纯函数** → `(argv|None, 说明)`。
+
+    **选最小那一档**：已经初始化就**不重走全行程自检**（两指先张开再合上）——
+    那正是 `--close` 单独这一档存在的理由（2026-10-07 加）。
+    读不到 / 不认识的值 ⇒ **不写**：串口不通时写指令能不能到得了都说不准，
+    而它会动到手指。fail-closed。
+    """
+    if status is None:
+        return None, ("读不到 `0x0200`（串口没通 / 夹爪没上电）—— **一个寄存器都不写**。"
+                      "串口不通时写指令能不能到得了都说不准，而它会动手指")
+    if status == ag95_init_close.INIT_READY:          # 1
+        return (["--close"],
+                "已初始化（0x0200=1）⇒ **只合拢**，不重走全行程自检")
+    if status == 0:
+        return (["--go", "--close"],
+                "未初始化（0x0200=0）⇒ 初始化 + 合拢，一步到位")
+    if status == 2:
+        return None, ("`0x0200=2`（**初始化正在进行**）—— **不写**。"
+                      "这时候再发一次初始化是往半途里插一脚；等它做完再跑一次本命令")
+    return None, ("`0x0200=%s` —— 只认得 0 / 1 / 2，这个值不敢猜，**一个寄存器都不写**"
+                  % status)
+
+
+def gripper_init_payload_lines(argv):
+    """写之前要**先给人看**的完整报文。**纯函数** → 行列表。
+
+    人确认的是**那一条**：`--close` 与 `--go --close` 动的是**不同的寄存器、不同的
+    行程**（一个只合拢、一个先张开再合上），报文必须照实分开写 —— 否则「确认」确认
+    的不是将要发生的事。力/目标值取自 `ag95_init_close` 自己的常量（**同源**）。
+    """
+    init = "--go" in argv
+    close = "--close" in argv
+    return [
+        "    ⚠️  马上要**写夹爪寄存器**（红线 2 点名的「初始化 / 开合」，**会动手指**）：",
+        "        脚本                 python3 %s %s"
+        % (GRIPPER_SCRIPT, " ".join(argv)),
+        "        写 0x%04X（初始化）   %s" % (
+            ag95_init_close.REG_INIT,
+            "**是** —— 一次**全行程自检**：两指先走到全开（1000）再合上"
+            if init else "**否**（不重走自检，两指不做全行程）"),
+        "        写 0x%04X / 0x%04X  %s" % (
+            ag95_init_close.REG_FORCE, ag95_init_close.REG_TARGET,
+            "**是** —— 力 %d N、目标 %d 千分（全闭）⇒ **合拢**；"
+            "指尖沿法兰轴**再探出 15.6 mm**"
+            % (ag95_init_close.FORCE_N, ag95_init_close.TARGET_PERMILLE)
+            if close else "**否**"),
+        "    授权只认**这一次**：任务描述 / 环境变量 / 上一次给过的，都不算。",
+        "    跑之前请确认（红线 2 的物理事实）：**急停就在手边**，"
+        "**两指整个行程里没有手、也没有遮挡**。",
+    ]
+
+
+def run_gripper_init(argv, timeout=GRIPPER_INIT_TIMEOUT, runner=None, repo=REPO):
+    """跑 `ag95_init_close.py`（**子进程**，本文件不重实现写寄存器）。
+
+    返回 `(rc, 输出)`；起不来 / 超时 ⇒ `(None, 说明)`。`runner` 可注入 ⇒ 离线可测。
+    """
+    cmd = [sys.executable, os.path.join(repo, GRIPPER_SCRIPT)] + list(argv)
+    run = subprocess.run if runner is None else runner
+    try:
+        p = run(cmd, cwd=repo, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, ("超时（%gs）—— 进程已放弃等待，**但它可能还在动**。"
+                      "先确认两指停了再往下" % timeout)
+    except OSError as exc:
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+
+
+def judge_gripper_init(record):
+    """跑完之后这一项怎么算。**纯函数** → `(status, detail)`。
+
+    没跑 ⇒ `(None, "")`（没有这一项，不是绿）。跑了 ⇒ 按脚本退出码给说法：
+    非 0 一律 **FAIL**，文案带上脚本自己那几行 —— 它会说清是哪一步卡住的
+    （串口打不开 / 未初始化 / 写失败），转述会丢信息。
+    """
+    if not record:
+        return None, ""
+    if record.get("dry_run"):
+        return SKIP, ("`--dry-run` ⇒ **一个寄存器都没写**（这是「没做」，不是绿）。"
+                      "实跑时会按读到的 0x0200 选最小一档，并在写之前把完整报文"
+                      "摆出来要一次**当次**确认")
+    rc, out = record.get("rc"), record.get("out") or ""
+    note = record.get("note") or ""
+    # 取脚本自己那几行结论（它用 ❌/✅ 起头）—— 转述会丢信息。
+    tail = "；".join([ln.strip() for ln in out.splitlines()
+                      if ln.strip() and ("❌" in ln or "✅" in ln)][-2:])
+    if rc is None:
+        return FAIL, ("**没跑成**：%s%s" % (out, ("（%s）" % note) if note else ""))
+    if rc != 0:
+        return FAIL, ("脚本退出码 %d（%s，不是「没做」）—— %s"
+                      % (rc, note or "环境不满足", tail or out[-300:]))
+    return PASS, ("已执行，脚本退出码 0（%s）；P1 那次只读读数就是**做完之后**的状态"
+                  % (note or ""))
+
+
+def ask_gripper_authorization(prompt_fn=input, isatty=None):
+    """真写之前**当场**再确认一次。**没有无人值守模式**（非终端直接拒）。
+
+    与 `ask_authorization` / `board_gate._run_repair` 同一条纪律。区别只在于
+    这里问的是**手指**：所以确认的是那三件物理事实，不是「要不要继续」。
+    """
+    isatty = sys.stdin.isatty if isatty is None else isatty
+    if not isatty():
+        print("    ❌ 写夹爪寄存器需要**当次**交互确认，而这里不是终端。"
+              "**没有**无人值守模式。")
+        return False
+    print("        请确认：这是**当次**授权、**急停就在手边**、"
+          "**两指整个行程里没有手也没有遮挡**。")
+    try:
+        ans = prompt_fn("        确认写夹爪寄存器？(yes) > ")
+    except EOFError:
+        return False
+    if str(ans).strip().lower() != "yes":
+        print("        未确认 —— **一个寄存器都不写**。")
+        return False
+    return True
+
+
+def gripper_init_step(port, read_status=None, ask=None, run=None, out=print):
+    """读 `0x0200` → 选最小一档 → 摆报文 → **当次确认** → 跑。
+
+    返回 `{"status","argv","rc","out","note"}` 或 `None`（没写）。**依赖全可注入**
+    ⇒ 整条链离线可测（含「没确认就一个寄存器都不写」）。
+    """
+    read_status = board_lib.gripper_state if read_status is None else read_status
+    ask = ask_gripper_authorization if ask is None else ask
+    run = run_gripper_init if run is None else run
+
+    st, why = read_status(port)
+    argv, note = gripper_init_plan(st)
+    out("  夹爪初始化：%s" % note)
+    if argv is None:
+        out("      ⛔ **不写**。%s" % (("（%s）" % why) if why else ""))
+        return {"status": st, "argv": None, "rc": None, "out": note, "note": note,
+                "refused": True}
+
+    out("  从 0x0200=%s 选出的那一档：`%s`" % (st, " ".join(argv)))
+    for ln in gripper_init_payload_lines(argv):
+        out(ln)
+    if not ask():
+        return {"status": st, "argv": argv, "rc": None, "out": "未确认",
+                "note": note, "refused": True}
+    rc, text = run(argv)
+    return {"status": st, "argv": argv, "rc": rc, "out": text, "note": note}
 
 
 def attach_log_missing_note(log_path):
@@ -2080,6 +2273,11 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     report = {"rows": [], "absent": {}}
     task = None
     site = None
+    # 夹爪初始化那一次的记录（`--init-gripper` 才会被赋值）。放在 `def finish` 之前：
+    # `finish` 是闭包，读的是**调用时**的值 —— 这样每一处 `return finish(...)` 都自动
+    # 带上它，不必在十几个出口各传一遍（漏一个，报告里那一栏就会静默变成「没做」，
+    # 而那正是这一栏要防的误读）。
+    gripper_init = None
     params, sources = {}, {}
 
     def add(title, item, absent=None):
@@ -2092,6 +2290,7 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         return item
 
     def finish(code, **kw):
+        kw.setdefault("gripper_init", gripper_init)
         return _finish(report, code, a, task=task, **kw)
 
     # ================================================== P0 自检（静态）
@@ -2173,9 +2372,38 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                 print(ln)
         add(S0, Item(WRITE_PATH_ITEM, *judge_write_path(isatty)))
 
+    # 红线 6 第二条写路径（夹爪寄存器）：同一条纪律、同一个判定函数。
+    # 报文**取决于读到的 0x0200**（已初始化就只合拢）⇒ 这一项列在这里，报文在真写
+    # 之前才摆得出来（就在下面那道 S0 闸门之后）。
+    if a.init_gripper:
+        add(S0, Item(GRIPPER_INIT_ITEM, *judge_write_path(
+            isatty, "--init-gripper",
+            fire_note="真写之前会**按读到的 0x0200 选最小的一档**、把完整报文"
+                      "（哪些寄存器、走多少行程）摆出来，再要你敲一次 yes")))
+
     code, _, _ = decide(counted(report, S0), None, launched=False)
     if code != 0:
         return finish(code, launched=False)
+
+    # ---- 夹爪初始化：**在读 P1 之前**做完，这样 P1 那次只读读数反映的就是
+    #      「做完之后」的状态（一个读数同时回答「写成了吗」与「合规吗」）。
+    gripper_init = None
+    if a.init_gripper:
+        print("\n—— 夹爪初始化（`--init-gripper`：红线 6 写路径，会动手指）——")
+        if a.dry_run:
+            print("  （`--dry-run`：**一个寄存器都不写**。实跑时按读到的 0x0200 选档：）")
+            for st in (1, 0):
+                _argv, _note = gripper_init_plan(st)
+                print("      0x0200=%s ⇒ %s" % (st, _note))
+            print("      0x0200=2 ⇒ **不写**（初始化进行中，再发一次是往半途插一脚）")
+            print("      读不到   ⇒ **不写**（串口不通时指令到没到都说不准）")
+            gripper_init = {"dry_run": True}
+        else:
+            gripper_init = gripper_init_step(site.gripper_port if site else None)
+            add(S0, Item(GRIPPER_INIT_ITEM, *judge_gripper_init(gripper_init)))
+            code, _, _ = decide(counted(report, S0), None, launched=False)
+            if code != 0:
+                return finish(code, launched=False)
 
     # ================================================== P1 前置（只读）
     print("\n—— %s ——" % S1)
@@ -2514,6 +2742,14 @@ def _parser():
                          "摆出来，臂已上电时还要再确认一次，切完按只读复核判"
                          "「生效 / 未生效」。deactivate 恒空 —— 那一份判定在 "
                          "board_gate 里，本文件原样透传")
+    ap.add_argument("--init-gripper", action="store_true",
+                    help="⚠️ 写路径：把夹爪弄到「已初始化」（红线 2 点名的"
+                         "「初始化 / 开合」，**会动手指**）。与 --repair-controller "
+                         "同一条纪律：P0 先确认有交互终端（没有就退 2，**栈都不起**），"
+                         "**按读到的 0x0200 选最小的一档**（已初始化 ⇒ 只合拢，"
+                         "不重走全行程自检），真写之前把完整报文（哪些寄存器、"
+                         "走多少行程）摆出来再要一次**当次**确认，**没有**无人值守"
+                         "模式。必须在臂使能、急停在手边、两指行程内无人无遮挡时给。")
     ap.add_argument("--override-freshness", default=None, metavar="理由",
                     help="外参超期时由人显式破例，**必须写下为什么**（原样进报告）")
     ap.add_argument("--timeout", type=float, default=None,
@@ -2714,7 +2950,7 @@ def score_round(task, lines):
 
 
 def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
-            repair_exercised=None, t_launch=None, t_stop=None,
+            repair_exercised=None, gripper_init=None, t_launch=None, t_stop=None,
             verdict_state=None, log_path=None, launched=False, dry_run=False):
     print()
     print("—— 结论 ——")
@@ -2725,6 +2961,24 @@ def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
           % ("yes" if repair_exercised else "no",
              "" if repair_exercised else
              "   ← 没被绊倒时的绿是**空的**，别读成「验证过了」"))
+    # 同一条规定：没被绊倒 / 没给开关时的绿是**空的**。这一栏尤其要说清 ——
+    # 「夹爪是好的」有两种来路（**刚写的** / **本来就是**），报告里必须分得开。
+    if a.init_gripper:
+        if gripper_init is None:
+            print("  gripper init exercised: 未走到（在上面被挡下了）")
+        elif gripper_init.get("dry_run"):
+            print("  gripper init exercised: dry-run   ← **一个寄存器都没写**")
+        elif gripper_init.get("refused"):
+            print("  gripper init exercised: no（拒绝：%s）"
+                  % (gripper_init.get("note") or "未确认"))
+        else:
+            print("  gripper init exercised: yes（读了 0x0200=%s ⇒ `%s`，脚本退出码 %s）"
+                  % (gripper_init.get("status"),
+                     " ".join(gripper_init.get("argv") or []),
+                     gripper_init.get("rc")))
+    else:
+        print("  gripper init exercised: no（没给 --init-gripper）"
+              "   ← P1 那次读数只说明**当时**是什么状态，不说明是谁弄成那样的")
     if launched:
         moved, note = judge_handoff_window(
             t_launch, t_stop, task.start_delay if task else 0.0,
@@ -2738,13 +2992,15 @@ def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
 
     if a.json_report:
         _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
-                      t_launch, t_stop, verdict_state, log_path, launched)
+                      gripper_init, t_launch, t_stop, verdict_state, log_path,
+                      launched)
     print("=" * 74)
     return code
 
 
 def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
-                  t_launch, t_stop, verdict_state, log_path, launched):
+                  gripper_init, t_launch, t_stop, verdict_state, log_path,
+                  launched):
     if path_in_repo(a.json_report):
         # 第二道锁：`P0.输出路径` 已经会退 2、根本走不到这里。留着是因为这条路径
         # 通向**红线 3**（公开仓），多一道便宜的锁值得；但它**不是**主判据 ——
@@ -2766,6 +3022,14 @@ def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
         "authorized_motion": bool(a.authorize_motion),
         "repair_exercised": (None if repair_exercised is None
                              else bool(repair_exercised)),
+        # 同一条纪律（没被绊倒时的绿是空的）：没给 `--init-gripper` ⇒ None。
+        # 给了没写成 ⇒ 记下**为什么**（拒绝 / 未确认 / 脚本非 0），
+        # 免得事后把「那一栏是 no」读成「夹爪本来就是好的」。
+        "gripper_init_exercised": (None if not a.init_gripper else
+                                   bool(gripper_init and not
+                                        (gripper_init.get("dry_run")
+                                         or gripper_init.get("refused")))),
+        "gripper_init": (None if not a.init_gripper else gripper_init),
         "handoff_window": {"moved_maybe": moved, "note": note},
         "items": [i.as_dict() for (_, i, ab) in report["rows"] if not ab],
         "absent": report["absent"],

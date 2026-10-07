@@ -594,11 +594,25 @@ try:
     check("  不重实现控制器的写路径：没有 switch_controller 服务名、没有它的调用",
           "/controller_manager/switch_controller" not in SRC
           and "switch_controllers(" not in SRC)
-    check("  写路径的唯一开关是 `--repair-controller`：CLI 上是 store_true，"
-          "透传给 board_gate 时只在 repair=True 时拼进去（两处，没有第三处）",
-          SRC.count('"--repair-controller"') == 2
+    # 写路径的开关是**闭集**：控制器切换 + 夹爪寄存器这**两条**。断言钉的是
+    # 「每一条都：① CLI 上是 store_true（默认只读）② 过同一道 P0 授权闸门
+    # ③ 出现次数就是下面这个数 ⇒ 多出一条没有闸门的写路径会当场红」。
+    # 计数是**故意**的（照旧版对 `--repair-controller` 的做法）：新增一条写路径
+    # 必须回来改这个数，改的时候就得说清它的授权闸门在哪。
+    check("  写路径①控制器切换 `--repair-controller`：store_true、只在 repair=True "
+          "时透传给 board_gate（三处，没有第四处）",
+          SRC.count('"--repair-controller"') == 3
           and 'ap.add_argument("--repair-controller", action="store_true"' in SRC
           and "repair=a.repair_controller" in SRC)
+    check("  写路径②夹爪寄存器 `--init-gripper`：store_true、过**同一道** "
+          "judge_write_path（两处，没有第三处）",
+          SRC.count('"--init-gripper"') == 2
+          and 'ap.add_argument("--init-gripper", action="store_true"' in SRC
+          and 'judge_write_path(\n            isatty, "--init-gripper"' in SRC)
+    check("  两条写路径**共用**同一个授权判定（不是各写一份 —— 分叉的那一份会给"
+          "出假的授权）",
+          SRC.count("def judge_write_path(") == 1
+          and SRC.count("judge_write_path(") == 3)
     check("收栈用 board_lib.teardown（不另抄一套 kill 逻辑）",
           "board_lib.teardown" in SRC)
     check("--stop 面对的是**别人的**进程 ⇒ 逐个 pid 发信号，绝不 killpg",
@@ -2339,6 +2353,193 @@ try:
           and "P2 起栈" not in r_ns.stdout, "rc=%s" % r_ns.returncode)
     check("  并且明说站点那几项还不知道（robot_ip / 外参 / publish_camera_tf）",
           mentions(r_ns.stdout, "robot_ip", "camera_* 外参", "publish_camera_tf"))
+
+    # =================================================================
+    # 13b. 红线 6 第二条写路径：`--init-gripper`（夹爪寄存器）
+    # =================================================================
+    section("[13b] 红线 6：夹爪初始化并进启动器 —— 选最小一档、报文先摆、当次确认")
+
+    # ---- ① 选档：读到的 0x0200 → 该跑哪一档（**最小**那一档）---------
+    argv1, note1 = board_run.gripper_init_plan(1)
+    check("0x0200=1（已初始化）⇒ **只合拢**：argv 里**没有** --go "
+          "（不重走全行程自检 —— 那是白动一次）",
+          argv1 == ["--close"], "argv=%s" % (argv1,))
+    check("  而且说明里写得出「不重走全行程自检」",
+          "只合拢" in note1 and "全行程自检" in note1, note1)
+    check("0x0200=0（未初始化）⇒ 初始化 + 合拢（一步到位）",
+          board_run.gripper_init_plan(0)[0] == ["--go", "--close"])
+    a2, n2 = board_run.gripper_init_plan(2)
+    check("0x0200=2（**初始化进行中**）⇒ 拒绝，不给命令（再发一次是往半途插一脚）",
+          a2 is None and "进行" in n2, "%s / %s" % (a2, n2))
+    aN, nN = board_run.gripper_init_plan(None)
+    check("读不到 0x0200 ⇒ 拒绝（串口不通时写指令到没到都说不准）—— fail-closed",
+          aN is None and "读不到" in nN, "%s / %s" % (aN, nN))
+    aX, nX = board_run.gripper_init_plan(7)
+    check("不认识的值 ⇒ 拒绝，且**点名**那个值（不是默默当成 0）",
+          aX is None and "7" in nX, "%s / %s" % (aX, nX))
+
+    # ---- ② 报文：人确认的是**那一条** ---------------------------------
+    close_lines = "\n".join(board_run.gripper_init_payload_lines(["--close"]))
+    both_lines = "\n".join(board_run.gripper_init_payload_lines(["--go", "--close"]))
+    check("报文里写着要跑的**确切命令行**",
+          "ag95_init_close.py --close" in close_lines)
+    check("`--close` 那一档明说**不写 0x0100**（不重走自检）",
+          "0x0100" in close_lines and "**否**" in close_lines)
+    check("`--go --close` 那一档明说 0x0100 要写、且是一次**全行程自检**",
+          "全行程自检" in both_lines and "**是**" in both_lines)
+    check("两档印出来**不是同一份**（否则「确认」确认的不是将要发生的事）",
+          close_lines != both_lines)
+    check("报文里写了 15.6 mm 那个物理后果（合拢时指尖再探出）",
+          "15.6 mm" in close_lines and "15.6 mm" in both_lines)
+    check("力的值与 ag95_init_close 的常量同一个数（50 N —— 与 grasp_planner.yaml 的"
+          "ag95_force 一致）",
+          str(board_run.ag95_init_close.FORCE_N) in close_lines
+          and board_run.ag95_init_close.FORCE_N == 50)
+    check("  而且是**引用**来的，不是这里又抄一个数（抄了就会静默分叉，"
+          "而人确认的是**那一条**）",
+          "ag95_init_close.FORCE_N" in SRC
+          and "ag95_init_close.TARGET_PERMILLE" in SRC
+          and "ag95_init_close.REG_INIT" in SRC)
+    check("报文里写了当次授权那句（数据文件不许冒充授权）",
+          "只认**这一次**" in close_lines)
+
+    # ---- ③ 整条链（依赖注入）：没确认就**一个寄存器都不跑** -----------
+    calls = []
+    saw = []
+
+    def _fake_run(argv, **kw):
+        calls.append(list(argv))
+        return 0, "✅ 假装写完了"
+
+    def _step(status, answer=True):
+        calls[:] = []
+        return board_run.gripper_init_step(
+            "/dev/假装",
+            read_status=lambda port: (status, "ok"),
+            ask=lambda: answer,
+            run=_fake_run, out=lambda *a: saw.append(" ".join(map(str, a))))
+
+    rec = _step(1)
+    check("0x0200=1 + 确认 ⇒ 真的跑了，且跑的是 `--close`（不写 0x0100）",
+          calls == [["--close"]] and rec["rc"] == 0, "calls=%s" % (calls,))
+    rec = _step(0)
+    check("0x0200=0 ⇒ 跑 `--go --close`", calls == [["--go", "--close"]])
+    rec = _step(2)
+    check("0x0200=2 ⇒ **一次都没跑**（竞态里的半途不许插一脚）",
+          calls == [] and rec["refused"], "calls=%s" % (calls,))
+    rec = _step(None)
+    check("读不到 ⇒ **一次都没跑**", calls == [] and rec["refused"])
+    rec = _step(1, answer=False)
+    check("★ 已初始化、但**没确认** ⇒ `--close` 也**一次都不跑**"
+          "（确认的是「将要发生的事」，不是「要不要继续」）",
+          calls == [] and rec["refused"], "calls=%s" % (calls,))
+    check("  这一条不是空转：同样的 status 换成 answer=True 就跑得起来",
+          _step(1, answer=True) and calls == [["--close"]])
+
+    # ---- ④ 跑完之后这一项怎么算（三态，不许把「没做」渲染成绿） ------
+    check("没跑 ⇒ 没有这一项（None ≠ PASS）",
+          board_run.judge_gripper_init(None) == (None, ""))
+    st, det = board_run.judge_gripper_init(
+        {"rc": 0, "out": "✅ 成功", "note": "已初始化（0x0200=1）⇒ **只合拢**"})
+    check("退出码 0 ⇒ PASS，并写明 P1 那次读数就是**做完之后**的状态",
+          st == board_run.PASS and "做完之后" in det, det)
+    st, det = board_run.judge_gripper_init(
+        {"rc": 2, "out": "❌ AG-95 未初始化（0x0200=0）—— 拒绝只合拢",
+         "note": "未初始化（0x0200=0）"})
+    check("退出码 2 ⇒ **FAIL**（不是「没做」，也不是绿），并把脚本自己那行带出来",
+          st == board_run.FAIL and "退出码 2" in det and "拒绝只合拢" in det, det)
+    st_rc2 = st          # M4 的对照物：下面的 `st` 会被别的夹具覆盖
+    # 超时这一路：**判不出退出码 ≠ 进程没在动** —— 这句提醒长在**适配器**里
+    # （它才知道自己刚才是超时还是压根没起得来），判定函数把它整段带出去。
+    def _boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 90.0)
+
+    rc_to, text_to = board_run.run_gripper_init(["--close"], runner=_boom)
+    check("超时 ⇒ 拿不到退出码，且说明里点出**它可能还在动**（先确认两指停了）",
+          rc_to is None and "还在动" in text_to, text_to)
+    st, det = board_run.judge_gripper_init({"rc": rc_to, "out": text_to, "note": "n"})
+    check("  判定函数把这段原样带进报告（不许换一句「失败」了事）",
+          st == board_run.FAIL and "还在动" in det, det)
+
+    def _enoent(cmd, **kw):
+        raise OSError(2, "No such file or directory")
+
+    rc_nf, text_nf = board_run.run_gripper_init(["--close"], runner=_enoent)
+    check("脚本根本起不来 ⇒ 也是 FAIL，说明里带上**具体异常类型**"
+          "（`OSError(2, …)` 会细化成 `FileNotFoundError` —— 现场一眼看出是"
+          "「找不到脚本」还是「串口没权限」）",
+          rc_nf is None and "FileNotFoundError" in text_nf
+          and "No such file" in text_nf, text_nf)
+    check("  而且给出的命令是**绝对路径**（CWD 不该决定跑的是哪一份脚本）",
+          board_run.run_gripper_init(
+              ["--close"], runner=lambda cmd, **kw: calls.append(cmd) or
+              types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+          and calls[-1][1] == os.path.join(REPO, "scripts", "ag95_init_close.py"),
+          str(calls[-1]) if calls else "没有调用")
+    st, det = board_run.judge_gripper_init({"dry_run": True})
+    check("--dry-run ⇒ **SKIP**（是「没做」，不是绿）", st == board_run.SKIP, det)
+
+    # ---- ⑤ 端到端：非交互 + --init-gripper ⇒ 起栈之前就退 2 ----------
+    r = run_cli("--task", "a1", "--site", site_path, "--dry-run",
+                "--init-gripper", env={"PATH": no_ros})
+    check("真跑一次：--init-gripper 在非交互终端 ⇒ P0 红、退 2",
+          r.returncode == 2 and "[FAIL] %s" % board_run.GRIPPER_INIT_ITEM in r.stdout,
+          "rc=%s" % r.returncode)
+    check("  而且**停在 P0**：P1/P2 那两个阶段头一次都没印（拦在起栈之前）",
+          "P1 前置" not in r.stdout and "P2 起栈" not in r.stdout)
+    check("  文案指出它要的是**当次**授权（与控制器那条同一个判据函数）",
+          "--init-gripper" in r.stdout and "当次" in r.stdout)
+    r_gd = run_cli("--task", "a1", "--site", site_path, "--dry-run",
+                   env={"PATH": no_ros})
+    check("  不带这个开关时 P0 里没有这一项（写路径是逐一显式开的）",
+          board_run.GRIPPER_INIT_ITEM not in r_gd.stdout
+          and "P2 起栈" in r_gd.stdout, "rc=%s" % r_gd.returncode)
+    check("  并且报告里那一栏说得清「谁把它弄成这样的」（没给开关时不冒充验证过）",
+          "gripper init exercised: no（没给 --init-gripper）" in r_gd.stdout,
+          r_gd.stdout[-400:])
+    check("  报告 JSON 里有 `gripper_init_exercised` 这一栏（照 repair_exercised）",
+          "gripper_init_exercised" in SRC and '"gripper_init_exercised":'
+          in SRC)
+
+    # ---- ⑥ 变异：上面每一条「吃劲」吗（改前 ≠ 改后，不是「改坏了会红」）----
+    section("[13b-mut] 变异：把闸门拆掉，断言必须翻面")
+
+    # M1 退回 2026-10-07 之前的形状：已初始化也重走全行程自检（`--go --close`）。
+    m = load_mutant(_mutate(SRC, '        return (["--close"],',
+                            '        return (["--go", "--close"],', "gplan"),
+                       "gplan")
+    mut_argv, _ = m.gripper_init_plan(1)
+    check("M1 已初始化也重走全行程自检（= 改之前的行为）⇒ 「只合拢」那条翻面",
+          mut_argv == ["--go", "--close"] and argv1 == ["--close"],
+          "变异后 %s；改前 %s" % (mut_argv, argv1))
+
+    # M2 削掉「初始化进行中就拒绝」那道闸门。
+    m = load_mutant(_mutate(SRC, "    if status == 2:", "    if False:", "g2"),
+                    "g2")
+    _ma, mut_n2 = m.gripper_init_plan(2)
+    check("M2 削掉「0x0200=2 ⇒ 拒绝」⇒ 文案不再说得出「进行中」（拿半途当没做）",
+          "进行" not in (mut_n2 or "") and "进行" in n2,
+          "变异后 %r；改前 %r" % (mut_n2, n2))
+
+    # M3 把「当次确认」那道闸门拆掉（先写后问 = 确认变成了走个形式）。
+    m = load_mutant(_mutate(SRC, "    if not ask():", "    if False:", "gask"),
+                    "gask")
+    calls[:] = []
+    m.gripper_init_step("/dev/假装",
+                        read_status=lambda port: (1, "ok"),
+                        ask=lambda: False, run=_fake_run, out=lambda *a: None)
+    check("M3 拆掉「没确认就不写」⇒ 一次**都没确认**的调用照样动了手指"
+          "（★ 这一条防的是「确认」退化成走过场）",
+          calls == [["--close"]], "变异后 calls=%s" % (calls,))
+
+    # M4 非 0 退出码也当成功（把「报成功」与「真做成」混为一谈）。
+    m = load_mutant(_mutate(SRC, "    if rc != 0:", "    if False:", "grc"),
+                    "grc")
+    mut_st, _ = m.judge_gripper_init(
+        {"rc": 2, "out": "❌ AG-95 未初始化（0x0200=0）", "note": "未初始化"})
+    check("M4 非 0 退出码也当成功 ⇒ FAIL 那条翻成 PASS（脚本说没做成，报告说绿）",
+          mut_st == board_run.PASS and st_rc2 == board_run.FAIL,
+          "变异后 %s；改前 %s" % (mut_st, st_rc2))
 
     # =================================================================
     # 14. 参数集守卫：本启动器发出的键 vs 旧入口 board_a1.build_cmd
