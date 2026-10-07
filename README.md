@@ -277,12 +277,9 @@ ur5-vision-grasp/
 
 ```bash
 source /opt/ros/humble/setup.bash
-# test_minimal 要 import ultralytics，所以必须叠加 conda 环境（其余不需要，
-# 但叠了一起跑没问题）。不加这一行，test_minimal 会报「ultralytics 未安装」，
-# 看起来像项目坏了 —— 其实只是解释器不对。
-export PYTHONPATH=~/robotics/venvs/robot-vision/lib/python3.10/site-packages:$PYTHONPATH
 
-python3 scripts/test_minimal.py          # 冒烟：模型加载 + 投影数学
+# 下面这些**没有一个**需要 conda 环境（`ultralytics`/`torch` 只在训练与
+# detector 节点里用；解释器那件事见上面「两个解释器问题」一节）。
 python3 scripts/test_perception_3d.py    # 感知单元
 python3 scripts/test_detector_device.py  # 设备退化分支
 python3 scripts/test_real_launch.py      # launch 参数面 + 收工卫生 + 相机序列号守卫

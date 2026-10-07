@@ -120,6 +120,16 @@ check("★ `rc=2` **不许**算通过 —— 它是「这个环境跑不了我�
       "与 `state_check.py` 的约定同源",
       rag.summarize([("a", rag.SKIP, 1.0)])[0] == 0
       and rag.summarize([("a", rag.SKIP, 1.0)])[1].find("环境不满足") >= 0)
+check("★ 总表按**拦不拦**说事：警告与失败**各有名字**，不靠红绿两色"
+      "（用户 2026-10-07 裁定：「可以有只 warning 的错误，"
+      "但要有 failed 拦截重要错误」）",
+      "警告" in rag.summarize([("a", rag.SKIP, 1.0)])[1]
+      and "失败" in rag.summarize([("a", rag.PASS, 1.0),
+                                   ("b", rag.FAIL, 1.0)])[1])
+check("★ 警告再多也**不拦**：42 道里 30 道「环境不满足」＋ 1 道通过 ⇒ 仍退 0"
+      "（第一百一十一轮悬案 ⑧ 的裁决：**不设阈值**，缺依赖是这台机器的事）",
+      rag.summarize([("g%d" % i, rag.SKIP, 1.0) for i in range(30)]
+                    + [("p", rag.PASS, 1.0)])[0] == 0)
 check("  有 FAIL ⇒ 退 1，且**点名**是哪一道",
       rag.summarize([("a", rag.PASS, 1.0), ("b", rag.FAIL, 1.0)])[0] == 1
       and "b" in rag.summarize([("a", rag.PASS, 1.0),

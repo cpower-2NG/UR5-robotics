@@ -264,18 +264,22 @@ runs/detect/block_grid_demo/
 
 ### 6.1 无 ROS 的逻辑自检
 
-不依赖 ROS2 / Gazebo，一次性验证三件事：模型能否加载、2D→3D 投影数学、深度中值滤波。
+不依赖 ROS2 / Gazebo 的逻辑自检现在是这两道：
 
 ```bash
-python3 scripts/test_minimal.py
+python3 scripts/test_perception_3d.py     # 2D→3D 投影数学 + 感知单元（纯逻辑）
+python3 scripts/test_model_resolution.py  # 「到底会加载哪一个 .pt」（D67）
 ```
 
-> ✅ 该脚本现在**显式加载仓库根的 `block_best.pt`**（1 类 `block`）。因此
-> **看到「类别数: 1」是预期的**，不代表环境坏了——它验证的正是本项目实际部署的方块模型。
+> ⚠️ 本节原先给的是 `scripts/test_minimal.py`，**已于第一百一十二轮删除**
+> （见 `docs/RESTRUCTURE_PLAN.md`）。理由：它三项里有**两项测的是 numpy**
+> —— 函数里手写的数组求逆、求中位数，不测本仓库的任何东西；它身上还有一处
+> **静默假通过**（模型文件 `block_best.pt` 不在时 `return True`，即「没加载却报通过」）。
 >
-> 旧版此处写的是 `YOLO("yolov8n.pt")` 却打印「COCO 类别示例」：那个名字在仓库根其实
-> 指向方块模型，真 COCO 被挤到 `yolov8n_backup.pt`（现已改名 `yolov8n_coco.pt`），
-> 这正是 D6「同名不同物」。该名字已删除，脚本也已改为显式路径。
+> **「模型文件在不在、能不能真加载起来」这一项，离线现在没有替代品**：
+> `test_model_resolution.py` 管的是**解析到哪个文件**，不是能不能加载；
+> 真机上由启动器的 P4「检测器活着」那一项把关（`model:=` 解析不到时
+> **detector 会死掉而整栈其余照跑**，所以那一项非有不可）。
 
 ### 6.2 实时检测（走 ROS2 节点）
 
@@ -388,7 +392,6 @@ A: 编辑 `scripts/generate_grid_world.py` 中的配置参数，运行即可重�
 | `scripts/label_blocks.py` | 手动标注工具（备用） |
 | `scripts/train_yolo_block.py` | YOLO 训练脚本 |
 | `scripts/demo_pipeline.py` | 端到端演示（合成数据） |
-| `scripts/test_minimal.py` | 最小验证测试（YOLO + 3D 投影 + 深度滤波，无需 ROS） |
 | `scripts/move_block.py` | 移动仿真方块（`set_pose` 服务） |
 | `ros2_ws/src/yolo_detector/` | ROS2 检测节点（标准方式） |
 | `ros2_ws/src/yolo_bringup/worlds/` | Gazebo 世界文件 |
