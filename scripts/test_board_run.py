@@ -615,7 +615,7 @@ try:
                  "split_entry", "parse_callable", "build_launch_cmd", "params_to_argv",
                  "resolve_launch_params", "planner_yaml_params", "path_in_repo",
                  "find_task_file", "find_marker", "render_counts", "score_round",
-                 "playing_is_vacuous", "count_vacuous",
+                 "playing_is_vacuous", "count_vacuous", "needs_repress",
                  "find_authorization_keys", "task_dotted_paths", "judge_write_path",
                  "judge_repair_outcome", "switch_payload_lines", "repair_hint",
                  "print_repair_hint", "task_params", "judge_entry_parity",
@@ -1277,6 +1277,97 @@ try:
     check("★ 报告键已改名：`gate_p3_exit`/`gate_p4_exit` 在源码里**不再出现**"
           "（它们读起来像阶段判决，实为 `board_gate.py` 子进程的退出码）",
           _seen == {"controllers_gate_exit", "p4_gate_exit"}, repr(sorted(_seen)))
+
+    # -----------------------------------------------------------------
+    # 5f. 空洞绿在**要跑运动**的那一轮是**动作问题**，不只是记录问题
+    #     （2026-10-07 用户裁定：拦住并引导重按）
+    # -----------------------------------------------------------------
+    section("[5f] 交棒前复核「人在环」：空洞绿在 R0 **不拦**、在运动轮 **必拦**")
+
+    _P3_V = I("P3.示教器 PLAYING", board_run.PASS, "", vacuous=True)
+    _P3_F = I("P3.示教器 PLAYING", board_run.PASS, "", vacuous=False)
+    _P3_N = I("P3.示教器 PLAYING", board_run.PASS, "", vacuous=None)
+
+    check("★ 实绿（起栈前不是 PLAYING ⇒ 人真按了）⇒ **不用**重按",
+          board_run.needs_repress([_P3_F]) is False)
+    check("★ 空洞绿 ⇒ **要**重按（人可能压根没按，而臂会动）",
+          board_run.needs_repress([_P3_V]) is True)
+    check("  **判不了**（`None`）也 ⇒ **要**（fail-closed）",
+          board_run.needs_repress([_P3_N]) is True)
+    check("  那一项**压根找不到** ⇒ 也**要**（判不了就按「要」办，fail-closed）",
+          board_run.needs_repress([]) is True)
+    check("  与 `playing_is_vacuous` **逐档同源**（一个说空洞、另一个却放行"
+          "＝没有任何东西拦得住）",
+          all(board_run.needs_repress([I("P3.示教器 PLAYING", board_run.PASS, "",
+                                         vacuous=board_run.playing_is_vacuous(c))])
+              == (board_run.playing_is_vacuous(c) is not False)
+              for c in ({**CAB_RUN, **_pl}, CAB_RUN, None)))
+
+    # ★ 关键边界：**不许下沉进 `decide()`**。`decide()` 是全流程唯一的退出码
+    #   出口（P0–P5 都走它）——把空洞绿放进去，**R0（无运动）**也会被拦在 P3，
+    #   白丢掉 P4 的证据。空洞绿该不该拦，取决于**下一步会不会动**。
+    check("★ `decide()` **不**看 vacuous：空洞绿在 R0（无运动）照旧不拦",
+          board_run.decide([_P3_V])[0] == 0,
+          "decide=%r" % (board_run.decide([_P3_V]),))
+    check("  源码级钉子：`decide()` 的函数体里**不出现** vacuous"
+          "（想搬进去之前，先想清楚 R0 会不会被一起拦掉）",
+          "vacuous" not in func_code("decide"))
+    check("★ P5 确实按 `needs_repress` 拦，且复核项挡在交棒之前（源码级）",
+          '"P5.人在环复核"' in SRC and "needs_repress(counted(report, S3))" in SRC)
+
+    # ---- 两步握手：**真跑**（注入假 dashboard ＋ 假时钟 ＋ 空 sleep）----
+    _CLK = [0.0]
+
+    def _tick():
+        _CLK[0] += 1.0
+        return _CLK[0]
+
+    def _scripted(seq):
+        it = iter(seq)
+        cur = [seq[0]]
+
+        def f(_ip):
+            try:
+                cur[0] = next(it)
+            except StopIteration:
+                pass
+            return cur[0]
+        return f
+
+    _STOPPED = dict(CAB_RUN)
+    _PLAYING = {**CAB_RUN, **_pl}
+
+    def _loop(seq, timeout=6.0):
+        _CLK[0] = 0.0
+        return board_run.ensure_in_the_loop(
+            "x", timeout, poll=1.0, dash=_scripted(seq), clock=_tick,
+            sleep=lambda _s: None, prompt=lambda *_a: None)
+
+    _ok, _why = _loop([_PLAYING, _STOPPED, _PLAYING])
+    check("★★ 人真按了（PLAYING → STOPPED → PLAYING **都看到**）⇒ 放行",
+          _ok is True, _why)
+
+    _ok, _why = _loop([_PLAYING])
+    check("★★ 它**一直** PLAYING（没看见离开）⇒ **不放行**"
+          "（这正是「残 PLAYING」那一档；只看一句「按一下」是判不出来的）",
+          _ok is False and "没看到它离开" in _why, _why)
+
+    _ok, _why = _loop([_PLAYING, _STOPPED])
+    check("  按了停止却没等到播放 ⇒ **不放行**",
+          _ok is False and "没等到 PLAYING" in _why, _why)
+
+    _ok, _why = _loop([_STOPPED, _PLAYING])
+    check("  本来就没在跑 ⇒ 离开那一步立刻成立，只等播放 ⇒ 放行",
+          _ok is True, _why)
+
+    _m_nr = load_mutant(_mutate(
+        SRC, "            return getattr(i, \"vacuous\", False) is not False\n",
+        "            return getattr(i, \"vacuous\", False) is True\n", "nr"), "nr")
+    if _m_nr is not None:
+        check("★ 变异：把「判不了」当成实绿 ⇒ 那一档**翻面**"
+              "（不翻面就说明本条断言恒真、等于没写）",
+              _m_nr.needs_repress([_P3_N]) is False
+              and board_run.needs_repress([_P3_N]) is True)
 
     # =================================================================
     # 6. 外参

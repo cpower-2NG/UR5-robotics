@@ -59,6 +59,16 @@
   2 = 在**交棒之前**停下了（「我拒绝了」）：有 FAIL、有 SKIP（没验到）、
       或没给 `--authorize-motion`。**这一档不许读成通过。**
 
+★ **交棒前复核「人在环」（只在给了 `--authorize-motion` 的那一轮）**：P3 的
+  `P3.示教器 PLAYING` 可能是一条**空洞绿** —— 上一轮收栈之后控制柜**仍停在
+  PLAYING**（第一百一十轮实测），于是启动器看到「PLAYING」就以为人按了，
+  而其实**这一轮没人按**。不跑运动时那只是个记录问题；**要跑运动时它是动作问题：
+  臂会动**。所以真交棒之前会让人**重按一次（先 STOP，再 PLAY）**，并且
+  **两步都看到**才算数（只看一句「按一下」的话，两个动作挨得近时轮询可能一次都
+  没看见 STOPPED ⇒ 判不了）。判据是纯函数 `needs_repress()`。
+  ⚠️ 这一条**不下沉进 `decide()`**：放进去会把 **R0（无运动）**也拦在 P3，
+  白丢 P4 的证据 —— 空洞绿该不该拦，取决于**下一步会不会动**。
+
 ⚠️ 离线（本机 WSL 没有 rclpy、没有板子）整跑**必然退 2** —— 那是**正确**的结果
    （fail-closed）。`--dry-run` 只看静态（只读文件、只拼命令，**不跑任何子进程**）；
    它退 0 **不代表**任何闸门验过，报告里会逐项标「声明缺席」。
@@ -1125,6 +1135,34 @@ def playing_is_vacuous(cabinet):
     return bool(board_lib.is_playing(cabinet))
 
 
+IN_LOOP_ITEM = "P3.示教器 PLAYING"
+
+
+def needs_repress(items):
+    """交棒**之前**要不要让人重按一次（STOP → PLAY）。**纯函数** → `bool`。
+
+    `items` = 已计入三态的 `P3` 那几项。
+
+    · `False` —— `P3.示教器 PLAYING` 是**实绿**（起栈前不是 PLAYING ⇒ 人真按了）
+    · `True`  —— 空洞绿（`True`）或**判不了**（`None`）；**那一项压根找不到**也算
+      `True`（fail-closed：判不了就按「要」办）
+
+    ⚠️ **这一条只在「真要跑运动」的那一轮生效，绝不能下沉进 `decide()`。**
+    `decide()` 是全流程唯一的退出码出口（P0–P5 都走它），把空洞绿放进去会连
+    **R0（`skip_planner:=true`、无运动）**一起拦在 P3 ⇒ 白丢掉 P4 的证据。
+    空洞绿在**不跑运动**时只是一个**记录**问题（用户 2026-10-07 的裁决：
+    「标记 ＋ 总表分开计数」），在**要跑运动**时才是**动作**问题（人可能压根没按，
+    而臂会动）。同一根判据，**要不要拦取决于下一步会不会动**。
+
+    ★ 先例就在同一个文件里：`counted()` 把「声明缺席」的项排除在三态计数之外，
+    理由也是「同一件事在不同场合该不该算数不一样」。同一条道理。
+    """
+    for i in items:
+        if getattr(i, "name", None) == IN_LOOP_ITEM:
+            return getattr(i, "vacuous", False) is not False
+    return True
+
+
 def count_vacuous(items):
     """→ `(确认空洞的 PASS 数, 未判的 PASS 数)`。**纯函数**。
 
@@ -1647,22 +1685,79 @@ def open_log(path):
     return open(os.path.expanduser(path), "w")
 
 
+def wait_for_state(ip, want, timeout, poll=2.0, dash=None, clock=time.time,
+                   sleep=None):
+    """轮询只读直到 `want(回复)` 为真 → `(到了没, 最后一次回复, 用时)`。
+
+    只读查询（`robotmode` / `programState` / `safetystatus`）；**不发** play / power /
+    stop —— 按播放是**人的动作**（红线 6）。
+
+    `dash` / `clock` / `sleep` 都可注入 ⇒ 这个循环**离线测得动**
+    （照 `wait_for_finish` 的先例）。
+    """
+    dash = dash or board_lib.dashboard
+    sleep = time.sleep if sleep is None else sleep
+    t0 = clock()
+    last = None
+    while True:
+        last = dash(ip)
+        if want(last):
+            return True, last, clock() - t0
+        if clock() - t0 >= timeout:
+            return False, last, clock() - t0
+        sleep(poll)
+
+
 def wait_for_playing(ip, timeout, poll=2.0, dash=None, clock=time.time):
     """起栈**之后**轮询只读直到 PLAYING → `(到了没, 最后一次回复, 用时)`。
 
     只读查询（`robotmode` / `programState` / `safetystatus`）；**不发** play / power /
     stop —— 按播放是**人的动作**（红线 6）。
     """
-    dash = dash or board_lib.dashboard
-    t0 = clock()
-    last = None
-    while True:
-        last = dash(ip)
-        if is_playing(last):
-            return True, last, clock() - t0
-        if clock() - t0 >= timeout:
-            return False, last, clock() - t0
-        time.sleep(poll)
+    return wait_for_state(ip, is_playing, timeout, poll=poll, dash=dash, clock=clock)
+
+
+def ensure_in_the_loop(ip, timeout, poll=2.0, dash=None, clock=time.time,
+                       sleep=None, prompt=print):
+    """交棒**之前**复核「人在环」—— 让人重按一次（**先 STOP，再 PLAY**），
+    并**看到那两步都真的发生**。→ `(过了没, 说明)`。
+
+    为什么是**两步握手**，不是只喊一句「按 STOP 再按 PLAY」：两个动作挨得近时，
+    2 s 一次的轮询可能**一次都没看见 STOPPED** —— 那时「PLAYING 一直为真」
+    既可能是「人按了」也可能是「压根没动」，**判不了**。所以卡在两步之间：
+    先**确认**它离开 PLAYING，再等它回来 ⇒ 「按过」这件事是**看到**的，不是猜的。
+    第一步没看到就直接**不交棒**（fail-closed）。
+
+    这**不是新规矩**：第一百一十轮实测过「收栈之后控制柜可能仍停在 PLAYING」，
+    当时的结论就是「每轮之间必须在示教器上按一次 STOP」—— 这里只是把它写成
+    启动器自己会走的步骤。
+
+    全程只读（`dashboard`）；**不发** play / power / stop。
+    """
+    prompt("")
+    prompt("=" * 66)
+    prompt("👉 交棒前复核「人在环」：请在示教器上按一下 **停止（STOP）**。")
+    prompt("   （上一轮收栈后控制柜可能还停在 PLAYING —— 那种绿**不算**你按过。）")
+    prompt("=" * 66)
+    left, d, _ = wait_for_state(ip, lambda x: not is_playing(x), timeout,
+                                poll=poll, dash=dash, clock=clock, sleep=sleep)
+    if not left:
+        return False, ("%.0fs 内没看到它离开 PLAYING（原文 %r）—— 「人在环」"
+                       "是不是**这一轮**走通的，判不了 ⇒ **不交棒**"
+                       % (timeout, str((d or {}).get("programState", "")).strip()))
+
+    prompt("")
+    prompt("=" * 66)
+    prompt("👉 现在请按示教器上的 **播放（PLAY）**。")
+    prompt("=" * 66)
+    back, d, waited = wait_for_state(ip, is_playing, timeout,
+                                     poll=poll, dash=dash, clock=clock,
+                                     sleep=sleep)
+    if not back:
+        return False, ("按了停止之后，%.0fs 内没等到 PLAYING（原文 %r）⇒ **不交棒**"
+                       % (timeout, str((d or {}).get("programState", "")).strip()))
+    return True, ("STOP → PLAY 两步**都看到了**（%.0fs 后回到 PLAYING）—— "
+                  "「人在环」是这一轮走通的" % waited)
 
 
 def find_marker(lines, marker):
@@ -2264,27 +2359,41 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                              "--authorize-motion 给了，但终端上没有确认 ⇒ 不交棒"))
                 code = 2
             else:
-                add(S5, Item("P5.交棒", PASS,
-                             "已授权（当次）；盯日志到收工并按任务描述的判分器判分"))
-                timeout = (a.timeout if a.timeout is not None else
-                           (task.timeout if task.timeout is not None else 900.0))
-                print("  盯日志（最多 %.0fs）：%s" % (timeout, log_path))
-                lines, finished = wait_for_finish(log_path, clock() + timeout,
-                                                  task.finish_marker, clock=clock)
-                if not finished:
-                    print("\n  ❌ %.0fs 内没等到 %r —— 被超时中断"
-                          % (timeout, task.finish_marker))
-                verdict_state, verdict = score_round(task, lines)
-                add(S5, Item("P5.判分",
-                             PASS if verdict is True else
-                             (FAIL if verdict is False else SKIP),
-                             verdict_state))
-                if verdict is None:
-                    code = 2
-                elif verdict is False:
-                    code = 1
-                else:
-                    code = 0 if finished else 2
+                # ★ 交棒前复核「人在环」—— **只在这一轮真会动的时候做**。
+                # P3 那条绿可能是**残 PLAYING**（上一轮收栈留下的），那时启动器
+                # 嘴上说「人在环走通了」而人根本没按 ⇒ 臂会动。这是启动器最该
+                # 消灭的一类失误，所以在这里拦住（判据见 `needs_repress`）。
+                # ⚠️ 不给 `--authorize-motion` 的那一轮走不到这里 ⇒ R0 的
+                # P0–P4 证据**一点不受影响**。
+                if needs_repress(counted(report, S3)):
+                    ok_loop, why_loop = ensure_in_the_loop(site.robot_ip,
+                                                           a.play_timeout, clock=clock)
+                    add(S5, Item("P5.人在环复核",
+                                 PASS if ok_loop else FAIL, why_loop))
+                    if not ok_loop:
+                        code = 2
+                if code == 0:
+                    add(S5, Item("P5.交棒", PASS,
+                                 "已授权（当次）；盯日志到收工并按任务描述的判分器判分"))
+                    timeout = (a.timeout if a.timeout is not None else
+                               (task.timeout if task.timeout is not None else 900.0))
+                    print("  盯日志（最多 %.0fs）：%s" % (timeout, log_path))
+                    lines, finished = wait_for_finish(log_path, clock() + timeout,
+                                                      task.finish_marker, clock=clock)
+                    if not finished:
+                        print("\n  ❌ %.0fs 内没等到 %r —— 被超时中断"
+                              % (timeout, task.finish_marker))
+                    verdict_state, verdict = score_round(task, lines)
+                    add(S5, Item("P5.判分",
+                                 PASS if verdict is True else
+                                 (FAIL if verdict is False else SKIP),
+                                 verdict_state))
+                    if verdict is None:
+                        code = 2
+                    elif verdict is False:
+                        code = 1
+                    else:
+                        code = 0 if finished else 2
     finally:
         if proc is not None:
             print("\n—— 收栈 ——")
