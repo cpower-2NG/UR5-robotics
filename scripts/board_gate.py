@@ -533,17 +533,40 @@ def _det_point(d3):
 # =====================================================================
 
 class Item:
-    __slots__ = ("name", "status", "detail", "evidence")
+    """一个三态项 ＋ 一个**正交**的 `vacuous`：这一条绿**算不算数**。
 
-    def __init__(self, name, status, detail, evidence=None):
+    `vacuous` 三态，且**只在 `P3.示教器 PLAYING` 上用**：
+
+    | 值 | 含义 |
+    |---|---|
+    | `False`（默认） | 与「人在环」无关，或已确认是**人**干的 |
+    | `True` | **确认空洞**：绿是真的，但「人在环走通了」是**假的**（残 PLAYING） |
+    | `None` | **判不了**（起栈前没读到控制柜）—— 最容易被读成「验过了」的那一档 |
+
+    ⚠️ 为什么要有它：状态列只有 `PASS`，而 `PASS` 有**两种含义**（「人按的」与
+    「上一轮残状态，人根本没动手」），真相原先**只在 detail 的散文里**。⇒ 连跑
+    三次若只看状态列，会把第 2 次数成一次「人在环走通了」（2026-10-07 R0 阶梯
+    实测，差一点就这么数了）。这与本仓「**SKIP 不得渲染成绿色**」是同一个病：
+    一个绿有两种含义，而记录里只剩一种字面。
+    """
+    __slots__ = ("name", "status", "detail", "evidence", "vacuous")
+
+    def __init__(self, name, status, detail, evidence=None, vacuous=False):
         self.name = name
         self.status = status
         self.detail = detail
         self.evidence = evidence or {}
+        self.vacuous = vacuous
 
     def as_dict(self):
-        return {"item": self.name, "status": self.status,
-                "detail": self.detail, "evidence": self.evidence}
+        d = {"item": self.name, "status": self.status,
+             "detail": self.detail, "evidence": self.evidence}
+        # 只在**不是** `False` 时才写这个键：`False` 是默认值（＝这一项与人在环
+        # 无关），给每一项都盖一个 `"vacuous": false` 是噪声。`True` 与 `None`
+        # 都必须落进 JSON —— 尤其 `None`，它是最容易被读成「验过了」的那一档。
+        if self.vacuous is not False:
+            d["vacuous"] = self.vacuous
+        return d
 
 
 def _required_controllers(args):

@@ -9,6 +9,12 @@
 
 运行:
   python scripts/test_minimal.py
+
+退出码（本仓约定，与 `state_check.py` 同源）：
+  0 = 跑到的都通过；1 = 有断言失败；**2 = 一项都没验到**（环境不满足，不是失败）
+⚠ **`SKIP` 不是通过**：本机没叠 conda 环境时 YOLO 那一段**没验到**，
+  它在总结里印 `SKIP` 而不是 `✓ PASS` —— 两者混在一起的话，人就学会无视它了
+  （台账里这道红被逐轮手写「与本轮无关」跳过了 5 次）。
 """
 
 import sys
@@ -18,12 +24,25 @@ from pathlib import Path
 # 添加项目根目录
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-import numpy as np
-import cv2
+try:
+    import numpy as np
+    import cv2
+except ImportError as exc:
+    # 缺 numpy/cv2 ⇒ **退 2（环境不满足），不是退 1**。两者的区别见文件头。
+    # 这道分支意味着 main() 里不必再有「一项都没验到」的判断：numpy/cv2 是硬依赖，
+    # 进得来这个模块就说明它俩在，测试 2/3 必然跑得成。
+    print("⏭  环境不满足：%s —— 本机没有 numpy/cv2，这道自检跑不了（**没验到**）" % exc)
+    sys.exit(2)
 
 
 def test_yolo():
-    """测试 YOLOv8 模型加载和推理。"""
+    """测试 YOLOv8 模型加载和推理。
+
+    **三态**：`True` 通过 / `False` 断言失败 / **`None` 没验到**（环境不满足）。
+    缺 ultralytics 或缺模型文件都是 `None` —— 它们是「这台机器上跑不了这一段」，
+    不是「这一段坏了」。两者都退成 `False` 的话，本机一跑就是红的、而红得没有
+    信息量，人就学会无视它（台账里这道红正是这么被跳过 5 次的）。
+    """
     print("=" * 60)
     print("[Test 1] YOLOv8 模型加载与推理")
     print("=" * 60)
@@ -31,8 +50,10 @@ def test_yolo():
     try:
         from ultralytics import YOLO
     except ImportError:
-        print("ERROR: ultralytics 未安装。请运行: pip install ultralytics")
-        return False
+        print("SKIP: ultralytics 未安装（本机没叠 conda 环境）。"
+              "要跑这一段: PYTHONPATH=<venv>/lib/python3.10/site-packages，"
+              "见 README「跑脚本」一节")
+        return None
 
     # 加载模型 —— 本项目实际部署的方块检测器（1 类 block）。
     # 旧版此处写的是 YOLO("yolov8n.pt") 却打印「COCO 类别示例」：那个名字
@@ -40,8 +61,11 @@ def test_yolo():
     # 存在——继续用会触发 ultralytics 静默联网下载（D6/D24）。
     model_path = Path(__file__).resolve().parent.parent / "block_best.pt"
     if not model_path.is_file():
-        print(f"WARNING: 未找到 {model_path}，跳过模型加载测试。")
-        return True
+        # ⚠️ 这里**曾经 `return True`** —— 模型文件根本不在，却报「通过」。
+        # 没验到就是没验到，不是「绿」。同族的坑本仓踩过：`0x0100` 只写寄存器
+        # 被读来判状态，读回来永远是 0，于是一直「通过」（AGENTS.md §2 红线 2）。
+        print(f"SKIP: 未找到 {model_path}，模型加载与推理**没验到**。")
+        return None
     print(f"加载 {model_path.name}...")
     model = YOLO(str(model_path))
     print(f"模型加载成功。类别数: {len(model.names)}")
@@ -64,7 +88,9 @@ def test_yolo():
     if result.boxes is None or len(result.boxes) == 0:
         print("WARNING: 未检测到目标。阈值可能太高或模拟图像不匹配。")
         print("  尝试降低 confidence_threshold 或使用真实图像。")
-        # 不算失败，因为模拟图像可能确实检测不到
+        # 仍算通过：**模型加载与推理这两件事确实跑了**，只是合成图没检出东西。
+        # 与上面「模型文件不在」不同 —— 那一个连推理都没发生。（这一条留 `True`
+        # 是作者的判断，不是漏改。）
         return True
 
     boxes = result.boxes.xyxy.cpu().numpy()
@@ -182,19 +208,31 @@ def main():
     print("  测试总结")
     print("=" * 60)
     all_pass = True
+    skipped = []
     for name, ok in results:
-        status = "✓ PASS" if ok else "✗ FAIL"
-        if not ok:
+        if ok is None:
+            status = "— SKIP（没验到）"
+            skipped.append(name)
+        elif ok:
+            status = "✓ PASS"
+        else:
+            status = "✗ FAIL"
             all_pass = False
         print(f"  {name:.<20} {status}")
 
     print()
-    if all_pass:
-        print("  全部测试通过! 可以继续部署 ROS2 环境。")
-    else:
+    if not all_pass:
         print("  部分测试失败，请检查环境配置。")
+    elif skipped:
+        print("  跑到的都通过，但**没验到的**：%s —— SKIP 不算通过。" % "、".join(skipped))
+    else:
+        print("  全部测试通过! 可以继续部署 ROS2 环境。")
 
-    return 0 if all_pass else 1
+    # 退出码：1 = 有断言失败；0 = 跑到的都通过（**允许有 SKIP** —— 与
+    # `test_ag95_probe.py` 同一约定：局部没验到不把整道判红）。
+    # 「一项都验不到」在**导入期**就退 2 了（numpy/cv2 是硬依赖），所以这里没有
+    # 那个分支 —— 写了也永远不亮，等于假装有覆盖。
+    return 1 if not all_pass else 0
 
 
 if __name__ == '__main__':

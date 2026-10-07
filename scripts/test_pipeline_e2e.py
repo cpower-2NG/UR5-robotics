@@ -50,14 +50,25 @@ import sys
 import time
 
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseStamped, TransformStamped
-from vision_msgs.msg import (
-    Detection2DArray, Detection2D, BoundingBox2D, Pose2D, Point2D,
-    Detection3DArray, ObjectHypothesisWithPose,
-)
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import Image, CameraInfo
+    from geometry_msgs.msg import PoseStamped, TransformStamped
+    from vision_msgs.msg import (
+        Detection2DArray, Detection2D, BoundingBox2D, Pose2D, Point2D,
+        Detection3DArray, ObjectHypothesisWithPose,
+    )
+except ImportError as exc:
+    # ⚠️ **退 2（环境不满足），不是退 1**。缺的是**依赖**（本机没有 rclpy /
+    # vision_msgs，或没 source 工作区），不是「判据不成立」。两者混在一起的话，
+    # 本机一跑就是红的、而红得没有信息量 —— 人就开始无视它，第 109 轮那道
+    # 崩死 13.5 小时的守卫就是这么被无视掉的。
+    # 本仓约定：`0` 通过 / `1` 断言失败 / `2` 环境不满足（见 `state_check.py`）。
+    print("⏭  环境不满足：%s —— 本机没有 rclpy / vision_msgs 或没 source 工作区，"
+          "这道自检在这里跑不了（**没验到**，不算通过也不算失败）" % exc)
+    sys.exit(2)
 from tf2_ros import StaticTransformBroadcaster
 
 FX = FY = 138.5          # 554 / 4

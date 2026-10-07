@@ -175,8 +175,10 @@ def load_mutant(src_text, tag):
     return mod
 
 
-def I(name, status, detail="", evidence=None):
-    return board_gate.Item(name, status, detail, evidence)
+def I(name, status, detail="", evidence=None, **kw):
+    # `**kw` 是给 `vacuous=` 走的（[5e] 要用）。夹具**转发**而不是自己再实现一遍
+    # 三态 —— 抄一份的话，`Item` 加字段时这里会静默漏掉，测试就成了假绿。
+    return board_gate.Item(name, status, detail, evidence, **kw)
 
 
 def unquoted_scalar(text, key):
@@ -613,6 +615,7 @@ try:
                  "split_entry", "parse_callable", "build_launch_cmd", "params_to_argv",
                  "resolve_launch_params", "planner_yaml_params", "path_in_repo",
                  "find_task_file", "find_marker", "render_counts", "score_round",
+                 "playing_is_vacuous", "count_vacuous",
                  "find_authorization_keys", "task_dotted_paths", "judge_write_path",
                  "judge_repair_outcome", "switch_payload_lines", "repair_hint",
                  "print_repair_hint", "task_params", "judge_entry_parity",
@@ -1181,6 +1184,99 @@ try:
                   {**CAB_RUN, "programState": "PLAYING ur5ros.urp"}) != ""
               and _m_rp.residual_playing_note(
                   {**CAB_RUN, "programState": "PLAYING ur5ros.urp"}) == "")
+
+    # -----------------------------------------------------------------
+    # 5e. 上面那根判据的**机器可读**那一面（2026-10-07 R0 阶梯第 2 次逼出来的）
+    # -----------------------------------------------------------------
+    section("[5e] 空洞绿：`PASS` 有两种含义 ⇒ 机器也要分得清（不只写在散文里）")
+
+    _pl = {"programState": "PLAYING ur5ros.urp"}
+    _pa = {"programState": "PAUSED ur5ros.urp"}
+    check("★ 起栈前 PLAYING ⇒ `True`（确认**空洞**）",
+          board_run.playing_is_vacuous({**CAB_RUN, **_pl}) is True,
+          repr(board_run.playing_is_vacuous({**CAB_RUN, **_pl})))
+    check("  起栈前 STOPPED ⇒ `False`（确认是**人**按的）",
+          board_run.playing_is_vacuous(CAB_RUN) is False)
+    check("  ★ Dashboard 没答话 ⇒ `None`（**判不了**）—— 不许当 `False`："
+          "把「没读到」算成「确认是人按的」正是本仓最贵的那类误读",
+          board_run.playing_is_vacuous(None) is None,
+          repr(board_run.playing_is_vacuous(None)))
+    check("  PAUSED 不算（与 `is_playing` 同一条，不另立判据）",
+          board_run.playing_is_vacuous({**CAB_RUN, **_pa}) is False)
+
+    # ★ 两面必须同源：散文说「空洞」而 JSON 说「不是」的话，就没有任何东西拦得住。
+    check("★ 与 `residual_playing_note` **逐档一致**（同一根判据的两个出口，"
+          "不许一个说空洞、另一个说没事）",
+          all((board_run.residual_playing_note(c) != "")
+              == (board_run.playing_is_vacuous(c) is not False)
+              for c in ({**CAB_RUN, **_pl}, CAB_RUN, None, {**CAB_RUN, **_pa})))
+
+    check("  `count_vacuous` 把「确认空洞」与「未判」**分开数**"
+          "（合成一个数会重演「同一个标签盖两种状态」）",
+          board_run.count_vacuous([
+              I("a", board_run.PASS, "d", vacuous=True),
+              I("b", board_run.PASS, "d", vacuous=None),
+              I("c", board_run.PASS, "d"),
+              I("e", board_run.FAIL, "d", vacuous=True),
+          ]) == (1, 1),
+          repr(board_run.count_vacuous([
+              I("a", board_run.PASS, "d", vacuous=True),
+              I("b", board_run.PASS, "d", vacuous=None)])))
+
+    _vline = "\n".join(board_run.render_item(
+        I("P3.示教器 PLAYING", board_run.PASS, "0s 后 PLAYING", vacuous=True)))
+    _uline = "\n".join(board_run.render_item(
+        I("P3.示教器 PLAYING", board_run.PASS, "PLAYING", vacuous=None)))
+    _nline = "\n".join(board_run.render_item(
+        I("P4.camera", board_run.PASS, "30.0 Hz")))
+    check("★ 空洞绿在**状态行底下**补一行「空洞绿…没有证明人在环走通了」",
+          "空洞绿" in _vline and "人在环" in _vline)
+    check("  未判那一档也补一行，且**明写不许读成验过了**",
+          "未判" in _uline and "不许" in _uline)
+    check("  与人在环无关的 PASS（P4.camera）**一个字都不多**"
+          "（正常的一轮别被噪声淹没）",
+          "空洞" not in _nline and "未判" not in _nline)
+
+    _sum_v = "\n".join(board_run.render_summary(
+        [I("a", board_run.PASS, "d", vacuous=True),
+         I("b", board_run.PASS, "d"),
+         I("c", board_run.FAIL, "d")], 2))
+    check("★ 总表**必须**单独说一句空洞绿 —— 否则三连跑会被读成"
+          "「人在环走通 3 次」，而真相是 1 次",
+          "2 项 PASS" in _sum_v and "1 项空洞" in _sum_v, _sum_v)
+    check("  没有空洞项时**不多说**（`PASS 1 / FAIL 0 / SKIP 0` 就完了）",
+          "空洞" not in "\n".join(board_run.render_summary(
+              [I("a", board_run.PASS, "d")], 2)))
+
+    check("★ `Item.as_dict()` 只在**不是 False** 时才写 `vacuous`"
+          "（False 是默认值 ⇒ 写满屏是噪声；但 `None`（未判）**必须**落进 JSON）",
+          "vacuous" not in I("a", board_run.PASS, "d").as_dict()
+          and I("a", board_run.PASS, "d", vacuous=True).as_dict()["vacuous"] is True
+          and I("a", board_run.PASS, "d", vacuous=None).as_dict()["vacuous"] is None)
+
+    check("源码钉子：P3 那条 Item 传的是 `vacuous=playing_is_vacuous(...)`，"
+          "且取的是 `facts.get(\"cabinet\")`（与散文那支**同源**）",
+          "vacuous=playing_is_vacuous(" in SRC
+          and "playing_is_vacuous(facts.get(\"cabinet\"))" in SRC)
+
+    _m_pv = load_mutant(_mutate(
+        SRC, "    return bool(board_lib.is_playing(cabinet))\n",
+        "    return False\n", "pv"), "pv")
+    if _m_pv is not None:
+        check("变异：把 `playing_is_vacuous` 的残状态那一支**掐掉**（恒 False）"
+              "⇒ 第 2 次 R0 那种空洞绿又变回「看起来是人按的」",
+              board_run.playing_is_vacuous({**CAB_RUN, **_pl}) is True
+              and _m_pv.playing_is_vacuous({**CAB_RUN, **_pl}) is False)
+
+    # 键改名（2026-10-07）：旧名读起来像「P3/P4 阶段的判决」，其实是子进程退出码。
+    _rec_ast = [n for n in ast.walk(TREE)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and n.value in ("gate_p3_exit", "gate_p4_exit",
+                                "controllers_gate_exit", "p4_gate_exit")]
+    _seen = {n.value for n in _rec_ast}
+    check("★ 报告键已改名：`gate_p3_exit`/`gate_p4_exit` 在源码里**不再出现**"
+          "（它们读起来像阶段判决，实为 `board_gate.py` 子进程的退出码）",
+          _seen == {"controllers_gate_exit", "p4_gate_exit"}, repr(sorted(_seen)))
 
     # =================================================================
     # 6. 外参

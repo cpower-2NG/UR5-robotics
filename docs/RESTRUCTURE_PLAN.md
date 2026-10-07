@@ -16035,3 +16035,151 @@ run 3′ 的 JSON 里：`exit=2`、**`gate_p3_exit=0`** —— 而那一轮 P3 *
 6. 沿用第一百零九轮的：`run_all_guards.sh` 要不要加；`board_gate.py --json-report`
    的 P0 守卫；R0 的 `min_candidates: 4` 是否合适；计划第 7 步的 4 份
    `leftovers()` 抄本。
+
+---
+
+## 第一百一十一轮：守卫清单从**手抄**改成**算出来的**；第一次全扫逮到 4 道红，**根因全是「缺依赖被报成断言失败」**（2026-10-07）
+
+### 0. 一句话
+
+`run_all_guards.py` 的清单**由 `os.listdir` 算出来**（不是手维护）⇒ 第一次全扫就
+逮到 **4 道红**，而它们**全都被台账逐轮手写「与本轮无关」跳过过**；逐道查下去，
+**4 道的根因是同一个**：缺依赖却退 `1`（断言失败），不是退 `2`（环境不满足）——
+**一道永远红、而红得没有信息量的守卫，和一道永远绿的守卫一样没用**，
+人只会学会无视它，第一百零九轮那道崩死 13.5 小时的守卫就是这么死的。
+
+### 1. 起因：手抄清单是会烂的
+
+第一百零九轮的病**不是**「某道守卫坏了」，是「**没人知道它坏了**」——
+手工维护的清单漏掉了 `test_startup_docs.py`，它沉默了 ~13.5 小时。
+⇒ 本轮的清单**不写死**：`guard_files()` = `os.listdir(scripts/)` 里所有
+`test_*.py` ∪ `EXTRA_GUARDS`（`state_check.py`：它是守卫但没有 `test_` 前缀）
+− 自己。**加一道守卫 = 建一个文件，不改清单。**
+
+`test_run_all_guards.py` 只钉这一条：第 [1] 节是「目录里每一个 `test_*.py`
+都在清单里」的**逐个比对**（差集为空），不是「条数够多」；第 [4] 节**变异**——
+把「扫目录」换成手写清单并**故意漏一道**，第 [1] 节**必须翻红**。
+★ 变异体住在临时目录里，它自己的 `HERE` 是那个空目录 ⇒ 必须**显式**把真实的
+`scripts/` 传进去，否则它测的是「临时目录是空的」而**为了错的理由变红**。
+
+### 2. 第一次全扫：32 通过 / **4 红** / 5 环境不满足（共 41）
+
+红的是：`test_ag95_probe.py`、`test_guard_path.py`、`test_minimal.py`、
+`test_pipeline_e2e.py`。**4 道**里**没有一道是新的**——台账里它们被逐轮手写
+跳过：`10083`「与本轮无关：`ultralytics` 未安装」、`12645`「与本轮无关」、
+`13698`「`test_guard_path`/`test_minimal`/`test_pipeline_e2e` 退出码 1」……
+`test_minimal.py` 那一道**被跳过了 5 次**。
+
+⇒ **每轮作者手写的「与本轮无关」，正是机器该替他判的那件事。** 这是本轮的全部意义。
+
+### 3. 4 道红的根因：**全是缺依赖**，且 3 道**报错了方式**
+
+| 脚本 | 缺什么 | 实测证据（不是我推断的） |
+|---|---|---|
+| `test_guard_path.py` | `rclpy` | 回溯结束于 `ModuleNotFoundError: No module named 'rclpy'` |
+| `test_pipeline_e2e.py` | `rclpy` / `vision_msgs` | 同上 |
+| `test_ag95_probe.py` | `action_msgs` | **探针自己印的**：`637 ‰（千分位原值；**未换算：No module named 'action_msgs'**）` |
+| `test_minimal.py` | `ultralytics` | `ERROR: ultralytics 未安装` |
+
+**判据（本仓 0/1/2 约定）**：`0` 通过 / `1` **断言失败** / `2` **环境不满足**。
+前 3 道把「本机跑不了这一段」报成了「这一段坏了」——**两者混在一起，本机一跑
+就是红的，而红得没有信息量**。★ 这一条不是本轮新立的：`state_check.py` 早就
+这么退码，另有 5 道已经在照做，**是这 4 道没跟上**。
+
+### 4. 逐道处置
+
+| 脚本 | 改法 |
+|---|---|
+| `test_guard_path.py` | 懒 import（`rclpy`/`planner_node`）包 `try/except ImportError` ⇒ 退 **2** |
+| `test_pipeline_e2e.py` | 模块级 ROS import 包 `try/except` ⇒ 退 **2** |
+| `test_ag95_probe.py` | 把那条「dump 读到 60.5 mm」**拆成两条**：原值 637‰ 一条（本机就能验），**换算**一条带 `skip=`（换算走 `grasp_planner.gripper` ⇒ 要 ROS 环境）⇒ `PASS 36 / SKIP 4 / FAIL 0`，退 0 |
+| `test_minimal.py` | 见 §5 |
+
+★ `test_ag95_probe.py` 那一条拆开之后**信息量更高了**：原先它红，人读到的结论是
+「探针坏了」；现在它明说「**原值读到了 637‰ 是真的验到了**，换算那一步本机没验到」。
+**同一批断言，把「验到什么」与「没验到什么」分开写，红绿才有意义。**
+
+### 5. `test_minimal.py`：一处**静默假通过**，比缺依赖更该修
+
+它原来有两处问题，第二处是**真的缺陷**、不是环境：
+
+1. 缺 `ultralytics` ⇒ `return False` ⇒ 退 1（同 §3）。
+2. **模型文件 `block_best.pt` 不在时 `return True`** —— 模型**根本没加载**，
+   却报「通过」。这是**静默假通过**，与 AGENTS.md §2 红线 2 记的 `0x0100` 是
+   **同一个形状**（只写寄存器被读来判状态，读回来恒 0，于是一直「通过」）。
+
+**处置**：`test_yolo()` 改成**三态** `True` / `False` / **`None`（没验到）**；
+`block_best.pt` 不在 ⇒ `None`。总表把 `None` 印成 **`— SKIP（没验到）`**，
+并单独一行印「跑到的都通过，但**没验到的**：YOLO 检测 —— SKIP 不算通过」。
+`numpy`/`cv2` 也包了 `try/except` ⇒ 退 **2**（它们是硬依赖，进得来模块就说明它在，
+所以「一项都没验到」那一支**不必写在 `main()` 里** —— 写了也永远不亮，**等于假装有覆盖**）。
+
+**两个分支都真跑了，不是看源码猜的**：
+
+- 塞一个假的 `ultralytics` 进 `sys.modules`、模型文件仍不在 ⇒ 逼出那一支
+  ⇒ **返回 `None`**（改前是 `True`）。
+- 用 `sys.meta_path` 钩子**真的把 `numpy` 挡掉** ⇒ 退 **2**（改前会回溯 ⇒ 退 1）。
+- 正常路径 ⇒ 退 **0**（YOLO 一项 SKIP，另两项通过）。
+
+★ 刻意**没改**的一处：`result.boxes` 为空时仍 `return True` ——
+那是「模型加载与推理**确实跑了**，只是合成图没检出东西」，与「模型文件不在、
+连推理都没发生」是两回事。**已在代码里写明这是判断、不是漏改**，
+免得下一个人当成同一类 bug 顺手改掉。
+
+### 6. 用户四项设计决定：落地三项，第四项卡在没有参考图
+
+| # | 决定 | 状态 |
+|---|---|---|
+| 1 | `run_all_guards.sh` 加不加 | ✅ **加了**，但做成 **`.py`**（理由：要复用 `run_all_guards.py` 的纯函数做自检；`.sh` 测不了） |
+| 2 | 空洞绿怎么记 | ✅ 取「`vacuous` 标记 ＋ 总表分开计数」，已实现 |
+| 3 | `gate_p3_exit`/`gate_p4_exit` 改名 | ✅ 改为 `controllers_gate_exit` / `p4_gate_exit` |
+| 4 | `topcam_drift_check` 的参考帧 | ⏳ **已裁决**（`site.yaml` 加键），**未实现** —— 要一帧真参考图才验得完，需真机 + 当次授权 |
+
+**空洞绿的三态**（`board_gate.Item.vacuous`，与 `status` **正交**）：
+`False` = 与「人在环」无关或已确认是人干的／`True` = **确认空洞**（绿是真的，
+但「人在环走通了」是**假的**）／`None` = **判不了**（起栈前没读到控制柜）。
+判据是**纯函数** `playing_is_vacuous()` / `count_vacuous()` ⇒ 离线可测；
+`render_summary` **用 PASS 总数当分母**印「上面这 N 项 PASS 里，M 项空洞」。
+（★ 这里我自己先写错过一次：分母用了「空洞 + 未判」，于是印出「1 项 PASS 里
+1 项空洞」，被本轮新加的自检逮住 —— **新断言当场抓到了写它的人**。）
+
+### 7. 终态：35 通过 / **0 红** / 7 环境不满足（共 42），退 0
+
+**★ 这个「0 红」是分类出来的，不是掩盖出来的** —— 反证就是 §3 那张表的第三列：
+四道的红**每一道都有实测证据**指向「本机缺这个包」，没有一道是「看起来像环境
+就放过」。唯一真正的缺陷（§5 的静默假通过）**没有**被归进环境，而是**修掉了**。
+
+`test_run_all_guards.py`（跑守卫的那个跑者的自检）**也在被扫的清单里**，
+且通过 —— 它守卫的正是「清单漏不掉」。
+
+### 8. 本轮改了哪些文件
+
+新增 `scripts/run_all_guards.py`（跑者）、`scripts/test_run_all_guards.py`（跑者的自检）；
+改 `scripts/board_gate.py`（`Item.vacuous`）、`scripts/board_run.py`
+（`playing_is_vacuous`/`count_vacuous`/报告键改名/`SKIP` 不许绿）、
+`scripts/test_board_run.py`（[5e] 空洞绿那一节 ＋ 变异 ＋ 改名钉子）、
+`scripts/test_ag95_probe.py`、`test_guard_path.py`、`test_pipeline_e2e.py`、`test_minimal.py`；
+文档 `docs/待执行命令.md`（悬案 ④⑤ 标记已裁决并执行、⑥ 标记已裁决未实现 ＋ 新增 ⑦⑧）。
+
+### 9. 悬案
+
+1. **`test_minimal.py` 算不算守卫**（新增 ⑦）：它被扫进清单只因**文件名**以
+   `test_` 开头，而 `README.md` 自己叫它「冒烟」，且三项里**两项测的是 numpy**
+   （手写数组求逆/求 median），不是仓库里的任何东西。三个选项：保持现状／
+   改名 `smoke_minimal.py` 移出清单／只留 `test_yolo`。**属设计。**
+2. **`run_all_guards.py` 的聚合退出码**（新增 ⑧）：≥1 道跑了且无 FAIL ⇒ 退 0，
+   哪怕 42 道里 30 道是 `rc=2`。明细与点名都印在总表里（不藏），但退出码不为
+   此说话 ⇒ 一台没 source 工作区的机器上也会显得「全过」。**属设计。**
+3. **`topcam_drift_check.py` 接 P4**（§6 第 4 项）：已裁决走 `site.yaml` 新键，
+   改站点 schema 要一帧真参考图才验得完 ⇒ **需真机 + 当次授权**，
+   属「需要你看现场」的一类。
+4. **R1（有运动）仍未跑过**，含计划要求的「刻意扰动那一次」。
+5. **`repair_exercised` 四次都是 `false`** ⇒ 控制器修复路径的绿仍是**空的**。
+6. 沿用：`board_gate.py --json-report` 的 P0 守卫；R0 的 `min_candidates: 4`
+   是否合适；计划第 7 步的 4 份 `leftovers()` 抄本（`board_ctrlc_check.py:107`、
+   `board_chain_check.py:84`、`board_state_machine_check.py:118`、
+   `moveit_only_check.py:96`）—— 它们**没有一道有离线自检**。
+7. **没有一道守卫在守「守卫的退出码约定」**：本轮 4 道红全靠**跑一遍**才发现。
+   要不要加一条「凡是 import 重依赖的 `test_*.py`，都必须 import 在
+   `try/except ImportError` 里」的源码级守卫？**这条我拿不准会不会误伤**
+   （有些脚本的重依赖是可选路径），**留给用户定**。

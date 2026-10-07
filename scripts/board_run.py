@@ -1106,6 +1106,37 @@ def residual_playing_note(cabinet):
     return ""
 
 
+def playing_is_vacuous(cabinet):
+    """`P3.示教器 PLAYING` 这一条绿**算不算数**。**纯函数** → `True` / `False` / `None`。
+
+    与 `residual_playing_note()` 是**同一根判据的两面**：那一支给**人**读（散文），
+    这一支给**机器**读（进 JSON、进结算）。两者必须同步改 —— 合在一处算就是
+    为了让它们不可能漂开。
+
+    · `False` —— 起栈**之前**控制柜不是 PLAYING ⇒ 这个 PLAYING 是**人按出来的**。
+    · `True`  —— 起栈之前**就已经** PLAYING（残状态）⇒ 绿是真的（控制器确实连得上，
+      闸门该放行 —— 用户的裁决是「说清 ＋ 放行」），但「**人在环走通了**」是假的。
+    · `None`  —— 起栈前**没读到**（Dashboard 没答话）⇒ **判不了**。⚠️ 这一档
+      **不许**当成 `False`：把「没读到」算成「确认是人按的」，正是本仓最贵的那类
+      误读（「一次状态查询报告的往往是它自己那个对象的活性」）。
+    """
+    if cabinet is None:
+        return None
+    return bool(board_lib.is_playing(cabinet))
+
+
+def count_vacuous(items):
+    """→ `(确认空洞的 PASS 数, 未判的 PASS 数)`。**纯函数**。
+
+    分开数是因为它们**不一样**：`True` 是**查实了**的（人没动手），`None` 是
+    **没查到**。合成一个数会重演「同一个标签盖两种状态」。
+    """
+    def _v(i):
+        return getattr(i, "vacuous", False)
+    return (sum(1 for i in items if i.status == PASS and _v(i) is True),
+            sum(1 for i in items if i.status == PASS and _v(i) is None))
+
+
 def judge_preflight(facts):
     """P1 全部前置项 → `[Item, ...]`（顺序 = `P1_NAMES`）。**纯函数**。
 
@@ -1353,8 +1384,17 @@ def render_item(item, absent=None):
         return ["  [缺席] %-18s —（这一档没测）" % item.name,
                 "         ↳ 声明缺席（%s）—— 既不计入通过，也不计入失败" % absent]
     lines = ["  [%s] %-18s %s" % (item.status, item.name, item.detail)]
+    # `SKIP` 与「空洞绿」是同一条规矩的两个实例：**一条状态行不许自带两种含义**。
+    # 所以两者都在状态行底下补一行，把「这一条到底证明了什么」说死。
+    v = getattr(item, "vacuous", False)
     if item.status == SKIP:
         lines.append("         ↳ **没验到**，不计入通过。")
+    elif item.status == PASS and v is True:
+        lines.append("         ↳ ⚠️ **空洞绿**：状态是 `PASS`，但这一条**没有**证明"
+                     "「人在环走通了」（理由见上）。")
+    elif item.status == PASS and v is None:
+        lines.append("         ↳ ⚠️ **未判**：「人在环」这一半**没读到**控制柜 ⇒ "
+                     "**不许**读成验过了。")
     return lines
 
 
@@ -1374,6 +1414,20 @@ def render_summary(items, code, absent=None, verdict_state=None, dry_run=False):
     p, f, s = render_counts(items)
     out = ["  PASS %d / FAIL %d / SKIP %d" % (p, f, s)
            + ("（另有 %d 项声明缺席，不计入）" % len(absent) if absent else "")]
+    # ⚠️ 总表**必须**把空洞绿单独说一句。理由：连跑 N 次时，只有第 1 次真的考到人
+    # （之后每轮起栈前控制柜还是 PLAYING，除非人按 STOP）。若总表只印
+    # `PASS 24`，三连跑会被读成「人在环走通 3 次」，而真相是 1 次。
+    n_vac, n_unjudged = count_vacuous(items)
+    if n_vac or n_unjudged:
+        bits = []
+        if n_vac:
+            bits.append("**%d 项空洞**（人没按，是上一轮留下的残状态）" % n_vac)
+        if n_unjudged:
+            bits.append("**%d 项未判**（起栈前没读到控制柜）" % n_unjudged)
+        # 分母是**全部** PASS（`p`），不是空洞数 —— 写成空洞数会印出
+        # 「上面这 1 项 PASS 里，1 项空洞」，而总数其实是 2。
+        out.append("  ⚠️ 上面这 %d 项 PASS 里，%s —— **都不算「人在环走通了」**。"
+                   % (p, "、".join(bits)))
     if verdict_state:
         out.append("  本任务判分：%s" % verdict_state.splitlines()[0])
     if code == 0 and dry_run:
@@ -2083,11 +2137,15 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         if ok:
             # `facts["cabinet"]` 是 **P1**（＝起栈**之前**）读到的那一份 —— 只有它
             # 能回答「这一条是不是人按的」（理由见 `residual_playing_note`）。
+            # `vacuous` 与上面那句 `residual_playing_note(...)` 是**同一根判据**的
+            # 两个出口（给人读 / 给机器读），必须同源 —— 所以这里也传同一个
+            # `facts["cabinet"]`（＝**P1、起栈之前**读到的那一份）。
             add(S3, Item("P3.示教器 PLAYING", PASS,
                          "%.0fs 后 %s（原文 %r）%s"
                          % (waited, board_lib.dash_program_state(d),
                             str(d.get("programState", "")).strip(),
-                            residual_playing_note(facts.get("cabinet")))))
+                            residual_playing_note(facts.get("cabinet"))),
+                         vacuous=playing_is_vacuous(facts.get("cabinet"))))
         else:
             got = str((d or {}).get("programState", "")).strip()
             add(S3, Item("P3.示教器 PLAYING", FAIL,
@@ -2534,8 +2592,18 @@ def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
         "handoff_window": {"moved_maybe": moved, "note": note},
         "items": [i.as_dict() for (_, i, ab) in report["rows"] if not ab],
         "absent": report["absent"],
-        "gate_p3_exit": (gate_p3 or {}).get("exit"),
-        "gate_p4_exit": (gate_p4 or {}).get("exit"),
+        # ⚠️ 这两个键**改过名**（2026-10-07）。旧名 `gate_p3_exit` / `gate_p4_exit`
+        # 读起来像「P3 / P4 阶段的判决」，**其实不是**：它们是 `board_gate.py`
+        # 那一次**子进程**的退出码，而两次的子进程覆盖范围**不一样** ——
+        #   · P3 那次是 `--only controllers` ⇒ 只管**控制器**子闸门；
+        #     P3 的 `示教器 PLAYING` 那一半是**本文件自己**判的（`wait_for_playing`），
+        #     **不进**这个字段。
+        #   · P4 那次覆盖 P4 的全套预检。
+        # 实测踩点：2026-10-07 R0 阶梯第 3′ 次 JSON 是 `exit=2` 配
+        # `gate_p3_exit=0`，而那一轮 P3 **明确 FAIL**（示教器 300 s 没等到 PLAYING）
+        # —— 差一点被读成「P3 过了」。阶段的判决看 `items` 与末行的 `exit`。
+        "controllers_gate_exit": (gate_p3 or {}).get("exit"),
+        "p4_gate_exit": (gate_p4 or {}).get("exit"),
         "verdict": verdict_state,
         "exit": code,
     }

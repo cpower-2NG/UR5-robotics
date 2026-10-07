@@ -428,9 +428,18 @@ def main():
 
     print(__doc__.strip().splitlines()[1])
     ok = True
-    import rclpy
-    from rclpy.executors import SingleThreadedExecutor
-    from grasp_planner.planner_node import GraspPlanner
+    try:
+        import rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        from grasp_planner.planner_node import GraspPlanner
+    except ImportError as exc:
+        # ⚠️ **退 2（环境不满足），不是退 1**。这里缺的是**依赖**（本机没有 rclpy
+        # 或没 source 工作区），不是「判据不成立」——两者必须分开，否则本机一跑
+        # 就是红的，而红得没有信息量，人就开始无视它。
+        # 本仓约定：`0` 通过 / `1` 断言失败 / `2` 环境不满足（见 `state_check.py`）。
+        print("⏭  环境不满足：%s —— 本机没有 rclpy / 没 source 工作区，"
+              "这道自检在这里跑不了（**没验到**，不算通过也不算失败）" % exc)
+        return 2
 
     # 起一个**真的** GraspPlanner（`gripper_backend:=none`，不碰硬件）。
     # A/D 两段共用这一个实例 —— rclpy 在一个进程里 init 两次不可靠。

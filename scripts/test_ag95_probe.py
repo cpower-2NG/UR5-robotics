@@ -391,8 +391,25 @@ def main() -> int:
             check("扫从站：退出码 0（有设备就该成功）", rc == 0, f"rc={rc}")
 
             rc, out = _run_probe(["--port", pair.port, "--slave", "1", "--dump"])
-            check("dump：FC3 读到 0x0202 = 637‰（含两种方向解释）",
-                  "[OK ] 0x0202" in out and "60.5" in out, out)
+            # ⚠️ 这两条**必须分开钉**。`60.5`（637‰ 换算成的毫米数）要 **ROS 环境**：
+            # 换算来自 `grasp_planner.gripper`，它 import `action_msgs`。本机没 source
+            # 时探针**明说自己没换算**（输出里有「未换算」）—— 那不是缺陷，是这一档
+            # 在这里跑不了。
+            #
+            # 原来合成一条断言 ⇒ 本机**恒红**，而红得没有信息量。这正是本文件的
+            # 反面：题记说它「**离线**，不需要真夹爪」，可这一条却偷偷要 ROS。
+            # （2026-10-07 `run_all_guards.py` 扫出来的，见 RESTRUCTURE_PLAN
+            # 第一百一十一轮。）判据：**读到值**离线也要钉；**换算结果**只在
+            # 换算真的做了的时候钉，否则记 SKIP。
+            _converted = "未换算" not in out
+            check("dump：FC3 读到 0x0202（原值 637‰）",
+                  "[OK ] 0x0202" in out and "637" in out, out)
+            check("dump：再换算成 60.5 mm（**要 ROS 环境**：换算走 "
+                  "`grasp_planner.gripper` ⇒ `action_msgs`）",
+                  ("60.5" in out) if _converted else False,
+                  (out if _converted
+                   else "本机没有 ROS 环境 ⇒ 探针自己说「未换算」，这一档**没验到**"),
+                  skip=not _converted)
             check("dump：非法地址 0x0300 报错（不是崩溃）",
                   "[--] 0x0300" in out, out)
             check("dump：FC3 与 FC4 都试过",
