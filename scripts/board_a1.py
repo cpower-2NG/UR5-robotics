@@ -381,6 +381,8 @@ def main(argv=None):
             name = {0: "未初始化", 2: "初始化进行中"}.get(st, f"未知值 {st}")
             print(f"❌ AG-95 {name}（0x0200={st}）—— 先跑：")
             print("     python3 scripts/ag95_init_close.py --go")
+            print("   （写完停在**全开**——规划器起栈时自己会 open()，这里不需要闭合。")
+            print("    要**闭合**态是另一回事，那是碰点标定：`--close`，见待执行命令.md）")
             print("   未初始化时起栈，规划器会在启动序列上静默卡住 ~15 分钟。")
             return 2
         print("  ✓ AG-95 已初始化（0x0200=1）")

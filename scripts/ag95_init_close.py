@@ -11,8 +11,8 @@ AG-95 **断电就丢初始化**（指示灯转红闪、位置回读归零），�
 
 闸门（**默认什么都不做**）
 ==========================
-不带 `--go` 时**一个寄存器都不写**，只读状态并打印「本来会写什么」。
-真写必须显式给 `--go`。这是本仓库对「会动的东西」的一贯做法
+不带 `--go` / `--close` 时**一个寄存器都不写**，只读状态并打印「本来会写什么」。
+真写必须显式给开关。这是本仓库对「会动的东西」的一贯做法
 （对照 `ag95_dry_run: true` 的默认值）。
 
 **写之前请确认一件具体的物理事实**（不是「用户说过可以」）：
@@ -31,6 +31,17 @@ AG-95 **断电就丢初始化**（指示灯转红闪、位置回读归零），�
 
 所以本脚本**默认只做 ①**，② 要额外给 `--close`。
 
+**两档可以分开给**（2026-10-07 之前不行 —— `--close` 必须搭 `--go`）：
+
+| 给什么 | 做什么 | 什么时候用 |
+|---|---|---|
+| `--go` | 只初始化，停在**全开** | 起栈前过 P1 闸门（规划器起栈时自己会 `open()`，见 `planner_node.py`） |
+| `--close` | **只合拢**，不碰 `0x0100` | 夹爪**已经初始化**、只要闭合态。**碰点标定**要的就是这一档：TCP `0/0/204.2` 只在**闭合**时成立（张开时真指尖在 188.6，差 **15.6 mm**）。以前只能 `--go --close`，等于为了合拢把**全行程自检**重走一遍 —— 白动一次 |
+| `--go --close` | 初始化 + 合拢 | 上电后第一次，一步到位 |
+
+⚠️ `--close` **单独给**时先读 `0x0200`：**不是 1 就拒绝，一个寄存器都不写**。
+未初始化时 `0x0202` 恒 0 ⇒ 写目标 0 会「报成功但手指一步没动」（§丙-5 那个静默假成功）。
+
 寄存器（**2026-10-02 实测**，见 `docs/待执行命令.md` §丙-5）
 =========================================================
   `0x0100` 初始化命令 —— **只写**，读回恒 0（FC3/FC4 都一样）⇒ **不能用它判状态**
@@ -40,11 +51,12 @@ AG-95 **断电就丢初始化**（指示灯转红闪、位置回读归零），�
 
 用法
 ====
-    python3 scripts/ag95_init_close.py            # 只读：打印现状 + 本来会写什么
-    python3 scripts/ag95_init_close.py --go       # 只做初始化（两指走到全开）
+    python3 scripts/ag95_init_close.py                # 只读：打印现状 + 本来会写什么
+    python3 scripts/ag95_init_close.py --go           # 只做初始化（两指走到全开）
+    python3 scripts/ag95_init_close.py --close        # 只合拢（要求 0x0200=1，不碰 0x0100）
     python3 scripts/ag95_init_close.py --go --close   # 初始化 + 合拢到 0 mm
 
-退出码：0 成功、2 环境不满足（串口打不开 / 缺 pymodbus / 写失败）。
+退出码：0 成功、2 环境不满足（串口打不开 / 缺 pymodbus / 写失败 / `--close` 时未初始化）。
 """
 import argparse
 import inspect
@@ -177,9 +189,10 @@ def main(argv=None):
                     help="等 0x0200 变 1 的最长秒数（初始化是一次全行程"
                          "自检，实测 >1.3 s）")
     ap.add_argument("--go", action="store_true",
-                    help="真的写寄存器。不给就是只读预演。")
+                    help="真的写 0x0100 做初始化（两指走到全开）。不给就是只读预演。")
     ap.add_argument("--close", action="store_true",
-                    help="初始化之后再合拢到 0 mm（会给 --go 才能生效）")
+                    help="合拢到 0 mm。**可以单独给**（只合拢，不重走全行程自检），"
+                         "但那时要求 0x0200=1，否则拒绝、一个寄存器都不写")
     args = ap.parse_args(argv)
     # `wait_init_done` 读的是模块级常量，这里按命令行覆盖一次（测试用小的值）。
     INIT_TIMEOUT = args.init_timeout
@@ -190,42 +203,69 @@ def main(argv=None):
     try:
         show("开始前", snapshot(g))
 
-        if not args.go:
-            print("（未给 --go：**只读预演，一个寄存器都不写**）")
-            print(f"  本来会写：0x0100 = 0x01   → 两指走到**全开**（1000）")
-            if args.close:
-                print(f"           0x0101 = {FORCE_N}")
-                print(f"           0x0103 = {TARGET_PERMILLE}   → 两指**合拢**到 0 mm")
-            print("\n  ⚠️ 合拢时指尖会沿法兰轴**再伸出 15.6 mm** —— 确认周围是空的再给 --go。")
+        if not (args.go or args.close):
+            print("（未给 --go / --close：**只读预演，一个寄存器都不写**）")
+            print("  三种跑法各写什么：")
+            print("    --go          0x0100 = 0x01"
+                  "                       → 两指走到**全开**（1000）")
+            print(f"    --close       0x0101 = {FORCE_N} / 0x0103 = {TARGET_PERMILLE}"
+                  f"          → 两指**合拢**到 0 mm（要求 0x0200=1，**不碰** 0x0100）")
+            print("    --go --close  上面两段，先开再合")
+            print("\n  ⚠️ 合拢时指尖会沿法兰轴**再伸出 15.6 mm** —— 确认周围是空的再给开关。")
             return 0
 
-        # ---- ① 初始化（安全方向：张开）----
-        print("① 写 0x0100 = 0x01（单向初始化）→ 两指将**完全张开**…")
-        if not g.write(REG_INIT, 0x01):
-            print("❌ 初始化写失败")
-            return 2
-        st, dt = g.wait_init_done()
-        pos = g.read(REG_ACTUAL)
-        print(f"   初始化{'完成' if st == INIT_READY else '**没等到完成**'}"
-              f"（{dt:.1f}s）：0x0200 = {st}，0x0202 = {pos}  ← 1000 才是完全张开\n")
-        if st != INIT_READY:
-            print(f"⚠️ 0x0200 = {st}（1 才是已完成；2 = 还在做）—— 多等一会儿再看，"
-                  f"别急着下结论")
-            return 2
-        if pos != 1000:
-            print(f"⚠️ 初始化完成了，但 0x0202 读到 {pos}（不是 1000）—— "
-                  f"手指可能被东西挡住，查一下")
+        # 步骤号按实际会走的段现算：只给 --close 时是从「力」起算的 ①②，不是 ②③。
+        circ = "①②③④"
+        n = 0
 
-        # ---- ② 合拢 ----
+        if args.go:
+            # ---- 初始化（安全方向：张开）----
+            n += 1
+            print(f"{circ[n - 1]} 写 0x0100 = 0x01（单向初始化）→ 两指将**完全张开**…")
+            if not g.write(REG_INIT, 0x01):
+                print("❌ 初始化写失败")
+                return 2
+            st, dt = g.wait_init_done()
+            pos = g.read(REG_ACTUAL)
+            print(f"   初始化{'完成' if st == INIT_READY else '**没等到完成**'}"
+                  f"（{dt:.1f}s）：0x0200 = {st}，0x0202 = {pos}  ← 1000 才是完全张开\n")
+            if st != INIT_READY:
+                print(f"⚠️ 0x0200 = {st}（1 才是已完成；2 = 还在做）—— 多等一会儿再看，"
+                      f"别急着下结论")
+                return 2
+            if pos != 1000:
+                print(f"⚠️ 初始化完成了，但 0x0202 读到 {pos}（不是 1000）—— "
+                      f"手指可能被东西挡住，查一下")
+        else:
+            # ---- 只合拢：**先验初始化态**，再发位置指令 ----
+            print("（未给 --go：**不写 0x0100**，即**不重走全行程自检**）")
+            st = g.read(REG_INIT_STATUS)
+            if st is None:
+                print("❌ 读不到 0x0200（串口问题）—— 拒绝发位置指令")
+                return 2
+            if st != INIT_READY:
+                name = {0: "未初始化", 2: "初始化进行中"}.get(st, f"未知值 {st}")
+                print(f"❌ AG-95 {name}（0x0200={st}）—— **拒绝只合拢**，"
+                      f"一个位置指令都不发。")
+                print("   未初始化时 0x0202 恒 0，写目标 0 会「报成功但手指一步没动」，"
+                      "而且没有任何日志说得出来（§丙-5）。")
+                print("   加 --go 一起做："
+                      "python3 scripts/ag95_init_close.py --go --close")
+                return 2
+            print(f"   0x0200 = {st}（已初始化）⇒ 可以只合拢\n")
+
+        # ---- 合拢 ----
         if not args.close:
             show("结果（只做了初始化）", snapshot(g))
             print("（未给 --close：不发位置指令 ⇒ 夹爪停在**全开**）")
             return 0
 
-        print(f"② 写 0x0101 = {FORCE_N}（力）")
+        n += 1
+        print(f"{circ[n - 1]} 写 0x0101 = {FORCE_N}（力）")
         if not g.write(REG_FORCE, FORCE_N):
             print("⚠️ 力写失败，继续（位置才是关键）")
-        print(f"③ 写 0x0103 = {TARGET_PERMILLE}（目标位置）→ 两指将**合拢**…")
+        n += 1
+        print(f"{circ[n - 1]} 写 0x0103 = {TARGET_PERMILLE}（目标位置）→ 两指将**合拢**…")
         if not g.write(REG_TARGET, TARGET_PERMILLE):
             print("❌ 位置写失败")
             return 2

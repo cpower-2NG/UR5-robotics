@@ -1228,7 +1228,9 @@ def judge_preflight(facts):
             name = {0: "未初始化", 2: "初始化进行中"}.get(st, "未知值 %s" % st)
             out.append(Item("P1.AG-95 初始化", FAIL,
                             "%s（0x0200=%s）—— 先跑 "
-                            "`python3 scripts/ag95_init_close.py --go`。未初始化时"
+                            "`python3 scripts/ag95_init_close.py --go`（写完停在"
+                            "**全开**；规划器起栈时自己会 `open()`，所以这里不需要"
+                            "闭合）。未初始化时"
                             "起栈，规划器会在启动序列上**静默卡住十几分钟**"
                             % (name, st)))
         else:

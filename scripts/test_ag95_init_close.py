@@ -2,9 +2,14 @@
 """`scripts/ag95_init_close.py` 的自检（离线，不需要真夹爪、不需要 Gazebo、不需要 colcon build）。
 
 这个脚本是全仓库**唯一会主动驱动夹爪**的东西，所以自检的重点不是「能不能初始化」，
-而是**「不给 `--go` 时它到底写没写」** —— 写错了夹爪当场就动，而现场的人
-以为它在预演。这条用一个**手写的最小 Modbus RTU 从站**（跑在 pty 上）真的量：
+而是**「什么时候它到底写没写」** —— 写错了夹爪当场就动，而现场的人以为它在预演。
+这条用一个**手写的最小 Modbus RTU 从站**（跑在 pty 上）真的量：
 从站把收到的每一次 FC6 记在 `slave.writes` 里，断言它是空的。
+
+2026-10-07 起 `--close` **可以单独给**（只合拢，不重走全行程自检），闸门也随之从
+「`--close` 必须搭 `--go`」换成「`--close` 单独给时要求 `0x0200 == 1`」。所以这里多了
+一组：**未初始化时 `--close` 单独给 ⇒ 拒绝且一个寄存器都不写**（就是原来的用例，
+判据换了），以及**已初始化时 `--close` 单独给 ⇒ 只写力与位置、不碰 `0x0100`**。
 
 ⚠️ 从站类直接复用 `test_ag95_probe.py` 里的那一个（按路径加载），
 **不复制一份** —— 复制出来的量具迟早会和原件分叉，而分叉的量具会给出假的绿。
@@ -110,9 +115,10 @@ def main() -> int:
         why = '没有 pymodbus —— pip3 install "pymodbus>=3.6"（板上装了就能全跑）'
 
     names = ["预演：一个寄存器都不写", "预演：打印本来会写什么", "预演：退出码 0",
-             "预演 + --close 也不写", "--go：只写了初始化寄存器",
+             "--close 单独给但未初始化：拒绝且不写", "--go：只写了初始化寄存器",
              "--go：初始化完成即停（不发位置）", "--go --close：写了力与位置",
-             "--go --close：合拢到 0", "--go：没走到 1000 时告警", "退出码 2：口打不开"]
+             "--go --close：合拢到 0", "--close 单独给（已初始化）：不碰 0x0100",
+             "--go：没走到 1000 时告警", "退出码 2：口打不开"]
     if not has_pymodbus:
         for n in names:
             check(n, False, why, skip=True)
@@ -128,10 +134,16 @@ def main() -> int:
             check("预演：打印本来会写什么",
                   "0x0100 = 0x01" in out and "全开" in out, out)
             check("预演：退出码 0", rc == 0, f"rc={rc}")
+            # 上面那份 regs 是 0x0200=0（未初始化）。`--close` 单独给现在**是写路径**，
+            # 但它必须先验初始化态 ⇒ 未初始化就拒绝，且**一个寄存器都不写**。
             before = list(slave.writes)
             rc, out = run_script(["--close"])
-            check("预演 + --close 也不写（--close 不能绕开 --go 的闸门）",
+            check("--close 单独给但未初始化：拒绝且一个寄存器都不写",
                   slave.writes == before, f"写了 {slave.writes}")
+            check("--close 单独给但未初始化：退出码 2（不是 0 —— 不是「没做」）",
+                  rc == 2, f"rc={rc}\n{out}")
+            check("--close 单独给但未初始化：文案说明为什么（0x0202 恒 0 静默假成功）",
+                  "拒绝只合拢" in out and "一步没动" in out, out)
 
         # ---- 3. --go：只初始化 ------------------------------------------
         print("\n[3] --go（只初始化）：写一个寄存器，然后停在**全开**")
@@ -160,6 +172,25 @@ def main() -> int:
                   slave.regs[0x0202] == 0 and "已合拢到 0.0 mm" in out,
                   f"0x0202={slave.regs[0x0202]}\n{out}")
             check("--go --close：退出码 0", rc == 0, f"rc={rc}")
+
+        # ---- 4b. --close 单独给（已初始化）：**不碰 0x0100** --------------
+        # 这一档是 2026-10-07 新增的：碰点标定要的是**闭合**态，而夹爪通常
+        # **已经初始化**了 —— 再跑一次 --go 等于白做一个全行程自检。
+        print("\n[4b] --close 单独给（0x0200=1）：只写力与位置，**不写 0x0100**")
+        regs = {0x0100: 0, 0x0200: 1, 0x0201: 1, 0x0202: 1000,
+                0x0101: 50, 0x0103: 1000}
+        with with_slave(regs, actual_reg=0x0202, target_reg=0x0103, step=1000) as slave:
+            rc, out = run_script(["--close"])
+            check("--close 单独给（已初始化）：**没有**写 0x0100（不重走全行程自检）",
+                  0x0100 not in [a for a, _ in slave.writes], f"写了 {slave.writes}")
+            check("--close 单独给（已初始化）：写了力与位置",
+                  (0x0101, SCRIPT.FORCE_N) in slave.writes
+                  and (0x0103, SCRIPT.TARGET_PERMILLE) in slave.writes,
+                  f"写了 {slave.writes}")
+            check("--close 单独给（已初始化）：合拢到 0",
+                  slave.regs[0x0202] == 0 and "已合拢到 0.0 mm" in out,
+                  f"0x0202={slave.regs[0x0202]}\n{out}")
+            check("--close 单独给（已初始化）：退出码 0", rc == 0, f"rc={rc}\n{out}")
 
         # ---- 5. 一个真·负例：初始化没走到 1000 要**出声** ----------------
         print("\n[5] 负例：初始化之后位置**不是** 1000（卡住/夹住了）")
