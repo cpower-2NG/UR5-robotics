@@ -17627,3 +17627,121 @@ x = −521.67   y = −282.55   z = 29.14   (mm)
   10–25 mm）都过。
 
 守卫：`test_deidentified.py` / `test_docs_map.py` / `state_check.py` 见提交说明。
+---
+
+## 第一百二十五轮：深度流修好；并查到一条**框架缺陷** —— 落地的那份外参在真机上跑是 17.46 mm，不是 1.41 mm
+
+### 一、俯视相机深度流：修好了（症状 → 病因 → 修法 → 判据）
+
+当时的症状：`realsense2_camera_node` 每秒刷 `Depth stream start failure / IR stream start
+failure (Hardware Error)`，彩色正常，设备未被抢，USB 协商到 5000 Mbps，`perception_3d`
+每 5 秒记一次 `No depth image received yet, skipping.` ⇒ `/targets_3d` 恒空。
+
+**病因不是硬件坏**：相机被上一次**不干净的 kill**（栈是用 `timeout 1500` 起的，到点发
+SIGTERM，realsense 节点没机会把 pipeline 停干净）留在了一个卡住的状态。
+
+**修法**：仓库外那份参数文件 `~/.config/ur5-vision-grasp/realsense_camera.yaml` 加一行
+`initial_reset: true`（开流前先复位相机硬件）。只加这一行，序列号原样；备份
+`.bak-1007-depth`，`diff` 只有这 5 行（含注释）。
+
+**判据**（板端实测，只起相机、不碰臂不碰控制箱）：
+
+| # | 判据 | 结果 |
+|---|---|---|
+| 1 | 日志出现 `Resetting device...`（证明是**参数文件**生效，不是命令行 `-p`） | 1 次 ✅ |
+| 2 | `Depth(0)` / `Infra(1)` / `Infra(2)` / `Color(0)` 四条流各开一次 | 4/4 ✅ |
+| 3 | `hardware error` / `stream start failure` 计数 | **0** ✅ |
+
+> ⚠️ 这一条**不是**「本来就没坏、只是没起对」—— 起法一直没变，变的只是加了复位。
+> 也就是说它是**状态相关**的：上次不干净地退出，下次就起不来。
+
+### 二、先把一个便宜的怀疑排掉：改对了文件，但没接进 launch？
+
+用**板子自己那份** `board_lib.py` 真读站点文件（不是我在本机读）：
+
+```
+extrinsics() 返回 7 个键，值与 10-07 落地值逐位一致；
+missing_keys: （无）；validate_site 的问题: （无）
+```
+
+⇒ 「改对了键名但拼错了」「文件没被读到」这一类静默失效，排除。
+
+### 三、框架缺陷：`optical_to_link()` **只换旋转、不换平移**
+
+**代码证据。** `board_extrinsics.py:268` 的函数体是：
+
+```python
+R = np.asarray(R_bc, float) @ OPTICAL_TO_LINK.T
+return R, np.asarray(t_bc, float)          # ← t 原样返回
+```
+
+它等于假定 `camera_link` 与 `camera_color_optical_frame` **同一个原点**。`cmd_compose`
+（:706）接着把**同一个 t** 分别打印成「相机光学系」和「camera_link」两行 —— 代码自己
+就没区分这两者。
+
+**实测（只起俯视相机，`tf2` 查，不碰臂）：**
+
+| 变换 | 平移 | 与常数 `OPTICAL_TO_LINK` 的夹角 |
+|---|---|---|
+| `camera_color_frame ← camera_color_optical_frame` | **0.0000 mm** | **0.0000°** ⇒ 常数本身**没错** |
+| `camera_link ← camera_color_frame` | 14.9597 mm | **0.2472°**（标准 URDF 该是 0） |
+| `camera_link ← camera_color_optical_frame` | **14.9597 mm** | **0.2472°** |
+
+⇒ 错的是「`camera_link` 与 `camera_color_frame` 同朝向**且**同原点」这个隐含假定。
+
+**为什么运行时真的会中招。** `real.launch.py:370-385` 发的静态 TF 是
+`base_link → **camera_link**`（注释里写的「一个固定的轴约定旋转」正是那个错假定），
+而 `projector_node.py:429/511` 查的是 `base_link ← msg.header.frame_id`，也就是
+`camera_color_optical_frame`。TF 一合成，**驱动的 `camera_link→…→光学系` 就被乘了进去**。
+
+**判决实验**（只起相机＋一条 `static_transform_publisher`，**不碰臂、不用授权**）：
+拿站点里**落地的那 7 个数**发 `base_link→camera_link`，再查回
+`base_link ← camera_color_optical_frame`：
+
+```
+实测 t = [0.43490825531, 1.06622384355, 0.82390819123]
+站点 t = [0.419973,       1.066797,       0.824546]
+预测（若 15 mm 会加）t + R·t_lo = [0.434908, 1.066224, 0.823909]
+```
+
+**逐位吻合** ⇒ 那 14.96 mm 真的加进去了。
+
+### 四、后果 —— 以及纠正我上一轮自己写错的一个数
+
+按真实链（旋转+平移都乘）重算 15 个碰点的残差：
+
+| 换基 | 旧（10-06，换掉的） | 新（10-07，落地的） |
+|---|---|---|
+| 标定文件自己那套约定（常数） | 18.83 mm | **1.41 mm** |
+| **运行时实际（驱动发的）** | **22.48 mm** | **17.46 mm** |
+
+⇒ **落地那份在真机上只比旧的好 1.3 倍，不是 13 倍**；两者都被同一个 ~15 mm 系统性
+偏置（残差均值 `(+16.7, −4.0, +2.7)` mm，**是偏置不是噪声**）抬着。
+
+> 🔧 **自纠**：上一轮（第一百二十四轮）我写的「实测约定下新那份 5.29 mm」**低估了** ——
+> 那个脚本只把**旋转**换了，没把平移那一项乘进去。5.29 → 17.46。正文不删，在此更正。
+
+**修正量。** 把同一份标定改写成正确的 `base←camera_link`（`t_bl = t_bo − R_bl t_lo`）：
+
+```
+camera_x  0.419973145 → 0.405039227     Δ = −14.93 mm
+camera_y  1.066796808 → 1.067398761     Δ =  +0.60 mm
+camera_z  0.824545689 → 0.825184391     Δ =  +0.64 mm
+camera_qx 0.243577278 → 0.245100309
+camera_qy 0.269661355 → 0.270646810
+camera_qz −0.670981881 → −0.671143423
+camera_qw 0.646325134 → 0.645168698
+```
+
+改对后走真实链的残差 = **1.41 mm**（自检：改写后 `base←光学系` 的平移与标定值差
+**0.000 mm**）。**未落地 —— 待裁：改数（站点配置）还是改代码（`optical_to_link`）。**
+
+### 五、这一轮改了什么
+
+- 板上：`~/.config/ur5-vision-grasp/realsense_camera.yaml` 加 `initial_reset: true`
+  （备份 `.bak-1007-depth`）。**没有改站点配置里的外参**。
+- 仓库：`docs/当前状态.md` 那一行 —— 把「RMS 1.41 mm」标成**标定约定下的数**，
+  补上运行时的 17.46 mm、判决实验、修正量与「待裁」；深度流那段从「必须先解决」
+  改成「已修好 + 修法 + 判据」。
+
+守卫：`test_deidentified.py` / `test_docs_map.py` / `state_check.py` 见提交说明。
