@@ -339,7 +339,14 @@ def main():
         if not a.extrinsics:
             print('!! --init 必须给 --extrinsics：它是这条链的**基准**')
             return 2
-        base_from_cam = base_from_camera(json.load(open(a.extrinsics, encoding='utf-8')))
+        _doc = json.load(open(a.extrinsics, encoding='utf-8'))
+        base_from_cam = base_from_camera(_doc)
+        # ★ 基准**指纹**：记当时那份外参的**值**，`--solve` 每次都回头比一次。
+        #   只记路径挡不住「路径没变、内容被重写」—— 那正是「重标一次外参」的样子。
+        #   **在 compose 之前就取**：它记的必须是**真正用来推 base←板 的那一份**，
+        #   万一将来 compose 变成会就地改写的写法，放在后面就会记成另一回事。
+        #   见 baseline_state()。
+        fp = baseline_fingerprint(_doc)
         base_from_board = compose(base_from_cam, cam_from_board)
         Rb, tb = base_from_board
         data = {'board': a.board,
@@ -348,11 +355,8 @@ def main():
                 'dictionary': board_meta['dictionary'],
                 'base_from_board_R': Rb.tolist(), 'base_from_board_t': tb.tolist(),
                 'from_extrinsics': a.extrinsics,
-                # ★ 基准**指纹**：把当时那份外参的**值**记下来，`--solve` 每次都
-                #   回头比一次。只记路径挡不住「路径没变、内容被重写」——
-                #   而那正是「重标一次外参」的样子。见 baseline_state()。
-                'from_extrinsics_R': base_from_cam[0].tolist(),
-                'from_extrinsics_t': base_from_cam[1].tolist(),
+                'from_extrinsics_R': fp['R'],
+                'from_extrinsics_t': fp['t'],
                 'reproj_rms_px': rms, 'n_corners': n_pts}
         with open(a.store, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=1)
