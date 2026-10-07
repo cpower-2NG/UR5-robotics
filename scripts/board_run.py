@@ -59,6 +59,20 @@
   2 = 在**交棒之前**停下了（「我拒绝了」）：有 FAIL、有 SKIP（没验到）、
       或没给 `--authorize-motion`。**这一档不许读成通过。**
 
+★ **两种跑法，都要支持（AI 驱动 / 人手动）**：这个入口**不是只给人用的**。
+  `--authorize-motion` 那一轮要「当次授权」（红线 6），而**授权的证明可以有两种**，
+  由有没有交互终端决定（纯函数 `handoff_mode()`）：
+
+  · `keyboard`（有终端：人自己起的那一轮）—— 起栈后**敲一次 `yes`**。
+  · `pendant`（没终端：**AI 驱动**的那一轮）—— 不敲键盘。证明改由
+    **示教器上那次物理按压**承担：起栈**前**不是 PLAYING、起栈**后**是 PLAYING
+    ⇒ 那一下**只可能是人按的**（`playing_is_vacuous()`）。同一个终端跑不了两种
+    模式的旧版**直接把 AI 驱动堵死**，而 AI 恰恰不是终端。
+
+  ⚠️ **pendant 不是「无人值守」**：它每一步都要求**人在示教器上动手**，
+  只是不要键盘。上面那条物理证明**验不了**时（残 PLAYING / 起栈前读不到控制柜）
+  就**退化成要求 STOP → PLAY 两步握手** —— 那同样只有真人做得到。
+
 ★ **交棒前复核「人在环」（只在给了 `--authorize-motion` 的那一轮）**：P3 的
   `P3.示教器 PLAYING` 可能是一条**空洞绿** —— 上一轮收栈之后控制柜**仍停在
   PLAYING**（第一百一十轮实测），于是启动器看到「PLAYING」就以为人按了，
@@ -1961,6 +1975,48 @@ def ask_authorization(prompt_fn=input, isatty=None):
     return True
 
 
+def handoff_mode(isatty):
+    """交棒的「当次授权」走哪一条路。**纯函数** → `'keyboard'` / `'pendant'`。
+
+    · `'keyboard'` —— 有交互终端（**人自己起的那一轮**）：敲 `yes`。
+    · `'pendant'`  —— 没有交互终端（**AI 驱动的那一轮**）：不敲键盘，证明改由
+      **示教器上那次物理按压**承担，由 `needs_repress()` / `ensure_in_the_loop()`
+      **去验**（验不了就要求 STOP → PLAY 两步握手）。
+
+    ⚠️ **为什么必须有 `'pendant'` 这一路**：用户 2026-10-07 的要求是这个入口
+    「**要能支持 AI 自己跑，也要能支持人手动跑**」。旧版在非终端上**直接拒绝**
+    （`ask_authorization` 里那句「没有无人值守模式」），把 AI 驱动整个堵死 ——
+    而 AI 起栈时 stdin 恰恰不是终端。堵死它并不能换来安全：**能敲键盘的人
+    未必在臂旁边**，而按示教器的人一定在。
+
+    ⚠️ `'pendant'` **不等于无人值守**：它要求人**物理上在示教器前动手**。
+    纯靠环境的判据（环境变量 / 任务描述 / 上一次的记忆）仍然一律不算数
+    —— 见 `find_authorization_keys()`。
+    """
+    return "keyboard" if isatty() else "pendant"
+
+
+def confirm_handoff(mode, prompt_fn=input, isatty=None):
+    """交棒确认（红线 6 的「当次授权」那一关）。→ `(过了没, 说明)`。
+
+    `keyboard` 走 `ask_authorization()`（原样，一个字都没改）；`pendant` **不提问**，
+    只把「接下来由什么证明」印清楚，然后**交给下面的复核**去验 ——
+    那一关不通就照样不交棒。
+    """
+    if mode == "keyboard":
+        ok = ask_authorization(prompt_fn=prompt_fn,
+                               isatty=(lambda: True) if isatty is None else isatty)
+        return ok, ("有交互终端 —— 已敲 `yes`" if ok
+                    else "给了 `--authorize-motion`，但终端上没有确认 ⇒ 不交棒")
+
+    print("    ℹ️ 没有交互终端（AI 驱动）⇒ **不敲键盘**，确认改由**示教器**承担：")
+    print("       你起栈时按的那次 PLAY 会被**核对**（起栈前不是 PLAYING、")
+    print("       起栈后是 PLAYING ⇒ 那一下只可能是人按的）。")
+    print("       核对不了（上一轮的残 PLAYING / 起栈前读不到控制柜）就会")
+    print("       要你**当场补一次 STOP → PLAY** —— 两步都看见才算。")
+    return True, "无交互终端：确认由**示教器上的物理按压**承担（下一步复核它）"
+
+
 def stop_stack(clock=time.time):
     """收掉**别人起的**栈（`--stop`）→ 收完还剩几条。
 
@@ -2354,18 +2410,28 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                              "没有 --authorize-motion ⇒ **任务未交棒**（红线 6：真机"
                              "动作逐次授权）。栈会收掉；退 2 **不许**读成通过"))
                 code = 2
-            elif not ask_authorization(prompt_fn=prompt_fn, isatty=isatty):
-                add(S5, Item("P5.交棒", SKIP,
-                             "--authorize-motion 给了，但终端上没有确认 ⇒ 不交棒"))
-                code = 2
             else:
+                # ★ 「当次授权」的证明有两条路，见 `handoff_mode()`：
+                #   有终端（人手动起的轮次）⇒ 敲 yes；没终端（**AI 驱动**）⇒ 由
+                #   示教器上那次物理按压承担。**两条都要人动手**，都不接受
+                #   环境变量/任务描述/上次记忆冒充（红线 6）。
+                mode = handoff_mode(isatty)
+                ok_conf, why_conf = confirm_handoff(mode, prompt_fn=prompt_fn,
+                                                    isatty=isatty)
+                if not ok_conf:
+                    add(S5, Item("P5.交棒", SKIP, why_conf))
+                    code = 2
+                else:
+                    # 记下**这一次的授权是怎么证明的** —— 与 `repair exercised`
+                    # 同一个道理：事后要能分清「AI 跑的」还是「人手动跑的」。
+                    add(S5, Item("P5.交棒确认", PASS, why_conf))
                 # ★ 交棒前复核「人在环」—— **只在这一轮真会动的时候做**。
                 # P3 那条绿可能是**残 PLAYING**（上一轮收栈留下的），那时启动器
                 # 嘴上说「人在环走通了」而人根本没按 ⇒ 臂会动。这是启动器最该
                 # 消灭的一类失误，所以在这里拦住（判据见 `needs_repress`）。
                 # ⚠️ 不给 `--authorize-motion` 的那一轮走不到这里 ⇒ R0 的
                 # P0–P4 证据**一点不受影响**。
-                if needs_repress(counted(report, S3)):
+                if code == 0 and needs_repress(counted(report, S3)):
                     ok_loop, why_loop = ensure_in_the_loop(site.robot_ip,
                                                            a.play_timeout, clock=clock)
                     add(S5, Item("P5.人在环复核",

@@ -616,6 +616,7 @@ try:
                  "resolve_launch_params", "planner_yaml_params", "path_in_repo",
                  "find_task_file", "find_marker", "render_counts", "score_round",
                  "playing_is_vacuous", "count_vacuous", "needs_repress",
+                 "handoff_mode",
                  "find_authorization_keys", "task_dotted_paths", "judge_write_path",
                  "judge_repair_outcome", "switch_payload_lines", "repair_hint",
                  "print_repair_hint", "task_params", "judge_entry_parity",
@@ -1368,6 +1369,52 @@ try:
               "（不翻面就说明本条断言恒真、等于没写）",
               _m_nr.needs_repress([_P3_N]) is False
               and board_run.needs_repress([_P3_N]) is True)
+
+    # -----------------------------------------------------------------
+    # 5g. 两种跑法：AI 驱动 / 人手动。**把 AI 那条路堵死是缺陷，不是谨慎**
+    #     （2026-10-07 用户要求：「要能够支持 ai 自己能运行，也能支持我手动启动」）
+    # -----------------------------------------------------------------
+    section("[5g] 交棒确认的两条路：有终端敲 `yes`，没终端用示教器上的按压")
+
+    check("★ 有交互终端 ⇒ `keyboard`（人自己起的那一轮，原样敲 `yes`）",
+          board_run.handoff_mode(lambda: True) == "keyboard")
+    check("★★ **没有**交互终端 ⇒ `pendant`（AI 驱动的那一轮）—— "
+          "旧版在这里**直接拒绝**，等于把 AI 驱动的跑法整个堵死",
+          board_run.handoff_mode(lambda: False) == "pendant")
+
+    def _boom(*_a, **_k):
+        raise AssertionError("pendant 模式**不该**向人要键盘输入")
+
+    _ok_p, _why_p = board_run.confirm_handoff("pendant", prompt_fn=_boom)
+    check("★★ pendant 模式**不碰 stdin**（给它一个「一调用就炸」的 prompt_fn）"
+          "⇒ 照样放行，且说明里讲清「证明改由示教器承担」",
+          _ok_p is True and "示教器" in _why_p, _why_p)
+
+    _ok_k1 = board_run.confirm_handoff("keyboard", prompt_fn=lambda _p: "yes")[0]
+    _ok_k2 = board_run.confirm_handoff("keyboard", prompt_fn=lambda _p: "no")[0]
+    check("  keyboard 模式仍然**必须**敲 `yes`：敲 `yes` 放行、敲别的**不**放行",
+          _ok_k1 is True and _ok_k2 is False)
+
+    check("★ 源码级钉子：P5 按 `handoff_mode(isatty)` 选路，且报告里**记下"
+          "这一次是哪种**（事后要分得清 AI 跑的与人手动跑的）",
+          "handoff_mode(isatty)" in SRC and '"P5.交棒确认"' in SRC)
+
+    # ★ 变异：退回「永远要键盘」—— 那正是用户指出的缺陷本身。
+    #   必须看到 **AI 驱动那一档由「交棒」翻成「不交棒」**。
+    _m_hm = load_mutant(_mutate(
+        SRC, '    return "keyboard" if isatty() else "pendant"\n',
+        '    return "keyboard"\n', "hm"), "hm")
+    if _m_hm is not None:
+        _mut_ok = _m_hm.confirm_handoff(_m_hm.handoff_mode(lambda: False),
+                                        prompt_fn=lambda _p: "yes",
+                                        isatty=lambda: False)[0]
+        _real_ok = board_run.confirm_handoff(
+            board_run.handoff_mode(lambda: False), prompt_fn=_boom)[0]
+        check("★ 变异：退回「永远要键盘」⇒ **AI 驱动那一档翻面**"
+              "（由「已确认」变成「不交棒」；不翻面说明 5g 断言恒真、等于没写）",
+              _m_hm.handoff_mode(lambda: False) == "keyboard"
+              and _mut_ok is False and _real_ok is True,
+              "改后 %r / 改前 %r" % (_mut_ok, _real_ok))
 
     # =================================================================
     # 6. 外参
