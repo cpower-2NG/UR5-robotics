@@ -17693,6 +17693,9 @@ return R, np.asarray(t_bc, float)          # ← t 原样返回
 `base_link → **camera_link**`（注释里写的「一个固定的轴约定旋转」正是那个错假定），
 而 `projector_node.py:429/511` 查的是 `base_link ← msg.header.frame_id`，也就是
 `camera_color_optical_frame`。TF 一合成，**驱动的 `camera_link→…→光学系` 就被乘了进去**。
+（这条也回代码核过，堵掉「说不定检测器发的是 camera_link」这条退路：检测器
+`detector_node.py:264/304` 把输入图的 `frame_id` **原样抄过去**，而彩色图那一帧就是
+`camera_color_optical_frame`。）
 
 **判决实验**（只起相机＋一条 `static_transform_publisher`，**不碰臂、不用授权**）：
 拿站点里**落地的那 7 个数**发 `base_link→camera_link`，再查回
