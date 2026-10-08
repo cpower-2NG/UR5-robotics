@@ -38,13 +38,38 @@
      （`find_authorization_keys`）。授权也不来自环境变量 / 上一次的记忆 / shell
      别名 —— 红线 6 后半句「上一次的授权不覆盖这一次」禁的就是这个形状：一条会被
      复制、会被沿用的**数据**，不能冒充**一次**授权。
-  ② **当次 + 被告知**。两个开关在**起栈之前**都要一个交互终端（P0.写路径授权 /
-     P0.夹爪初始化授权；非交互 ⇒ FAIL、退 2，**栈都不起**，两条共用一个
-     `judge_write_path`）；真写之前先把**完整报文**摆出来。控制器那份是服务名 /
-     activate 列表 / `deactivate_controllers` 恒空 / strictness / timeout，确认
-     动作在 `board_gate._run_repair` 里（**臂已上电**那一刻）；夹爪那份是**哪几个
-     寄存器、走多少行程**，并**按读到的 `0x0200` 选最小的一档**（已初始化就只合拢，
-     不重走全行程自检）—— 人确认的是**那一条**，所以两档印出来必须不是同一份。
+  ② **当次 + 被告知**。两个开关在**起栈之前**都要一次「人在环」的证明（P0.写路径
+     授权 / P0.夹爪初始化授权；两条共用一个 `judge_write_path`）；真写之前先把
+     **完整报文**摆出来。控制器那份是服务名 / activate 列表 / `deactivate_controllers`
+     恒空 / strictness / timeout，确认动作在 `board_gate._run_repair` 里（**臂已上电**
+     那一刻）；夹爪那份是**哪几个寄存器、走多少行程**，并**按读到的 `0x0200`
+     选最小的一档**（已初始化就只合拢，不重走全行程自检）—— 人确认的是**那一条**，
+     所以两档印出来必须不是同一份。
+     **证明有两档，由 `handoff_mode()` 决定，判据只有一份**：
+       · `keyboard`（有终端）⇒ 敲一次 `yes`；
+       · `pendant`（**没终端 = AI 驱动**）⇒ **不敲键盘**，改由**示教器上的物理动作**
+         承担（STOP → PLAY 两步握手，`board_lib.ensure_in_the_loop` 只读核验）。
+       两档都拿不到证明 ⇒ FAIL、退 2，**栈都不起**。注意旧版在非终端下**一律拒**
+       —— 那正好把 AI 驱动整条路堵死（AI 恰恰不是终端），是**缺陷**不是保守。
+
+起栈之后：孤儿与残留（**这是本文件最容易留脏东西的地方**）
+======================================================
+起栈用的是 `start_new_session=True`，栈在自己的会话里。于是有一个**很能骗人**的
+形状：领头的进程一死，子进程被 init 收养（PPID 变成 1），`pkill -f <名字>` 也可能
+刚好没匹配上 —— 现象是**臂不动了但节点还在**，下一轮起栈时它们和新的抢串口。
+三条对付它：
+
+  ① **按会话收，不按名字收**。`/proc/<pid>/stat` 的 sid 是**收养之后仍然不变**的，
+     所以「本启动器起的那些」可以用 sid 精确圈出来。⚠️ 只在**自己就是会话领头**
+     （`sid == pid`）时才动那个会话 —— 否则会顺手把**人手敲起来的那一栈**也扫掉。
+  ② **名字表只是补充**，`LEFTOVER_RE` 来自板子上真正会被拉起的那些节点，
+     且只当兜底；**僵尸（state `Z`）不算活的** —— 把它算进去，收完就会假报残留。
+  ③ **截住信号**。`finally` 在 `kill` 下**根本不会执行**，所以 SIGTERM/SIGHUP
+     进来时**先收栈、再退**（`board_lib.install_stop_handlers`）。
+     另有一份**仓库外**的记录 `~/.config/ur5-vision-grasp/last_stack.json`
+     （`UR5VG_STACK_RECORD` 可覆盖）写明这一轮起的会话；`--stop` 就是拿它来收
+     **上一轮**起的栈（人已经走了、终端关了也能收）。收完还剩几条**如实报**，
+     不够就让你 `--stop` 再来一次 —— 不报「已清理」。
   ③ **可复验**。切换执行过之后，按**只读复核**的结果判「已生效 / 已执行但未生效」
      （P3.控制器修复）。发出去的请求 ≠ 结果：未生效是 **FAIL**，不是绿。
      夹爪那一条对应的是 `gripper init exercised: yes/no` —— 而且它排在 P1 **之前**，
@@ -80,6 +105,13 @@
   只是不要键盘。上面那条物理证明**验不了**时（残 PLAYING / 起栈前读不到控制柜）
   就**退化成要求 STOP → PLAY 两步握手** —— 那同样只有真人做得到。
 
+★ **AI 转达**：AI 驱动时，**要人动手的那几句由启动器印出来、AI 原样念给人听**
+  —— 不替人按、不替人答，也不把「我按了」写进任何数据文件（授权不许来自数据）。
+  约定：这类行以 `board_lib.HUMAN_MARK`（`>>> 需要人动手`）开头，**中文、独立一行、
+  动词在前**（「去示教器按**播放**」），并附一句「为什么要你动手」。启动器**等**
+  人做完（轮询只读），等不到就**退 2**，不猜、不绕过。
+  所以 AI 那一轮的正确姿势是：把这一行**转达出去**，然后**等**启动器自己往下走。
+
 ★ **交棒前复核「人在环」（只在给了 `--authorize-motion` 的那一轮）**：P3 的
   `P3.示教器 PLAYING` 可能是一条**空洞绿** —— 上一轮收栈之后控制柜**仍停在
   PLAYING**（第一百一十轮实测），于是启动器看到「PLAYING」就以为人按了，
@@ -104,8 +136,14 @@
     python3 scripts/board_run.py --task a1                # 全流程（P5 还要 --authorize-motion）
     python3 scripts/board_run.py --task a1 --attach --log ~/a1_board.log
     python3 scripts/board_run.py --task a1 --init-gripper  # 先把夹爪弄到「已初始化」
-    python3 scripts/board_run.py --stop                   # 收掉别人起的栈（不发运动命令）
+    python3 scripts/board_run.py --stop                   # 收掉残留的栈（含上一轮那个会话）
     python3 scripts/board_run.py --help                   # 本文件是真相源，--help 即权威
+
+AI 驱动时**唯一**要人配合的地方（其余全自动）：
+    · 起栈后**去示教器按「播放」** —— 启动器不发 play / power / stop，也不替你按；
+    · 给 `--init-gripper` / `--repair-controller` 时，**当场补一次 STOP → PLAY**
+      （当次授权的证明）；提示会以 `>>> 需要人动手` 开头印出来，**由 AI 原样转达**。
+  人没动手 / 核验不了 ⇒ 启动器**退 2**（不写、不交棒），不会自己往下走。
 """
 
 import sys
@@ -1603,7 +1641,8 @@ def run_show_args(entry, env, timeout=120.0):
 
 def gate_argv(json_path, *, only=None, slots_total=None, min_candidates=None,
               expect_params=None, allow_skip=None, trajectory_action=None,
-              pick_zone=None, repair=False, fast=False):
+              pick_zone=None, repair=False, fast=False, robot_ip=None,
+              play_timeout=None):
     """拼 `board_gate.py` 的命令行。**纯函数**（离线钉得住「P3 只要控制器」）。
 
     `only="controllers"` 时，其余五项交给它的 `--allow-skip` 声明缺席 —— 那正是
@@ -1629,6 +1668,16 @@ def gate_argv(json_path, *, only=None, slots_total=None, min_candidates=None,
         argv += ["--expect-param", "%s=%s" % (k, v)]
     if repair:
         argv.append("--repair-controller")
+        # ★ 修复走**当次授权**，而「AI 驱动」那一轮（没有交互终端）拿不到键盘上的
+        #   `yes`：证明改由**示教器上的 STOP → PLAY 两步握手**承担，board_gate 需要
+        #   控制柜 IP 才能做那两步的**只读**核验。所以只有 repair 这一档才递 ——
+        #   其余的只读档连不上控制柜也无所谓（board_gate 默认不碰 Dashboard）。
+        #   ⚠️ 不给 ip（站点没配好）时**什么都不递**：board_gate 自己会 fail-closed
+        #      （核验不了 ⇒ 不发 switch_controller），这里不许替它猜一个。
+        if robot_ip:
+            argv += ["--dashboard-host", str(robot_ip)]
+        if play_timeout is not None:
+            argv += ["--play-timeout", str(float(play_timeout))]
     if fast:
         argv += ["--discover-timeout", "8", "--controller-timeout", "60",
                  "--camera-window", "0.5", "--targets-timeout", "0.5",
@@ -1719,23 +1768,13 @@ def wait_for_state(ip, want, timeout, poll=2.0, dash=None, clock=time.time,
                    sleep=None):
     """轮询只读直到 `want(回复)` 为真 → `(到了没, 最后一次回复, 用时)`。
 
-    只读查询（`robotmode` / `programState` / `safetystatus`）；**不发** play / power /
-    stop —— 按播放是**人的动作**（红线 6）。
-
-    `dash` / `clock` / `sleep` 都可注入 ⇒ 这个循环**离线测得动**
-    （照 `wait_for_finish` 的先例）。
+    ⚠️ **本体在 `board_lib`**（连同 `ensure_in_the_loop`）—— 2026-10-08 搬过去的：
+       `board_gate` 的写路径（控制器切换）现在也要走同一个两步握手，而**只读轮询
+       这份判据只能有一处**（两份并存正是缺陷活下来的方式：一处精确比、一处子串比）。
+       本函数只是薄壳，签名与语义原样保留，好让既有的离线断言继续钉在名字上。
     """
-    dash = dash or board_lib.dashboard
-    sleep = time.sleep if sleep is None else sleep
-    t0 = clock()
-    last = None
-    while True:
-        last = dash(ip)
-        if want(last):
-            return True, last, clock() - t0
-        if clock() - t0 >= timeout:
-            return False, last, clock() - t0
-        sleep(poll)
+    return board_lib.wait_for_state(ip, want, timeout, poll=poll, dash=dash,
+                                    clock=clock, sleep=sleep)
 
 
 def wait_for_playing(ip, timeout, poll=2.0, dash=None, clock=time.time):
@@ -1748,46 +1787,28 @@ def wait_for_playing(ip, timeout, poll=2.0, dash=None, clock=time.time):
 
 
 def ensure_in_the_loop(ip, timeout, poll=2.0, dash=None, clock=time.time,
-                       sleep=None, prompt=print):
-    """交棒**之前**复核「人在环」—— 让人重按一次（**先 STOP，再 PLAY**），
-    并**看到那两步都真的发生**。→ `(过了没, 说明)`。
+                       sleep=None, prompt=print, why="复核「人在环」",
+                       consequence="不交棒", doing="启动器", step=(1, 2)):
+    """交棒**之前**（写路径那一档是**真写之前**）复核「人在环」——
+    让人重按一次（**先 STOP，再 PLAY**），并**看到那两步都真的发生**。
+    → `(过了没, 说明)`。
 
-    为什么是**两步握手**，不是只喊一句「按 STOP 再按 PLAY」：两个动作挨得近时，
-    2 s 一次的轮询可能**一次都没看见 STOPPED** —— 那时「PLAYING 一直为真」
-    既可能是「人按了」也可能是「压根没动」，**判不了**。所以卡在两步之间：
-    先**确认**它离开 PLAYING，再等它回来 ⇒ 「按过」这件事是**看到**的，不是猜的。
-    第一步没看到就直接**不交棒**（fail-closed）。
+    ⚠️ **本体在 `board_lib`**（2026-10-08 搬过去）：`board_gate` 的控制器切换
+       也要用**同一个**握手当授权证明 —— 两处各写一份，迟早一处松一处紧，而松的
+       那一处给的是**假授权**。本函数是薄壳，签名原样保留（离线断言钉在名字上）。
 
-    这**不是新规矩**：第一百一十轮实测过「收栈之后控制柜可能仍停在 PLAYING」，
-    当时的结论就是「每轮之间必须在示教器上按一次 STOP」—— 这里只是把它写成
-    启动器自己会走的步骤。
+    ★ 为什么是**两步握手**：两个动作挨得近时，2 s 一次的轮询可能**一次都没看见
+       STOPPED** —— 那时「PLAYING 一直为真」既可能是「人按了」也可能是「压根没动」，
+       **判不了**。所以卡在两步之间 ⇒ 「按过」这件事是**看到**的，不是猜的。
 
-    全程只读（`dashboard`）；**不发** play / power / stop。
+    ★ 这是「**没有终端**时唯一能拿到的当次授权证明」（AI 驱动那一轮）：
+       它替掉的是键盘上的 `yes`。判据是**物理动作**，不是语气。
+       `why` / `consequence` / `doing` / `step` 只影响文案：写路径的后果是
+       「**不写**」、交棒的后果是「**不交棒**」，话说成一样就没人分得清了。
     """
-    prompt("")
-    prompt("=" * 66)
-    prompt("👉 交棒前复核「人在环」：请在示教器上按一下 **停止（STOP）**。")
-    prompt("   （上一轮收栈后控制柜可能还停在 PLAYING —— 那种绿**不算**你按过。）")
-    prompt("=" * 66)
-    left, d, _ = wait_for_state(ip, lambda x: not is_playing(x), timeout,
-                                poll=poll, dash=dash, clock=clock, sleep=sleep)
-    if not left:
-        return False, ("%.0fs 内没看到它离开 PLAYING（原文 %r）—— 「人在环」"
-                       "是不是**这一轮**走通的，判不了 ⇒ **不交棒**"
-                       % (timeout, str((d or {}).get("programState", "")).strip()))
-
-    prompt("")
-    prompt("=" * 66)
-    prompt("👉 现在请按示教器上的 **播放（PLAY）**。")
-    prompt("=" * 66)
-    back, d, waited = wait_for_state(ip, is_playing, timeout,
-                                     poll=poll, dash=dash, clock=clock,
-                                     sleep=sleep)
-    if not back:
-        return False, ("按了停止之后，%.0fs 内没等到 PLAYING（原文 %r）⇒ **不交棒**"
-                       % (timeout, str((d or {}).get("programState", "")).strip()))
-    return True, ("STOP → PLAY 两步**都看到了**（%.0fs 后回到 PLAYING）—— "
-                  "「人在环」是这一轮走通的" % waited)
+    return board_lib.ensure_in_the_loop(
+        ip, timeout, poll=poll, dash=dash, clock=clock, sleep=sleep,
+        prompt=prompt, why=why, consequence=consequence, doing=doing, step=step)
 
 
 def find_marker(lines, marker):
@@ -1873,23 +1894,41 @@ def judge_output_paths(log_path, json_report, repo=REPO):
 
 
 def judge_write_path(isatty, flag="--repair-controller", fire_note=None):
-    """写路径那一档能不能往下走。**纯函数** → `(status, detail)`。
+    """写路径那一档走**哪条授权的证明**。**纯函数** → `(status, detail)`。
 
     两条写路径（`--repair-controller` 控制器切换、`--init-gripper` 夹爪寄存器）
     **共用本函数** —— 纪律是同一条，两处各写一份迟早会分叉，而分叉的那一份会给出
     假的授权。`flag` 与 `fire_note` 只影响文案。
 
-    非交互 ⇒ **FAIL**，不是 SKIP：这不是「没验到」，是「这个请求本身不成立」。
-    放在 P0，是为了**在起栈之前**就拒 —— 臂上电、栈起着的时候才发现没法授权，
-    那已经晚了。
+    ★ 两条路**都要人动手**，区别只在**拿什么当证明**（与 `handoff_mode()` 同源）：
+      · 有交互终端（人自己起的那一轮）⇒ 敲一次 `yes`；
+      · **没有**终端（AI 驱动的那一轮）⇒ **不敲键盘**，改由**示教器上的物理动作**
+        承担（STOP → PLAY 两步握手，只读核验，两步都看到才算）—— 提示压成
+        `>>> 需要人动手` 一行，**由 AI 转达给人**（用户 2026-10-08 的裁定）。
+
+    🔴 旧版在第二档上直接 FAIL（「非交互即拒」）。那是**缺陷不是谨慎**：
+       AI 起栈时 stdin 恰恰不是终端 ⇒ `--init-gripper` 那条路**整条走不动**，
+       而 AI 驱动**正是本启动器要支持的两种跑法之一**（2026-10-07 用户裁定
+       「要能够支持 ai 自己能运行，也能支持我手动（不用 ai）启动」）。
+       能敲键盘的人**未必在臂旁边**，按示教器的人**一定在** —— 拿「有没有键盘」
+       当授权门槛，卡住的是**协作方式**，不是风险。
+
+    ⚠️ 两档都在 P0 就 PASS，**不**在 P0 判死：真正的核验发生在**真写那一刻**
+       （`ensure_in_the_loop` fail-closed —— 读不到控制柜、或没看到那两步 ⇒
+       **一个寄存器都不写 / 不切控制器**）。
+       授权仍然只认**当次**：任务描述 / 环境变量 / 上一次的记忆一律不算（红线 6）。
     """
-    if isatty():
+    mode = handoff_mode(isatty)
+    if mode == "keyboard":
         return (PASS, "有交互终端 —— 到时候会**先打印完整报文**，再要你敲一次 yes；"
                       + (fire_note or "发文那一刻（臂已上电）还会再确认一次"))
-    return (FAIL, "`%s` 要的是**当次**授权，而这里不是终端。"
-                  "授权**不许**来自任务描述 / 环境变量 / 上一次的记忆（AGENTS.md "
-                  "红线 6：「上一次的授权不覆盖这一次」）。换成交互终端再来；"
-                  "不要写路径的话去掉这个开关即可（默认只读）。" % flag)
+    return (PASS, "没有交互终端（**AI 驱动**）—— 到时候会**先打印完整报文**，"
+                  "再把提示压成 `%s` 一行**由 AI 转达给人**，由**示教器上的 "
+                  "STOP → PLAY 两步握手**承担**当次**授权（只读核验，两步都看到才"
+                  "算；核验不了就**不写**）。授权**不许**来自任务描述 / 环境变量 / "
+                  "上一次的记忆（红线 6：「上一次的授权不覆盖这一次」）。%s"
+                  % (board_lib.HUMAN_MARK,
+                     fire_note or "发文那一刻（臂已上电）还会再确认一次"))
 
 
 def _required_controllers_for(task):
@@ -2065,6 +2104,10 @@ def judge_gripper_init(record):
         return SKIP, ("`--dry-run` ⇒ **一个寄存器都没写**（这是「没做」，不是绿）。"
                       "实跑时会按读到的 0x0200 选最小一档，并在写之前把完整报文"
                       "摆出来要一次**当次**确认")
+    if record.get("refused_pre"):
+        return FAIL, ("**没写**：动手之前就有 %d 条残留进程（判据 "
+                      "`board_lib.leftovers()`）—— 先 `--stop` 清干净再来"
+                      % record.get("leftovers", 0))
     rc, out = record.get("rc"), record.get("out") or ""
     note = record.get("note") or ""
     # 取脚本自己那几行结论（它用 ❌/✅ 起头）—— 转述会丢信息。
@@ -2079,25 +2122,41 @@ def judge_gripper_init(record):
                   % (note or ""))
 
 
-def ask_gripper_authorization(prompt_fn=input, isatty=None):
-    """真写之前**当场**再确认一次。**没有无人值守模式**（非终端直接拒）。
+def ask_gripper_authorization(prompt_fn=input, isatty=None, ip=None,
+                              timeout=300.0, dash=None, clock=time.time,
+                              sleep=None, out=print, loop=None):
+    """真写之前**当场**再要一次当次授权。两条路，**都要人动手**（见 `handoff_mode`）。
+
+    · 有交互终端 ⇒ 敲 `yes`（原样，一个字没改）；
+    · **没有**终端（AI 驱动）⇒ **不敲键盘**：改由**示教器上的 STOP → PLAY 两步
+      握手**承担，只读核验，两步都看到才算（`ensure_in_the_loop`）。
 
     与 `ask_authorization` / `board_gate._run_repair` 同一条纪律。区别只在于
     这里问的是**手指**：所以确认的是那三件物理事实，不是「要不要继续」。
+    ⚠️ 两档的**强度是一样的** —— 键盘那个 `yes` 也只是「人在当下这么说了」，
+       它证明不了两指之间有没有手；区别只在**用哪种方式表达**。
     """
     isatty = sys.stdin.isatty if isatty is None else isatty
+    loop = ensure_in_the_loop if loop is None else loop
     if not isatty():
-        print("    ❌ 写夹爪寄存器需要**当次**交互确认，而这里不是终端。"
-              "**没有**无人值守模式。")
-        return False
-    print("        请确认：这是**当次**授权、**急停就在手边**、"
-          "**两指整个行程里没有手也没有遮挡**。")
+        out("    没有交互终端（**AI 驱动**）⇒ **不敲键盘**：这次授权改由**示教器上"
+            "的物理动作**承担（STOP → PLAY 两步握手，只读核验）。")
+        out("    请确认（红线 2 的物理事实）：**急停就在手边**、"
+            "**两指整个行程里没有手也没有遮挡**。")
+        ok, why = loop(ip, timeout, dash=dash, clock=clock, sleep=sleep, prompt=out,
+                       why="这次写夹爪寄存器的授权",
+                       consequence="一个寄存器都不写",
+                       doing="写夹爪", step=(1, 2))
+        out("    %s %s" % ("✅" if ok else "❌", why))
+        return ok
+    out("        请确认：这是**当次**授权、**急停就在手边**、"
+        "**两指整个行程里没有手也没有遮挡**。")
     try:
         ans = prompt_fn("        确认写夹爪寄存器？(yes) > ")
     except EOFError:
         return False
     if str(ans).strip().lower() != "yes":
-        print("        未确认 —— **一个寄存器都不写**。")
+        out("        未确认 —— **一个寄存器都不写**。")
         return False
     return True
 
@@ -2156,6 +2215,11 @@ def ask_authorization(prompt_fn=input, isatty=None):
     """
     isatty = sys.stdin.isatty if isatty is None else isatty
     if not isatty():
+        # ⚠️ 2026-10-08 起这一支**在实际路径上到不了**了：`confirm_handoff()` 只在
+        #    `handoff_mode() == "keyboard"`（＝有终端）时才调本函数，非终端那一档
+        #    走 **示教器 STOP → PLAY**（见 `board_lib.ensure_in_the_loop`）。
+        #    留着它是**兜底**，不是「非终端就该拒」的政策 —— 别拿这句当政策去
+        #    堵 AI 驱动那条路（那正是这一轮修掉的缺陷）。
         print("    ❌ 交棒需要交互确认，而这里不是终端。**没有**无人值守模式。")
         return False
     print("    ⚠️  接下来把指挥权交给这套栈：规划器会**真的驱动机械臂**。")
@@ -2212,28 +2276,36 @@ def confirm_handoff(mode, prompt_fn=input, isatty=None):
     return True, "无交互终端：确认由**示教器上的物理按压**承担（下一步复核它）"
 
 
-def stop_stack(clock=time.time):
-    """收掉**别人起的**栈（`--stop`）→ 收完还剩几条。
+def stop_stack(clock=time.time, record=None, entries=None):
+    """收掉**残留的**栈（`--stop`）→ 收完还剩几条（**实测**）。
 
     ⚠️ 与 `board_lib.teardown()` 的区别：`teardown` 收的是**我们自己起的**进程组，
-    所以它敢 `killpg(proc.pid)`。这里面对的是**别人的**进程，pgid 可能落在别人的
-    会话里 —— `killpg` 会误伤，所以只**逐个 pid** 发信号。「谁是栈进程」的判据仍然
-    用 `board_lib.leftovers()` 那一份（含它修好的自我排除），不另抄一套。
+    所以它敢 `killpg(proc.pid)`（那个 pid 还活着，不会被回收）。这里面对的是**别人的**
+    进程：`killpg` 可能打进别人的进程组 ⇒ 一律不开。收的本体还是 `board_lib.sweep()`
+    —— 判据只有一份，不在这里另抄一套。「谁是栈进程」用 `board_lib.leftovers()`。
+
+    ★ 2026-10-08 补：**再加一份按 session 收的**。上一次启动器起的栈会把自己的
+      `(pid, sid)` 记在仓库外（`board_lib.STACK_RECORD`）。为什么要它：名字名单
+      漏一个节点时，`--stop` 原来会报「已收干净」—— 那是**假的**（实测漏的正是
+      `trajectory_until_node` / `urscript_interface`）。session id **不随
+      re-parent 改变**，所以「上一轮是谁起的」这件事在启动器被打死之后追得回来。
+      ⚠️ 只有记录里 `sid == pid`（＝当年那个 leader 自己开的 session）才敢按
+      session 收 —— 人从自己 shell 里起的栈不满足，收了会把人的终端一起端掉。
     """
-    stale = board_lib.leftovers()
-    if not stale:
+    rec = board_lib.read_stack_record() if record is None else record
+    sess = board_lib.owned_session_pids(rec, entries=entries)
+    if not board_lib.leftovers() and not sess:
+        board_lib.clear_stack_record()
         return []
-    for line in stale:
-        with contextlib.suppress(ValueError, ProcessLookupError, PermissionError):
-            os.kill(int(line.split()[0]), signal.SIGTERM)
-    deadline = clock() + 15
-    while clock() < deadline and board_lib.leftovers():
-        time.sleep(1)
-    for line in board_lib.leftovers():
-        with contextlib.suppress(ValueError, ProcessLookupError, PermissionError):
-            os.kill(int(line.split()[0]), signal.SIGKILL)
-    time.sleep(2)
-    return board_lib.leftovers()
+    if sess:
+        print("  · 顺带按 session 收：上一轮启动器起的栈记在 %s（leader sid=%s）——"
+              " 名字名单之外的那些也跑不掉"
+              % (board_lib.stack_record_path(), rec.get("sid")))
+    left = board_lib.sweep(rec.get("pid"), rec.get("sid"), entries=entries,
+                           clock=clock)
+    if not left and not board_lib.owned_session_pids(rec, entries=entries):
+        board_lib.clear_stack_record()
+    return left
 
 
 # =====================================================================
@@ -2246,11 +2318,24 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     # 交互与否**只解析一次**：P0 的写路径闸门与 P5 的交棒确认必须看到同一件事
     # （两处各查一次 isatty，中间被换掉的话就是自证式判据）。
     isatty = sys.stdin.isatty if isatty is None else isatty
+    # 「当次授权」走哪条路，也是**只解析一次**（纯函数），并一路带进报告 ——
+    # 事后要能分清这一轮是**人手动跑的**还是 **AI 驱动跑的**。
+    auth_mode = handoff_mode(isatty)
 
     print("=" * 74)
     print("  board_run —— 任务无关的真机启动器")
     print("  永不发 play/power/stop；控制器闸门默认只读；退出码 0/1/2（见文件头）")
     print("=" * 74)
+
+    # 「AI 驱动」那一轮（没有交互终端）先立**转达契约**：它得知道下面那些
+    # `>>> 需要人动手` 的行是**给人看的**，而且要**原样**转达（用户 2026-10-08 的
+    # 裁定：启动器要提示 AI 去告诉人按 PLAY/STOP）。人手动跑的那一轮不印 ——
+    # 终端前就坐着人，再讲一遍「请转达给人」是噪音。
+    # ⚠️ `--stop` 与 `--dry-run` 也不印：那两条**根本不会有**要人动手的步骤，
+    #    先立一份用不上的契约，只会让读输出的人去找那些不存在的行。
+    if auth_mode == "pendant" and not a.stop and not a.dry_run:
+        board_lib.relay_notice(timeout=a.play_timeout, doing="去示教器按 PLAY/STOP")
+        print()
 
     if a.stop:
         print("\n—— 收栈（--stop）——")
@@ -2278,6 +2363,9 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
     # 带上它，不必在十几个出口各传一遍（漏一个，报告里那一栏就会静默变成「没做」，
     # 而那正是这一栏要防的误读）。
     gripper_init = None
+    # 收栈之后**实测**还剩几条（`finally` 里赋值）。放在这里是为了让 `finish`
+    # 这个闭包在**任何**出口都能带上它 —— 与 `gripper_init` 同一个理由。
+    stale_after = None
     params, sources = {}, {}
 
     def add(title, item, absent=None):
@@ -2291,6 +2379,8 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
 
     def finish(code, **kw):
         kw.setdefault("gripper_init", gripper_init)
+        kw.setdefault("stale_after_teardown", stale_after)
+        kw.setdefault("authorization_mode", auth_mode)
         return _finish(report, code, a, task=task, **kw)
 
     # ================================================== P0 自检（静态）
@@ -2399,7 +2489,26 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
             print("      读不到   ⇒ **不写**（串口不通时指令到没到都说不准）")
             gripper_init = {"dry_run": True}
         else:
-            gripper_init = gripper_init_step(site.gripper_port if site else None)
+            # ⚠️ **写之前先看残留**（2026-10-08 补的顺序缺陷）。旧版把这一段整个排在
+            #    P1 之前，而「残留进程」那一项是 P1 的 —— 于是**先动了手指，才发现
+            #    上一轮的栈还活着**。残留栈上的 `ur_ros2_control` / 规划器仍握着
+            #    控制器：这时候写夹爪、或请人在示教器上按 PLAY，臂都可能动起来。
+            #    判据不另抄：还是 `board_lib.leftovers()` 那一份。
+            stale = board_lib.leftovers()
+            if stale:
+                gripper_init = {"refused_pre": True, "leftovers": len(stale)}
+                add(S0, Item(GRIPPER_INIT_ITEM, FAIL,
+                             "**一个寄存器都没写**：动手之前就有 %d 条残留进程。"
+                             "残留栈上的控制器仍握着机械臂 —— 此时写夹爪、或请人"
+                             "按 PLAY，臂都可能动。先 `--stop` 清干净再来。\n"
+                             "      %s" % (len(stale), stale[0][:120])))
+                code, _, _ = decide(counted(report, S0), None, launched=False)
+                return finish(code, launched=False)
+            gripper_init = gripper_init_step(
+                site.gripper_port if site else None,
+                ask=(lambda: ask_gripper_authorization(
+                    isatty=isatty, ip=(site.robot_ip if site else None),
+                    timeout=a.play_timeout, clock=clock)))
             add(S0, Item(GRIPPER_INIT_ITEM, *judge_gripper_init(gripper_init)))
             code, _, _ = decide(counted(report, S0), None, launched=False)
             if code != 0:
@@ -2500,6 +2609,34 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                      "已起（pid=%d，独立进程组；日志 %s）" % (proc.pid, log_path)))
 
     launched = proc is not None
+
+    # ★ 收栈要**只做一次**，而且**信号也算数**（2026-10-08 的孤儿缺陷）。
+    #   `finally` 只在 **Python 自己走到那儿**时才执行；被 `kill`（SIGTERM：`timeout` /
+    #   CI / AI 那一轮的收尾；SIGHUP：终端被关）时默认处置是**当场死** ⇒ 栈那一整个
+    #   **独立 session** 原地不动，子节点 re-parent 到 init（PPID=1）继续跑 ——
+    #   这就是「挂残留、孤儿进程」的来路。所以：
+    #     ① 把 `(pid, sid)` 记到**仓库外** —— `--stop` 与下一次启动靠它按 session 追回来；
+    #     ② 把 SIGTERM / SIGHUP 接成「先收栈，再退」。
+    stop_once = {"done": False}
+
+    def teardown_once(note=None):
+        if stop_once["done"] or proc is None:
+            return []
+        stop_once["done"] = True
+        if note:
+            print(note)
+        stale = board_lib.teardown(proc)
+        if not stale:               # 真收干净了才销记录；没干净 ⇒ 留给下次 `--stop`
+            board_lib.clear_stack_record()
+        return stale
+
+    restore_sig = (board_lib.install_stop_handlers(
+        lambda name: teardown_once("\n⚠️ 收到 %s —— 先收栈，再退（等不到 finally）" % name))
+        if proc is not None else (lambda: None))
+    if proc is not None:
+        board_lib.write_stack_record(proc.pid, board_lib.sid_of(proc.pid),
+                                     extra={"log": log_path, "task": task.name})
+
     gate_dir = tempfile.mkdtemp(prefix="board_run_gate_")
     rec3 = rec4 = None
     verdict = None
@@ -2511,8 +2648,13 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         print("\n—— %s ——" % S3)
         print()
         print("=" * 66)
-        print("👉 现在去示教器按**播放**（URCap 的 External Control 程序）。")
-        print("   本启动器**不发** play / power / stop —— 那是人的动作（红线 6）。")
+        # 这一行**必须能被人转达**：没有终端时 AI 拿到的只有这段文字，
+        # 「👉 现在去示教器按播放」那样夹在散文里的句子，AI 可能只当注释念一遍
+        # 就过去了。`human_action` 给的是固定前缀 + 动词在前的独立一行。
+        board_lib.human_action(
+            "去示教器按**播放**（URCap 的 External Control 程序）",
+            why="本启动器**不发** play / power / stop —— 那是人的动作（红线 6）；"
+                "按了它自己会往下走")
         print("=" * 66)
         ok, d, waited = wait_for_playing(site.robot_ip, a.play_timeout, clock=clock)
         if ok:
@@ -2538,7 +2680,9 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         j3 = os.path.join(gate_dir, "p3.json")
         argv3 = gate_argv(j3, only="controllers",
                           trajectory_action=task.trajectory_action,
-                          repair=a.repair_controller, fast=True)
+                          repair=a.repair_controller, fast=True,
+                          robot_ip=(site.robot_ip if site else None),
+                          play_timeout=a.play_timeout)
         rc3, rec3, why3 = run_gate(argv3, env, timeout=240.0)
         if rec3 is None:
             add(S3, Item("P3.控制器闸门", SKIP,
@@ -2645,7 +2789,7 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                 #   有终端（人手动起的轮次）⇒ 敲 yes；没终端（**AI 驱动**）⇒ 由
                 #   示教器上那次物理按压承担。**两条都要人动手**，都不接受
                 #   环境变量/任务描述/上次记忆冒充（红线 6）。
-                mode = handoff_mode(isatty)
+                mode = auth_mode      # 与 P0 的写路径闸门同一个值（只解析一次）
                 ok_conf, why_conf = confirm_handoff(mode, prompt_fn=prompt_fn,
                                                     isatty=isatty)
                 if not ok_conf:
@@ -2691,10 +2835,33 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
                     else:
                         code = 0 if finished else 2
     finally:
+        restore_sig()
         if proc is not None:
             print("\n—— 收栈 ——")
-            board_lib.teardown(proc)
-            print("  ✓ 收栈完成（⚠️ 收栈不代替在示教器上按 STOP）")
+            already = stop_once["done"]
+            stale = teardown_once()
+            if already:
+                print("  · 上面那次信号已经收过一遍了（收栈幂等，不重复动手）")
+            elif stale:
+                # ⚠️ **不报「完成」**：收完还有残留就照实说（旧版这里恒印「✓ 收栈完成」，
+                #    而判据那份名单漏了 `trajectory_until_node` / `urscript_interface`
+                #    ⇒ 报的是**假绿**。见 `board_lib.LEFTOVER_RE` 的出处注释）。
+                print("  ❌ 收完还剩 %d 条 —— **没收干净**（下次 P1 会被拦下）；"
+                      "记录留在 %s，可用 `--stop` 再收"
+                      % (len(stale), board_lib.stack_record_path()))
+            else:
+                print("  ✓ 收栈完成")
+            # ★ 收栈**不等于**臂停下：External Control 程序还开着、控制柜那一侧
+            #   还是使能的 —— 要停臂得**人在示教器上按 STOP**。
+            #   用户 2026-10-08 点名了这件事：「启动器需要提示 ai 告诉我去示教器
+            #   点 play 和 stop」。所以这一句走**同一份转达契约**
+            #   （`>>> 需要人动手`），不能只当一句备注印在收尾里 —— AI 只有拿到
+            #   这个前缀才知道「这行是给人看的，要原样念出去」。
+            board_lib.human_action(
+                "去示教器按**停止**（External Control 程序还开着、臂还使能着）",
+                why="启动器收的是**电脑这一侧**的栈；控制柜那一侧的程序没停，"
+                    "臂仍在使能 —— 只有示教器上的 STOP 能停它（红线 6：那是人的动作）")
+            stale_after = stale
         if logf is not None:
             with contextlib.suppress(OSError):
                 logf.close()
@@ -2734,22 +2901,26 @@ def _parser():
                     help="不起栈，只对**已经起着**的栈做 P3/P4/P5（配合 --log）")
     ap.add_argument("--authorize-motion", action="store_true",
                     help="声明这是**当次**的真机动作授权（红线 6）。仍是逐次授权："
-                         "交棒前会在终端上再问一次，**没有**无人值守模式")
+                         "交棒前还要再证一次「人在环」—— 有终端就敲一次 yes，"
+                         "**没终端（AI 驱动）**就核对示教器上那次 PLAY，核对不了"
+                         "要你当场补 STOP → PLAY。**没有**无人值守模式")
     ap.add_argument("--repair-controller", action="store_true",
                     help="⚠️ 写路径：控制器闸门不过时交给 board_gate 的收敛式修复。"
-                         "红线 6 点名了「控制器切换」⇒ 这一档要**当次**授权：P0 会先"
-                         "确认有交互终端（没有就退 2，**栈都不起**），发文前把完整报文"
-                         "摆出来，臂已上电时还要再确认一次，切完按只读复核判"
-                         "「生效 / 未生效」。deactivate 恒空 —— 那一份判定在 "
-                         "board_gate 里，本文件原样透传")
+                         "红线 6 点名了「控制器切换」⇒ 这一档要**当次**授权，两档"
+                         "由 handoff_mode() 定：**有终端**敲 yes；**没终端（AI 驱动）**"
+                         "改由示教器 STOP → PLAY 两步握手（只读核验）。两档都拿不到"
+                         "证明就退 2、**栈都不起**。发文前把完整报文摆出来，臂已上电"
+                         "时还要再确认一次，切完按只读复核判「生效 / 未生效」。"
+                         "deactivate 恒空 —— 那一份判定在 board_gate 里，本文件原样透传")
     ap.add_argument("--init-gripper", action="store_true",
                     help="⚠️ 写路径：把夹爪弄到「已初始化」（红线 2 点名的"
                          "「初始化 / 开合」，**会动手指**）。与 --repair-controller "
-                         "同一条纪律：P0 先确认有交互终端（没有就退 2，**栈都不起**），"
+                         "同一条纪律：两档「当次」授权（终端敲 yes / 示教器 STOP→PLAY），"
+                         "拿不到证明就退 2、**栈都不起**，"
                          "**按读到的 0x0200 选最小的一档**（已初始化 ⇒ 只合拢，"
                          "不重走全行程自检），真写之前把完整报文（哪些寄存器、"
-                         "走多少行程）摆出来再要一次**当次**确认，**没有**无人值守"
-                         "模式。必须在臂使能、急停在手边、两指行程内无人无遮挡时给。")
+                         "走多少行程）摆出来再要一次**当次**确认。"
+                         "必须在臂使能、急停在手边、两指行程内无人无遮挡时给。")
     ap.add_argument("--override-freshness", default=None, metavar="理由",
                     help="外参超期时由人显式破例，**必须写下为什么**（原样进报告）")
     ap.add_argument("--timeout", type=float, default=None,
@@ -2764,8 +2935,10 @@ def _parser():
     ap.add_argument("--play-timeout", type=float, default=300.0,
                     help="起栈后等人在示教器按「播放」的秒数上限（默认 300）")
     ap.add_argument("--stop", action="store_true",
-                    help="收掉别人起的栈（逐个 pid 发信号，判据用 board_lib），"
-                         "不发任何运动命令")
+                    help="收掉**残留的**栈：名字名单 + 上一轮启动器记在 "
+                         "~/.config/ur5-vision-grasp/last_stack.json 里的那个会话"
+                         "（UR5VG_STACK_RECORD 可换路径）。逐会话 / 逐个 pid 发信号，"
+                         "判据用 board_lib，不发任何运动命令。收完还剩几条**如实报**")
     ap.add_argument("--dry-run", action="store_true",
                     help="只看会发什么命令、每个值从哪来：**不起栈、不连设备、"
                          "不跑任何子进程**。它退 0 只表示「计划立得住」，"
@@ -2951,7 +3124,8 @@ def score_round(task, lines):
 
 def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
             repair_exercised=None, gripper_init=None, t_launch=None, t_stop=None,
-            verdict_state=None, log_path=None, launched=False, dry_run=False):
+            verdict_state=None, log_path=None, launched=False, dry_run=False,
+            stale_after_teardown=None, authorization_mode=None):
     print()
     print("—— 结论 ——")
     for ln in render_summary(counted(report), code, report["absent"],
@@ -2985,6 +3159,13 @@ def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
             planner_alive(task))
         print("  " + ("🔴 " if moved else "• ") + note)
         print("  收栈不代替在示教器上按 STOP —— 收的是这套栈，不是控制柜里的程序。")
+        # 收栈是**实测**：改完之后仍有残留（名字名单之外的孤儿）就照实说，
+        # 别让人以为「栈收了 = 现场干净了」。
+        print("  收栈后残留：%s"
+              % ("0 条（实测 `board_lib.leftovers()` + session 都空）"
+                 if not stale_after_teardown else
+                 "**还有 %d 条** —— 见上面的逐条清单，`--stop` 再收一次"
+                 % len(stale_after_teardown)))
     elif dry_run and code == 0:
         print("  （--dry-run：栈没有起，也不该起；上面的绿只说明**计划拼得出来**）")
     else:
@@ -2993,14 +3174,14 @@ def _finish(report, code, a, *, task=None, gate_p3=None, gate_p4=None,
     if a.json_report:
         _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
                       gripper_init, t_launch, t_stop, verdict_state, log_path,
-                      launched)
+                      launched, stale_after_teardown, authorization_mode)
     print("=" * 74)
     return code
 
 
 def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
                   gripper_init, t_launch, t_stop, verdict_state, log_path,
-                  launched):
+                  launched, stale_after_teardown=None, authorization_mode=None):
     if path_in_repo(a.json_report):
         # 第二道锁：`P0.输出路径` 已经会退 2、根本走不到这里。留着是因为这条路径
         # 通向**红线 3**（公开仓），多一道便宜的锁值得；但它**不是**主判据 ——
@@ -3045,6 +3226,15 @@ def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
         # —— 差一点被读成「P3 过了」。阶段的判决看 `items` 与末行的 `exit`。
         "controllers_gate_exit": (gate_p3 or {}).get("exit"),
         "p4_gate_exit": (gate_p4 or {}).get("exit"),
+        # 收栈是**实测**：空 list = 真收干净（名字名单 + session 两路都空）。
+        # 非空 ⇒ 还有孤儿活着（名字名单之外的那种），字段里逐条留着。
+        "stale_after_teardown": (None if not launched
+                                 else list(stale_after_teardown or [])),
+        # 这一轮的「当次授权」是**哪条路**给的证明（`keyboard` = 人手动跑的那轮敲了
+        # yes；`pendant` = AI 驱动那轮，由示教器上的物理按压承担）。事后要能分清
+        # 「谁在什么位置上按的」—— 与 `authorized_motion` 是两个问题：那个只说
+        # 「有没有给开关」，这个说「给了开关之后证明是怎么来的」。
+        "authorization_mode": authorization_mode,
         "verdict": verdict_state,
         "exit": code,
     }
@@ -3058,13 +3248,15 @@ def _write_report(a, report, code, task, gate_p3, gate_p4, repair_exercised,
 
 def main(argv=None):
     # ⚠️ **人在环的提示语必须当场可见。** `print` 写进**重定向的文件**时 Python 是
-    #    块缓冲（攒满 8 KB 才冲），而 P3 那句「现在去示教器按**播放**」正是
+    #    块缓冲（攒满 8 KB 才冲），而 P3 那句「去示教器按**播放**」正是
     #    **只有被人看见才有意义**的一行 —— 看不见 ⇒ 空等 `--play-timeout` ⇒ 退 2，
     #    而报告把它记成「你没按」，**反过来怪操作的人**。
     #    2026-10-06 真机第 1 次实际发生：启动器 `nohup` 到文件跑，提示语 18:13:16
     #    就发出去了，可盯着那个文件的那一头**同一时刻读到的是空文件**，
     #    300 s 到点，P3 记 FAIL。**这不是操作者按晚了，是提示语没送到。**
     #    （栈子进程另有 `PYTHONUNBUFFERED=1`，与这里无关：这里管的是启动器**自己**。）
+    #    ★ AI 驱动时这一条更吃劲：提示语是**给 AI 读的**，AI 要把它原样转给人
+    #      （见 `board_lib.human_action`）。攒在缓冲区里 ⇒ AI 也看不见 ⇒ 同样空等。
     for _s in (sys.stdout, sys.stderr):
         try:
             _s.reconfigure(line_buffering=True)

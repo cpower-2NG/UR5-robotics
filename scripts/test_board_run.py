@@ -156,6 +156,18 @@ def _mutate(src, old, new, tag):
     return src.replace(old, new, 1)
 
 
+# ⚠️ 这条锚点必须**够长**：`board_run.py` 里有两处 `    if not isatty():`
+#    （`ask_gripper_authorization` 与 `ask_authorization`），而 `_mutate` 只换
+#    **第一处**。锚点漂到另一处，变异就换了个东西测 —— 那正是「锚点漂了照样跑过」
+#    的假绿。带上下面那两行就唯一了。
+# ⚠️ 换掉的**只有第一行**：第二行原样保留 —— 它是那条 `out(...)` 的**头半句**，
+#    连它一起换掉会把下一行的续行字符串撇成「未闭合」（第一版就这么炸在 SyntaxError 上）。
+_PENDANT_GRIPPER_LINE = ('        out("    没有交互终端（**AI 驱动**）⇒ **不敲键盘**：'
+                         '这次授权改由**示教器上"')
+_ANCHOR_PENDANT_GRIPPER = "    if not isatty():\n" + _PENDANT_GRIPPER_LINE
+_ANCHOR_PENDANT_GRIPPER_MUT = "    if False:\n" + _PENDANT_GRIPPER_LINE
+
+
 TMP_ROOT = None      # 由下面建起来（变异体也写进这里，跑完一起删）
 
 
@@ -561,12 +573,19 @@ def run_cli(*args, env=None):
     「非交互 ⇒ 拒绝」那几条断言就会随「谁在跑测试」变结果（拿运气当判据）。
     给了 DEVNULL，交互档一律拿到 EOF —— 那正是「没有人在旁边授权」的样子。
     """
+    e = clean_env(**(env or {}))
+    # 起栈记录（`--stop` 按它去收 session）也重定向进 tmpdir：离线测试**不许**动
+    # 真人 `~/.config/ur5-vision-grasp/last_stack.json` —— 那份记着**真的**上一次
+    # 起的栈，拿它当夹具就是自证式判据（而且 `--stop` 会顺着它去杀真进程）。
+    e[board_lib.STACK_RECORD_ENV] = REC_PATH
     return subprocess.run([sys.executable, RUN_PATH] + list(args),
                           capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                          env=clean_env(**(env or {})))
+                          env=e)
 
 
 tmpdir = TMP_ROOT = tempfile.mkdtemp(prefix="board_run_test_")
+# 起栈记录的那一份（`run_cli` 塞给子进程、`--stop` 那条 e2e 写进去的也是它）。
+REC_PATH = os.path.join(tmpdir, "last_stack.json")
 site_path, planner_path = tmp_env_files(tmpdir)
 try:
     # =================================================================
@@ -1832,12 +1851,35 @@ try:
           mut_o == board_run.PASS and real_o == board_run.FAIL,
           "改后 %s / 改前 %s" % (mut_o, real_o))
 
-    m = load_mutant(_mutate(SRC, "    if isatty():", "    if True:", "wpath"), "wpath")
-    mut_w = m.judge_write_path(lambda: False)[0]
-    real_w = board_run.judge_write_path(lambda: False)[0]
-    check("削掉「非交互 ⇒ 拒绝写路径」⇒ 没有当次授权也能发切换（[13] 吃劲）",
-          mut_w == board_run.PASS and real_w == board_run.FAIL,
+    # 这条变异**就是 2026-10-08 之前的那个形状**：没有交互终端 ⇒ 写路径整个不通
+    # （`ask_gripper_authorization` 里那句「本脚本没有无人值守模式」）。用户的要求是
+    # 它**要能支持 AI 驱动**：非终端改走**示教器 STOP → PLAY 两步握手**。
+    # 把那一档削掉 ⇒ 又回到敲键盘 ⇒ AI 那一轮永远拿不到授权。
+    m = load_mutant(_mutate(SRC, _ANCHOR_PENDANT_GRIPPER,
+                            _ANCHOR_PENDANT_GRIPPER_MUT, "wpath"), "wpath")
+    _seen = []
+
+    def _boom_input(*_a, **_k):
+        """键盘那条路的 `prompt_fn`：**没有终端**就是 EOF（与 `input()` 同形）。"""
+        raise EOFError
+
+    def _loop_ok(ip, timeout, **kw):
+        _seen.append((ip, timeout, kw.get("consequence")))
+        return True, "STOP → PLAY 两步**都看到了**"
+
+    mut_w = m.ask_gripper_authorization(isatty=lambda: False, ip="203.0.113.7",
+                                        loop=_loop_ok, out=lambda *a: None,
+                                        prompt_fn=_boom_input)
+    real_w = board_run.ask_gripper_authorization(
+        isatty=lambda: False, ip="203.0.113.7", loop=_loop_ok,
+        out=lambda *a: None, prompt_fn=_boom_input)
+    check("削掉「非交互 ⇒ 走示教器两步握手」⇒ 没有终端时又回到敲键盘"
+          "（AI 驱动整条路不通 —— 这正是要修的那个缺陷）",
+          mut_w is False and real_w is True,
           "改后 %s / 改前 %s" % (mut_w, real_w))
+    check("  而且改前那次**真的**把控制柜 IP 递给了握手（判据不是「函数返回 True」）",
+          bool(_seen) and _seen[-1][0] == "203.0.113.7"
+          and _seen[-1][2] == "一个寄存器都不写", str(_seen[-1:]))
 
     m = load_mutant(_mutate(SRC, '    return FAIL, ("已执行但**未生效**（复核仍 %s）',
                             '    return PASS, ("已执行但**未生效**（复核仍 %s）',
@@ -2046,6 +2088,52 @@ try:
         with contextlib.suppress(Exception):
             decoy.wait(timeout=5)
 
+    # ★ 名字名单**兜不住**的那一半：一个**名字不在名单里**的节点，只有当它是
+    #   「上一轮启动器起的」时才收得掉 —— 靠的是那份仓库外的 `(pid, sid)` 记录。
+    #   这一条**必须**是一条真进程：只在内存里造一个 rec 是自证式的
+    #   （那样测的是 `owned_session_pids()` 的算术，不是「收栈真的够得着它」）。
+    #   孙进程的 argv 里刻意**不含**任何名单词 ⇒ 名字那条路必然漏它。
+    #   ⚠️ 记录要写进**子进程会读的那一份**（`REC_PATH` ＝ `run_cli` 塞给它的
+    #   那个 tmpdir 路径）。第一版这里漏了 `path=` ⇒ 写进了真人那份默认位置，
+    #   子进程读的是 tmpdir ⇒ 永远收不到，而**失败信息看起来像代码坏了**。
+    leader = subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys, time\n"
+         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)',\n"
+         "                  'zzz_not_in_leftover_list'])\n"
+         "time.sleep(120)\n"],
+        start_new_session=True)
+    try:
+        time.sleep(0.8)
+        sib = board_lib.session_pids(board_lib.sid_of(leader.pid))
+        check("先确认：这一栈**名字判据看不见**（否则下面测的不是 session 那条路）",
+              bool(sib) and len(sib) >= 2
+              and not any(str(p) == s.split()[0] for s in board_lib.leftovers()
+                          for p in sib),
+              "sid 成员=%s 名单命中=%s" % (sib, board_lib.leftovers()))
+        board_lib.write_stack_record(leader.pid, board_lib.sid_of(leader.pid),
+                                     path=REC_PATH)
+        r = run_cli("--stop")
+        gone = []
+        for _ in range(40):
+            gone = [p for p in sib if board_lib.proc_stat(p)[0] not in (None, "Z")]
+            if not gone:
+                break
+            time.sleep(0.1)
+        check("★ 名单之外的成员也收掉了（判据 = 按 session 收，不是按名字）",
+              not gone, "还剩 %s" % gone)
+        check("  且 `--stop` 把「顺带按 session 收」说了出来（不然这一条是黑箱）",
+              "session" in r.stdout)
+        check("  记录收干净后被销掉（否则下一轮永远在追一个已经没了的会话）",
+              board_lib.read_stack_record(path=REC_PATH) == {})
+    finally:
+        with contextlib.suppress(Exception):
+            leader.kill()
+        with contextlib.suppress(Exception):
+            leader.wait(timeout=5)
+        with contextlib.suppress(Exception):
+            board_lib.clear_stack_record(path=REC_PATH)
+
     # =================================================================
     # 12. 端到端
     # =================================================================
@@ -2154,7 +2242,14 @@ try:
           and "[PASS] P2.槽位数" in out)
     check("  等不到播放 ⇒ 退 2，并**立刻收栈**（不把栈留给下一次）",
           rc == 2 and "收栈完成" in out and "[FAIL] P3.示教器 PLAYING" in out,
-          "rc=%s" % rc)
+          "rc=%s 尾部=%r" % (rc, out[-300:]))
+    # ★ 收尾那一步也得能**转达**：收栈只收掉电脑这一侧，控制柜那边要人按 STOP。
+    #   用户 2026-10-08 点名的就是「提示 ai 告诉我去示教器点 play **和 stop**」——
+    #   没有 `>>> 需要人动手` 这个前缀，AI 拿到的只是一句收尾备注，不会念给人。
+    check("★ 收完栈后，把「去示教器按停止」也压成能转达的一行"
+          "（**不只是**一句收尾备注）",
+          board_lib.HUMAN_MARK in out and "去示教器按**停止**" in out,
+          "尾部=%r" % out[-400:])
     check("  板子不在线 ⇒ 控制器闸门是 SKIP（**没验到**），不是 PASS",
           "[SKIP] P3.控制器闸门" in out)
     rec_ok = json.load(open(os.path.join(tmpdir, "e2e_ok.json"), encoding="utf-8"))
@@ -2234,15 +2329,24 @@ try:
           board_run.TASK_KNOWN_TOP == ("task", "launch", "params", "model",
                                        "start_delay", "expect", "score"))
 
-    # ---- ② 当次：起栈之前就要有交互终端 ------------------------------
+    # ---- ② 当次：写路径两条都要人动手，区别只在**拿什么当证明** --------
+    # 2026-10-08 改：**没有交互终端**不再一律 FAIL。旧行为「非终端直接拒」把
+    # **AI 驱动**整条路堵死（用户的要求是「要能支持 AI 自己跑，也要能支持人手动跑」），
+    # 而它换不来安全 —— **能敲键盘的人未必在臂旁边，按示教器的人一定在**。
+    # 现在：非终端 ⇒ P0 这一项 PASS，但**授权改成运行时由示教器 STOP → PLAY
+    # 两步握手当场核验**（`ask_gripper_authorization` / `confirm_handoff`），
+    # 核验不了就**不写**（fail-closed）。所以 P0 的 PASS **不等于**「已经授权了」。
     st, det = board_run.judge_write_path(lambda: False)
-    check("--repair-controller + 非交互终端 ⇒ **FAIL**（不是 SKIP：请求本身不成立）",
-          st == board_run.FAIL)
-    check("  理由里点名「当次」，并明说授权不许来自任务描述/环境变量/上次的记忆",
+    check("--repair-controller + 非交互终端 ⇒ **PASS**（路走得通：授权改由示教器承担）",
+          st == board_run.PASS, st)
+    check("  理由里点名「当次」、说清证明来自示教器 STOP → PLAY，并明说授权不许来自"
+          "任务描述/环境变量/上一次的记忆（红线 6）",
           "当次" in det and "任务描述" in det and "环境变量" in det
-          and "红线 6" in det)
-    check("  有交互终端才 PASS", board_run.judge_write_path(lambda: True)[0]
-          == board_run.PASS)
+          and "红线 6" in det and "示教器" in det and "STOP" in det)
+    check("  并且带上**可转达**的那一行（AI 拿到的只有文字，得知道要转达给人）",
+          board_lib.HUMAN_MARK in det)
+    check("  有交互终端也是 PASS（两档都通，区别只是拿什么当证明）",
+          board_run.judge_write_path(lambda: True)[0] == board_run.PASS)
 
     # ---- ②′ 红线 3：运行记录不许落进公开仓（**P0 就拦，起栈之前**）-----------
     # 2026-10-06 抓到的洞：`--json-report` 只在**最后**判了一下、且**不翻退出码**
@@ -2326,15 +2430,35 @@ try:
     check("  闸门过的时候也不印（没什么可修的）",
           not board_run.print_repair_hint(board_run.PASS, False, "a1", out=sink2))
 
-    # ---- 端到端：非交互 + --repair-controller ⇒ 起栈之前就退 2 --------
+    # ---- 端到端：非交互 + --repair-controller ⇒ **不再拦在 P0** --------
+    # 2026-10-08 改（用户的要求：启动器要支持 AI 驱动）：非交互终端过去在这里就退 2
+    # （「没有无人值守模式」），把 AI 整条路堵死。现在 P0 这一项 **PASS**，授权改成
+    # 运行时由**示教器 STOP → PLAY 两步握手**当场核验（核验不了就不写）。
+    # ⚠️ 所以下面断言的是「**PASS 并且路继续往下走**」—— 判据不再落在 P0 上。
     r = run_cli("--task", "a1", "--site", site_path, "--dry-run",
                 "--repair-controller", env={"PATH": no_ros})
-    check("真跑一次：--repair-controller 在非交互终端 ⇒ P0 红、退 2",
-          r.returncode == 2 and "[FAIL] %s" % board_run.WRITE_PATH_ITEM in r.stdout,
+    check("真跑一次：--repair-controller 在非交互终端 ⇒ P0 **PASS**、路通下去",
+          r.returncode == 0 and "[PASS] %s" % board_run.WRITE_PATH_ITEM in r.stdout,
           "rc=%s" % r.returncode)
-    check("  而且**停在 P0**：P1/P2 那两个阶段头一次都没印（拦在起栈之前）",
-          "P1 前置" not in r.stdout and "P2 起栈" not in r.stdout
-          and "起栈中" not in r.stdout)
+    check("  而且**过了 P0**：P1/P2 都印出来了（旧版在这里就退 2）",
+          "P1 前置" in r.stdout and "P2 起栈" in r.stdout)
+    check("  P0 那一项明说证明来自示教器（不是「没人值守也能跑」）",
+          "示教器" in r.stdout and "STOP" in r.stdout)
+    # 转达契约只在**真会走栈**的那一趟印（`--dry-run` 没有要人动手的步骤）：
+    # 所以拿一趟**不带** `--dry-run` 的来验。它同样没有 ros2（PATH=no_ros）⇒ 停在
+    # P0.ROS 环境，但那正好证明契约印在**任何**要动手之前。
+    r_real = run_cli("--task", "a1", "--site", site_path,
+                     "--repair-controller", env={"PATH": no_ros})
+    check("  真跑一趟（非 dry-run）：先印**转达契约** —— AI 得知道那些"
+          "「>>> 需要人动手」是给人看的",
+          r_real.returncode == 2 and board_lib.HUMAN_MARK in r_real.stdout
+          and "[AI 驱动]" in r_real.stdout and "原样念给人听" in r_real.stdout,
+          "rc=%s" % r_real.returncode)
+    check("  契约**只印一次**（同一趟里出现两次就说明有人把它放进了循环）",
+          r_real.stdout.count("[AI 驱动]") == 1)
+    check("  而这趟是**它自己**没配好环境才停的（P0.ROS 环境 红），写路径那一项仍是绿",
+          "[FAIL] P0.ROS 环境" in r_real.stdout
+          and "[PASS] %s" % board_run.WRITE_PATH_ITEM in r_real.stdout)
     check("  报文在起栈之前就摆出来了（服务名 + 恒空的 deactivate）",
           board_gate.SWITCH_SERVICE in r.stdout
           and "deactivate_controllers []" in r.stdout)
@@ -2343,6 +2467,8 @@ try:
     check("  同一份 profile 不带这个开关时 P0 里没有这一项（只读是默认）",
           board_run.WRITE_PATH_ITEM not in r_ro.stdout
           and "P2 起栈" in r_ro.stdout, "rc=%s" % r_ro.returncode)
+    check("  而且 `--dry-run` **不印**转达契约（那一趟根本没有要人动手的步骤）",
+          board_lib.HUMAN_MARK not in r_ro.stdout and "[AI 驱动]" not in r_ro.stdout)
     check("  P0 就把参数集摆出来了（P0 不过的话走不到 P2，披露不能只在顺利路径上）",
           "参数集（" in r_ro.stdout)
     r_ns = run_cli("--task", "a1", "--site", os.path.join(tmpdir, "没有这个站点.yaml"),
@@ -2479,14 +2605,19 @@ try:
     st, det = board_run.judge_gripper_init({"dry_run": True})
     check("--dry-run ⇒ **SKIP**（是「没做」，不是绿）", st == board_run.SKIP, det)
 
-    # ---- ⑤ 端到端：非交互 + --init-gripper ⇒ 起栈之前就退 2 ----------
+    # ---- ⑤ 端到端：非交互 + --init-gripper ⇒ **不再拦在 P0** ----------
+    # 与 `--repair-controller` 同一条改动（2026-10-08）：非交互终端从「P0 直接红」
+    # 改成「P0 PASS + 运行时由示教器 STOP → PLAY 当场核验」。`--dry-run` 下**一个
+    # 寄存器都不写**，所以这一趟走到 P2 就够证明路通了（真写那一步在下面 ⑥ 里
+    # 用依赖注入单测）。
     r = run_cli("--task", "a1", "--site", site_path, "--dry-run",
                 "--init-gripper", env={"PATH": no_ros})
-    check("真跑一次：--init-gripper 在非交互终端 ⇒ P0 红、退 2",
-          r.returncode == 2 and "[FAIL] %s" % board_run.GRIPPER_INIT_ITEM in r.stdout,
+    check("真跑一次：--init-gripper 在非交互终端 ⇒ P0 **PASS**、路通下去",
+          r.returncode == 0
+          and "[PASS] %s" % board_run.GRIPPER_INIT_ITEM in r.stdout,
           "rc=%s" % r.returncode)
-    check("  而且**停在 P0**：P1/P2 那两个阶段头一次都没印（拦在起栈之前）",
-          "P1 前置" not in r.stdout and "P2 起栈" not in r.stdout)
+    check("  而且**过了 P0**：P1/P2 都印出来了（旧版在这里就退 2）",
+          "P1 前置" in r.stdout and "P2 起栈" in r.stdout)
     check("  文案指出它要的是**当次**授权（与控制器那条同一个判据函数）",
           "--init-gripper" in r.stdout and "当次" in r.stdout)
     r_gd = run_cli("--task", "a1", "--site", site_path, "--dry-run",

@@ -28,11 +28,13 @@ import sys
 
 sys.dont_write_bytecode = True   # 防 .pyc 假绿（仓库约定）
 
+import builtins                  # noqa: E402
 import contextlib                # noqa: E402
 import importlib.util            # noqa: E402
 import io                        # noqa: E402
 import os                        # noqa: E402
 import tempfile                  # noqa: E402
+import types                     # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -350,6 +352,110 @@ def section_source_pins():
           f"freeze@{i_freeze} 首项@{i_first_item}")
 
 
+# --------------------------------- 4b. 写路径的当次授权：两条路都不许空过
+def section_repair_authorization():
+    """`_run_repair` 里「要当次授权」那一段（2026-10-08：非交互终端不再一律拒）。
+
+    这条能离线测的原因：授权那一段**只**依赖 `isatty()` 与注入的 `loop`；探测对象
+    是假的 probe —— 不碰 ROS、不碰控制器、不碰串口。发出去的 `switch_controllers`
+    记在假 probe 上，于是「核验不过时**一个字节都没发**」是**看得见**的，
+    而不是靠读源码相信它。
+    """
+    print("\n[4b] 写路径的当次授权：终端敲 yes / 示教器 STOP→PLAY，两档都不许空过")
+
+    class _Probe:
+        """假 probe：switch 过就报 active，否则 inactive。"""
+
+        def __init__(self):
+            self.switched = []
+
+        def switch_controllers(self, req):
+            self.switched.append(list(req))
+
+        def list_controllers(self):
+            return {C: "active"} if self.switched else {C: "inactive"}
+
+    def _args(**over):
+        d = {"repair_attempts": 1, "dashboard_host": "203.0.113.7",
+             "play_timeout": 5.0}
+        d.update(over)
+        return types.SimpleNamespace(**d)
+
+    def quiet(*a):
+        return None
+
+    seen = []
+
+    def _loop_ok(ip, timeout, **kw):
+        seen.append((ip, timeout, kw.get("consequence")))
+        return True, "STOP → PLAY 两步**都看到了**"
+
+    def _loop_no(ip, timeout, **kw):
+        seen.append((ip, timeout, kw.get("consequence")))
+        return False, "读不到控制柜 IP ⇒ **核验不了**"
+
+    p = _Probe()
+    ok = board_gate._run_repair(_args(), p, [C], isatty=lambda: False,
+                                loop=_loop_ok, out=quiet)
+    check("★ 没有交互终端（AI 驱动）⇒ 走示教器两步握手，过了才发 switch_controller",
+          ok is True and p.switched == [[C]], f"ok={ok} switched={p.switched}")
+    check("  而且真把控制柜 IP 与「不写的后果」递进了握手（不是「返回 True 就算过」）",
+          bool(seen) and seen[-1][0] == "203.0.113.7"
+          and seen[-1][2] == "不发 switch_controller", str(seen[-1:]))
+
+    p2 = _Probe()
+    ok2 = board_gate._run_repair(_args(), p2, [C], isatty=lambda: False,
+                                 loop=_loop_no, out=quiet)
+    check("  核验不过 ⇒ **一个字节都不发**（fail-closed，不是「那就当确认了」）",
+          ok2 is False and p2.switched == [], f"ok={ok2} switched={p2.switched}")
+
+    # 站点没配好、没给 --dashboard-host ⇒ 核验不了 ⇒ 也不发（**不许**替它猜个 IP）
+    p2b = _Probe()
+    ok2b = board_gate._run_repair(
+        _args(dashboard_host=None), p2b, [C], isatty=lambda: False,
+        loop=lambda ip, timeout, **kw: (ip is not None,
+                                        "过了" if ip else "没给控制柜 IP"),
+        out=quiet)
+    check("  没给 `--dashboard-host` ⇒ 核验不了 ⇒ 也不发（不许替它猜一个 IP）",
+          ok2b is False and p2b.switched == [])
+
+    # 有终端、却读不出确认（EOF）⇒ 拒。input 必须先堵死，否则真终端上会**卡住**。
+    real_input = builtins.input
+    p3 = _Probe()
+    builtins.input = lambda *a, **k: (_ for _ in ()).throw(EOFError())
+    try:
+        ok3 = board_gate._run_repair(_args(), p3, [C], isatty=lambda: True,
+                                     loop=_loop_ok, out=quiet)
+    finally:
+        builtins.input = real_input
+    check("  说有终端、却读不出确认（EOF）⇒ 拒，且**一次都没发**",
+          ok3 is False and p3.switched == [], f"ok={ok3} switched={p3.switched}")
+
+    # 变异：把「没有终端就走示教器」这一支短路掉，AI 驱动那条路必须**当场消失**。
+    src = open(os.path.join(HERE, "board_gate.py"), encoding="utf-8").read()
+    m = _mutate(src, "    if not isatty():", "    if False:  # MUT", "m6")
+    if m is not None:
+        pm = _Probe()
+        builtins.input = lambda *a, **k: (_ for _ in ()).throw(EOFError())
+        try:
+            got = m._run_repair(_args(), pm, [C], isatty=lambda: False,
+                                loop=_loop_ok, out=quiet)
+        finally:
+            builtins.input = real_input
+        check("M6 短路掉示教器那一支 ⇒ AI 驱动只能去敲键盘、于是发不出去（与改前不同）",
+              ok is True and got is False and pm.switched == [],
+              f"改前={ok} 改后={got} switched={pm.switched}")
+
+    check("  源码里**不再**有「非终端就直接拒」的旧文案（它把 AI 驱动整条路堵死）",
+          "本脚本**没有**无人值守模式" not in src)
+    check("  两档走的是**同一个**握手件（board_lib.ensure_in_the_loop），不另抄一套",
+          "board_lib.ensure_in_the_loop" in src)
+    check("  默认判据就是 sys.stdin.isatty（谁改了默认值这里立刻红）",
+          "isatty = sys.stdin.isatty if isatty is None else isatty" in src)
+    check("  --dashboard-host / --play-timeout 是命令行参数（AI 得能把站点 IP 递进来）",
+          '"--dashboard-host"' in src and '"--play-timeout"' in src)
+
+
 # ------------------------------------------------- 5. 离线跑一遍 main()
 def section_cli():
     print("\n[5] 命令行行为（离线）")
@@ -401,6 +507,7 @@ def main():
     section_three_states()
     section_mutation()
     section_source_pins()
+    section_repair_authorization()
     section_cli()
     print("\n" + "=" * 70)
     if _failed:
