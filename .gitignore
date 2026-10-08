@@ -37,3 +37,11 @@ runs/
 # detector_node 会按 $YOLO_MODEL_DIR → CWD 逐级向上 → 包内 models/ 的顺序查找，
 # 找不到就明确报错，**不会**联网下载 COCO 权重冒充（见 D6/D24）。
 ros2_ws/src/yolo_detector/models/*.pt
+
+# Claude Code 的本机状态目录：会话记录、worktree 注册表、权限设置。
+# 它是**每台机器各一份**的运行期状态，不是项目内容 —— 入库的话每次
+# `git status` 里都留一条 `?? .claude/`，而且 `.claude/worktrees/` 下会多出
+# 整份仓库副本（实测：仓库内曾有 3 个 worktree ⇒ 每次递归 grep 都多下探 3 份）。
+# worktree 现在一律建在仓库外（`~/robotics/worktrees/ur5-vision-grasp/`），
+# 这里再兜一道底：无论谁在仓库里跑 Claude Code，都不该把它的状态提交上去。
+.claude/
