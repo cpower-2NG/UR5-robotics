@@ -261,8 +261,20 @@ def check_runbook(section, offset, entry, keys, values):
             bad.append(f'{RUNBOOK}:{ln} 是真机命令却没有 `robot_ip:=`')
 
     if seen_keys and seen_keys != keys:
-        bad.append(f'A1 一节所有 launch 块合起来仍缺参数：'
-                   f'{sorted(keys - seen_keys)}')
+        # ⚠️ 这句原来只印 `keys - seen_keys`。当三块**多**了键（启动器反而没有）时，
+        #    那个差集是空的，于是报出「仍缺参数：[]」—— **红得对、话是错的**，
+        #    2026-10-08 实测踩到（在途改动给三块加了 `grasp_point_mode` /
+        #    `table_plane_z`，而 `board_a1.py::build_cmd()` 还没同步）。
+        #    报红的原因必须能直接指向该改哪边，否则下一个人会去查一个不存在的缺项。
+        missing = sorted(keys - seen_keys)
+        extra = sorted(seen_keys - keys)
+        detail = []
+        if missing:
+            detail.append(f'少 {missing}')
+        if extra:
+            detail.append(f'多 {extra}')
+        bad.append(f'A1 一节所有 launch 块合起来与启动器不一致：'
+                   f'{"、".join(detail)}')
 
     # ⑤ ROS_DOMAIN_ID 必须显式导出
     if 'ROS_DOMAIN_ID=99' not in section:

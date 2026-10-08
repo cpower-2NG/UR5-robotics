@@ -230,6 +230,14 @@ def build_cmd(a):
         "carry_objects:=true",
         "tf_required:=true",
         "use_target_plane:=true", "target_plane_z:=0.0285",
+        # 抓取点取**顶面中心**而不是检测框中心。框框住的是方块在图像上的整个
+        # **侧影**（顶面 + 朝着相机的那些竖面），斜视下框中心比顶面中心低
+        # (S·sinα·f)/(2D) —— 本机俯视 54.1°，实测偏 13.6 mm，而方块才 28.5 mm 宽。
+        # 两条棱中点法把它修回来（详见 projector_node.py 的说明）。
+        # ⚠️ 这三行必须与 `docs/待执行命令.md` A1 一节那三块**同时**改：
+        #    `scripts/test_startup_docs.py` 拿本函数当**真值**比对文档，
+        #    只改一边就判红（那正是要的）。
+        "grasp_point_mode:=top_face_center", "table_plane_z:=0.0",
         "publish_camera_tf:=true",
         # 规划器推迟启动：`start_delay` 包的是 [realsense, detector, perception,
         # planner]，**不含 UR 驱动**。驱动立刻起、抢在规划器之前把 5000x 连接建立好，
