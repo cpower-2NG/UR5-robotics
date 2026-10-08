@@ -17,6 +17,7 @@ perception_3d / projector_node 自检 —— 不需要仿真器，也不需要�
 退出码 0 = 全通过，1 = 有失败项。
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ PERCEPTION_SRC = PROJECT_ROOT / "ros2_ws" / "src" / "perception_3d" / "perceptio
 
 try:
     import rclpy
-    from geometry_msgs.msg import TransformStamped, PoseStamped, Point
+    from geometry_msgs.msg import TransformStamped, PoseStamped, Point, Quaternion
 except ImportError as e:
     print(f"[SKIP] 未找到 ROS2 Python 环境（{e}）。")
     print("       请先 source /opt/ros/humble/setup.bash 再运行本脚本。")
@@ -179,6 +180,148 @@ def main():
     node2.detection_callback(msg2)
     check("像素坐标不误报", node2._warned_normalized is False)
     node2.destroy_node()
+
+    print("\n--- 抓取点：框中心 vs 顶面中心（正向模型）---")
+    # 这一节不碰真机、不读标定文件：自己造一个「斜视俯视」相机，把一个方块的
+    # 8 个角正投影出去、取包围盒，再拿这个包围盒去问算法「方块中心在哪」。
+    # 于是**真值是构造出来的**，误差是可以直接算出来的毫米数。
+    #
+    # 为什么不信手算：这条修正的第一次实现（把两棱中点投影回像素、再与
+    # target_plane_z 求交）在正向模型上是**零效果** —— 两列误差一模一样。
+    # 原因是中点落在 z=(H+0)/2 上，同一根射线延伸到 z=H 落点是另一个 (x,y)。
+    # 肉眼看不出来，只有正向模型能抓出来。见 _top_face_xy 的 docstring。
+    h_top = 0.0285                       # 方块高（顶面高度）
+    eye = np.array([0.42, 1.067, 0.825])  # 相机在 base 下（真机 topcam 量级）
+    aim = np.array([0.47, 0.30, 0.0])     # 光轴指向台面
+    fwd = aim - eye
+    fwd /= np.linalg.norm(fwd)
+    rgt = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
+    rgt /= np.linalg.norm(rgt)
+    dwn = np.cross(fwd, rgt)
+    R_co = np.column_stack([rgt, dwn, fwd])   # 光学->base（列 = 光学基）
+
+    def _R_to_quat(Rm):
+        """旋转矩阵 -> Quaternion 消息。"""
+        tr = float(Rm[0, 0] + Rm[1, 1] + Rm[2, 2])
+        w = math.sqrt(max(0.0, 1.0 + tr)) / 2.0
+        return Quaternion(w=w,
+                          x=float((Rm[2, 1] - Rm[1, 2]) / (4.0 * w)),
+                          y=float((Rm[0, 2] - Rm[2, 0]) / (4.0 * w)),
+                          z=float((Rm[1, 0] - Rm[0, 1]) / (4.0 * w)))
+
+    tf_geom = TransformStamped()
+    tf_geom.transform.rotation = _R_to_quat(R_co)
+    tf_geom.transform.translation.x = float(eye[0])
+    tf_geom.transform.translation.y = float(eye[1])
+    tf_geom.transform.translation.z = float(eye[2])
+
+    check("四元数往返能还原旋转矩阵",
+          float(np.abs(node._quat_to_matrix(tf_geom.transform.rotation) - R_co).max()) < 1e-12)
+
+    fx_g, fy_g, cx_g, cy_g = 611.747, 610.951, 326.370, 229.938
+
+    def _bbox(bx, by, s_xy, s_z=None):
+        """把 s_xy×s_xy×s_z 的棱柱放在 (bx,by,0)，返回它侧影的包围盒。"""
+        s_z = h_top if s_z is None else s_z
+        hx = s_xy / 2.0
+        pts = np.array([[x, y, z] for x in (bx - hx, bx + hx)
+                        for y in (by - hx, by + hx) for z in (0.0, s_z)])
+        pc = (pts - eye) @ R_co            # R 正交：cam = R^T (base-t) <=> (base-t)@R
+        u = cx_g + fx_g * pc[:, 0] / pc[:, 2]
+        v = cy_g + fy_g * pc[:, 1] / pc[:, 2]
+        return u.min(), u.max(), v.min(), v.max()
+
+    node.target_plane_z = h_top
+    node.table_plane_z = 0.0
+    node.camera_model.fx = lambda: fx_g
+    node.camera_model.fy = lambda: fy_g
+    node.camera_model.cx = lambda: cx_g
+    node.camera_model.cy = lambda: cy_g
+
+    e_old, e_new, worst = [], [], 0.0
+    for bx, by in [(0.485, 0.301), (0.450, 0.250), (0.520, 0.360), (0.485, 0.400)]:
+        for s_xy in (0.0285, 0.0394, 0.045):
+            u0, u1, v0, v1 = _bbox(bx, by, s_xy)
+            uc, vc, sy = (u0 + u1) / 2.0, (v0 + v1) / 2.0, v1 - v0
+            old = node._ray_plane_xy(uc, vc, h_top, R_co, eye)
+            new = node._top_face_xy(uc, vc, sy, tf_geom)
+            e_old.append(math.hypot(old[0] - bx, old[1] - by) * 1000.0)
+            e_new.append(math.hypot(new[0] - bx, new[1] - by) * 1000.0)
+            worst = max(worst, e_new[-1])
+    check("框中心（旧行为）确实系统性偏 —— 均值 > 10 mm",
+          float(np.mean(e_old)) > 10.0, f"均值 {np.mean(e_old):.2f} mm")
+    check("顶面中心（新行为）落到亚毫米 —— 最大 < 1 mm",
+          worst < 1.0, f"最大 {worst:.2f} mm（旧 {np.mean(e_old):.2f} mm）")
+
+    # 偏差方向：这条钉住「不是随便偏，是偏在视线方向上」。+y 朝相机
+    # （相机 y=1.067，方块 y≈0.30），所以旧算法的抓取点落在顶面**靠相机那一侧**。
+    u0, u1, v0, v1 = _bbox(0.485, 0.301, 0.0394)
+    old = node._ray_plane_xy((u0 + u1) / 2.0, (v0 + v1) / 2.0, h_top, R_co, eye)
+    check("旧偏差方向 = +y（朝相机）且横向几乎为零",
+          (old[1] - 0.301) > 0.010 and abs(old[0] - 0.485) < 0.003,
+          f"Δ=({(old[0] - 0.485) * 1000:+.2f},{(old[1] - 0.301) * 1000:+.2f}) mm")
+
+    # 框不紧（真实 YOLO 框不会像素级贴合）不该被放大成毫米级误差
+    loose = []
+    for pad in (1.0, 3.0, 5.0):
+        u0, u1, v0, v1 = _bbox(0.485, 0.301, 0.0394)
+        n_pad = node._top_face_xy((u0 + u1) / 2.0, (v0 + v1) / 2.0,
+                                  (v1 + pad) - (v0 - pad), tf_geom)
+        loose.append(math.hypot(n_pad[0] - 0.485, n_pad[1] - 0.301) * 1000.0)
+    check("框每边松 5 px，误差仍 < 1 mm",
+          max(loose) < 1.0, f"最松一档 {max(loose):.2f} mm")
+
+    # 默认模式必须**逐位**不变：这条是给「改了别的路径」上的保险。
+    # 深度取该像素射线与顶面交点到相机的距离（真机上 `_robust_depth` 给的
+    # 就是这个量级），这样平面模式的高度校验才会放行。
+    uu, vv = (u0 + u1) / 2.0, (v0 + v1) / 2.0
+    p_on_plane = node._ray_plane_xy(uu, vv, h_top, R_co, eye)
+    depth_g = float(np.linalg.norm(np.array([p_on_plane[0], p_on_plane[1], h_top]) - eye))
+    x_d = (uu - cx_g) * depth_g / fx_g
+    y_d = (vv - cy_g) * depth_g / fy_g
+    p_none = node._ray_plane_pose(x_d, y_d, depth_g, tf_geom, uu, vv,
+                                  node.get_clock().now().to_msg())
+    p_old = node._ray_plane_xy(uu, vv, h_top, R_co, eye)
+    check("grasp_xy=None 与老路径逐位一致（默认行为不变）",
+          p_none is not None and
+          abs(p_none.pose.position.x - p_old[0]) < 1e-12 and
+          abs(p_none.pose.position.y - p_old[1]) < 1e-12 and
+          abs(p_none.pose.position.z - h_top) < 1e-12,
+          f"({p_none.pose.position.x:.9f},{p_none.pose.position.y:.9f})"
+          if p_none is not None else "返回 None")
+
+    # 顶面高度填错时，新方法不该比旧的更差（真高 28.5，参数故意填偏）
+    for h_wrong in (0.020, 0.035, 0.045):
+        node.target_plane_z = h_wrong
+        eo, en = [], []
+        for bx, by in [(0.485, 0.301), (0.450, 0.250), (0.520, 0.360), (0.485, 0.400)]:
+            u0, u1, v0, v1 = _bbox(bx, by, 0.0394)
+            uc, vc, sy = (u0 + u1) / 2.0, (v0 + v1) / 2.0, v1 - v0
+            o = node._ray_plane_xy(uc, vc, h_wrong, R_co, eye)
+            n = node._top_face_xy(uc, vc, sy, tf_geom)
+            eo.append(math.hypot(o[0] - bx, o[1] - by) * 1000.0)
+            en.append(math.hypot(n[0] - bx, n[1] - by) * 1000.0)
+        check(f"target_plane_z 填成 {h_wrong * 1000:.0f}mm 时新方法仍不差于旧方法",
+              max(en) < max(eo), f"新 {max(en):.2f}mm vs 旧 {max(eo):.2f}mm")
+    node.target_plane_z = h_top
+
+    # 配置写错必须能被看见，而不是静默算错
+    from projector_node import grasp_point_config_warnings as _warn
+    check("配置正确时不吵人",
+          _warn(0.0285, 0.0, 'top_face_center') == []
+          and _warn(None, 0.0, 'bbox_center') == [])
+    check("table_plane_z >= target_plane_z 会被喊出来（不静默）",
+          len(_warn(0.0285, 0.0285, 'top_face_center')) == 1
+          and len(_warn(0.0285, 0.05, 'top_face_center')) == 1)
+    check("模式名拼错会被喊出来（否则静默退回不修正）",
+          len(_warn(0.0285, 0.0, 'topface_center')) == 1
+          and len(_warn(0.0285, 0.0, 'top_face_centre')) == 1)
+    node.table_plane_z = 0.05          # 故意写反
+    _bad = node._top_face_xy((u0 + u1) / 2.0, (v0 + v1) / 2.0, (v1 - v0), tf_geom)
+    check("  → 偏量约等于一个方块高",
+          _bad is not None and math.hypot(_bad[0] - 0.485, _bad[1] - 0.301) > 0.02,
+          f"偏 {math.hypot(_bad[0] - 0.485, _bad[1] - 0.301) * 1000:.1f} mm")
+    node.table_plane_z = 0.0
 
     print("\n--- 针孔投影数值自洽 ---")
     patch_intrinsics(node)

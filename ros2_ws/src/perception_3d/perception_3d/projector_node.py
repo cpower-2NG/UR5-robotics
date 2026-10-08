@@ -77,6 +77,38 @@ DEPTH_SCALE_BY_ENCODING = {
     '64FC1': 1.0,
 }
 
+# grasp_point_mode 的合法取值。写成集合而不是散在各处的字面量：下面那句
+# `== 'top_face_center'` 一旦拼错，行为会**静默退回**框中心 —— 不报错、
+# 不警告，只是坐标差十几毫米。这一类「看不见的降级」在本文件里栽过。
+GRASP_POINT_MODES = ('bbox_center', 'top_face_center')
+
+
+def grasp_point_config_warnings(target_plane_z, table_plane_z, mode):
+    """抓取点配置的自检，返回告警文本列表（空列表 = 没问题）。
+
+    纯函数，不碰节点，所以能直接自测。两件事会**静默**算错，都要喊出来：
+
+      1. ``mode`` 拼错 —— 会退回 ``bbox_center`` 而不报错；
+      2. ``table_plane_z >= target_plane_z`` —— 两条棱求出的「中点」跑到方块
+         外面，偏量正好是一个方块高。
+    """
+    out = []
+    if mode not in GRASP_POINT_MODES:
+        out.append(
+            f'grasp_point_mode={mode!r} 不是已知取值 {GRASP_POINT_MODES} —— '
+            f'本节点会按 bbox_center（检测框中心）处理，也就是**不修正**。'
+            f'斜视下那是十几毫米的系统偏差，请检查参数拼写。'
+        )
+    if (mode == 'top_face_center' and target_plane_z is not None
+            and table_plane_z >= target_plane_z):
+        out.append(
+            f'grasp_point_mode=top_face_center 要求 table_plane_z '
+            f'({table_plane_z:.4f}) **小于** target_plane_z '
+            f'({target_plane_z:.4f})，当前配置反了 —— '
+            f'顶面中心会算到方块外面。请检查 launch/yaml 参数。'
+        )
+    return out
+
 
 class Perception3D(Node):
     """2D 检测 → 3D 投影节点"""
@@ -116,6 +148,22 @@ class Perception3D(Node):
         self.declare_parameter('target_plane_z', 0.0285)   # = 台面 + 方块高（顶面）
         self.declare_parameter('plane_depth_tol', 0.03)
 
+        # ---- 「抓取点取框里的哪个像素」（默认保持原行为）----
+        # 检测框框住的是方块在图像上的**整个侧影**（顶面 + 朝向相机的那些竖面），
+        # 不是顶面。相机以 α 角斜视时，侧影中心比顶面中心在图上低
+        # (S·sinα·f)/(2D) 像素（S 方块边长、D 深度、f 焦距，与方位角无关）。
+        # 实测一块 22 px 见方的方块上这个量是 6 px —— 折算到 base 是
+        # **13.6 mm**，而方块才 28.5 mm 宽：夹爪会咬在顶面边上。
+        #
+        # 'top_face_center' 用两条**已知高度**的棱把它修回来：
+        #   · 侧影最高点 = 方块远端上棱，一定落在 z = target_plane_z 上；
+        #   · 侧影最低点 = 方块近端下棱，一定落在 z = table_plane_z 上。
+        # 这两点在 x/y 上的中点**恰好**是顶面中心的 x/y —— 边长 S 与投影比例
+        # 在里面自动消掉，所以不需要标定「方块多大」或「相机多斜」。
+        # （只在**平面模式**下有意义：深度模式下高度不已知，两条棱的平面无从谈起。）
+        self.declare_parameter('grasp_point_mode', 'bbox_center')
+        self.declare_parameter('table_plane_z', 0.0)       # 台面高度（近端棱所在平面）
+
         # 话题名做成参数（P2-7）。原因很具体：真机上 realsense2_camera 打开
         # align_depth.enable:=true 后，**对齐后的深度发布在
         # /camera/aligned_depth_to_color/image_raw**，而 /camera/depth/image_raw
@@ -137,6 +185,15 @@ class Perception3D(Node):
         self.target_plane_z = (float(self.get_parameter('target_plane_z').value)
                                if _use_plane else None)
         self.plane_depth_tol = float(self.get_parameter('plane_depth_tol').value)
+        self.grasp_point_mode = str(self.get_parameter('grasp_point_mode').value)
+        self.table_plane_z = float(self.get_parameter('table_plane_z').value)
+
+        # 配置自检：写错的话**不会报任何错**，只是坐标系统性偏一个可算出来的量。
+        # 代价是整轮抓取，值得在启动时喊一声。抽成纯函数是为了能自测
+        # （见 scripts/test_perception_3d.py）。
+        for _w in grasp_point_config_warnings(
+                self.target_plane_z, self.table_plane_z, self.grasp_point_mode):
+            self.get_logger().error(_w)
 
         # ---- 相机模型 ----
         self.camera_model = PinholeCameraModel()
@@ -344,7 +401,53 @@ class Perception3D(Node):
             [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
         ])
 
-    def _ray_plane_pose(self, x, y, z, transform, u, v, stamp):
+    def _ray_plane_xy(self, u, v, z_plane, R, t):
+        """像素 ``(u,v)`` 的射线 ∩ 平面 ``z = z_plane``，返回 ``(x, y)``。
+
+        射线与平面平行、或平面落在相机背后时返回 ``None``。
+        ``R, t`` 是 target_frame ← 相机光学系 的旋转与平移。
+        """
+        cx, cy = self.camera_model.cx(), self.camera_model.cy()
+        fx, fy = self.camera_model.fx(), self.camera_model.fy()
+        d_base = R @ np.array([(u - cx) / fx, (v - cy) / fy, 1.0])
+        if abs(float(d_base[2])) < 1e-9:
+            return None                      # 射线与平面平行
+        s = (z_plane - float(t[2])) / float(d_base[2])
+        if s <= 0.0:
+            return None                      # 平面在相机背后
+        p = t + s * d_base
+        return (float(p[0]), float(p[1]))
+
+    def _top_face_xy(self, u, v, size_y, transform):
+        """侧影框中心 → 顶面中心：返回 ``(x, y)``（target_frame 下，z 另由调用方取）。
+
+        推导见 ``grasp_point_mode`` 参数处的注释。要点是：侧影最高点与最低点
+        分别被两条已知高度的平面钉住，而**这两点的 x/y 中点就是顶面中心的
+        x/y** —— 边长 S 与投影比例在里面自动消掉。
+
+        ⚠️ 注意是取中点的 (x, y)，**不要**把它投影回像素再拿那根射线去与
+        ``z = target_plane_z`` 求交：中点在 z = (H+0)/2 上，同一根射线延伸到
+        z = H 会落到**另一个** (x, y)，等于什么都没修（这一点由正向模型探针
+        实测抓出来过，两列误差一模一样）。
+
+        近似之处：这只在「侧影最高/最低点恰好在 u = u_c 这根竖线上」时严格
+        成立。相机方位角偏离方块中心时最高点是远处那个**角**，位置与竖线差
+        半个边长，于是留下一点残差 —— 具体多大见 test_perception_3d.py 的
+        「顶面中心」一节（那里用正向模型量，不靠真机标定）。
+
+        求不出交点（射线与平面平行、平面在相机背后）时返回 ``None``。
+        """
+        tr = transform.transform
+        R = self._quat_to_matrix(tr.rotation)
+        t = np.array([tr.translation.x, tr.translation.y, tr.translation.z])
+
+        far = self._ray_plane_xy(u, v - size_y * 0.5, self.target_plane_z, R, t)
+        near = self._ray_plane_xy(u, v + size_y * 0.5, self.table_plane_z, R, t)
+        if far is None or near is None:
+            return None
+        return ((far[0] + near[0]) * 0.5, (far[1] + near[1]) * 0.5)
+
+    def _ray_plane_pose(self, x, y, z, transform, u, v, stamp, grasp_xy=None):
         """像素射线 ∩ 平面 ``z = target_plane_z``，**位置不经过深度**。
 
         ``x, y, z`` 是同一像素的深度反投影点（相机光学系），这里只借它表达
@@ -354,6 +457,11 @@ class Perception3D(Node):
         与平面高度比较。相差超过 ``plane_depth_tol`` 时判为无效并返回 None ——
         这一条是用来挡「空台面被检测成方块」的：那时深度指向的是台面，
         高度会明显低于方块顶面所处的平面。
+
+        ``grasp_xy``：**定位**改用这个 (x, y)（z 仍取 ``target_plane_z``）。
+        俯视斜视时框中心不是顶面中心（见 ``_top_face_xy``），由调用方算好后
+        传进来。深度校验**始终**用 (u,v) 那个反投影点，不受它影响 ——
+        「那儿确实有东西」这件事该由检测框自己的深度说了算。
 
         返回 ``PoseStamped``；平面在相机背后或校验不通过时返回 ``None``。
         """
@@ -369,6 +477,8 @@ class Perception3D(Node):
         if s <= 0.0:
             return None                      # 平面在相机背后
         p = t + s * d_base
+        if grasp_xy is not None:
+            p[0], p[1] = grasp_xy
 
         z_from_depth = float((R @ np.array([x, y, z]) + t)[2])
         if abs(z_from_depth - self.target_plane_z) > self.plane_depth_tol:
@@ -516,7 +626,25 @@ class Perception3D(Node):
                 )
 
                 if self.target_plane_z is not None:
-                    base_pose = self._ray_plane_pose(x, y, z, transform, u, v, stamp)
+                    # 框中心 ≠ 顶面中心（斜视下差十几毫米，见 grasp_point_mode）。
+                    # 默认 'bbox_center' 保持老行为；切到 'top_face_center' 时
+                    # 只换**定位用的那个 (x,y)**，深度校验一点没动。
+                    grasp_xy = None
+                    if self.grasp_point_mode == 'top_face_center':
+                        grasp_xy = self._top_face_xy(u, v, size_y, transform)
+                        if grasp_xy is None:
+                            # 求不出顶面中心：宁可不发，也不要退回框中心发一个
+                            # 已知偏十几毫米的点 —— 那正是这次要修的东西。
+                            self.get_logger().warn(
+                                f'top_face_center：({u:.1f},{v:.1f}) 两条棱求不出'
+                                f'与已知平面的交点，跳过本目标。'
+                                f'（常见原因：table_plane_z/target_plane_z 配置反了）',
+                                throttle_duration_sec=5.0
+                            )
+                            continue
+
+                    base_pose = self._ray_plane_pose(x, y, z, transform, u, v, stamp,
+                                                     grasp_xy=grasp_xy)
                     if base_pose is None:
                         # 平面在相机背后，或深度校验没过（例如空台面被判成方块）
                         continue

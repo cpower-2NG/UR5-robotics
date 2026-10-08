@@ -387,6 +387,19 @@ def generate_launch_description():
             'plane_depth_tol', default_value='0.03',
             description='平面模式下，深度反投影出的 z 与平面高度的允许差（米）。'
                         '超过则判该检测无效（用于挡住「空台面被检测成方块」）'),
+        DeclareLaunchArgument(
+            'grasp_point_mode', default_value='bbox_center',
+            description='抓取点取框里的哪个像素。bbox_center = 检测框中心（原行为）；'
+                        'top_face_center = 顶面中心 —— 斜视下侧影中心比顶面中心低'
+                        '(S·sinα·f)/(2D) 像素（实测 22px 方块上 6px ≈ base 13.6mm），'
+                        '这一项用「远端上棱 ∩ target_plane_z」与「近端下棱 ∩ '
+                        'table_plane_z」两点的中点把它修回来。仅在 use_target_plane=true '
+                        '时有意义（深度模式高度未知，两条棱的平面无从谈起）'),
+        DeclareLaunchArgument(
+            'table_plane_z', default_value='0.0',
+            description='台面高度（base_link 系，米），即 grasping 时近端下棱所在的平面。'
+                        '只在 grasp_point_mode=top_face_center 时用到；必须**小于** '
+                        'target_plane_z'),
     ]
 
     max_sync_dt_arg = DeclareLaunchArgument(
@@ -654,6 +667,9 @@ def generate_launch_description():
             'use_target_plane': LaunchConfiguration('use_target_plane'),
             'target_plane_z': LaunchConfiguration('target_plane_z'),
             'plane_depth_tol': LaunchConfiguration('plane_depth_tol'),
+            # 「抓取点取哪儿」：bbox_center（原行为）/ top_face_center（修正斜视偏差）
+            'grasp_point_mode': LaunchConfiguration('grasp_point_mode'),
+            'table_plane_z': LaunchConfiguration('table_plane_z'),
             # 采样/配准旋钮：全部在参数面上出现，理由见上面那一组 DeclareLaunchArgument
             'depth_scale': LaunchConfiguration('depth_scale'),
             'depth_grid': LaunchConfiguration('depth_grid'),

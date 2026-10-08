@@ -200,7 +200,7 @@ def unquoted_scalar(text, key):
 # ===================================================================== 夹具
 # 真机 `ros2 launch … --show-args` 的输出形状：每条声明一行 `    '名字':`，
 # 下面缩进的是说明与默认值。本机没有 ROS 跑不了真的，所以按这个形状**手抄**一份，
-# 内容 = 三份入口文件里 `DeclareLaunchArgument` 声明过的全部名字（46 个）。
+# 内容 = 三份入口文件里 `DeclareLaunchArgument` 声明过的全部名字（48 个）。
 # [3] 会拿三份源码 AST 出来的名字**回头逐字对一遍** —— 源码改了名这里就该红，
 # 红了就照着改夹具（夹具是「真机输出」的替身，改它不是作弊，是同步）。
 FIX_SHOW_ARGS = """
@@ -312,6 +312,16 @@ Arguments (pass arguments as '<name>:=<value>'):
         深度与平面的最大容许差（m）。
 
         (default: '0.02')
+
+    'grasp_point_mode':
+        抓取点取框中心还是顶面中心。
+
+        (default: 'bbox_center')
+
+    'table_plane_z':
+        台面高度（m），顶面中心修正要用。
+
+        (default: '0.0')
 
     'gripper_backend':
         sim / ag95 / none。
@@ -688,7 +698,7 @@ try:
     # ⚠️ 只管 `params:` 里那几项：`launch.start_delay: 120` 是**任务字段**
     #    （启动器自己用 %g 拼成字符串），它不带引号是对的。
     quoted_keys = ("carry_objects", "gripper_backend", "use_target_plane",
-                   "target_plane_z")
+                   "target_plane_z", "grasp_point_mode", "table_plane_z")
     check("a1.yaml 的 params 里这几个值**带引号**（`:=True` 与 `:=true` 不是同一个"
           "字符串，而且那种差异不报错）",
           all(unquoted_scalar(a1_text, k) is None for k in quoted_keys),
@@ -759,10 +769,11 @@ try:
     section("[3] 声明集：`--show-args` 的解析（含诱饵行）+ 夹具与 launch 源码对齐")
 
     declared = board_run.parse_declared_args(FIX_SHOW_ARGS)
-    check("解析出 46 个声明名", len(declared) == 46, "得到 %d 个" % len(declared))
+    check("解析出 48 个声明名", len(declared) == 48, "得到 %d 个" % len(declared))
     check("真机要用的那几个都在里面",
           {"robot_ip", "planner_params_file", "camera_x", "camera_qw",
            "target_plane_z", "use_target_plane", "gripper_backend",
+           "grasp_point_mode", "table_plane_z",
            "carry_objects", "start_delay", "model", "camera_source"} <= declared)
 
     decoys = [
