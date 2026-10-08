@@ -11,6 +11,16 @@
 本文件里**没有一处**会写设备或发运动命令。`gripper_state` / `dashboard` /
 `port_busy` 全是只读查询。
 
+里面有三块东西，都是**两份调用方共用**的（所以放在这里，不各抄一份）：
+  · **收栈**（`sweep` / `teardown` / `session_pids` / `install_stop_handlers`）——
+    `board_run` 的 `finally`、信号处理与 `--stop` 走的是同一段本体，判据只有一份；
+  · **上一轮的记录**（`read_stack_record` / `write_stack_record` /
+    `owned_session_pids`，默认 `~/.config/ur5-vision-grasp/last_stack.json`）——
+    ⚠️ 写在**仓库外**：本仓是公开副本，运行记录不进仓；
+  · **人机协作**（`human_action` / `relay_notice` / `wait_for_state` /
+    `ensure_in_the_loop`）—— 要人动手的那几句压成 `HUMAN_MARK` 开头的一行，
+    **由 AI 原样转达**；核验一律只读，验不过就是**不写**（fail-closed）。
+
 用法（自查「现在生效的站点配置是哪份、合不合法」）：
 
     python3 scripts/board_lib.py [--site PATH]
@@ -18,7 +28,9 @@
 退出码：0 = 站点配置合法且外参没过期；1 = 有毛病（逐条列出）；2 = 读不到文件。
 """
 
+import contextlib
 import datetime as dt
+import json
 import os
 import re
 import signal
@@ -34,11 +46,40 @@ REPO = os.path.dirname(HERE)
 
 # ⚠️ 排除 `bash -c`：经 ssh 跑时调用者那条命令行里带着同样的模式，会把自己匹配上
 #    （board_chain_check.py / board_ctrlc_check.py 都踩过，ssh 直接 255）。
+#
+# ★ 这份名单是**枚举出来的**，不是猜的。出处（2026-10-08，只读读板上的**已安装**上游）：
+#     /opt/ros/humble/share/ur_robot_driver/launch/ur_control.launch.py
+#     /opt/ros/humble/share/ur_robot_driver/launch/ur_dashboard_client.launch.py
+#     /opt/ros/humble/share/ur_moveit_config/launch/ur_moveit.launch.py
+#   逐条取 `Node(package=…, executable=…)`，再按**本仓的启动参数**挑出真会起的那些：
+#     会起：ur_robot_driver/{ur_ros2_control_node, robot_state_helper, urscript_interface,
+#                            trajectory_until_node, dashboard_client, controller_stopper_node}
+#           robot_state_publisher、controller_manager/spawner ×N、move_group、
+#           realsense2_camera_node、detector_node、projector_node、planner_node、
+#           static_transform_publisher（相机 TF）、`ros2 launch yolo_bringup`
+#     不起（本仓显式关掉）：rviz2（`launch_rviz:=false`）、
+#           servo_node_main（`launch_servo:=false`）
+#     ⚠️ `controller_manager/ros2_control_node` 那一档只在 `use_fake_hardware:=true`
+#        时起（ur_control.launch.py 的两个 Node 各带一个条件）。本仓走真机，
+#        起的是 `ur_ros2_control_node` —— 但**两条都留在名单里**：那个开关不在
+#        本仓手里（上游默认值改一次就换人），而漏掉的表现是**假绿**。
+#     ⚠️ `spawner` 是短暂进程（拉完控制器就退出），但仍然算 —— 卡住的那一个会一直
+#        占着 controller_manager 的服务。写全路径形式（`controller_manager/spawner`）
+#        是为了不把别人的同名进程也算进来。
+#
+# 🔴 **漏一个名字的代价不是红，是假绿**（2026-10-08 实测）：
+#     `trajectory_until_node` 与 `urscript_interface` 原来不在名单里 ⇒ `--stop`
+#     报「已收干净」**是假的**（复核 `ps` 时那两个还在），而 P1.残留进程 那道闸门
+#     用同一个判据，于是**跟着一起假绿**。
+# ★ 所以名单**不再是唯一保险**：我们自己起的栈按 **session id** 收（`session_pids()`），
+#   不靠名字 —— 见 `teardown()`。名字这一份只用来认**别人起的**栈。
 LEFTOVER_RE = re.compile(
     r"ros2 launch yolo_bringup|move_group|robot_state_publisher"
     r"|detector_node|projector_node|planner_node|realsense2_camera_node"
     r"|static_transform_publisher|ur_ros2_control_node"
-    r"|ur_robot_driver/(dashboard_client|robot_state_helper|controller_stopper)")
+    r"|ur_robot_driver/(dashboard_client|robot_state_helper|controller_stopper"
+    r"|trajectory_until_node|urscript_interface)"
+    r"|controller_manager/(ros2_control_node|spawner)")
 
 
 # ============================================================ 进程残留
@@ -141,35 +182,279 @@ def leftovers(ps_out=None, me=None, own=None, pattern=None):
     return out
 
 
-def teardown(proc):
-    """收栈。⚠️ 只 killpg **父进程组**；`ros2 launch` 的子节点里有一批
-    （`move_group` / `robot_state_publisher` / `static_transform_publisher` /
-    `ur_ros2_control_node`）在父进程被收后会**重新挂到 init**，
-    所以必须再按模式扫一遍（2026-10-05 实测：漏扫会留下 PPID=1 的孤儿）。
+def proc_stat(pid):
+    """`/proc/<pid>/stat` → `(state, session id)`；读不到 `(None, None)`。
+
+    字段序（`stat(5)`）：pid (comm) **state** ppid pgrp **session** tty_nr …
+    所以从**最后**一个 `)` 往右切、跳过 state/ppid/pgrp 之后是 session。
+    与 `_ppid()` 同一个切法、同一个理由（comm 里可能有空格与括号）。
     """
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    deadline = time.time() + 15
-    while time.time() < deadline and leftovers():
-        time.sleep(1)
-    if leftovers():
-        for line in leftovers():
-            try:
-                os.kill(int(line.split()[0]), signal.SIGKILL)
-            except (ValueError, ProcessLookupError):
-                pass
-        time.sleep(2)
+        with open(f"/proc/{int(pid)}/stat", "rb") as fh:
+            tail = fh.read().rsplit(b")", 1)[1].split()
+        return tail[0].decode("ascii", "replace"), int(tail[3])
+    except (OSError, IndexError, ValueError):
+        return None, None
+
+
+def sid_of(pid):
+    """`/proc/<pid>/stat` 里的 **session id**；读不到返回 `None`。"""
+    return proc_stat(pid)[1]
+
+
+def session_entries():
+    """`[(pid, sid), …]` —— 扫 `/proc`。只读。
+
+    ⚠️ **僵尸不算**（state == `Z`）：僵尸已经死了，只是还没被父进程回收 ——
+    把它算成「还活着」会让收栈永远报「没收干净」。实测（2026-10-08）：e2e 夹具里
+    那句 `(session N 里还有 pid N —— 名字名单漏了它)` 就是这么来的 ——
+    leader 已经被 SIGKILL，它自己就是僵尸，而 `proc.wait()` 还没轮到。
+    """
+    out = []
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for d in names:
+        if d.isdigit():
+            state, s = proc_stat(d)
+            if s is not None and state != "Z":
+                out.append((int(d), s))
+    return out
+
+
+def session_pids(sid, entries=None):
+    """同一 **session** 里的全部 pid（**含孤儿**），排除本进程。`entries` 可注入 ⇒ 离线可测。
+
+    ★ 为什么按 session 收，而不是按名字收（2026-10-08）：
+      · `ros2 launch` 的子节点在父进程被收之后会**重新挂到 init**（PPID=1）——
+        血缘断了，**名字成了唯一线索**；而名字是一份手抄的名单，漏一个就是假绿
+        （实测漏了 `trajectory_until_node` / `urscript_interface`）。
+      · session id **不随 re-parent 改变**：`start_new_session=True` 起的那个
+        leader 的子子孙孙都带着它，哪怕中间那一层已经死了。
+      ⇒ 我们自己起的栈，收干净这件事**不再依赖名单全不全**。
+    """
+    entries = session_entries() if entries is None else entries
+    me = os.getpid()
+    return [p for p, s in entries if s == sid and p != me]
+
+
+def is_session_leader(pid, sid=None):
+    """`pid` 是不是**自己开了**一个 session（session id == 自己的 pid）。
+
+    ⚠️ 这是「敢不敢按 session 收」的**安全闸门**，不能省：
+      我们起栈用 `start_new_session=True` ⇒ leader 是它，那个 session 里**只有**
+      这套栈，整锅端掉不会误伤。
+      而**人从自己 shell 里**敲的 `ros2 launch`，它的 session 就是那个 shell 的
+      session —— 按 session 收会**把人自己的终端一起杀掉**。
+    """
+    return (sid if sid is not None else sid_of(pid)) == pid
+
+
+def kill_pids(pids, sig):
+    """逐个 pid 发信号（不 killpg：对面可能是别人的进程组）。返回发成功的条数。"""
+    n = 0
+    for p in pids:
+        try:
+            os.kill(int(p), sig)
+            n += 1
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+    return n
+
+
+def sweep(leader, sid=None, out=print, entries=None, clock=time.time, sleep=None,
+          grace=15.0, killpg=False):
+    """收栈的**本体** —— `teardown()`（收自己起的）与 `--stop`（收别人起的）共用。
+
+    `leader` = 我们自己起的那个进程组 / session 的 leader pid（**可能已经死了**）。
+    `sid`    = 要按 session 收的会话。
+
+    ⚠️ 按 session 收的**门槛**就是 `is_session_leader()`：人从 shell 里敲的
+       `ros2 launch`，sid 是那个 **shell 的** session，整锅端掉会**把人自己的
+       终端一起杀掉**。⛔ 别在这里放宽它。
+    ⚠️ `killpg` 默认 **False**：只有 leader **还活着**的调用方才敢开。leader 死了
+       之后它的 pid 可能被**回收**给别的进程，那时 `killpg` 打的是别人的进程组。
+
+    返回**实测**残留（空 list = 真收干净了）—— 不返回「我以为」。
+    """
+    sleep = time.sleep if sleep is None else sleep
+    own_session = bool(leader is not None and is_session_leader(leader, sid))
+
+    # 快路径：整组 SIGTERM，让 launch 自己走它那套收工流程（节点会报 finished cleanly）
+    if killpg:
+        try:
+            os.killpg(leader, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if own_session:
+        kill_pids(session_pids(sid, entries=entries), signal.SIGTERM)
+    if not killpg:                      # 别人的栈：按名字点名，逐个 SIGTERM
+        kill_pids([int(ln.split()[0]) for ln in leftovers()
+                   if ln.split() and ln.split()[0].isdigit()], signal.SIGTERM)
+
+    deadline = clock() + grace
+    while clock() < deadline and (leftovers() or
+                                  (own_session and session_pids(sid, entries=entries))):
+        sleep(1)
+
+    # 还活着的：先按 session（含孤儿）再来一遍，然后按名字补扫
+    if own_session:
+        kill_pids(session_pids(sid, entries=entries), signal.SIGKILL)
+    for line in leftovers():
+        try:
+            os.kill(int(line.split()[0]), signal.SIGKILL)
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+    if own_session or leftovers():
+        sleep(2)
+
     stale = leftovers()
+    orphan = session_pids(sid, entries=entries) if own_session else []
+    if orphan:                      # session 里还有活口 ⇒ 名字没认出来的那些
+        stale = list(stale) + ["(session %d 里还有 pid %s —— 名字名单漏了它)"
+                               % (sid, ",".join(str(p) for p in orphan))]
     if stale:
-        print("\n⚠️ 收尾后仍有残留（下次会被前置检查拦下）：")
+        out("\n⚠️ 收尾后仍有残留（下次会被前置检查拦下）：")
         for s in stale:
-            print("  " + s[:120])
+            out("  " + s[:120])
+    return stale
+
+
+def teardown(proc, out=print, entries=None, clock=time.time, sleep=None, grace=15.0):
+    """收掉**我们自己起的**那套栈 → 收完还剩几条。**返回实测，不返回「我以为」**。
+
+    ⚠️ 孤儿是这里的**主要**敌人：`ros2 launch` 的子节点在父进程被收之后会
+    **重新挂到 init**（PPID=1），进程组也跟着散。所以收三样：
+      ① `killpg`（leader 还活着，用它）；
+      ② **按 session 收**（`session_pids`）—— 只要 leader 是我们起的（`start_new_session`
+         ⇒ session 里只有这套栈），这一遍**一个都跑不掉**，包括已经 re-parent 的孤儿；
+      ③ **按名字扫**（`leftovers()`）—— 补「不在 session 里」的漏网（例如有人手动
+         补起过一个节点）。
+    本体在 `sweep()`（`--stop` 也走它，判据只有一份）。
+    """
+    sid = sid_of(proc.pid) if proc is not None else None
+    stale = sweep(proc.pid if proc is not None else None, sid, out=out,
+                  entries=entries, clock=clock, sleep=sleep, grace=grace,
+                  killpg=proc is not None)
+    if proc is not None:
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    return stale
+
+
+# ------------------------------------------------- 信号：别把栈留成孤儿
+
+def install_stop_handlers(on_signal, signals=None):
+    """把 SIGTERM / SIGHUP 接到 `on_signal(name)` 上，然后**结束当前流程**。
+
+    ⚠️ 为什么非有不可（2026-10-08 的缺陷）：收栈原来只写在 `run()` 的 `finally`
+      里，而 `finally` 只在 **Python 自己走到那儿** 时才执行。别人
+      `kill <启动器 pid>`（SIGTERM：`timeout` / CI / AI 那一轮的收尾；
+      SIGHUP：终端被关）时，默认处置是**当场死** ⇒ 栈那一整个**独立会话**
+      （`start_new_session=True`）原地不动，子节点**重新挂到 init**（PPID=1）
+      继续跑 —— 这就是「挂残留、孤儿进程」的来路。
+      信号处理器里先收栈，孤儿才不会产生。
+
+    `on_signal` 收到的是信号名（`"SIGTERM"` / `"SIGHUP"`），由它去决定说什么、
+    收什么；收完这里抛 `SystemExit(128+n)`（**故意不走正常出口** —— 正常出口会
+    写报告、给判分，而这一轮是被中断的，不该伪装成跑完）。返回 `restore()`。
+    """
+    signals = (signal.SIGTERM, signal.SIGHUP) if signals is None else signals
+    previous = {}
+
+    def _handler(signum, _frame):
+        on_signal(signal.Signals(signum).name)
+        raise SystemExit(128 + signum)
+
+    for sig in signals:
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, _handler)
+
+    def restore():
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+    return restore
+
+
+# ------------------------------------------------- 上一轮起的栈（`--stop` 用）
+
+STACK_RECORD = "~/.config/ur5-vision-grasp/last_stack.json"
+#: 覆盖记录路径的环境变量。**给离线测试用的**：测试跑出来的 `--stop` 不该去动
+#: 真人 `~/.config` 里那一份（那份记着**真的**上一次起的栈的 session，测试拿它
+#: 当夹具就是自证式判据）。现场不用设它。
+STACK_RECORD_ENV = "UR5VG_STACK_RECORD"
+
+
+def stack_record_path(path=None):
+    if path is None:
+        path = os.environ.get(STACK_RECORD_ENV) or STACK_RECORD
+    return os.path.expanduser(path)
+
+
+def write_stack_record(pid, sid, path=None, extra=None):
+    """记下**我们自己起的**那一套栈的 `(pid, sid)` → 路径；写不成返回 `None`。
+
+    ⚠️ 为什么落在**仓库外**（红线 3）：里面是 pid / session id / 日志路径 ——
+      运行记录，不是配置。仓内的 `*.py` 与文档一个字都不许沾。
+    ⚠️ 为什么是 `sid` 而不是「一份进程名单」：名单会漏（实测漏过
+      `trajectory_until_node` / `urscript_interface`），而 session id 不随
+      re-parent 改变 —— 启动器**被谁打死**都能顺着它找到整锅。
+    """
+    rec = {"pid": int(pid), "sid": int(sid), "at": time.time(),
+           "written_by": os.getpid()}
+    rec.update(extra or {})
+    p = stack_record_path(path)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, ensure_ascii=False)
+        return p
+    except OSError:
+        return None
+
+
+def read_stack_record(path=None):
+    """读回来（**只读**）；没有 / 坏了 ⇒ `{}`。
+
+    坏了就当没有，**不许**拿半截记录去杀进程 —— 判据宁可少一条。
+    """
+    try:
+        with open(stack_record_path(path), encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(rec, dict) or not isinstance(rec.get("sid"), int):
+        return {}
+    return rec
+
+
+def clear_stack_record(path=None):
+    with contextlib.suppress(OSError):
+        os.remove(stack_record_path(path))
+
+
+def owned_session_pids(rec=None, entries=None, path=None):
+    """按**记录下来的** session 取活口 —— 但只认「它自己就是 leader」的那一种。
+
+    ⚠️ 复用 `is_session_leader` 那道安全闸门（写成 `sid == pid` 的形式）：
+      记录里的 sid 必须**等于**记录里的 pid，才敢按 session 收。人从 shell 里
+      起的栈，sid 是那个 shell 的 session —— 按 session 收会**把人自己的终端
+      一起杀掉**。旧记录（或被人改过的记录）不满足 ⇒ 返回空，退回按名字收。
+    """
+    rec = read_stack_record(path) if rec is None else rec
+    if not isinstance(rec, dict):
+        return []
+    sid, pid = rec.get("sid"), rec.get("pid")
+    # ⚠️ **两个都必须是整数**才算数（`{}` 的 get 全返回 None，而 `None == None`
+    #    会让「空记录」看起来像「sid 就是 leader」—— 第一版就栽在这儿：
+    #    没有记录文件时 `rec["sid"]` 直接 KeyError，`--stop` 退 1）。
+    if not (isinstance(sid, int) and isinstance(pid, int) and sid == pid):
+        return []
+    return session_pids(sid, entries=entries)
 
 
 # ============================================================ 只读查询
@@ -297,6 +582,132 @@ def is_playing(d):
     子串那份**碰巧**是对的，精确比那份恒 False —— 两份并存正是缺陷能活下来的原因。）
     """
     return dash_program_state(d) == "PLAYING"
+
+
+# ============================================================ 人机协作（AI 转达）
+#
+# ★ 这一节是**为「AI 驱动」那一轮写的**（2026-10-08 用户裁定）：
+#   「启动器需要提示 ai 告诉我去示教器点 play 和 stop。启动器要考虑到 ai+人工的
+#     协作方式。」
+#
+#   背景：AI 在后台跑（没有终端），它的输出进**日志** —— 人**看不到**。
+#   所以「请到示教器按播放」这句话，原来印给人看的散文现在得**由 AI 转达给人**。
+#   改成固定前缀的一行之后，AI 的原样转达就够了：**每少一道转述，就少一次走样**。
+#
+#   ⚠️ 判据**不是**「AI 有没有照做」，而是「**物理动作有没有发生**」：
+#     那两步由 `ensure_in_the_loop()` 用**只读** Dashboard 查询核验，两步都看见才算。
+#     提示语气再客气也不构成授权（红线 6）。
+#
+#   ⚠️ 这一节里**没有一处**写设备、发运动或发 play/power/stop —— 全是只读查询。
+HUMAN_MARK = ">>> 需要人动手"
+
+
+def human_action(text, step=None, total=None, why=None, out=print):
+    """印**一行**「需要人动手」——前缀固定 `HUMAN_MARK`，好让 AI 认出来**原样转达**。
+
+    中文、动词在前、独立一行（用户 2026-10-07 的裁定：当场要做的动作别夹在
+    英文段落里）。第二行只写「为什么 + 做完会怎样」，是给人读的注脚，
+    **不是**指令的一部分 —— 转达第一行就够。
+    """
+    n = "" if step is None else "（第 %s/%s 步）" % (step, total if total else "?")
+    out("%s%s：%s" % (HUMAN_MARK, n, text))
+    if why:
+        out("    （%s；做完启动器自己会看到，**不用回复**）" % why)
+
+
+def relay_notice(out=print, timeout=None, doing="启动器"):
+    """无终端（AI 驱动）时印**一次**的「转达契约」。
+
+    写在最前面，是为了让 AI 在第一次需要人之前就知道该怎么处理那些行 ——
+    而不是等它先愣一次。
+    """
+    out("[AI 驱动] 本次没有交互终端：下面所有以「%s」开头的行"
+        "**都是给你转达给人的**。" % HUMAN_MARK)
+    out("          原样念给人听即可 —— 你**代劳不了**：那几步要在示教器上真的按。")
+    out("          %s 每一步最多等 %s。"
+        % (doing, ("%.0fs" % timeout) if timeout else "（按 --play-timeout）"))
+
+
+def wait_for_state(ip, want, timeout, poll=2.0, dash=None, clock=time.time,
+                   sleep=None):
+    """轮询只读直到 `want(回复)` 为真 → `(到了没, 最后一次回复, 用时)`。
+
+    只读查询（`robotmode` / `programState` / `safetystatus`）；**不发** play / power /
+    stop —— 按播放是**人的动作**（红线 6）。
+
+    `dash` / `clock` / `sleep` 都可注入 ⇒ 这个循环**离线测得动**。
+    """
+    dash = dash or dashboard
+    sleep = time.sleep if sleep is None else sleep
+    t0 = clock()
+    last = None
+    while True:
+        last = dash(ip)
+        if want(last):
+            return True, last, clock() - t0
+        if clock() - t0 >= timeout:
+            return False, last, clock() - t0
+        sleep(poll)
+
+
+def ensure_in_the_loop(ip, timeout, poll=2.0, dash=None, clock=time.time,
+                       sleep=None, prompt=print, why="复核「人在环」",
+                       consequence="不交棒", doing="启动器", step=(1, 2)):
+    """让人在示教器上**重按一次（先 STOP，再 PLAY）**，并**看到那两步都真的发生**
+    → `(过了没, 说明)`。
+
+    ★ 这是「**没有终端**时唯一能拿到的当次授权证明**」（AI 驱动那一轮）。
+      它替掉的是键盘上的 `yes`：能敲键盘的人**未必在臂旁边**，而按示教器的人一定在。
+
+    为什么是**两步握手**，不是只喊一句「按 STOP 再按 PLAY」：两个动作挨得近时，
+    2 s 一次的轮询可能**一次都没看见 STOPPED** —— 那时「PLAYING 一直为真」
+    既可能是「人按了」也可能是「压根没动」，**判不了**。所以卡在两步之间：
+    先**确认**它离开 PLAYING，再等它回来 ⇒ 「按过」这件事是**看到**的，不是猜的。
+    第一步没看到就直接**不往下走**（fail-closed）。
+
+    这**不是新规矩**：第一百一十轮实测过「收栈之后控制柜可能仍停在 PLAYING」，
+    当时的结论就是「每轮之间必须在示教器上按一次 STOP」—— 这里只是把它写成
+    启动器自己会走的步骤。
+
+    全程只读（`dashboard`）；**不发** play / power / stop。
+    `why` / `consequence` / `doing` 只影响文案（写路径那一档要说「不写」而不是
+    「不交棒」—— 两处的后果不一样，话说成一样就没人分得清了）。
+    """
+    if not ip:
+        return False, ("读不到控制柜 IP ⇒ **核验不了**那个物理动作 ⇒ %s"
+                       "（授权只认**当次**，红线 6）" % consequence)
+
+    prompt("")
+    prompt("=" * 66)
+    human_action("请在示教器上按一下 **停止（STOP）**",
+                 step=step[0], total=step[1], out=prompt,
+                 why="上一轮收栈后控制柜可能仍停在 PLAYING —— 那种「本来就绿」"
+                     "不算你按过")
+    prompt("=" * 66)
+    left, d, _ = wait_for_state(ip, lambda x: not is_playing(x), timeout,
+                                poll=poll, dash=dash, clock=clock, sleep=sleep)
+    if not left:
+        return False, ("%.0fs 内没看到它离开 PLAYING（原文 %r）—— 「人在环」"
+                       "是不是**这一轮**走通的，判不了 ⇒ **%s**"
+                       % (timeout, str((d or {}).get("programState", "")).strip(),
+                          consequence))
+
+    prompt("")
+    prompt("=" * 66)
+    human_action("请在示教器上按一下 **播放（PLAY）**",
+                 step=step[1], total=step[1], out=prompt,
+                 why="前一步它不是 PLAYING、现在按到 PLAYING ⇒ 那一下**只可能是"
+                     "人按的**（这就是「当次」的证明）")
+    prompt("=" * 66)
+    back, d, waited = wait_for_state(ip, is_playing, timeout,
+                                     poll=poll, dash=dash, clock=clock,
+                                     sleep=sleep)
+    if not back:
+        return False, ("按了停止之后，%.0fs 内没等到 PLAYING（原文 %r）⇒ **%s**"
+                       % (timeout, str((d or {}).get("programState", "")).strip(),
+                          consequence))
+    return True, ("STOP → PLAY 两步**都看到了**（%.0fs 后回到 PLAYING）—— "
+                  "「%s」是这一轮走通的" % (waited, why))
 
 
 # ============================================================ 站点配置

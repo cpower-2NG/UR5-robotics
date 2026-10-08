@@ -20,10 +20,16 @@
 ========================================
 · **不建 action client、不发 FollowJointTrajectory、不发任何轨迹** —— 与
   `real_chain_check.py` 同一条纪律。
-· **不碰 Dashboard（29999）、更不碰 30001/30002/30003/30004**（AGENTS.md 红线 1）。
+· **不碰 30001/30002/30003/30004**（AGENTS.md 红线 1）。
 · **默认一个字节都不写**：只调 `list_controllers` / `get_parameters`（都是只读
   服务），加上只读订阅。唯一的写路径在 `--repair-controller` 后面，见下。
 · **不起栈、不收栈**。栈是别人起的，它只附着。
+
+⚠️ 与 Dashboard（29999）的关系（2026-10-08 改）：默认**不碰**。只有
+   `--repair-controller` **且没有交互终端**（AI 驱动的那一轮）时，才走
+   `board_lib.dashboard()` 做**只读**核验（`robotmode` / `programState` /
+   `safetystatus` 三条查询）—— 那是「示教器上那一下是不是人按的」的**唯一**证据
+   来源。**仍然不发** play / power / stop（红线 1 + 红线 6：那是人的动作）。
 
 退出码（沿用全仓的 0/1/2，不加第四个）
 =====================================
@@ -44,8 +50,15 @@
 `scaled_joint_trajectory_controller` 等于**把指挥权交给这套栈**，而臂此刻已上电
 ⇒ 属 AGENTS.md 红线 6 的**真机动作**，吃**当次**授权。所以：
   · 必须显式传 `--repair-controller`；
-  · 必须在**交互终端**上再敲一次 `yes`（`isatty()` 不过就直接退 2；
-    **本脚本没有无人值守模式**）；
+  · **当次授权**两条路（与 `board_run.handoff_mode()` 同源，两档都要人动手）：
+      · 有**交互终端**（人手动跑的那一轮）⇒ 再敲一次 `yes`；
+        敲不出来（EOF / 不是 yes）就**不发** switch_controller。
+      · **没有**终端（**AI 驱动**那一轮）⇒ **不敲键盘**：改由**示教器上的
+        STOP → PLAY 两步握手**承担，用只读 Dashboard 查询核验，**两步都看到**
+        才算；核验不了（没给 `--dashboard-host`、读不到控制柜、没看到那两步）
+        就**不发**。此时需要调用方给 `--dashboard-host <控制柜 IP>`。
+        ⚠️ 这不是「无人值守模式」：它要求的恰恰是**人物理上在示教器前动手**；
+           环境变量 / 任务描述 / 上一次的记忆**一律不算授权**（红线 6）。
   · `deactivate_controllers` **恒为 `[]`** —— **永不 deactivate** 任何控制器；
   · 修复走**收敛式**重试而不是盲 `while`：每发一次就重读一次
     `list_controllers`，达标即停。
@@ -75,6 +88,18 @@ import json
 import os
 import sys
 import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+# ⚠️ `board_lib` **顶层不 import rclpy/launch**（它的模块 docstring 里写着为什么），
+#    所以这里 import 它不会把本脚本「离线可测」的性质弄坏。
+#    用它只为两件事：① 「人在环」的两步握手（`ensure_in_the_loop`）；
+#    ② 那份**唯一**的 Dashboard 只读查询（`dashboard`）—— 写路径的判据不许在本
+#    文件里再抄一份（抄了就会静默分叉）。
+#    ⛔ 反过来不许：`board_lib` 不许 import `board_gate`（会成环），
+#    `board_gate` 也不许 import `board_run`（它是被 board_run 当子进程调的）。
+import board_lib                                          # noqa: E402
 
 # ⚠️ 本模块顶层**不 import rclpy / 任何消息包**。这不是风格洁癖：本机（WSL）的
 #    /opt/ros/humble 下**根本没装 rclpy**（只有纯 Python 的 ament_* 工具），
@@ -728,39 +753,54 @@ def _item_params(args, probe, graph):
 # 修复路径（唯一的写路径）
 # =====================================================================
 
-def _run_repair(args, probe, required):
+def _run_repair(args, probe, required, isatty=None, loop=None, out=print):
     """收敛式把 `required` 拉起来。
 
-    第一步不是「发命令」，是**要当次授权**（AGENTS.md 红线 6）。交互确认过不去
-    就直接返回 False —— 本脚本没有无人值守模式，这是设计不是偷懒。
+    第一步不是「发命令」，是**要当次授权**（AGENTS.md 红线 6）。两条路，**都要人
+    动手**（与 `board_run.handoff_mode()` 同源，判据只有一份）：
+      · 有交互终端 ⇒ 敲 `yes`；
+      · **没有**终端（AI 驱动）⇒ 不敲键盘，改由**示教器上的 STOP → PLAY 两步握手**
+        承担，只读核验（`board_lib.ensure_in_the_loop`），两步都看到才算。
+    拿不到证明就**不发** switch_controller —— fail-closed，不是「那就当确认了」。
     """
-    if not sys.stdin.isatty():
-        print("    ❌ --repair-controller 需要交互确认，而这里不是终端。"
-              "本脚本**没有**无人值守模式。")
-        return False
-    print()
-    print("    ⚠️  --repair-controller 会对 /controller_manager 发 "
-          "switch_controller，")
-    print(f"        激活 {', '.join(required)} —— 这等于**把指挥权交给这套栈**，")
-    print("        而臂此刻已上电。属 AGENTS.md 红线 6 的**真机动作**。")
-    print("        deactivate_controllers 恒为 []，本脚本**永不 deactivate**。")
-    try:
-        ans = input("        确认这是**当次**授权、急停就绪、工作区已隔离？"
-                    "(yes) > ")
-    except EOFError:
-        return False
-    if ans.strip().lower() != "yes":
-        print("        未确认 —— 不动控制器。")
-        return False
+    isatty = sys.stdin.isatty if isatty is None else isatty
+    loop = board_lib.ensure_in_the_loop if loop is None else loop
+    out()
+    out("    ⚠️  --repair-controller 会对 /controller_manager 发 "
+        "switch_controller，")
+    out("        激活 %s —— 这等于**把指挥权交给这套栈**，" % ", ".join(required))
+    out("        而臂此刻已上电。属 AGENTS.md 红线 6 的**真机动作**。")
+    out("        deactivate_controllers 恒为 []，本脚本**永不 deactivate**。")
+    if not isatty():
+        out("    没有交互终端（**AI 驱动**）⇒ **不敲键盘**：这次授权由**示教器上"
+            "的物理动作**承担（STOP → PLAY 两步握手，只读 Dashboard 核验）。")
+        out("    请确认：**急停就在手边**、**工作区已隔离**。")
+        ok, why = loop(getattr(args, "dashboard_host", None),
+                       getattr(args, "play_timeout", 300.0), prompt=out,
+                       why="这次 switch_controller 的授权",
+                       consequence="不发 switch_controller", doing="修复控制器",
+                       step=(1, 2))
+        out("    %s %s" % ("✅" if ok else "❌", why))
+        if not ok:
+            return False
+    else:
+        try:
+            ans = input("        确认这是**当次**授权、急停就绪、工作区已隔离？"
+                        "(yes) > ")
+        except EOFError:
+            return False
+        if ans.strip().lower() != "yes":
+            out("        未确认 —— 不动控制器。")
+            return False
 
     for i in range(1, args.repair_attempts + 1):
         probe.switch_controllers(required)
         time.sleep(1.5)
         states = probe.list_controllers()
         if states and all(is_active(states.get(n)) for n in required):
-            print(f"        第 {i} 次尝试后全部 active。")
+            out(f"        第 {i} 次尝试后全部 active。")
             return True
-        print(f"        第 {i} 次尝试后仍未达标（最多 {args.repair_attempts} 次）。")
+        out(f"        第 {i} 次尝试后仍未达标（最多 {args.repair_attempts} 次）。")
     return False
 
 
@@ -911,8 +951,16 @@ def main(argv=None):
                     help="调用方**显式**声明这一档本来就没有的项（逗号分隔），"
                          "如 skip_planner:=true 时给 telemetry,params")
     ap.add_argument("--repair-controller", action="store_true",
-                    help="⚠️ 写路径：控制器不合格时收敛式拉起（需交互确认）")
+                    help="⚠️ 写路径：控制器不合格时收敛式拉起（当次授权：终端里敲 yes，"
+                         "或示教器 STOP→PLAY 两步握手 + --dashboard-host）")
     ap.add_argument("--repair-attempts", type=int, default=3)
+    ap.add_argument("--dashboard-host", default=None,
+                    help="控制柜 IP —— **只在** `--repair-controller` 且没有交互终端"
+                         "时用到：走 29999 做**只读**核验（robotmode/programState/"
+                         "safetystatus），看示教器上那一下是不是人按的。不发 play/"
+                         "power/stop。不给 ⇒ 核验不了 ⇒ **不发** switch_controller")
+    ap.add_argument("--play-timeout", type=float, default=300.0,
+                    help="两步握手每一步最多等多久（秒）")
     ap.add_argument("--json-report", default=None)
     ap.add_argument("--list-items", action="store_true")
     a = ap.parse_args(argv)

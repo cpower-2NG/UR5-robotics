@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """board_lib.py 的自检 —— **纯离线**，不起进程、不开串口、不碰臂。
 
-分七节：
+分八节：
   1. 站点配置：合法性逐条说得对，缺项**不静默回落**
   2. 外参时效：fail-closed（「不知道」不许当成「新鲜」），且与 state_check.py 同线
   3. 残留进程：自我排除按**血缘/入口名**，不按函数住在哪个文件里
@@ -10,6 +10,7 @@
   5. 源码钉子：顶层不许 import ROS
   6. 命令行行为：模板**必须**被判不合法（一份看着像真的配置比空文件更危险）
   7. 控制柜回复的**线上格式**：带标签 / 带程序名后缀，判定不许拿原文比
+  8. 按 session 收栈 + 「AI 转达」：收栈记录、session 门槛、信号、两步握手
 
      python3 scripts/test_board_lib.py
 
@@ -547,6 +548,184 @@ def section_dash():
           and not board_lib.is_playing(None))
 
 
+def section_session_and_ai():
+    """按 session 收栈 + 「AI 转达」那一套（2026-10-08 修「挂残留 / 孤儿进程」与
+    「不支持 AI 驱动」时新加的）。
+
+    ⚠️ 这一节**绝不**真的调 `sweep()` / `teardown()`：它们会去杀**真的**进程
+    （本机此刻就可能有别的残留）。判据里能离线验的部分全是纯的（记录读写、
+    session 门槛、握手循环），这些才是这里要钉的。
+    """
+    print("\n[8] 按 session 收栈 + AI 转达：判据离线可钉的部分")
+
+    # ---- 残留名单：漏一个名字的代价是**假绿**（不是红）------------------
+    # 2026-10-08 实测：`trajectory_until_node` 与 `urscript_interface` 原来不在
+    # 名单里 ⇒ `--stop` 报「已收干净」是假的，P1.残留进程 跟着一起假绿。
+    for name in ("ur_robot_driver/trajectory_until_node",
+                 "ur_robot_driver/urscript_interface",
+                 "ur_robot_driver/controller_stopper_node",
+                 "controller_manager/ros2_control_node",
+                 "controller_manager/spawner"):
+        check(f"残留名单认得 {name}（漏了它 ⇒ 收栈报「干净」是假的）",
+              board_lib.LEFTOVER_RE.search(name) is not None)
+    # 反过来：本仓**不起**的东西不许进名单 —— 进了就会去收别人的界面/仿真节点。
+    for name in ("rviz2", "servo_node_main"):
+        check(f"  名单**不认** {name}（本仓 launch_rviz/launch_servo 都关着，"
+              f"认了会去杀别人的进程）",
+              board_lib.LEFTOVER_RE.search(name) is None)
+
+    # ---- session：不随 re-parent 改变的那条线索 -------------------------
+    state, sid = board_lib.proc_stat(os.getpid())
+    check("proc_stat(自己) 读得到 (state, session)，session 就是自己的 session",
+          state in ("R", "S", "D") and isinstance(sid, int) and sid > 0,
+          f"state={state} sid={sid}")
+    check("sid_of 就是 proc_stat 的第 2 个值（同一个切法，不另抄一遍）",
+          board_lib.sid_of(os.getpid()) == sid)
+    check("读不到的 pid ⇒ (None, None)，不抛（`/proc` 里进程随时会消失）",
+          board_lib.proc_stat(2 ** 22) == (None, None)
+          and board_lib.sid_of(2 ** 22) is None)
+
+    check("session 门槛：sid == 自己 pid 才算「它自己开的 session」",
+          board_lib.is_session_leader(1234, 1234) is True
+          and board_lib.is_session_leader(1234, 5678) is False)
+    check("  自己这一条读的是**同一个判据**："
+          "is_session_leader(getpid()) == (sid_of(getpid()) == getpid())",
+          board_lib.is_session_leader(os.getpid())
+          == (board_lib.sid_of(os.getpid()) == os.getpid()))
+    got = board_lib.session_pids(9, entries=[(1, 9), (2, 9), (3, 8), (4, 7)])
+    check("session_pids 按 session 挑，且**排除本进程**",
+          got == [1, 2] and os.getpid() not in got, str(got))
+    check("★ 真扫 `/proc` 时**僵尸不算活口**（它已经死了、只是还没被回收；"
+          "算进去的话收栈会永远报「没收干净」——e2e 里就是这么翻车的）",
+          "state != \"Z\"" in open(os.path.join(HERE, "board_lib.py"),
+                                  encoding="utf-8").read())
+
+    # ---- 记录下来的 (pid, sid)：`--stop` 在启动器被打死之后靠它 -------------
+    d = tempfile.mkdtemp(prefix="libstack_")
+    rec_path = os.path.join(d, "last_stack.json")
+    check("没有记录文件 ⇒ read_stack_record 给 {}（**不抛**）",
+          board_lib.read_stack_record(rec_path) == {})
+    check("  ⚠️ 空记录**不许**被当成「sid 就是 leader」（第一版栽在这儿："
+          "`{}` 的 .get 全是 None，`None == None` 让它去收一个不存在的 session，"
+          "`--stop` 当场 KeyError 退 1）",
+          board_lib.owned_session_pids({}, entries=[]) == []
+          and board_lib.owned_session_pids({"pid": 5}, entries=[]) == [])
+    p = board_lib.write_stack_record(4242, 4242, path=rec_path,
+                                     extra={"task": "a1", "log": "~/x.log"})
+    check("写记录（pid == sid ⇒ 它当年自己开的 session）",
+          p == rec_path and board_lib.read_stack_record(rec_path)["pid"] == 4242)
+    check("  按记录取 session 活口：只挑那个 session 的，别的 session 不碰",
+          board_lib.owned_session_pids(
+              board_lib.read_stack_record(rec_path),
+              entries=[(4242, 4242), (4243, 4242), (999, 1)]) == [4242, 4243])
+    check("  ⚠️ 记录里 sid != pid ⇒ **一条都不收**（那是别人 shell 的 session，"
+          "按 session 收会把人自己的终端一起杀掉）",
+          board_lib.owned_session_pids({"pid": 4242, "sid": 1},
+                                       entries=[(4242, 1), (4243, 1)]) == [])
+    with open(rec_path, "w", encoding="utf-8") as fh:
+        fh.write("{这不是 json")
+    check("记录文件坏了 ⇒ {}（**宁可少一条判据**，也不拿半截记录去杀进程）",
+          board_lib.read_stack_record(rec_path) == {})
+    board_lib.write_stack_record(4242, 4242, path=rec_path)
+    board_lib.clear_stack_record(rec_path)
+    check("clear 之后读不到（收干净就该销记录，否则下次 `--stop` 拿着旧 sid 乱收）",
+          not os.path.exists(rec_path))
+    check(f"记录路径可用 ${board_lib.STACK_RECORD_ENV} 覆盖"
+          f"（离线测试不许动真人 ~/.config 里那一份）",
+          board_lib.stack_record_path(rec_path) == rec_path)
+
+    # ---- 信号：别把栈留成孤儿 ------------------------------------------
+    import signal as _signal
+    calls = []
+    old = _signal.getsignal(_signal.SIGUSR1)
+    restore = board_lib.install_stop_handlers(lambda name: calls.append(name),
+                                              signals=(_signal.SIGUSR1,))
+    check("install_stop_handlers 真的换了处置",
+          _signal.getsignal(_signal.SIGUSR1) is not old)
+    try:
+        _signal.getsignal(_signal.SIGUSR1)(_signal.SIGUSR1, None)
+        raised = None
+    except SystemExit as exc:
+        raised = exc.code
+    check("  收到信号 ⇒ **先回调（收栈）、再抛 SystemExit**（默认处置是当场死，"
+          "栈就成了孤儿）",
+          calls == ["SIGUSR1"] and raised == 128 + _signal.SIGUSR1,
+          f"calls={calls} raised={raised}")
+    restore()
+    check("restore() 把处置还原（测试不留全局副作用）",
+          _signal.getsignal(_signal.SIGUSR1) is old)
+    _lib_src = open(os.path.join(HERE, "board_lib.py"), encoding="utf-8").read()
+    check("  默认管的是 SIGTERM / SIGHUP（`timeout`/CI/关终端那两种死法）",
+          "(signal.SIGTERM, signal.SIGHUP) if signals is None else signals"
+          in _lib_src)
+
+    # ---- 「AI 转达」的可转达性 ------------------------------------------
+    lines = []
+    board_lib.human_action("去示教器按**播放**", step=1, total=2,
+                           why="本启动器不发 play", out=lines.append)
+    check("human_action 第一行以固定前缀开头、**动词在前**、独立成行",
+          lines[0].startswith(board_lib.HUMAN_MARK)
+          and "（第 1/2 步）" in lines[0] and "按**播放**" in lines[0],
+          lines[0])
+    check("  第二行是「为什么」的注脚，**不**带前缀（转达第一行就够）",
+          len(lines) == 2 and not lines[1].startswith(board_lib.HUMAN_MARK)
+          and "本启动器不发 play" in lines[1])
+    lines2 = []
+    board_lib.relay_notice(out=lines2.append, timeout=300.0, doing="启动器")
+    check("relay_notice 说清三件事：那些行是给**人**的、要**原样**念、每步等多久",
+          board_lib.HUMAN_MARK in lines2[0] and "转达" in lines2[0]
+          and "原样" in lines2[1] and "300s" in lines2[2], str(lines2[:1]))
+
+    # ---- 「人在环」两步握手：判据与文案都离线钉住 ------------------------
+    class _Clock:
+        def __init__(self):
+            self.t = 0.0
+
+        def __call__(self):
+            return self.t
+
+        def sleep(self, s):
+            self.t += s
+
+    def _handshake(replies, ip="203.0.113.7", timeout=5.0):
+        it = iter(replies)
+        last = {}
+
+        def _dash(_ip, timeout=5.0):
+            try:
+                last.clear()
+                last.update(next(it))
+            except StopIteration:
+                pass
+            return dict(last)
+
+        c = _Clock()
+        said = []
+        ok, why = board_lib.ensure_in_the_loop(
+            ip, timeout, poll=1.0, dash=_dash, clock=c, sleep=c.sleep,
+            prompt=said.append, why="这次写夹爪寄存器的授权",
+            consequence="一个寄存器都不写", doing="写夹爪", step=(1, 2))
+        return ok, why, said
+
+    ok, why, said = _handshake([{"programState": "STOPPED ur5ros.urp"},
+                                {"programState": "PLAYING ur5ros.urp"}])
+    check("★ 两步都看到 ⇒ 过（这是「没有终端」时唯一能拿到的当次授权证明）",
+          ok and "两步**都看到了**" in why, why)
+    check("  两步的提示都是**可转达**的独立行（STOP 一条、PLAY 一条）",
+          sum(1 for ln in said if ln.startswith(board_lib.HUMAN_MARK)) == 2
+          and any("停止（STOP）" in ln for ln in said)
+          and any("播放（PLAY）" in ln for ln in said), str(said[:2]))
+    ok, why, _ = _handshake([{"programState": "PLAYING x.urp"}] * 40)
+    check("起栈前就是 PLAYING、一直没离开 ⇒ **不过**（残状态不算「人按过」）",
+          not ok and "没看到它离开 PLAYING" in why, why)
+    ok, why, _ = _handshake([{"programState": "STOPPED x.urp"}] * 40)
+    check("  离开了却没回来 ⇒ **不过**（「按过」这件事必须看到，不许猜）",
+          not ok and "没等到 PLAYING" in why, why)
+    ok, why, _ = _handshake([{}], ip=None)
+    check("读不到控制柜 IP ⇒ **核验不了** ⇒ 不过，而且说清后果是「不写」",
+          not ok and "核验不了" in why and "不写" in why, why)
+
+
 def main():
     print("board_lib 自检（纯离线：不起进程、不开串口、不碰臂）")
     section_site()
@@ -556,6 +735,7 @@ def main():
     section_source()
     section_cli()
     section_dash()
+    section_session_and_ai()
     print(f"\n{_n} 条断言，{len(_failed)} 条失败")
     if _failed:
         for n in _failed:
