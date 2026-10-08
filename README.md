@@ -310,6 +310,9 @@ python3 scripts/test_deidentified.py     # 公开仓脱敏把关：0 = 干净，
                                          #   不改提交信息；未跟踪的文件在 git add 之前对
                                          #   ls-files 是隐形的 —— 两条路径都真的漏过）
                                          #   只要标准库；**不需要** source ROS
+python3 scripts/test_doc_budget.py       # 常驻文档体量预算：超了说明「该检索的被当常驻读」
+                                         #   防的是注意力被慢慢吃掉，不是嫌文件多
+                                         #   预算表在脚本顶部，每个数字都带理由
 python3 scripts/test_docs_map.py         # 文档地图全覆盖 + 层声明一致 + 相对链接不断
 python3 scripts/test_startup_docs.py     # 真机启动文档守卫：runbook（`待执行命令.md` 的 A1
                                          #   一节）里写的 launch 参数集，必须 == 启动器
