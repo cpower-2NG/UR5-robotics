@@ -251,7 +251,7 @@ sudo ufw status verbose            # 需要 sudo；权威
 > 控制器停在 STOPPED —— 详见该节的 `switch_controller` 闸门。
 >
 > 本节仍然有用：它解释**为什么**要装 External Control URCap、切 Remote Control、
-> 标定为什么不能跳。这些前提 A1 一节默认已经满足，不会重讲。
+> 标定为什么不能跳。这些前提 [`A1现场runbook.md`](../A1现场runbook.md) 默认已经满足，不会重讲。
 >
 > ⚠️ **还有一条不报错的差别：几何。** 上游 `ur_control.launch.py` 用它自己那份
 > **出厂标称** URDF；本仓的 `real.launch.py` 把 `description_package` 显式设成
