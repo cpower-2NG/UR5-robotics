@@ -49,7 +49,7 @@
 > 当场 raise（这一点是好事：**响**比**静默跳过驱动**好）。
 > ⚠️ 上面这行只够**把栈起得来**。真机**完整的启动序列**（全套参数、`ROS_DOMAIN_ID`、
 > 「起栈 → 按 PLAY → 拉回控制器」的次序、预检四项、摆件数量、收工判据）
-> 见 [`docs/待执行命令.md`](待执行命令.md) 的 **A1 一节** —— 那是唯一真机跑通过的序列，
+> 见 [`docs/A1现场runbook.md`](A1现场runbook.md) —— 那是唯一真机跑通过的序列，
 > **本节不复述**。
 >
 > 仿真前提：`gz_ros2_control` 需 Harmonic 源码编译版（apt 的 humble 版依赖
@@ -368,7 +368,7 @@ ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense \
 ```
 
 > ⚠️ 真机的**完整启动序列**不在本节 —— 见
-> [`docs/待执行命令.md`](待执行命令.md) 的 **A1 一节**（唯一真机跑通过的那一份）。
+> [`docs/A1现场runbook.md`](A1现场runbook.md)（唯一真机跑通过的那一份）。
 
 > ⚠️ 本节原写的三条命令**都不可用**：`simulation.launch.py` 已删除；
 > `/trigger_grasp` 服务不存在（规划器是自主的，无需触发）；`pipeline.launch.py`

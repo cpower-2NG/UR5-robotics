@@ -245,7 +245,7 @@ sudo ufw status verbose            # 需要 sudo；权威
 > **它不是本项目的启动序列**，别拿它上机抓取。
 >
 > 本项目真机启动的唯一权威序列见
-> [`docs/待执行命令.md`](../待执行命令.md) 的 **A1 一节**：
+> [`docs/A1现场runbook.md`](../A1现场runbook.md)：
 > 起栈（`yolo_bringup bringup.launch.py camera_source:=realsense` + 全套参数）
 > → 按 PLAY → 把控制器拉回来 → 预检四项。**顺序反了会「连接被拒绝」**，
 > 控制器停在 STOPPED —— 详见该节的 `switch_controller` 闸门。

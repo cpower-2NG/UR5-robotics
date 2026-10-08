@@ -133,7 +133,7 @@ ros2 launch yolo_bringup grid_world.launch.py world:=color_objects_world.sdf
 
 | 脚本 | 适用 | 状态 |
 |---|---|---|
-| `scripts/generate_synthetic_data.py` | **只看仿真**：自己用 OpenCV 渲染图 + 自动出标签，生成 `block_dataset/` | ⚠️ **它的投影是转置的（D61）** —— 但它**渲染和标注共用同一个函数**，图与标签自洽，所以数据集本身有效、`block_best.pt` 不必重训。**不要拿它当真机的起点**（它的相机模型**没有旋转**，表达不了手眼外参） |
+| `scripts/generate_synthetic_data.py` | **只看仿真**：自己用 OpenCV 渲染图 + 自动出标签，生成 `block_dataset/` | ⚠️ **它的投影是转置的（D61）** —— 但它**渲染和标注共用同一个函数**，图与标签自洽，所以数据集本身有效、`block_best.pt` 不必重训。**不要拿它当真机的起点**（它的相机模型**没有旋转**，表达不了手眼外参）。⚠️ **它默认写 `block_dataset/` 且清空重建**（非空时要 `--force`）—— 而真机数据集也默认落在那个路径。**跑之前先确认那个目录里没有真机数据，或显式 `--out` 到别处** |
 | `scripts/auto_label_grid.py` | **真机（和仿真）**：`perception_3d/projector_node.py` 投影链的**严格逆运算**，走 tf + `/camera/color/camera_info`，含单应后端 | ✅ 自检 `scripts/test_label_projection.py` 全过。采集端用现成的 `scripts/collect_training_data.py`（订阅 ROS 话题，真机可直接用） |
 
 详见 `docs/RESTRUCTURE_PLAN.md` 第十二轮的 W4 一节与 D61 一条。
@@ -141,7 +141,7 @@ ros2 launch yolo_bringup grid_world.launch.py world:=color_objects_world.sdf
 ### 真机首验（相机来源三选一）
 
 > 🚀 **要真机抓取（不是只验感知）→ 只照
-> [`docs/待执行命令.md`](docs/待执行命令.md) 的「A1 · 真机『抓 4 放 4 + 槽位用尽收工』」一节。**
+> [`docs/A1现场runbook.md`](docs/A1现场runbook.md)。**
 > 那一节是**唯一**被真机跑通过的完整序列（参数集、次序、预检四项、收工判据都在那儿；
 > 2026-10-05 A1 验收 **4/4** 通过）。本节只回答「`camera_source` 这个枚举怎么选」，
 > **不重复那套序列** —— 本项目曾经有五份文档各讲一套启动流程，代价是十三条互相矛盾的说法。
@@ -249,6 +249,7 @@ ur5-vision-grasp/
     ├── 机械臂系统参考.md     # 恒久：设备与接口（只写不随任务变化的东西）
     ├── 经验总结-问题模式与处置.md  # 恒久：复发问题模式（跨阶段累积）
     ├── 待执行命令.md         # 要**你亲自执行**的命令 —— 只放「还没做的」
+    ├── A1现场runbook.md      # 真机启动序列（**唯一权威**）—— 从队列拆出来的，带机器守卫
     ├── 待执行命令-留档.md     # 上面那份的全部历史（甲-1…）+ 每条背后的论证
     ├── RESTRUCTURE_PLAN.md   # 流水：缺陷台账 + 改造计划 + 验收证据（历史，全文保留）
     ├── 阶段/阶段1-点对点抓放/  # 已完成阶段的产出：契约 / 技术文档 / 实验记录
@@ -314,8 +315,8 @@ python3 scripts/test_doc_budget.py       # 常驻文档体量预算：超了说�
                                          #   防的是注意力被慢慢吃掉，不是嫌文件多
                                          #   预算表在脚本顶部，每个数字都带理由
 python3 scripts/test_docs_map.py         # 文档地图全覆盖 + 层声明一致 + 相对链接不断
-python3 scripts/test_startup_docs.py     # 真机启动文档守卫：runbook（`待执行命令.md` 的 A1
-                                         #   一节）里写的 launch 参数集，必须 == 启动器
+python3 scripts/test_startup_docs.py     # 真机启动文档守卫：runbook（`A1现场runbook.md`）里
+                                         #   写的 launch 参数集，必须 == 启动器
                                          #   `scripts/board_a1.py` 实际会传的那一套
                                          #   内含真实的变异反例（参数少一个/多一个、
                                          #   入口换成 pipeline.launch.py，都必须判红）
@@ -386,8 +387,8 @@ python3 scripts/board_a1.py --params $HOME/site_real.yaml
 #   前置检查：无残留进程 / 串口空闲 / AG-95 已初始化 / 示教器在 PLAYING
 #   `--no-launch --log <文件>` 只对已有日志判分，不起栈、不动臂
 #   `--start-delay <秒>`（默认 25）规划器推迟启动，等 UR 驱动先连上
-#     ⚠️ A1 一节手敲的那两段用的 **120**（实测「一次 State tolerances failed
-#     都没有」）。25 是够按 PLAY 的保守下限，120 是建议值 —— 见该节的说明
+#     ⚠️ runbook 里手敲的那两段用的 **120**（实测「一次 State tolerances failed
+#     都没有」）。25 是够按 PLAY 的保守下限，120 是建议值 —— 见 runbook 的说明
 ```
 
 **2026-10-05 真机通过**（5 块 / 4 槽）：
@@ -635,7 +636,7 @@ python3 scripts/test_pipeline_e2e.py     # 端到端仿真闭环（项数由脚�
   > **上面两条只是「起得来」。**
   > **完整抓取的参数集、次序（起栈 → 示教器按 PLAY → 拉控制器）、预检四项、
   > 摆件要求与收工判据，一律以
-  > [`docs/待执行命令.md`](docs/待执行命令.md) 的 A1 一节为准** ——
+  > [`docs/A1现场runbook.md`](docs/A1现场runbook.md) 为准** ——
   > 本节讲的是「板上装了什么、缺什么、怎么编」，不重复那套序列。
   >
   > **「哪条命令回答哪个问题」（入口脚本速查）在上一节末尾**，本节不重复那张表 ——
