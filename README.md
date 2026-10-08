@@ -446,7 +446,7 @@ rviz2 -d ros2_ws/src/yolo_bringup/config/grasping.rviz --ros-args -p use_sim_tim
 # 终端 1
 ros2 launch yolo_bringup pipeline.launch.py camera_source:=external
 # 终端 2
-python3 scripts/test_pipeline_e2e.py     # 15 项断言
+python3 scripts/test_pipeline_e2e.py     # 端到端仿真闭环（项数由脚本自己报）
 ```
 
 它真起话题、真走 DDS，把合成的 `camera_info`+深度+检测框喂进运行中的 pipeline，
@@ -566,8 +566,8 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
   sudo apt install ros-humble-vision-msgs        # 板上有 4.1.1-1jammy arm64
   ```
 
-  另缺 AG-95 侧的 `pymodbus`（⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的
-  `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
+  ⚠️ AG-95 侧的 `pymodbus` 若要重装：用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的
+  `python3-pymodbus`（那是 2.1.0，API 不兼容）。**现在装没装**见 [docs/当前状态.md](docs/当前状态.md) §2。
 - ✅ **检测这一半已在板上跑通**（2026-09-28 实测）：权重 `block_best.pt`
   **不在本仓**（6 MB，属构建产物，按规范走外链；sha256 `a926d959…` 可用于核对
   你手上那份是不是同一个）；板上 `torch 2.5.0a0+nv24.08` + `ultralytics 8.4.26`
@@ -738,7 +738,10 @@ python3 scripts/board_lib.py     # 自查：生效的是哪份路径、逐条合
 
 ## 参考资料
 
-- [改造计划与缺陷台账](docs/RESTRUCTURE_PLAN.md) ← **先读这个**
+- [当前状态](docs/当前状态.md) ← **先读这个**：这台系统**现在**什么样
+- [机械臂系统参考](docs/机械臂系统参考.md)：设备 / 网络 / 接口 —— 读这一份就够
+- [文档地图](docs/文档地图.md)：每份文件属哪一层、旧文件名别名、仓库外的东西在哪
+- [改造计划与缺陷台账](docs/RESTRUCTURE_PLAN.md)：**已移出公开仓**（过程记录，去处见文档地图 §7）
 - [技术方案文档](docs/TECHNICAL_SPEC.md)（设计稿，注意顶部前提对照）
 - [方阵环境与训练流水线](docs/GRID_ENV_DESIGN.md)
 - [Gazebo Harmonic 文档](https://gazebosim.org/docs/harmonic)
