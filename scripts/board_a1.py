@@ -230,6 +230,26 @@ def build_cmd(a):
         "carry_objects:=true",
         "tf_required:=true",
         "use_target_plane:=true", "target_plane_z:=0.0285",
+        # ── 抓取点取**顶面中心**，不是检测框中心 ──────────────────────────
+        # 检测框框住的是方块在图像上的**整个侧影**（顶面 + 朝着相机的那些竖面），
+        # 不是顶面。斜视 α 角下侧影中心比顶面中心低 (S·sinα·f)/(2D) 像素 ——
+        # 2026-10-08 在真帧上量定：这帧 **6.44 px ≈ base 方向 13.7 mm**，而方块
+        # 才 28.5 mm 宽，夹爪正好咬在顶面靠相机那一侧。**两棱中点法**把它修回来
+        # （侧影最高点必在 target_plane_z、最低点必在 table_plane_z，取两点中点的
+        # x/y —— 边长 S 与投影比例自动消掉，不需要知道方块多大或相机多斜）。
+        # 细节见 `projector_node.py` 的 `_top_face_xy()`。
+        #
+        # `table_plane_z` 是近端下棱所在的台面高度，必须**小于** target_plane_z；
+        # 写反了 projector_node 构造时就记 ERROR（不静默）。0.0 与
+        # target_plane_z=0.0285「台面 + 方块高」的口径一致。
+        # ⚠️ 只在 `use_target_plane=true` 时有意义：深度模式高度未知，两条棱
+        #    所在的平面无从谈起（那时本键被忽略，不报错）。
+        # ⚠️ 这两行必须与 `docs/待执行命令.md` A1 一节那三块**同时**改：
+        #    `scripts/test_startup_docs.py` 拿本函数当**真值**比对文档，
+        #    只改一边就判红（那正是要的）。同理，改了这里要回头看
+        #    `board_run.py` 的 `LAUNCHED_ONLY_OK` —— 两边都有这个键时，
+        #    那边就得把理由撤掉（表会自己查过时）。
+        "grasp_point_mode:=top_face_center", "table_plane_z:=0.0",
         "publish_camera_tf:=true",
         # 规划器推迟启动：`start_delay` 包的是 [realsense, detector, perception,
         # planner]，**不含 UR 驱动**。驱动立刻起、抢在规划器之前把 5000x 连接建立好，
