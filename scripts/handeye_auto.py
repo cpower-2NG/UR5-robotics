@@ -213,6 +213,13 @@ def main() -> int:
         print("✅ 服务都在。开始盯姿态 —— **请开始用手挪臂**（每个姿态停 1~2 秒）。\n", flush=True)
 
         last_status = 0.0
+        # 存活检查用的两个量。**为什么需要**：驱动的 read() 在 RTDE 掉线时仍然
+        # `return OK`（`hardware_interface.cpp` 里那一段），于是「关节读数冻住」和
+        # 「人没挪臂」在屏幕上是**同一个样子** —— 都是「臂没怎么动」。
+        # 不分开报，就会闷头摆 20 个位姿、摆完才发现全白摆。
+        last_pose_vec = None
+        pose_unchanged_since = None
+        warned_frozen = False
         while rclpy.ok() and len(node.accepted) < args.target:
             cur = node.current()
             if cur is None:
@@ -222,6 +229,13 @@ def main() -> int:
                           "把臂转回去让板进画面", flush=True)
                 time.sleep(1.0 / args.poll_hz)
                 continue
+
+            cur_vec = tf_vec(cur["robot"])
+            if last_pose_vec is None or float(np.linalg.norm(cur_vec - last_pose_vec)) > 0.0005:
+                last_pose_vec = cur_vec
+                pose_unchanged_since = time.time()
+                warned_frozen = False
+            still_s = time.time() - (pose_unchanged_since or time.time())
 
             ok, (d_mm, ang) = novelty(cur, node.accepted, args.min_mm, args.min_deg)
             if ok:
@@ -244,7 +258,20 @@ def main() -> int:
                 if time.time() - last_status > 4:
                     last_status = time.time()
                     print(f"    …臂没怎么动（离最近样本 {d_mm:.0f} mm / {ang:.1f}°）"
-                          f"—— 已经 {len(node.accepted)}/{args.target} 个", flush=True)
+                          f"—— 已经 {len(node.accepted)}/{args.target} 个"
+                          f"｜当前法兰 {np.round(cur_vec * 1000, 0)} mm"
+                          f"，读数 {still_s:.0f}s 没变", flush=True)
+                    # 这一句是给「读数冻住」和「人真没动」分家的。
+                    # 人正在拖臂却一直没变 ⇒ 是冻住，不是没动。
+                    if still_s > 20 and not warned_frozen:
+                        warned_frozen = True
+                        print("    ⚠️ **角位移读数已经 20 秒没变了。**", flush=True)
+                        print("       如果你**正在用手拖臂**，那这不是「你没动」，而是**读数冻住了** ——",
+                              flush=True)
+                        print("       驱动的 read() 在 RTDE 掉线时仍会 return OK。"
+                              "先停下，别闷头摆 20 个位姿。", flush=True)
+                        print("       查法：板上另开一个终端 `ros2 topic hz /joint_states`，"
+                              "看它还在不在发。", flush=True)
             if args.max_minutes and (time.time() - t_start) > args.max_minutes * 60:
                 print(f"\n⏰ 到 {args.max_minutes} 分钟了，收摊。", flush=True)
                 break
