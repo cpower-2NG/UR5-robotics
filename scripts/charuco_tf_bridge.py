@@ -23,9 +23,16 @@ easy_handeye2 **自己不做检测**，它只是按固定时刻去查两条 TF
 1. **检不到就不发 TF**（而不是发上一帧的旧值）。
    这样 easy_handeye2 那条查询会**失败**，于是那一拍不会被记成样本 ——
    宁可少采一个点，也不能把脏样本混进去。
-2. **用当前 ROS 时间打时间戳，不用图像时间戳。**
-   相机有自己的时钟域，两边对不上是这一类标定最隐蔽的坑之一。
-   采样的那一刻臂是**静止**的，这点偏移无害。
+2. **TF 盖图像自己的时间戳**（`--stamp-source image`，默认）。
+   这条一开始写反过，代价是两轮实测全废 —— 记在这里免得再犯：
+   最初盖的是「发布那一刻」的 ROS 时间，理由写的是"采样的那一刻臂是静止的，这点偏移无害"。
+   可是**这条假设从来没有被工具强制过**（`--min-still` 是那两轮之后才加的），
+   而 easy_handeye2 那边（`handeye_sampler.py`）是拿**同一个时刻**去查两条 TF 的：
+   机械臂那条由驱动按真实时刻发出（查出来是准的），靶板这条却盖着发布时间 ——
+   于是在 t 时刻查回来的，其实是 t−延迟 那一刻的图像。
+   臂一动手，两条就差「腕部角速度 × 延迟」那么多，这正是实测那 12~34 mm 靶板散布的来源。
+   盖上图像时间戳，两条才说的是**同一个瞬间**。
+   （相机若是另一个时钟域，`_tf_stamp()` 会当场报错并退回发布时间 —— 那是**降级**不是修好。）
 3. **内参用我们自己标的那组（`--intrinsics`），不用 camera_info 自报的出厂值。**
    板上现役节点发的 `camera_info` 是出厂值（fx≈908、**D 全是零**），
    而我们标出来的是 **fx=900.30、RMS 0.17 px** 且带完整畸变模型。
@@ -193,6 +200,7 @@ class CharucoBridge(Node):
         # 对应三种完全不同的处置（挪板 / 挪臂 / 擦镜头或调光）。
         self.why: dict = {"stage": "还没收到帧", "n_marks": 0, "n_corners": 0, "rms": None}
         self.last_ok_wall = 0.0
+        self.stamp_warned = False
         self.frames_seen = 0
         self.detected = 0
 
@@ -266,7 +274,15 @@ class CharucoBridge(Node):
                        n_marks, n_corners, rms)
             return
         R, _ = cv2.Rodrigues(rvec)
-        self.last = {"n": int(n), "rms": rms, "R": R, "t": np.asarray(tvec, float).reshape(3)}
+        st = msg.header.stamp
+        self.last = {
+            "n": int(n), "rms": rms, "R": R, "t": np.asarray(tvec, float).reshape(3),
+            # 这一帧图像自己的时刻 —— 发 TF 就盖它，别盖「现在」（见 _tf_stamp）
+            "stamp": (int(st.sec), int(st.nanosec)),
+            # 从「图像拍下」到「检测完」过了多久。就等于 _tf_stamp 里那个延迟，
+            # 也等于「盖发布时间」时臂一动手会引入多大的时刻错配。
+            "lag_s": time.time() - (st.sec + st.nanosec * 1e-9),
+        }
         self.why = {"stage": "OK", "n_marks": n_marks, "n_corners": n_corners, "rms": rms}
         self.last_ok_wall = time.time()
         self.detected += 1
@@ -282,7 +298,7 @@ class CharucoBridge(Node):
         if time.time() - self.last_ok_wall > self.args.stale_s:
             return
         t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()   # 当前 ROS 时间，不是图像时间戳
+        t.header.stamp = self._tf_stamp()
         t.header.frame_id = self.camera_frame
         t.child_frame_id = self.args.board_frame
         x, y, z = (float(v) for v in self.last["t"])
@@ -295,6 +311,32 @@ class CharucoBridge(Node):
         t.transform.rotation.z = qz
         t.transform.rotation.w = qw
         self.broadcaster.sendTransform(t)
+
+    def _tf_stamp(self):
+        """这一帧 TF 该盖什么时间戳 —— 默认盖**图像**的。
+
+        为什么不是「现在」：easy_handeye2 采样时拿**同一个时刻**去查两条 TF
+        （`handeye_sampler.py`：`now − 200 ms` 查机械臂，同一个时刻查靶板）。
+        机械臂那条是驱动按真实时刻发的，查出来是准的；靶板这条要是盖成发布时刻，
+        那么在 t 时刻查回来的其实是 t−延迟 那一刻的图像 ——
+        臂一动手，两条就差了「腕部角速度 × 延迟」。
+        """
+        now = self.get_clock().now()
+        st = self.last.get("stamp") if self.last else None
+        if self.args.stamp_source == "image" and st is not None:
+            sec, nsec = st
+            lag = now.nanoseconds * 1e-9 - (sec + nsec * 1e-9)
+            if -0.05 <= lag <= 2.0:
+                m = now.to_msg()
+                m.sec, m.nanosec = sec, nsec
+                return m
+            if not self.stamp_warned:
+                self.stamp_warned = True
+                self.get_logger().error(
+                    f"⚠️ 图像时间戳跟 ROS 时钟差 {lag:+.2f}s，**像是两个时钟域** ⇒ "
+                    f"退回用发布时间。这是**降级**不是修好：臂停着没事，一动就又有偏差。"
+                )
+        return now.to_msg()
 
 
 def main() -> int:
@@ -310,6 +352,10 @@ def main() -> int:
     ap.add_argument("--max-rms", type=float, default=1.0, help="重投影 RMS 上限（px）")
     ap.add_argument("--publish-hz", type=float, default=20.0)
     ap.add_argument("--stale-s", type=float, default=0.5, help="上一帧好结果超过这么久就不发")
+    ap.add_argument("--stamp-source", choices=("image", "publish"), default="image",
+                    help="TF 盖**图像**的时间戳（默认）还是**发布那一刻**的。"
+                         "默认 image —— 见文件头第 2 条：盖发布时间会让臂在动时"
+                         "把两个不同瞬间的位姿配成一对")
     ap.add_argument("--status-every", type=float, default=5.0)
     args = ap.parse_args()
 
@@ -337,7 +383,8 @@ def main() -> int:
                     d = float(np.linalg.norm(node.last["t"]))
                     print(
                         f"    …心跳：{node.last['n']}/16 角点  RMS {node.last['rms']:.2f}px  "
-                        f"板心距相机 {d * 1000:.0f}mm｜已发 {node.detected} 次 TF",
+                        f"板心距相机 {d * 1000:.0f}mm｜已发 {node.detected} 次 TF"
+                        f"｜图像→检测延迟 {node.last['lag_s'] * 1000:.0f}ms",
                         flush=True,
                     )
     except (KeyboardInterrupt, ExternalShutdownException):

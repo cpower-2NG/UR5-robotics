@@ -23,6 +23,11 @@ from rclpy.node import Node
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
 
+try:
+    from controller_manager_msgs.srv import ListControllers
+except ImportError:  # 笔记本上没这个包
+    ListControllers = None
+
 OK = "✅"
 BAD = "❌"
 WARN = "⚠️ "
@@ -40,6 +45,28 @@ class Precheck(Node):
             return self.buf.lookup_transform(target, source, Time(), Duration(seconds=1.0))
         except Exception as e:
             return e
+
+    def freedrive_state(self) -> tuple[str, str]:
+        """问 controller_manager：freedrive_mode_controller 现在什么状态。
+
+        返回 (状态, 说明)。状态取值：active / inactive / unconfigured / missing / unknown。
+
+        ⚠️ 用 `spin_until_future_complete` 等结果，别自己 sleep 等 future ——
+        响应要靠节点的 executor 处理，光睡不转节点，future 永远不会 done。
+        """
+        if ListControllers is None:
+            return "unknown", "本机没有 controller_manager_msgs 包"
+        cli = self.create_client(ListControllers, "/controller_manager/list_controllers")
+        if not cli.wait_for_service(timeout_sec=5.0):
+            return "missing", "list_controllers 服务不在（驱动没起？）"
+        fut = cli.call_async(ListControllers.Request())
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)
+        if not fut.done():
+            return "unknown", "list_controllers 10 秒没回"
+        for c in fut.result().controller:
+            if c.name.endswith("freedrive_mode_controller"):
+                return c.state, c.name
+        return "missing", "控制器列表里没有 freedrive_mode_controller"
 
     def report(self) -> int:
         bad = 0
@@ -80,14 +107,29 @@ class Precheck(Node):
                   f"「Waiting for TF initialization…」，服务列表里什么都没有")
 
         # 4. 自由驱动控制器（人可以松手拖臂）
-        #    数是**订阅者**不是话题存不存在 —— 本节点若在同一个话题上建了
-        #    publisher，话题表就永远看得见它，那个检查会变成自证。
-        n_sub = self.count_subscribers(self.args.freedrive_topic)
-        if n_sub > 0:
-            print(f"{OK} 自由驱动控制器在线（{self.args.freedrive_topic} 有 {n_sub} 个订阅者）"
-                  f" —— 人拖臂不用按示教器那个键")
+        #
+        #    ⚠️ 判据必须是 controller_manager 报的**状态**，不能是话题订阅者数。
+        #    `freedrive_mode_controller` 在 `ur_control.launch.py` 的
+        #    `controllers_inactive` 名单里，spawner 带 `--inactive` 起它 ——
+        #    而控制器在 `on_configure` 阶段就把订阅建好了，**inactive 照样有人订阅**。
+        #    所以「订阅者数 > 0」是个**自证式绿灯**：它证明的只是「被配置过」。
+        #    没激活的控制器 `update()`/`write()` 根本不被调用 ⇒ 发多少条 True
+        #    都到不了机器人，而屏幕上一切正常。（2026-10-10 实测栽在这里。）
+        state, detail = self.freedrive_state()
+        if state == "active":
+            print(f"{OK} 自由驱动控制器 **active**（{detail}）")
+            print(f"     ⇒ 还要**程序 PLAYING** 才真能拖：freedrive 走反向接口，"
+                  f"程序一停它就没。")
+            print(f"       唯一算数的确认是驱动日志出现 "
+                  f"「Freedrive mode has been enabled successfully.」")
+        elif state in ("inactive", "unconfigured"):
+            bad += 1
+            print(f"{BAD} 自由驱动控制器是 **{state}**（{detail}）—— 拖不动臂，"
+                  f"而且**不会报错**")
+            print(f"     ⇒ 先激活： python3 scripts/switch_ctrl.py activate "
+                  f"freedrive_mode_controller")
         else:
-            print(f"{WARN}自由驱动控制器**不在**（{self.args.freedrive_topic} 没人订阅）")
+            print(f"{WARN}自由驱动控制器状态查不到：{detail}")
             print("    ⇒ 不影响采点，但人拖臂得按/按住示教器上的 freedrive 键；")
             print("      而 README 提醒过「按住示教键时驱动可能不工作」—— 那一拍可能没样本。")
         return bad
