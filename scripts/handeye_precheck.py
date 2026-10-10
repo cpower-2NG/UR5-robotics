@@ -78,6 +78,18 @@ class Precheck(Node):
         else:
             print(f"{BAD} 还缺 {bad} 条 —— easy_handeye2 会一直刷 "
                   f"「Waiting for TF initialization…」，服务列表里什么都没有")
+
+        # 4. 自由驱动控制器（人可以松手拖臂）
+        #    数是**订阅者**不是话题存不存在 —— 本节点若在同一个话题上建了
+        #    publisher，话题表就永远看得见它，那个检查会变成自证。
+        n_sub = self.count_subscribers(self.args.freedrive_topic)
+        if n_sub > 0:
+            print(f"{OK} 自由驱动控制器在线（{self.args.freedrive_topic} 有 {n_sub} 个订阅者）"
+                  f" —— 人拖臂不用按示教器那个键")
+        else:
+            print(f"{WARN}自由驱动控制器**不在**（{self.args.freedrive_topic} 没人订阅）")
+            print("    ⇒ 不影响采点，但人拖臂得按/按住示教器上的 freedrive 键；")
+            print("      而 README 提醒过「按住示教键时驱动可能不工作」—— 那一拍可能没样本。")
         return bad
 
 
@@ -88,6 +100,8 @@ def main() -> int:
     ap.add_argument("--effector-frame", default="tool0")
     ap.add_argument("--camera-frame", default="camera_color_optical_frame")
     ap.add_argument("--board-frame", default="charuco_board")
+    ap.add_argument("--freedrive-topic",
+                    default="/freedrive_mode_controller/enable_freedrive_mode")
     ap.add_argument("--watch", type=float, default=0.0, help="每 N 秒重刷一次；0=只报一次")
     args = ap.parse_args()
 
