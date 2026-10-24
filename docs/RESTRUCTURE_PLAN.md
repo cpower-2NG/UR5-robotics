@@ -4719,7 +4719,7 @@ $ ip route get <ip> from <board-ip>
 
 ```
 default via <ip>  dev eno1              metric 100   ← 赢
-default via <ip> dev wlx3c6a48573453   metric 600
+default via <ip> dev wlx*   metric 600
 ```
 
 于是开发机看到「我连的是 `<board-ip>`，回包却自称来自 `<host-ip>`」——
@@ -4743,7 +4743,7 @@ default via <ip> dev wlx3c6a48573453   metric 600
 ```bash
 # ❌ 别试
 sudo ip rule add from <board-ip> lookup 100
-sudo ip route add default via <ip> dev wlx3c6a48573453 table 100
+sudo ip route add default via <ip> dev wlx* table 100
 ```
 
 实测（只读）：
@@ -4805,7 +4805,7 @@ ssh -i ~/.ssh/board_ed25519 jetson@<board-ip> hostname
 
 唯一没排除的可能。判别法子写进甲-23 了：**先做甲-16**（把那两条规则的
 `-RemoteAddresses` 扩到 `<ip>/8`），在开发机起个临时监听，**从板子经无线**
-取一次（`curl --interface wlx3c6a48573453 …`）。通 ⇒ 路由没问题；不通（而板子上
+取一次（`curl --interface wlx* …`）。通 ⇒ 路由没问题；不通（而板子上
 `ping -I wlx… <ip>` 是通的）⇒ **H1 成立，「无线做开发链路」这个方案作废**，
 只能让网线同时承载开发网和机械臂网（小交换机，或 `真机缺失项清单.md` 里那个
 USB 3.0 千兆网卡）。**所以这一步值得在动 `eno1` 之前做** —— 它同时就是甲-13 的
@@ -4865,8 +4865,8 @@ USB 3.0 千兆网卡）。**所以这一步值得在动 `eno1` 之前做** —�
 不在开发机防火墙后面）：
 
 ```
-$ ping -I wlx3c6a48573453 -c 5 <ip>
-PING <ip> (<ip>) from <board-ip> wlx3c6a48573453
+$ ping -I wlx* -c 5 <ip>
+PING <ip> (<ip>) from <board-ip> wlx*
 64 bytes from <ip>: icmp_seq=1 ttl=255 time=2.20 ms
 …  5 packets transmitted, 5 received, 0% packet loss, rtt avg 2.503 ms
 ```
@@ -4880,7 +4880,7 @@ PING <ip> (<ip>) from <board-ip> wlx3c6a48573453
 顺带解释一条**很容易看错**的现象（必须写进文档，否则下一个人会误判）：
 
 ```
-$ ping -I wlx3c6a48573453 -c 3 <ip>     # 开发机
+$ ping -I wlx* -c 3 <ip>     # 开发机
 3 packets transmitted, 0 received, 100% packet loss
 ```
 
@@ -4896,7 +4896,7 @@ required`，所以删路由那条自愈定时器版只能用户跑）。拔线�
 ```
 $ ssh -o HostName=<board-ip> jetson 'hostname; ip route | grep default'
 yahboom
-default via <ip> dev wlx3c6a48573453 proto dhcp metric 600
+default via <ip> dev wlx* proto dhcp metric 600
 ```
 
 | 项 | 实测 | 说明 |
@@ -5055,7 +5055,7 @@ WSL 里那个监听器在 VM 内、不是 Windows 进程，**拿不到程序规�
 
 ### 三、顺带修正：连接名字与设备对上了
 
-`SZTU-usb` 是**无线**连接（`802-11-wireless`，活动在 `wlx3c6a48573453`），
+`SZTU-usb` 是**无线**连接（`802-11-wireless`，活动在 `wlx*`），
 不是名字暗示的 USB 网卡 —— 但正好印证了甲-23 的方案（USB 无线网卡走 `SZTU`）。
 板上还存着 `SZTU / SZTU-student / Yahboom / Yahboom2 / Yahboom3 / PDCN / idolm@ster`
 七套无线凭据（后六个 `AUTOCONNECT=yes`），换 SSID 时可直接用。
@@ -5171,7 +5171,7 @@ Humble 里这个选项叫 `--include-hidden-topics`，是我测错了。
 
 用户插上网线复测。这次是**真插上了**，所以测试成立（先验证前提再采信结论）：
 `eno1` 的 `operstate=up`、`carrier=1`、`nmcli` 显示 `connected`、**拿到租约 `<ip>/23`**。
-在这个前提下 `ip route | grep default` **仍然只有** `dev wlx3c6a48573453` 一条
+在这个前提下 `ip route | grep default` **仍然只有** `dev wlx*` 一条
 ⇒ **保险二（`ipv4.never-default yes`）实测通过**。这正是本条的硬判据：
 有线口明明拿到了 IP、链路是通的，却一条默认路由都没装；换作以前会冒出
 `default via <ip> dev eno1 metric 100` 把无线挤掉，`ssh jetson-wifi` 当场失效。
@@ -5314,7 +5314,7 @@ timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes -o HostName=<board-ip> jetso
 
 | 项 | 第三十八轮的说法 | 本轮实测 |
 |---|---|---|
-| 生效的无线网卡 | **USB 网卡** `wlx3c6a48573453` | **板载** `wlP1p1s0`（MAC `<mac>`） |
+| 生效的无线网卡 | **USB 网卡** `wlx*` | **板载** `wlP1p1s0`（MAC `<mac>`） |
 | 生效的连接 | `SZTU-usb`（**USB 卡**上的 profile —— 正是我改的那条） | **`SZTU`**（板载卡上的另一条 profile） |
 | USB 网卡还在吗 | 默认在 | `nmcli dev status` **没有它**；`lsusb` 只有两个 hub + 蓝牙电台（`0bda:c822`），**无任何 USB 无线网卡** |
 | 有线口 | 网线插着、`carrier=1`、租约 `<ip>/23` | **`eno1:unavailable`**（无载波） |
@@ -5437,7 +5437,7 @@ date:      Wed Sep 30 14:28:11 CST 2026
 
 **判据一：这块盘上从来没出现过那张 USB 无线网卡。**
 
-今早（2026-09-30）连上去的那块板子，活动接口是 **`wlx3c6a48573453`**
+今早（2026-09-30）连上去的那块板子，活动接口是 **`wlx*`**
 （= MAC `<mac>` 的 USB 网卡）。
 
 `<ip>` 上：
@@ -5518,14 +5518,14 @@ wtmp begins Wed Nov 22 04:57:15 2023        ← 从 2023 年一路记下来，�
 
 **关于「保险一」要单独说一句**：我先前写「保险一在实战场生效」，后来因为 `<ip>`
 上生效的是**板载卡 + `SZTU`** 而**撤回**了这个结论。现在看清楚了：
-今早那块板子**确实是 USB 网卡 `wlx3c6a48573453` 在 <board-ip> 上活动**（甲-23/甲-25 的实测），
+今早那块板子**确实是 USB 网卡 `wlx*` 在 <board-ip> 上活动**（甲-23/甲-25 的实测），
 **保险一（给 `SZTU-usb` 开 autoconnect）看起来是真的起作用的。**
 所以那次「撤回」是**基于别人机器的数据做出的**，**应当撤回那次撤回** ——
 但**要等板子找回来、重新实测一次**才写进结论（不重复「没验证就下结论」这个毛病）。
 
 ### 六、还没解决的
 
-1. **我们那块板子现在在哪、还活着吗。** 已知特征：USB 无线网卡 `wlx3c6a48573453`
+1. **我们那块板子现在在哪、还活着吗。** 已知特征：USB 无线网卡 `wlx*`
    （MAC `<mac>`）、D435i 常在、装着 `moveit` + `vision_msgs`。
    最后已知地址：**`<board-ip>`（无线）、`<host-ip>`（有线）** —— 现在**两个都不通**。
 2. **`<ip>` 是谁的机器。** 不是我们的，但为什么同镜像同主机名 ——
@@ -5587,7 +5587,7 @@ wtmp begins Wed Nov 22 04:57:15 2023        ← 从 2023 年一路记下来，�
 板子**不在** `<ip>/16`。剩下的解释按可能性排：
 
 1. **USB 网卡从板子上松了/掉了** —— 最像。甲-26 §四 那次的**直接证据**：
-   在 174 上跑 `nmcli dev status` 和 `lsusb`，**都看不见 `wlx3c6a48573453`**。
+   在 174 上跑 `nmcli dev status` 和 `lsusb`，**都看不见 `wlx*`**。
    （当时我把那条读成「这块板子上网卡不在」，现在换个读法：**我看到的很可能就是真板子的状态**
    —— 如果当时那台确实是我们的板子的话。这条**两种读法都指向同一个现场动作**：把网卡按回去。）
 2. 它在**校园网的其它段**（校园网不止这两个 /16）。
@@ -5722,7 +5722,7 @@ uptime = 6 天 23 小时 56 分
 `hostname -I` 列出除 loopback 外的**全部**地址。只回一个 `172.17.0.1`
 （那是 **`docker0` 网桥**，Docker 默认网段）⇒ 说明：
 
-- 无线网卡（`wlP1p1s0` 板载 / `wlx3c6a48573453` USB）**都没有地址** ⇒ 没关联上；
+- 无线网卡（`wlP1p1s0` 板载 / `wlx*` USB）**都没有地址** ⇒ 没关联上；
 - `eno1` **没有地址** ⇒ 有线没插或没起来。
 
 ⇒ **板子当前不在任何网络里。** 这解释了第四十二轮那两个 /16 为什么都是零：
@@ -5903,7 +5903,7 @@ B（USB 转网口）本来就不作首选 —— 它的用法是「`eno1` ← �
 
 | 配置名 | 绑在哪个网卡 | SSID | 自动连 |
 |---|---|---|---|
-| **`SZTU-usb`** | **`wlx3c6a48573453`** ← 就是那张 USB 卡 | `SZTU` | ✅ yes |
+| **`SZTU-usb`** | **`wlx*`** ← 就是那张 USB 卡 | `SZTU` | ✅ yes |
 | `SZTU-student` | `wlP1p1s0`（板载） | `SZTU-student` | yes |
 | `TP-LINK_3B72` | `wlP1p1s0`（板载） | `TP-LINK_3B72` | yes |
 
@@ -5960,11 +5960,11 @@ $ sudo insmod ~/rtl8821cu-src/8821cu.ko
 | 项 | 实测 |
 |---|---|
 | 驱动 | ✅ `8821cu 2428928 0`；`cfg80211 765952 2 8821cu,rtl8822ce` |
-| 接口 | ✅ **`wlx3c6a48573453`** —— 正是 `SZTU-usb` 绑死的名字 |
+| 接口 | ✅ **`wlx*`** —— 正是 `SZTU-usb` 绑死的名字 |
 | 绑驱动 | ✅ `1-2.2:1.0 → rtl8821cu` |
 | 连网 | ✅ **`connected SZTU-usb`，自己连上的**（预期命中，见 §二） |
 | 地址 | `<ip>`(eno1) · **`<board-ip>`(无线)** · `172.17.0.1`(docker0) |
-| 默认路由 | ✅ **只有一条**：`default via <ip> dev wlx3c6a48573453 metric 600` |
+| 默认路由 | ✅ **只有一条**：`default via <ip> dev wlx* metric 600` |
 | **`eno1`** | ✅ **完好**：只有 `<ip>/23 dev eno1` 直连路由、**没有默认路由**；SSH 照走 |
 | **外网** | ✅ `github.com → HTTP 200`（首次 16.9 s 冷启动 → 第二次 3.0 s）、`pypi.org → HTTP 200 0.28 s` |
 | oops | 无 ✅ |
@@ -6013,10 +6013,10 @@ $ sudo insmod ~/rtl8821cu-src/8821cu.ko
 
 | 项 | 实测 |
 |---|---|
-| 无线接口 | `wlx3c6a48573453` —— `connected / SZTU-usb` |
+| 无线接口 | `wlx*` —— `connected / SZTU-usb` |
 | 地址 / 网关 / 掩码 | `<board-ip>/22` · `<ip>` · 广播 `<ip>` |
 | DNS | `<ip>` · `<ip>` |
-| 默认路由 | ✅ **只有一条**：`default via <ip> dev wlx3c6a48573453 metric 600` |
+| 默认路由 | ✅ **只有一条**：`default via <ip> dev wlx* metric 600` |
 | `eno1` | `<ip>/23`，**只有直连路由、无默认路由** |
 | **开发机 → 板子（无线）** | ✅ `ssh jetson@<board-ip>` **直接连上** |
 | **开发机 → 板子（无线）ping** | ✅ **3 发 3 收，0% 丢包，2.5 ms** |
@@ -6115,7 +6115,7 @@ Host yahboom
 |---|---|
 | 经有线连板子 `<ip>` | ⏱ **超时** —— 网线已不在办公网上 |
 | 经无线连板子 `<board-ip>` | ✅ 通，序列号 `<board-serial>`（**先判亲，老规矩**） |
-| 默认路由 | ✅ 仍**只有一条**：`default via <ip> dev wlx3c6a48573453 metric 600` |
+| 默认路由 | ✅ 仍**只有一条**：`default via <ip> dev wlx* metric 600` |
 
 ⇒ **SSH 迁无线这条路的终点状态已经到达**：外网与 SSH 在无线，`eno1` 空出来给控制箱。
 
@@ -6380,10 +6380,10 @@ timeout 2 bash -c "echo > /dev/tcp/fe80::2d8:61ff:fe4b:9f4f%eno1/29999"
 ### 一、网络（① 1-1 验收）✅
 
 ```
-SZTU-usb     wlx3c6a48573453  yes  activated
+SZTU-usb     wlx*  yes  activated
 SZTU-student --               no   --
 TP-LINK_3B72 --               no   --
-default via <ip> dev wlx3c6a48573453 proto dhcp metric 600   ← 只剩一条
+default via <ip> dev wlx* proto dhcp metric 600   ← 只剩一条
 eno1  UP  <ip>/24        ← 去控制箱
 wlP1p1s0  DOWN                     ← 板载无线已断
 ```
