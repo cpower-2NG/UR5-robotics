@@ -9,26 +9,36 @@
 这条判据不要求知道靶板摆在哪，只要求**复核期间靶板没被挪**。所以靶板随便放，
 只要在相机视野里、复核全程不碰它。
 
-⚠️ **只查不存**：全程用 `get_current_transforms`（服务端只查、不写样本表），
-   **不调** `take_sample`。所以不会污染已有的样本表，也不用事后清理。
+⚠️ **只查不存**：不调 `take_sample`，不写服务端样本表，也不用事后清理。
+
+⚠️ **不依赖 easy_handeye2 服务端**（默认 `--source tf`）。原来走服务端的
+   `get_current_transforms`，可「开机接回来」的流程里**根本没起服务端**
+   （只有 `publish_on.sh` 的静态 TF 发布者），照着流程走会直接「服务不在」。
+   现在只用两条 TF：
+       `robot_base_frame → robot_effector_frame`（驱动发的 base_link→tool0）
+       `tracking_base_frame → tracking_marker_frame`（桥发的 相机→靶板）
+   这两个查询**各自在各自那棵树里**，所以**不需要** `handeye_publisher` 把两棵树连起来
+   —— 连起来是给下游用的，这里用不上（X 由存盘文件提供，自己乘）。
 
 ⚠️ **位姿必须够散**：一个位姿必然「通过」（它自己跟自己比）。所以这里要求每个新位姿
    跟已有位姿差 >min-mm **或** >min-deg，否则不收 —— 否则这个复核是**空的**。
 
-⚠️ 跑之前需要：驱动在跑（`base_link→tool0`）、腕部相机在发图、桥在发靶板 TF。
-   还得先起 `handeye_publisher`（`publish_on.sh`），否则两棵树是断开的。
-
 用法（板上）：
     ~/handeye_ws/scripts/run_ros.sh scripts/handeye_recheck.py --poses 5
+
+跑之前需要：驱动在跑（`base_link→tool0`）、腕部相机在发图、桥在发靶板 TF。
+`ros2 run tf2_ros tf2_echo base_link tool0` 和
+`ros2 run tf2_ros tf2_echo camera_color_optical_frame charuco_board` 都得有输出。
 """
 import argparse
-import math
 import sys
 import time
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformListener
 from easy_handeye2_msgs.srv import TakeSample
 from easy_handeye2.handeye_calibration import load_calibration
 
@@ -57,15 +67,50 @@ def is_new(sample: dict, accepted: list[dict], min_mm: float, min_deg: float):
     return (best[0] > min_mm) or (best[1] > min_deg), best
 
 
-class Recheck(Node):
-    def __init__(self) -> None:
+class TfProbe(Node):
+    """直查 TF 拿「法兰位姿」和「靶板在相机里」。不需要服务端、不需要发布者。"""
+
+    def __init__(self, base: str, tool: str, cam: str, marker: str) -> None:
         super().__init__("handeye_recheck")
+        self.frames = (base, tool, cam, marker)
+        self.buf = Buffer()
+        self.listener = TransformListener(self.buf, self)
+        self.call_error = ""
+
+    def current(self) -> dict | None:
+        rclpy.spin_once(self, timeout_sec=0.1)
+        base, tool, cam, marker = self.frames
+        try:
+            a = self.buf.lookup_transform(base, tool, Time())
+        except Exception as e:
+            self.call_error = (f"TF 查不到 {base} → {tool}"
+                               f"（驱动没起 / 还没 PLAY？）：{type(e).__name__}")
+            return None
+        try:
+            b = self.buf.lookup_transform(cam, marker, Time())
+        except Exception as e:
+            self.call_error = (f"TF 查不到 {cam} → {marker}"
+                               f"（相机没出图 / 桥没起 / 靶板不在视野？）：{type(e).__name__}")
+            return None
+        self.call_error = ""
+        return {"robot": a.transform, "tracking": b.transform}
+
+
+class ServiceProbe(Node):
+    """老路子：走服务端 `get_current_transforms`（只查不写样本表）。
+
+    ⚠️ 需要**服务端**在跑（`calibrate.launch.py` 起的那个），而开机接回的流程里
+    没有这一步。留它只是为了让「标定刚做完、服务端还活着」时能顺手复核。
+    """
+
+    def __init__(self) -> None:
+        super().__init__("handeye_recheck_srv")
         self.cli = self.create_client(TakeSample, NS + "get_current_transforms")
         self.call_error = ""
 
-    def current(self):
+    def current(self) -> dict | None:
         if not self.cli.wait_for_service(timeout_sec=10.0):
-            self.call_error = "get_current_transforms 服务不在"
+            self.call_error = "get_current_transforms 服务不在（服务端没起）"
             return None
         fut = self.cli.call_async(TakeSample.Request())
         rclpy.spin_until_future_complete(self, fut, timeout_sec=5.0)
@@ -91,13 +136,21 @@ def main() -> int:
     ap.add_argument("--still", type=float, default=0.7, help="每个位姿停稳这么多秒再取")
     ap.add_argument("--gate-mm", type=float, default=5.0, help="靶板落点散开的闸门")
     ap.add_argument("--max-minutes", type=float, default=15.0)
+    ap.add_argument("--source", choices=("tf", "service"), default="tf",
+                    help="位姿从哪拿：tf=直查 TF（默认，只要驱动+桥）；"
+                         "service=easy_handeye2 服务端（要服务端在跑）")
+    ap.add_argument("--robot-base-frame", default="")
+    ap.add_argument("--robot-tool-frame", default="")
+    ap.add_argument("--tracking-base-frame", default="")
+    ap.add_argument("--tracking-marker-frame", default="")
     args = ap.parse_args()
 
     cal = load_calibration(args.name)
+    p = cal.parameters
     t0 = cal.transform.translation
     q0 = cal.transform.rotation
     X = ha.T4(ha.tf_vec(t0), ha.tf_rot(cal.transform))
-    print(f"存盘的标定：{args.name}")
+    print(f"存盘的标定：{args.name}（{p.calibration_type}）")
     print(f"  t = [{t0.x*1000:+.2f}, {t0.y*1000:+.2f}, {t0.z*1000:+.2f}] mm，"
           f"|t| = {np.linalg.norm([t0.x, t0.y, t0.z])*1000:.2f} mm")
     print(f"  q = [{q0.x:+.6f}, {q0.y:+.6f}, {q0.z:+.6f}, {q0.w:+.6f}]\n")
@@ -107,7 +160,30 @@ def main() -> int:
         return 2
 
     rclpy.init()
-    node = Recheck()
+    if args.source == "tf":
+        # 帧名从标定文件里取 —— 文件里存的就是标定时用的那四个，别在这儿另抄一份。
+        # ⚠️ 用 getattr 而不是直接 `p.robot_base_frame`：这几个字段名是新版本
+        #    easy_handeye2 的叫法，老版本可能叫 `robot_base_link` / `tracking_marker`
+        #    之类。字段名对不上时**要报出来**，不能拿空串去查 TF（那会报一句
+        #    莫名其妙的「框名无效」，看着像硬件坏了）。
+        base = args.robot_base_frame or getattr(p, "robot_base_frame", "")
+        tool = args.robot_tool_frame or getattr(p, "robot_effector_frame", "")
+        cam = args.tracking_base_frame or getattr(p, "tracking_base_frame", "")
+        marker = args.tracking_marker_frame or getattr(p, "tracking_marker_frame", "")
+        miss = [n for n, v in (("robot_base_frame", base), ("robot_effector_frame", tool),
+                               ("tracking_base_frame", cam),
+                               ("tracking_marker_frame", marker)) if not v]
+        if miss:
+            print(f"❌ 标定文件里取不到帧名：{miss}")
+            print("   ⇒ 手动补：--robot-base-frame / --robot-tool-frame /"
+                  " --tracking-base-frame / --tracking-marker-frame")
+            rclpy.shutdown()
+            return 5
+        node = TfProbe(base, tool, cam, marker)
+        print(f"位姿来源：直查 TF  [{base} → {tool}] 与 [{cam} → {marker}]")
+    else:
+        node = ServiceProbe()
+        print("位姿来源：easy_handeye2 服务端 get_current_transforms")
     accepted: list[dict] = []
     last_pose = None
     still_since = time.time()
