@@ -223,7 +223,9 @@ def unquoted_scalar(text, key):
 # ===================================================================== 夹具
 # 真机 `ros2 launch … --show-args` 的输出形状：每条声明一行 `    '名字':`，
 # 下面缩进的是说明与默认值。本机没有 ROS 跑不了真的，所以按这个形状**手抄**一份，
-# 内容 = 三份入口文件里 `DeclareLaunchArgument` 声明过的全部名字（48 个）。
+# 内容 = 三份入口文件里 `DeclareLaunchArgument` 声明过的全部名字（52 个：
+#        2026-10-25 pc_top 那轮补了 pc_min_score / pc_table_hint / color_topic /
+#        color_buffer_len 四个）。
 # [3] 会拿三份源码 AST 出来的名字**回头逐字对一遍** —— 源码改了名这里就该红，
 # 红了就照着改夹具（夹具是「真机输出」的替身，改它不是作弊，是同步）。
 FIX_SHOW_ARGS = """
@@ -345,6 +347,26 @@ Arguments (pass arguments as '<name>:=<value>'):
         台面高度（m），顶面中心修正要用。
 
         (default: '0.0')
+
+    'pc_min_score':
+        pc_top 的分数闸门，低于它的检测不进点云估计。
+
+        (default: '0.30')
+
+    'pc_table_hint':
+        整帧兜底桌面的高度提示（m），带是相对它取的。
+
+        (default: '0.0')
+
+    'color_topic':
+        pc_top 用的彩色图（要与深度逐像素对齐）。
+
+        (default: '/camera/color/image_raw')
+
+    'color_buffer_len':
+        pc_top 的彩色帧缓冲长度。
+
+        (default: '5')
 
     'gripper_backend':
         sim / ag95 / none。
@@ -799,7 +821,7 @@ try:
     section("[3] 声明集：`--show-args` 的解析（含诱饵行）+ 夹具与 launch 源码对齐")
 
     declared = board_run.parse_declared_args(FIX_SHOW_ARGS)
-    check("解析出 48 个声明名", len(declared) == 48, "得到 %d 个" % len(declared))
+    check("解析出 52 个声明名", len(declared) == 52, "得到 %d 个" % len(declared))
     check("真机要用的那几个都在里面",
           {"robot_ip", "planner_params_file", "camera_x", "camera_qw",
            "target_plane_z", "use_target_plane", "gripper_backend",

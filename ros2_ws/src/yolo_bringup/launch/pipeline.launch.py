@@ -394,12 +394,33 @@ def generate_launch_description():
                         '(S·sinα·f)/(2D) 像素（实测 22px 方块上 6px ≈ base 13.6mm），'
                         '这一项用「远端上棱 ∩ target_plane_z」与「近端下棱 ∩ '
                         'table_plane_z」两点的中点把它修回来。仅在 use_target_plane=true '
-                        '时有意义（深度模式高度未知，两条棱的平面无从谈起）'),
+                        '时有意义（深度模式高度未知，两条棱的平面无从谈起）。'
+                        'pc_top = 点云顶面中心 —— 逐检测拟合局部桌面、找块体、'
+                        '取彩色亮层质心，射线 ∩ 顶面平面；**不需要** use_target_plane'
+                        '（高度从点云里量），实测 10 帧 3D 中位 3.5mm（另两种 11.5mm）'),
         DeclareLaunchArgument(
             'table_plane_z', default_value='0.0',
             description='台面高度（base_link 系，米），即 grasping 时近端下棱所在的平面。'
                         '只在 grasp_point_mode=top_face_center 时用到；必须**小于** '
                         'target_plane_z'),
+        DeclareLaunchArgument(
+            'pc_min_score', default_value='0.30',
+            description='grasp_point_mode=pc_top 时的分数闸门：低于它的检测不进'
+                        '点云估计。板/支架的误检多在 0.05–0.4，而真积木在 0.5 以上，'
+                        '所以这一项同时是「不误发」的主闸门'),
+        DeclareLaunchArgument(
+            'pc_table_hint', default_value='0.0',
+            description='整帧兜底桌面的高度提示（base_link 系，米）。局部拟合失败'
+                        '时用它；带是**相对它**取的（−80/+50 mm），所以换个装配'
+                        '只改这一个数，不写死绝对高度'),
+        DeclareLaunchArgument(
+            'color_topic', default_value='/camera/color/image_raw',
+            description='pc_top 用的彩色图（必须与**深度逐像素对齐**，真机用'
+                        'aligned depth）。只在 grasp_point_mode=pc_top 时订阅'),
+        DeclareLaunchArgument(
+            'color_buffer_len', default_value='5',
+            description='pc_top 的彩色帧缓冲长度；检测帧会去配时间最近的一张，'
+                        '差超过 max_sync_dt 就整批丢'),
     ]
 
     max_sync_dt_arg = DeclareLaunchArgument(
@@ -668,8 +689,14 @@ def generate_launch_description():
             'target_plane_z': LaunchConfiguration('target_plane_z'),
             'plane_depth_tol': LaunchConfiguration('plane_depth_tol'),
             # 「抓取点取哪儿」：bbox_center（原行为）/ top_face_center（修正斜视偏差）
+            # / pc_top（点云顶面中心，走 perception_3d/pc_grasp.py）
             'grasp_point_mode': LaunchConfiguration('grasp_point_mode'),
             'table_plane_z': LaunchConfiguration('table_plane_z'),
+            # pc_top 的三个旋钮 + 它的彩色输入
+            'pc_min_score': LaunchConfiguration('pc_min_score'),
+            'pc_table_hint': LaunchConfiguration('pc_table_hint'),
+            'color_topic': LaunchConfiguration('color_topic'),
+            'color_buffer_len': LaunchConfiguration('color_buffer_len'),
             # 采样/配准旋钮：全部在参数面上出现，理由见上面那一组 DeclareLaunchArgument
             'depth_scale': LaunchConfiguration('depth_scale'),
             'depth_grid': LaunchConfiguration('depth_grid'),
