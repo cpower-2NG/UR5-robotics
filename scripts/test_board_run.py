@@ -74,6 +74,17 @@ def check(name, cond, detail=''):
         _failed.append(name)
 
 
+def skip(name, why=''):
+    """本机**验不了**这一条 —— 印出来，不算 PASS 也不算 FAIL。
+
+    ⚠️ 只给「判据所依赖的现场在这台机器上根本不存在」的条目用。拿它给「懒得查」
+    打掩护，就是把 SKIP 渲染成绿（本文件开头第 3 条讲的就是这个）。
+    2026-10-25 第一次用：板上装了 ROS，`PATH` 里有没有 ros2 都不影响
+    启动器**自己 source** 的结果 —— 「缺 ROS 时 P0 报红」在板上永远验不到。
+    """
+    print("  [SKIP] %s%s" % (name, ("  " + why) if why else ''))
+
+
 def section(t):
     print("\n" + t)
 
@@ -2467,9 +2478,18 @@ try:
           "rc=%s" % r_real.returncode)
     check("  契约**只印一次**（同一趟里出现两次就说明有人把它放进了循环）",
           r_real.stdout.count("[AI 驱动]") == 1)
-    check("  而这趟是**它自己**没配好环境才停的（P0.ROS 环境 红），写路径那一项仍是绿",
-          "[FAIL] P0.ROS 环境" in r_real.stdout
-          and "[PASS] %s" % board_run.WRITE_PATH_ITEM in r_real.stdout)
+    # ⚠️ 这条只能在**没装 ROS** 的机器上验：启动器自己不信任调用者的 PATH，它会
+    #    source 系统与工作区的 setup.bash；板上这两个文件都在 ⇒ 再怎么改 PATH，
+    #    P0.ROS 环境 都是绿的，这条断言**永远**过不了。红不了也绿不了 = 噪音。
+    _need = board_run.ros_setup_files(repo=board_run.REPO)
+    if all(os.path.exists(f) for f in _need):
+        skip("而这趟是**它自己**没配好环境才停的（P0.ROS 环境 红），写路径那一项仍是绿",
+             "本机装了 ROS（%s 都在），启动器会自己 source 成功 ⇒ 这一条验不到；"
+             "开发机上照跑" % "、".join(_need))
+    else:
+        check("  而这趟是**它自己**没配好环境才停的（P0.ROS 环境 红），写路径那一项仍是绿",
+              "[FAIL] P0.ROS 环境" in r_real.stdout
+              and "[PASS] %s" % board_run.WRITE_PATH_ITEM in r_real.stdout)
     check("  报文在起栈之前就摆出来了（服务名 + 恒空的 deactivate）",
           board_gate.SWITCH_SERVICE in r.stdout
           and "deactivate_controllers []" in r.stdout)
