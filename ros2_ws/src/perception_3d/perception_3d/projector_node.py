@@ -519,6 +519,23 @@ class Perception3D(Node):
     # ------------------------------------------------------------------
     # 主回调
     # ------------------------------------------------------------------
+    def _lookup_tf_at(self, target_frame, source_frame, stamp):
+        """按**图像时刻**查 TF —— **超时固定为 0，绝不阻塞**。
+
+        为什么不能等（2026-10-25 板上实测的根因）：
+        本节点用单线程执行器，`/tf` 的消息也只能由这一个线程收。在回调里
+        `lookup_transform(..., timeout=1s)` 等一个「未来时刻」的变换时，这个
+        线程既收不到新的 `/tf`，也收不到深度 —— 等的那 1 秒恰好让缓冲**更旧**，
+        于是每次都等满超时，节点永久落后。实测：TF 缓冲落后 1.4 s 且不再收敛，
+        深度停在 13 帧前，`/targets_3d` 全程静默（日志里两种报错交替出现）。
+        查得到就用，查不到就跳过本批：与 `max_sync_dt` 同一口径 —— 宁可少发
+        一批，也不要发出一个基于**错误时刻**手臂位姿的坐标。
+        """
+        return self.tf_buffer.lookup_transform(
+            target_frame, source_frame, stamp,
+            timeout=rclpy.duration.Duration(seconds=0.0)
+        )
+
     def detection_callback(self, msg: Detection2DArray):
         """收到检测结果 → 投影到 3D → TF 变换 → 发布。"""
         # 收工途中到达的检测结果直接丢：此时 context 已经无效，往下走必然在
@@ -569,6 +586,34 @@ class Perception3D(Node):
         best_pose = None
         best_class = ''
 
+        # ---- Step 4: TF 变换 camera_frame → target_frame（整批只查一次）----
+        # 同一批检测的时间戳与坐标系都相同，逐条查纯属重复。更实际的理由：每条
+        # 都查一次缓冲、打一行日志，21 个候选时单帧回调被拖到 200 ms，`/tf` 又
+        # 排不上队（2026-10-25 实测：低阈值下 21 候选 → TF 连续失败 1568 次）。
+        # ⚠️ 查询**不许**带超时：见 `_lookup_tf_at()` 的说明。
+        try:
+            transform = self._lookup_tf_at(self.target_frame, camera_frame, stamp)
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            # D8: 原实现只 warn 一句就 continue——真机上 TF 缺失时**静默失效**，
+            #     表现为「什么都检测不到」，极难定位。改为 ERROR + 可操作提示，
+            #     并用连续失败计数把问题顶到明面上。
+            self.tf_fail_streak += 1
+            self.get_logger().error(
+                f'TF 查询失败（连续 {self.tf_fail_streak} 次）：{e} | '
+                f'需要 {self.target_frame} → {camera_frame} 的变换。'
+                f'真机请先完成手眼标定并发布静态 TF；仿真下由 URDF/SDF 提供。',
+                throttle_duration_sec=5.0
+            )
+            if self.tf_required:
+                raise RuntimeError(
+                    f'TF {self.target_frame} → {camera_frame} 不可用，'
+                    f'tf_required=True 故直接失败'
+                ) from e
+            return
+        self.tf_fail_streak = 0
+
         for detection in msg.detections:
             # ---- Step 1: 提取检测框 ----
             u = detection.bbox.center.position.x
@@ -616,108 +661,84 @@ class Perception3D(Node):
             y = (v - self.camera_model.cy()) * depth_val / self.camera_model.fy()
             z = depth_val
 
-            # ---- Step 4: TF 变换 camera_frame → target_frame ----
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.target_frame,
-                    camera_frame,
-                    stamp,
-                    timeout=rclpy.duration.Duration(seconds=1.0)
-                )
-
-                if self.target_plane_z is not None:
-                    # 框中心 ≠ 顶面中心（斜视下差十几毫米，见 grasp_point_mode）。
-                    # 默认 'bbox_center' 保持老行为；切到 'top_face_center' 时
-                    # 只换**定位用的那个 (x,y)**，深度校验一点没动。
-                    grasp_xy = None
-                    if self.grasp_point_mode == 'top_face_center':
-                        grasp_xy = self._top_face_xy(u, v, size_y, transform)
-                        if grasp_xy is None:
-                            # 求不出顶面中心：宁可不发，也不要退回框中心发一个
-                            # 已知偏十几毫米的点 —— 那正是这次要修的东西。
-                            self.get_logger().warn(
-                                f'top_face_center：({u:.1f},{v:.1f}) 两条棱求不出'
-                                f'与已知平面的交点，跳过本目标。'
-                                f'（常见原因：table_plane_z/target_plane_z 配置反了）',
-                                throttle_duration_sec=5.0
-                            )
-                            continue
-
-                    base_pose = self._ray_plane_pose(x, y, z, transform, u, v, stamp,
-                                                     grasp_xy=grasp_xy)
-                    if base_pose is None:
-                        # 平面在相机背后，或深度校验没过（例如空台面被判成方块）
+            # ---- Step 4 已在循环外完成：整批共用同一时刻的变换 ----
+            if self.target_plane_z is not None:
+                # 框中心 ≠ 顶面中心（斜视下差十几毫米，见 grasp_point_mode）。
+                # 默认 'bbox_center' 保持老行为；切到 'top_face_center' 时
+                # 只换**定位用的那个 (x,y)**，深度校验一点没动。
+                grasp_xy = None
+                if self.grasp_point_mode == 'top_face_center':
+                    grasp_xy = self._top_face_xy(u, v, size_y, transform)
+                    if grasp_xy is None:
+                        # 求不出顶面中心：宁可不发，也不要退回框中心发一个
+                        # 已知偏十几毫米的点 —— 那正是这次要修的东西。
+                        self.get_logger().warn(
+                            f'top_face_center：({u:.1f},{v:.1f}) 两条棱求不出'
+                            f'与已知平面的交点，跳过本目标。'
+                            f'（常见原因：table_plane_z/target_plane_z 配置反了）',
+                            throttle_duration_sec=5.0
+                        )
                         continue
-                else:
-                    cam_pose = PoseStamped()
-                    cam_pose.header.stamp = stamp
-                    cam_pose.header.frame_id = camera_frame
-                    cam_pose.pose.position = Point(x=x, y=y, z=z)
-                    cam_pose.pose.orientation = Quaternion(
-                        x=0.0, y=0.0, z=0.0, w=1.0)
-                    base_pose = self._transform_pose(cam_pose, transform)
-                base_pose.header.stamp = self.get_clock().now().to_msg()
-                base_pose.header.frame_id = self.target_frame
 
-                self.tf_fail_streak = 0
+                base_pose = self._ray_plane_pose(x, y, z, transform, u, v, stamp,
+                                                 grasp_xy=grasp_xy)
+                if base_pose is None:
+                    # 平面在相机背后，或深度校验没过（例如空台面被判成方块）
+                    continue
+            else:
+                cam_pose = PoseStamped()
+                cam_pose.header.stamp = stamp
+                cam_pose.header.frame_id = camera_frame
+                cam_pose.pose.position = Point(x=x, y=y, z=z)
+                cam_pose.pose.orientation = Quaternion(
+                    x=0.0, y=0.0, z=0.0, w=1.0)
+                base_pose = self._transform_pose(cam_pose, transform)
+            base_pose.header.stamp = self.get_clock().now().to_msg()
+            base_pose.header.frame_id = self.target_frame
 
-                class_name = ''
-                score = 0.0
-                if len(detection.results) > 0:
-                    class_name = detection.results[0].hypothesis.class_id
-                    score = detection.results[0].hypothesis.score
+            self.tf_fail_streak = 0
 
-                # ---- Step 5: 收进本批候选集（P3-6）----
-                # id 透传上游；上游没填时用序号兜底，保证每条都可区分。
-                d3 = Detection3D()
-                d3.header = base_pose.header
-                d3.id = detection.id if detection.id else f'det{len(targets_msg.detections)}'
-                hyp = ObjectHypothesisWithPose()
-                hyp.hypothesis.class_id = class_name
-                hyp.hypothesis.score = score
-                hyp.pose.pose = base_pose.pose
-                d3.results.append(hyp)
-                bbox3d = BoundingBox3D()
-                bbox3d.center = base_pose.pose   # 3D 位置在此；尺寸无意义故留零
-                d3.bbox = bbox3d
-                targets_msg.detections.append(d3)
+            class_name = ''
+            score = 0.0
+            if len(detection.results) > 0:
+                class_name = detection.results[0].hypothesis.class_id
+                score = detection.results[0].hypothesis.score
 
-                if score > best_score:
-                    best_score, best_pose, best_class = score, base_pose, class_name
+            # ---- Step 5: 收进本批候选集（P3-6）----
+            # id 透传上游；上游没填时用序号兜底，保证每条都可区分。
+            d3 = Detection3D()
+            d3.header = base_pose.header
+            d3.id = detection.id if detection.id else f'det{len(targets_msg.detections)}'
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = class_name
+            hyp.hypothesis.score = score
+            hyp.pose.pose = base_pose.pose
+            d3.results.append(hyp)
+            bbox3d = BoundingBox3D()
+            bbox3d.center = base_pose.pose   # 3D 位置在此；尺寸无意义故留零
+            d3.bbox = bbox3d
+            targets_msg.detections.append(d3)
 
-                # ⚠️ 日志里带上**本节点实际用的 (u,v) 与框尺寸**：出问题时最需要
-                #    判的就是「算 3D 点用的那个像素，和发布的 2D 框中心是不是同一个」。
-                #    只打 3D 结果的话，这条无法从外部核对 —— 而几何上一套
-                #    (u,v)+K+TF 的往返**必然闭合**，所以往返不闭合就说明 (u,v) 不同。
-                self.get_logger().info(
-                    f'Target [{class_name}] projected: '
-                    f'uv=({u:.1f},{v:.1f}) size=({size_x:.1f}×{size_y:.1f}) '
-                    f'{"[平面模式 " + format(self.target_plane_z, ".4f") + "]" if self.target_plane_z is not None else "[深度模式]"} '
-                    f'cam=({x:.3f},{y:.3f},{z:.3f}) → '
-                    f'base=({base_pose.pose.position.x:.3f},'
-                    f'{base_pose.pose.position.y:.3f},'
-                    f'{base_pose.pose.position.z:.3f})'
-                )
+            if score > best_score:
+                best_score, best_pose, best_class = score, base_pose, class_name
 
-            except (tf2_ros.LookupException,
-                    tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException) as e:
-                # D8: 原实现只 warn 一句就 continue——真机上 TF 缺失时**静默失效**，
-                #     表现为「什么都检测不到」，极难定位。改为 ERROR + 可操作提示，
-                #     并用连续失败计数把问题顶到明面上。
-                self.tf_fail_streak += 1
-                self.get_logger().error(
-                    f'TF 查询失败（连续 {self.tf_fail_streak} 次）：{e} | '
-                    f'需要 {self.target_frame} → {camera_frame} 的变换。'
-                    f'真机请先完成手眼标定并发布静态 TF；仿真下由 URDF/SDF 提供。',
-                    throttle_duration_sec=5.0
-                )
-                if self.tf_required:
-                    raise RuntimeError(
-                        f'TF {self.target_frame} → {camera_frame} 不可用，'
-                        f'tf_required=True 故直接失败'
-                    ) from e
-                continue
+            # ⚠️ 日志里带上**本节点实际用的 (u,v) 与框尺寸**：出问题时最需要
+            #    判的就是「算 3D 点用的那个像素，和发布的 2D 框中心是不是同一个」。
+            #    只打 3D 结果的话，这条无法从外部核对 —— 而几何上一套
+            #    (u,v)+K+TF 的往返**必然闭合**，所以往返不闭合就说明 (u,v) 不同。
+            # ⚠️ 级别是 **debug**：低阈值下一帧能有 20+ 个候选，info 级会变成
+            #    ~400 行/s 的日志，单帧回调被拖到 200 ms，反而把 `/tf` 饿死
+            #    （2026-10-25 实测）。每批那条「发布 N 个候选」仍留在 info。
+            self.get_logger().debug(
+                f'Target [{class_name}] projected: '
+                f'uv=({u:.1f},{v:.1f}) size=({size_x:.1f}×{size_y:.1f}) '
+                f'{"[平面模式 " + format(self.target_plane_z, ".4f") + "]" if self.target_plane_z is not None else "[深度模式]"} '
+                f'cam=({x:.3f},{y:.3f},{z:.3f}) → '
+                f'base=({base_pose.pose.position.x:.3f},'
+                f'{base_pose.pose.position.y:.3f},'
+                f'{base_pose.pose.position.z:.3f})'
+            )
+
 
         # ---- Step 6: 发布本批全部候选（P3-6）----
         # 一个都没投影成功时不发空数组：发了会让下游误以为「拍到了但没目标」，
@@ -729,9 +750,12 @@ class Perception3D(Node):
         if best_pose is not None:
             self.target_pub.publish(best_pose)   # 最高分那个，向后兼容
 
+        # 节流到 1 Hz：这条是**可用性信号**（节点真在发），不需要每批一行；
+        # 每批 20 行同样会挤占回调时间。
         self.get_logger().info(
             f'发布 {len(targets_msg.detections)} 个候选到 /targets_3d；'
-            f'/target_3d = [{best_class}] score={best_score:.2f}'
+            f'/target_3d = [{best_class}] score={best_score:.2f}',
+            throttle_duration_sec=1.0
         )
 
 

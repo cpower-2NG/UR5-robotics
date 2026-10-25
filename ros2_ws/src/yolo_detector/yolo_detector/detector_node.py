@@ -246,9 +246,15 @@ class YoloDetector(Node):
             self.get_logger().error(f'cv_bridge conversion failed: {e}')
             return
 
-        # 运行 YOLO 推理
+        # 运行 YOLO 推理。
+        # ⚠️ `conf` **必须**显式传给模型：Ultralytics 自己的默认阈值是 0.25，
+        #    不给的话它先在模型内部截断，下面那句 `if conf < self.conf_thresh`
+        #    就永远看不到 0.25 以下的框 —— 即 `confidence_threshold` 参数**低于
+        #    0.25 时静默无效**（2026-10-25 实测：参数是 0.05，输出仍只有 ≥0.25
+        #    的 2 个框；而离线直调模型 conf=0.01 时同一帧有 30 个框）。
+        #    这类「参数收下了、不起作用」的静默降级正是本仓反复踩的坑。
         t0 = time.time()
-        results = self.model(cv_image, verbose=False)
+        results = self.model(cv_image, conf=float(self.conf_thresh), verbose=False)
         dt = time.time() - t0
 
         if len(results) == 0:
