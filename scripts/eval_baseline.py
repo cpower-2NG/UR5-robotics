@@ -69,6 +69,19 @@ import sys
 
 import numpy as np
 
+# 点云抓取点的数学**只有一份**，在 perception_3d 包里（节点 `grasp_point_mode
+# :=pc_top` 用的是同一份）。这里按**路径**导入，不走 ament —— 本脚本要求
+# 「不需要 colcon build」，所以不能依赖安装后的包。
+# 为什么要共用：这个仓库里颜色曾在四处各写一份，对不齐时完全静默（标签与
+# names 错位，训练照样跑完）。抓取点若在节点和评估里各长一份，症状会是
+# 「离线很好、上板偏几毫米」，而两边都不知道该信谁。
+_PERCEPTION_SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "ros2_ws", "src", "perception_3d", "perception_3d")
+if _PERCEPTION_SRC not in sys.path:
+    sys.path.insert(0, _PERCEPTION_SRC)
+import pc_grasp  # noqa: E402
+
 # 标定板：与 docs/calib/charuco_A4_30mm_5x5.json 对应
 SQUARE_MM_DEFAULT = 30.93     # 实测打印比例 1.031 × 30.0
 MARKER_RATIO = 22.0 / 30.0    # 码边长 / 方格边长，打印缩放下同比
@@ -518,10 +531,10 @@ def board_to_base(frame, R_cb, t_cb, p_board):
 # ⚠️ 0.7 m 是 D435i 最差的量程：顶面 3D 点自身的重复性 ~1 mm，但
 # **绝对深度**仍有几毫米的偏置（它修不了）；精度验收要回近距（~0.35 m）。
 
-PC_MIN_SCORE = 0.30          # 低于这个分数不进点云估计（板/支架的误检多在 0.05–0.4）
-PC_TOP_POINTS_MIN = 200      # 顶面点过少 = 不是一块积木的顶面
-PC_TOP_BAND_MM = 2.5         # 顶面层厚：取「最高层 ±2.5 mm」
-PC_MIN_HEIGHT_MM = 15.0      # 顶面高出局部桌面不到 15 mm 的，不是积木
+PC_MIN_SCORE = pc_grasp.MIN_SCORE          # 低于这个分数不进点云估计
+PC_TOP_POINTS_MIN = pc_grasp.TOP_POINTS_MIN
+PC_TOP_BAND_MM = pc_grasp.TOP_BAND_MM
+PC_MIN_HEIGHT_MM = pc_grasp.MIN_HEIGHT_MM
 
 
 def point_cloud(f):
@@ -529,8 +542,8 @@ def point_cloud(f):
 
     用的 TF 与 `targets_to_board()` 是**同一份**（同一帧记录的），
     所以点云和管线的 base 坐标没有额外的手眼误差差。
+    实现见 `pc_grasp.base_cloud()`（节点用的是同一份）。
     """
-    import cv2
     tf_ok = (f["tf"].get("ok") or {})
     key = "base_link:camera_color_optical_frame"
     if key not in tf_ok:
@@ -538,218 +551,76 @@ def point_cloud(f):
                          % (f["dir"], key, ", ".join(sorted(tf_ok))))
     R_bc, t_bc = _tf_matrix(tf_ok[key])
     depth = f["depth"].astype(np.float64) / 1000.0
-    K = f["K"]
-    h, w = depth.shape
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    us, vs = np.meshgrid(np.arange(w, dtype=np.float64),
-                         np.arange(h, dtype=np.float64))
-    p_cam = np.stack([(us - cx) / fx * depth,
-                      (vs - cy) / fy * depth, depth], axis=-1)
-    return p_cam @ R_bc.T + t_bc, depth > 0
+    return pc_grasp.base_cloud(depth, f["K"], R_bc, t_bc)
 
 
 def _fit_plane(P, thresh_mm=3.0, iters=600, seed=0):
-    """RANSAC 平面；法向约束在竖直附近（桌面/顶面）。→ (n, c, n_inliers)。"""
-    if len(P) < 50:
-        return None
-    rng = np.random.default_rng(seed)
-    best = None
-    tol = thresh_mm / 1000.0
-    for _ in range(iters):
-        q = P[rng.choice(len(P), 3, replace=False)]
-        n = np.cross(q[1] - q[0], q[2] - q[0])
-        norm = np.linalg.norm(n)
-        if norm < 1e-9:
-            continue
-        n = n / norm
-        if abs(n[2]) < 0.9:               # 桌面法向与 base z 夹角 < 26°
-            continue
-        c = n @ q[0]
-        cnt = int((np.abs(P @ n - c) < tol).sum())
-        if best is None or cnt > best[0]:
-            best = (cnt, n, c)
-    if best is None:
-        return None
-    cnt, n, c = best
-    for _ in range(3):
-        I = P[np.abs(P @ n - c) < tol * 0.66]
-        if len(I) < 30:
-            break
-        m = I.mean(0)
-        _, _, vt = np.linalg.svd(I - m, full_matrices=False)
-        n = vt[-1]
-        c = n @ m
-    return n, c, cnt
+    """RANSAC 平面；法向约束在竖直附近。→ (n, c, n_inliers)。
+
+    实现见 `pc_grasp.fit_plane()`。保留这个薄包装是为了让自检
+    （scripts/test_eval_baseline.py）继续按原来的名字钉住它。
+    """
+    return pc_grasp.fit_plane(P, thresh_mm=thresh_mm, iters=iters, seed=seed)
 
 
 def _global_table_plane(P, valid):
-    """整帧兜底桌面。局部环拟合失败时用它，不让一帧整帧退掉。"""
-    z = P[:, :, 2]
-    band = valid & (z > -0.08) & (z < 0.05)
-    pts = P[band][::5]
-    if len(pts) < 500:
-        return None
-    fit = _fit_plane(pts)
-    return None if fit is None else (fit[0], fit[1])
+    """整帧兜底桌面。局部拟合失败时用它，不让一帧整帧退掉。"""
+    return pc_grasp.global_table_plane(P, valid, table_hint=0.0)
 
 
-def _local_table_plane(P, valid, box, pad_px=40, band_mm=8.0,
-                       global_plane=None):
+def _local_table_plane(P, valid, box, pad_px=pc_grasp.LOCAL_PAD_PX,
+                       band_mm=pc_grasp.LOCAL_BAND_MM, global_plane=None):
     """在检测框外扩 `pad_px` 的 ROI 里拟合局部桌面。
 
     为什么不是「框外一圈」：YOLO 框常比块**小**（rep-06 一块 39×51 px，块
     实际 ~64 px），贴着框的那一圈其实还在块顶上；于是「局部桌面」被拟成块
     顶，高度闸门随机误杀 —— 2026-10-25 rep-06/07 各漏 2 块就是这么来的。
-
-    改用中位带：ROI 里桌面占绝大多数，块顶高出桌面 28.5 mm ⇒ 取 ROI 中位
-    z 附近 ±`band_mm` 的点只含桌面，块在带外。ROI 内倾角很小（~0.15 m 上
-    1.3° 只有 3 mm），带内取全后再拟合不会把倾斜抹平。
+    改用中位带（实现见 `pc_grasp.local_table_plane()`）。
     """
-    h, w = valid.shape
-    x0, x1, y0, y1 = box
-    x0 = max(0, x0 - pad_px); x1 = min(w, x1 + pad_px)
-    y0 = max(0, y0 - pad_px); y1 = min(h, y1 + pad_px)
-    rv = valid[y0:y1, x0:x1]
-    pts = P[y0:y1, x0:x1][rv]
-    if len(pts) < 500:
-        return global_plane
-    zmed = float(np.median(pts[:, 2]))
-    pts = pts[np.abs(pts[:, 2] - zmed) < band_mm / 1000.0]
-    if len(pts) < 300:
-        return global_plane
-    fit = _fit_plane(pts)
-    if fit is None or fit[2] < 200:
-        return global_plane
-    n, c, _ = fit
-    if abs(n[2]) <= 0.985:             # 局部桌面倾角 < 10°
-        return global_plane
-    return n, c
+    return pc_grasp.local_table_plane(P, valid, box, pad_px=pad_px,
+                                      band_mm=band_mm,
+                                      global_plane=global_plane)
 
 
 def _plane_height(P, n, c):
     """点到平面的有向高度（朝上为正）。"""
-    return (P[..., 0] * n[0] + P[..., 1] * n[1] + P[..., 2] * n[2] - c) \
-        * (1.0 if n[2] > 0 else -1.0)
+    return pc_grasp.plane_height(P, n, c)
 
 
 def estimate_grasp_pc(f, det, plane, top_band_mm=PC_TOP_BAND_MM,
-                      pad_px=22, min_top=PC_TOP_POINTS_MIN,
+                      pad_px=pc_grasp.PAD_PX, min_top=PC_TOP_POINTS_MIN,
                       min_height_mm=PC_MIN_HEIGHT_MM):
     """一块积木 → base 系抓取点（顶面质心）或 None。
 
-    步骤：检测框放大 `pad_px` → 取「高出局部桌面 >8 mm」的连通域（含框中心
-    的那块）→ 顶面 = 该连通域 z 最高的 10% 的中位层 ± `top_band_mm` →
-    质心。放大检测框是为了矩形积木：YOLO 框可能只盖住它的一半。
+    算法与参数全在 `pc_grasp.estimate_top_point()`（节点用的是同一份）。
+    这里只补一件离线评估**独有**的事：同时算出**板系**坐标 `p_board`，
+    因为误差统计在板系里做，TF 往返会自动抵消。
+
+    ⚠️ 彩色分割的区域判据曾是「板系 z ∈ (−10, 50) mm」，2026-10-25 改成
+    与节点一致的「相对局部桌面的高度」。两者在 10 帧上差 0.02 mm（3.491 →
+    3.514 中位），但**少一条分叉**：同一份数学若在两条路上各有各的区域判据，
+    「离线很好、上板偏一点」这种事就没法排除。改后 10 帧逐条与节点一致。
+
+    步骤（细节见 pc_grasp 的模块文档）：检测框放大 `pad_px` → 取「高出
+    局部桌面 >8 mm」且含框中心的连通域 → 顶面 = 该连通域 z 最高的 10% 的
+    中位层 ± `top_band_mm` → x/y 取彩色亮层质心（Otsu），不是深度点质心
+    （0.7 m 处深度有位置相关偏置，按固定层高选点质心偏 5–10 px）。
     """
-    import cv2
     if plane is None:
         return None
-    n, c = plane
     P, valid = f["_cloud"]
-    h, w = valid.shape
-    K = f["K"]
-    R_bc, t_bc = _tf_matrix(f["tf"]["ok"]["base_link:camera_color_optical_frame"])
     R_cb, t_cb = f["_board_pose"]
-    cx, cy = det["cx"], det["cy"]
-    sx, sy = det["size_x"], det["size_y"]
-    x0 = max(0, int(round(cx - sx / 2 - pad_px)))
-    x1 = min(w, int(round(cx + sx / 2 + pad_px)))
-    y0 = max(0, int(round(cy - sy / 2 - pad_px)))
-    y1 = min(h, int(round(cy + sy / 2 + pad_px)))
-    if x1 - x0 < 12 or y1 - y0 < 12:
+    R_bc, t_bc = _tf_matrix(f["tf"]["ok"]["base_link:camera_color_optical_frame"])
+    out = pc_grasp.estimate_top_point(
+        P, valid, f["img"], det, plane, f["K"], R_bc, t_bc,
+        rel=(R_cb, t_cb), pad_px=pad_px,
+        top_band_mm=top_band_mm, min_top=min_top,
+        min_height_mm=min_height_mm)
+    if out is None:
         return None
-    roi = P[y0:y1, x0:x1]
-    rv = valid[y0:y1, x0:x1]
-    hh = _plane_height(roi, n, c)
-    mask = ((hh > 0.008) & rv).astype(np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    ncomp, lab, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    if ncomp < 2:
-        return None
-    ccx, ccy = int(round(cx - x0)), int(round(cy - y0))
-    ccx = min(max(ccx, 0), lab.shape[1] - 1)
-    ccy = min(max(ccy, 0), lab.shape[0] - 1)
-    k = int(lab[ccy, ccx])
-    if k == 0:                                    # 框中心落在缝里：取最近的域
-        ys, xs = np.nonzero(lab)
-        if len(ys) == 0:
-            return None
-        i = int(np.argmin((xs - ccx) ** 2 + (ys - ccy) ** 2))
-        k = int(lab[ys[i], xs[i]])
-    comp = (lab == k) & rv
-    if int(comp.sum()) < min_top:
-        return None
-    zc = roi[:, :, 2][comp]
-    zt = float(np.percentile(zc, 90))
-    sel = comp & (np.abs(roi[:, :, 2] - zt) < top_band_mm / 1000.0)
-    if int(sel.sum()) < min_top:
-        return None
-
-    # ---- 顶面平面（深度）----
-    py, px = np.nonzero(sel)
-    fit = _fit_plane(roi[py, px], thresh_mm=2.5)
-    if fit is None:
-        return None
-    n_top, c_top, _ = fit
-    if n_top[2] < 0:
-        n_top, c_top = -n_top, -c_top
-
-    # ---- 顶面质心（颜色）----
-    # 为什么不用深度点的质心：深度在 0.7 m 有位置相关的偏置，顶面会被压成
-    # 几度的「斜坡」；按固定层高选点只选到斜坡的一条带，质心偏 5–10 px
-    # （2026-10-25 实测）。顶面在彩色图里是块上最亮的一层，它的质心与
-    # 立方体模型给出的顶面中心差 1–2 px。
-    hsv = cv2.cvtColor(f["img"][y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
-    S_ch, V_ch = hsv[:, :, 1], hsv[:, :, 2]
-    p_cam_roi = (roi - t_bc) @ R_bc
-    zb = (p_cam_roi - t_cb) @ R_cb
-    cm = ((S_ch > 55) & (V_ch > 40) & rv
-          & (zb[:, :, 2] > -0.010) & (zb[:, :, 2] < 0.050)).astype(np.uint8)
-    cm = cv2.morphologyEx(cm, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    cm = cv2.morphologyEx(cm, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    nc, lc, sc, _ = cv2.connectedComponentsWithStats(cm, 8)
-    kc = int(lc[ccy, ccx])
-    if kc == 0 and nc > 1:
-        ys, xs = np.nonzero(lc)
-        i = int(np.argmin((xs - ccx) ** 2 + (ys - ccy) ** 2))
-        kc = int(lc[ys[i], xs[i]])
-    cmask = (lc == kc) if kc else (comp > 0)
-    if int(cmask.sum()) >= 100:
-        vv = V_ch[cmask].reshape(-1, 1)
-        thr = cv2.threshold(vv, 0, 255,
-                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
-        top = cmask & (V_ch > thr)
-        if int(top.sum()) < 100:
-            top = cmask
-    else:
-        top = comp
-    ys, xs = np.nonzero(top)
-    u_c = float(xs.mean() + x0)
-    v_c = float(ys.mean() + y0)
-
-    # ---- 像素射线 ∩ 顶面平面 ----
-    fx, fy = K[0, 0], K[1, 1]
-    cx_px, cy_px = K[0, 2], K[1, 2]
-    d_cam = np.array([(u_c - cx_px) / fx, (v_c - cy_px) / fy, 1.0])
-    d_base = R_bc @ d_cam
-    denom = float(n_top @ d_base)
-    if abs(denom) < 1e-12:
-        return None
-    t = float((c_top - n_top @ t_bc) / denom)
-    p_base = t_bc + t * d_base
-
-    # 顶面必须真的高出局部桌面：ChArUco 板/白色支架也会出框，它们贴桌面
-    p_cam = R_bc.T @ (p_base - t_bc)
-    p_board = R_cb.T @ (p_cam - t_cb)
-    plane_z = ((c - n[0] * p_base[0] - n[1] * p_base[1]) / n[2]
-               if abs(n[2]) > 1e-9 else p_base[2])
-    if (p_base[2] - plane_z) * 1000.0 < min_height_mm:
-        return None
-    return {"p_base": p_base, "p_board": p_board,
-            "score": float((det.get("best") or {}).get("score", 0.0)),
-            "class_id": (det.get("best") or {}).get("class_id", ""),
-            "n_top": int(top.sum()), "z_above_mm": round(
-                float((p_base[2] - plane_z) * 1000.0), 2)}
+    return {"p_base": out["p_base"], "p_board": out["p_rel"],
+            "score": out["score"], "class_id": out["class_id"],
+            "n_top": out["n_top"], "z_above_mm": out["z_above_mm"]}
 
 
 def assoc(truths, ests, max_mm):

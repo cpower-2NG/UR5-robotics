@@ -5,6 +5,7 @@
   /detections             (vision_msgs/Detection2DArray)
   /camera/depth/image_raw (sensor_msgs/Image)
   /camera/color/camera_info (sensor_msgs/CameraInfo)
+  /camera/color/image_raw (sensor_msgs/Image) — **只在 grasp_point_mode=pc_top 时订阅**
 
 发布:
   /targets_3d (vision_msgs/Detection3DArray) — target_frame 下**全部**目标的 3D 位姿
@@ -17,6 +18,12 @@
   4. 针孔投影: P_camera = Z * K⁻¹ * [u, v, 1]ᵀ
   5. TF: camera_frame → target_frame
   6. 发布 target_frame 下的 3D 坐标
+
+  第 3–4 步有两条路，由 ``grasp_point_mode`` 选：
+    · 默认（bbox_center / top_face_center）：上面那条，逐检测取深度；
+    · ``pc_top``：整批检测共用一次点云（``_pc_batch_state``），每个检测在
+      自己附近拟合局部桌面 → 找块体 → 取顶面 → **彩色亮层质心像素的射线
+      ∩ 顶面平面**。数学全在 ``pc_grasp.py``，与离线评估是同一份。
 
 为什么有**两个**发布话题（P3-6 的决定）:
   抓取规划器要做三件事——按 Y 排序（从左到右抓，避免机械臂横扫其他物体）、
@@ -65,6 +72,15 @@ import tf2_ros
 import tf2_geometry_msgs
 import numpy as np
 
+# 点云抓取点的数学与 scripts/eval_baseline.py（--est pc）**共用同一份**。
+# 为什么不是各写一份：颜色曾在四处各写一份，对不齐时完全静默（标签与 names
+# 错位，训练照样跑完）。抓取点若在节点与评估里各长一份，症状会是「离线很好、
+# 上板偏几毫米」，两边都不知道该信谁。
+try:
+    from . import pc_grasp
+except ImportError:                    # 直接按路径导入源码时（scripts 下自检）
+    import pc_grasp
+
 
 # 深度编码 → 「像素值 × 系数 = 米」。
 # D1: 原实现把深度值**直接当成米**用，且不判断编码。仿真里深度是 32FC1（米），
@@ -80,7 +96,7 @@ DEPTH_SCALE_BY_ENCODING = {
 # grasp_point_mode 的合法取值。写成集合而不是散在各处的字面量：下面那句
 # `== 'top_face_center'` 一旦拼错，行为会**静默退回**框中心 —— 不报错、
 # 不警告，只是坐标差十几毫米。这一类「看不见的降级」在本文件里栽过。
-GRASP_POINT_MODES = ('bbox_center', 'top_face_center')
+GRASP_POINT_MODES = ('bbox_center', 'top_face_center', 'pc_top')
 
 
 def grasp_point_config_warnings(target_plane_z, table_plane_z, mode):
@@ -98,6 +114,16 @@ def grasp_point_config_warnings(target_plane_z, table_plane_z, mode):
             f'grasp_point_mode={mode!r} 不是已知取值 {GRASP_POINT_MODES} —— '
             f'本节点会按 bbox_center（检测框中心）处理，也就是**不修正**。'
             f'斜视下那是十几毫米的系统偏差，请检查参数拼写。'
+        )
+    if mode == 'pc_top' and target_plane_z is not None:
+        # pc_top 的 z 来自「射线 ∩ 逐块拟合出的顶面」，**不用**固定平面。
+        # 两个开关同时开着时 target_plane_z 会被静默忽略 —— 说一声，
+        # 否则现场会以为「平面高度还调着」。
+        out.append(
+            f'grasp_point_mode=pc_top 与 use_target_plane=true 同时开着：'
+            f'target_plane_z ({target_plane_z:.4f}) **不参与**点云模式，'
+            f'位置由逐块顶面拟合给出。若想回到固定平面，请把 '
+            f'grasp_point_mode 改回去。'
         )
     if (mode == 'top_face_center' and target_plane_z is not None
             and table_plane_z >= target_plane_z):
@@ -164,6 +190,20 @@ class Perception3D(Node):
         self.declare_parameter('grasp_point_mode', 'bbox_center')
         self.declare_parameter('table_plane_z', 0.0)       # 台面高度（近端棱所在平面）
 
+        # ---- 点云模式（grasp_point_mode=pc_top）----
+        # 位置 = 「彩色顶面亮层的质心像素」的射线 ∩「逐块拟合出的顶面平面」。
+        # 为什么不用固定平面：0.7 m 处那个平面比真实顶面高 8–16 mm（实测
+        # 10 帧 Z 误差 7.34–15.86 mm），而逐块顶面能把 3D 中位误差压到
+        # 3.49 mm（中位 XY 1.69 / Z 0.98）。算法与参数见 pc_grasp.py。
+        #
+        # 为什么 x/y 不用深度点的质心：0.7 m 处深度有位置相关的偏置，顶面被
+        # 压成几度的斜坡，按固定层高选点只选到斜坡的一条带，质心偏 5–10 px；
+        # 彩色亮层质心与立方体模型真值差 1–2 px。**所以本模式必须订阅彩色图。**
+        self.declare_parameter('pc_min_score', 0.30)   # 低于此分数的检测不进点云估计
+        self.declare_parameter('pc_table_hint', 0.0)   # 台面在 target_frame 里的高度（米）
+        self.declare_parameter('color_topic', '/camera/color/image_raw')
+        self.declare_parameter('color_buffer_len', 5)
+
         # 话题名做成参数（P2-7）。原因很具体：真机上 realsense2_camera 打开
         # align_depth.enable:=true 后，**对齐后的深度发布在
         # /camera/aligned_depth_to_color/image_raw**，而 /camera/depth/image_raw
@@ -187,6 +227,8 @@ class Perception3D(Node):
         self.plane_depth_tol = float(self.get_parameter('plane_depth_tol').value)
         self.grasp_point_mode = str(self.get_parameter('grasp_point_mode').value)
         self.table_plane_z = float(self.get_parameter('table_plane_z').value)
+        self.pc_min_score = float(self.get_parameter('pc_min_score').value)
+        self.pc_table_hint = float(self.get_parameter('pc_table_hint').value)
 
         # 配置自检：写错的话**不会报任何错**，只是坐标系统性偏一个可算出来的量。
         # 代价是整轮抓取，值得在启动时喊一声。抽成纯函数是为了能自测
@@ -203,6 +245,9 @@ class Perception3D(Node):
         # D2: 原实现只存「最新一帧」深度，与检测之间没有任何时间关联；
         #     改为带时间戳的环形缓冲，按 stamp 就近配对。
         self.depth_buffer = deque(maxlen=self.get_parameter('depth_buffer_len').value)
+        # 彩色帧缓冲：只有 pc_top 需要（取顶面亮层质心）。存 BGR，与深度同
+        # 时间戳就近配对。缓冲区故意短：彩色帧 2.7 MB/张，长了白占内存。
+        self.color_buffer = deque(maxlen=self.get_parameter('color_buffer_len').value)
         self.depth_scale = None          # 首次收到深度图时确定
         self.bridge = CvBridge()
         self._warned_normalized = False  # D7 护栏：归一化坐标只提示一次
@@ -241,6 +286,15 @@ class Perception3D(Node):
             Detection2DArray, self.get_parameter('detections_topic').value,
             self.detection_callback, 10
         )
+
+        # 彩色图**只在点云模式**订阅：其余模式一个像素都不用，2.7 MB/帧
+        # 的拷贝纯属浪费，而单线程执行器最缺的就是回调时间。
+        self.color_sub = None
+        if self.grasp_point_mode == 'pc_top':
+            self.color_sub = self.create_subscription(
+                Image, self.get_parameter('color_topic').value,
+                self.color_callback, qos_best_effort
+            )
 
         if self.depth_scale_param > 0.0:
             self.depth_scale = float(self.depth_scale_param)
@@ -327,6 +381,16 @@ class Perception3D(Node):
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         self.depth_buffer.append((stamp, depth_m))
 
+    def color_callback(self, msg: Image):
+        """彩色图入缓冲（只有 pc_top 订阅）。"""
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'Color conversion failed: {e}')
+            return
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        self.color_buffer.append((stamp, img))
+
     def _nearest_depth(self, stamp_sec: float):
         """取与给定时间戳最接近的深度帧（D2）。
 
@@ -337,6 +401,20 @@ class Perception3D(Node):
             return None, None
         best = min(self.depth_buffer, key=lambda item: abs(item[0] - stamp_sec))
         return best[1], abs(best[0] - stamp_sec)
+
+    def _nearest_color(self, stamp_sec: float):
+        """取与给定时间戳最接近的彩色帧。返回 (img_bgr, dt)。"""
+        if not self.color_buffer:
+            return None, None
+        best = min(self.color_buffer, key=lambda item: abs(item[0] - stamp_sec))
+        return best[1], abs(best[0] - stamp_sec)
+
+    def _K(self):
+        """3×3 内参矩阵（pc_grasp 用的是矩阵形式）。"""
+        m = self.camera_model
+        return np.array([[m.fx(), 0.0, m.cx()],
+                         [0.0, m.fy(), m.cy()],
+                         [0.0, 0.0, 1.0]])
 
     def _depth_at(self, depth, u: float, v: float):
         """取 (u,v) 邻域内的有效深度中位数（米），无有效值返回 None。"""
@@ -517,6 +595,201 @@ class Perception3D(Node):
         return out
 
     # ------------------------------------------------------------------
+    # 单条检测 → 位姿：两条路
+    # ------------------------------------------------------------------
+    def _warn_if_normalized(self, msg):
+        """D7 运行时护栏：上游若误发**归一化**坐标，投影会静默算错。
+
+        ``x/y`` 全落在 0~1，深度取到图像左上角而非目标。历史上真有过一份
+        这样的实现（已删的 yolo_vision），接口一样、语义不同。只提示一次。
+
+        ⚠️ 为什么在**进循环之前**单独扫一遍（2026-10-25 改）：这条护栏原先
+        写在循环体里、TF 查询**之后**。于是 TF 一缺（真机就是常见状态），
+        回调在查询处就 return 了，护栏一次都不会触发 —— 而「上游发错坐标」
+        和「TF 没起来」恰恰会同时发生。它自己的自检
+        （test_perception_3d.py 的 D7 一节）在 HEAD 上就是红的，红的正是
+        这条路：**护栏的判据挂了在它保护的那件事之外**。
+        """
+        if self._warned_normalized:
+            return
+        for detection in msg.detections:
+            u = detection.bbox.center.position.x
+            v = detection.bbox.center.position.y
+            size_x = detection.bbox.size_x
+            size_y = detection.bbox.size_y
+            if (0.0 < u < 1.0 and 0.0 < v < 1.0
+                    and 0.0 < size_x <= 1.0 and 0.0 < size_y <= 1.0):
+                self._warned_normalized = True
+                self.get_logger().error(
+                    f'检测框看起来是**归一化**坐标（center=({u:.3f},{v:.3f}), '
+                    f'size=({size_x:.3f},{size_y:.3f})），而本节点按**像素**处理。'
+                    f'上游若确实发了归一化坐标，3D 投影会静默算错（D7）。'
+                    f'请确认 /detections 的发布者遵守像素约定。'
+                )
+                return
+
+    def _mode_label(self):
+        if self.grasp_point_mode == 'pc_top':
+            return '[点云模式]'
+        if self.target_plane_z is not None:
+            return f'[平面模式 {self.target_plane_z:.4f}]'
+        return '[深度模式]'
+
+    def _depth_pose(self, depth_m, transform, camera_frame, u, v, size_x,
+                    size_y, stamp):
+        """原路（深度反投影 / 已知平面 + 顶面修正）→ ``PoseStamped`` 或 ``None``。
+
+        与 ``_pc_top_pose`` 的分工：这条路用**单个深度值**定 z（或固定平面），
+        每个检测都自成一体、不建点云；``pc_top`` 用整片点云。行为与加入
+        pc_top 之前**逐字相同**，只是从回调里挪出来，好让两条路并列。
+        """
+        # ---- Step 2: 取稳健深度（最近簇中位数）----
+        depth_val = self._robust_depth(depth_m, u, v, size_x, size_y)
+
+        # 注意 `not math.isfinite` 这一条：NaN 比较恒为 False，所以单写
+        # `depth_val <= 0.0` 是拦不住 NaN 的，NaN 会一路投影成 NaN 位姿发布
+        # 出去。目前 `_robust_depth()` 的采样已用 np.isfinite 过滤，**不会**
+        # 返回 NaN（已实测），这条属于发布边界的兜底：真机上下游拿到 NaN
+        # 目标位姿，轻则 MoveIt 报错，重则规划出一条 NaN 轨迹。
+        if depth_val is None or not math.isfinite(depth_val) or depth_val <= 0.0:
+            self.get_logger().debug(
+                f'Invalid depth at ({u:.1f}, {v:.1f}), skipping.'
+            )
+            return None
+
+        # ---- Step 3: 针孔投影 (u,v,Z) → (X_c, Y_c, Z_c) ----
+        # 这一组是**深度反投影点**。两种定位模式都要先算它：
+        #   · 深度模式（默认）：它就是最终位置；
+        #   · 平面模式：只借它表达射线方向 (x/z, y/z, 1)，位置另由
+        #     射线与已知平面求交得到（见 _ray_plane_pose 的说明）。
+        x = (u - self.camera_model.cx()) * depth_val / self.camera_model.fx()
+        y = (v - self.camera_model.cy()) * depth_val / self.camera_model.fy()
+        z = depth_val
+
+        # ---- Step 4 已在循环外完成：整批共用同一时刻的变换 ----
+        if self.target_plane_z is not None:
+            # 框中心 ≠ 顶面中心（斜视下差十几毫米，见 grasp_point_mode）。
+            # 默认 'bbox_center' 保持老行为；切到 'top_face_center' 时
+            # 只换**定位用的那个 (x,y)**，深度校验一点没动。
+            grasp_xy = None
+            if self.grasp_point_mode == 'top_face_center':
+                grasp_xy = self._top_face_xy(u, v, size_y, transform)
+                if grasp_xy is None:
+                    # 求不出顶面中心：宁可不发，也不要退回框中心发一个
+                    # 已知偏十几毫米的点 —— 那正是这次要修的东西。
+                    self.get_logger().warn(
+                        f'top_face_center：({u:.1f},{v:.1f}) 两条棱求不出'
+                        f'与已知平面的交点，跳过本目标。'
+                        f'（常见原因：table_plane_z/target_plane_z 配置反了）',
+                        throttle_duration_sec=5.0
+                    )
+                    return None
+            base_pose = self._ray_plane_pose(x, y, z, transform, u, v, stamp,
+                                             grasp_xy=grasp_xy)
+            if base_pose is None:
+                # 平面在相机背后，或深度校验没过（例如空台面被判成方块）
+                return None
+            return base_pose
+
+        cam_pose = PoseStamped()
+        cam_pose.header.stamp = stamp
+        cam_pose.header.frame_id = camera_frame
+        cam_pose.pose.position = Point(x=x, y=y, z=z)
+        cam_pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        return self._transform_pose(cam_pose, transform)
+
+    def _pc_batch_state(self, depth_m, transform, stamp_sec):
+        """点云模式的**整批**准备：彩色帧配对 + 建云 + 整帧兜底桌面。
+
+        返回 dict（``P/valid/global_plane/R/t/K/img``）或 ``None``（本批跳过）。
+
+        ⚠️ 彩色图必须与**深度逐像素对齐**（真机 ``align_depth.enable:=true``，
+        对齐深度在 ``/camera/aligned_depth_to_color/...``）：顶面亮层质心是
+        在彩色像素上取的，它要拿去和同一像素的深度射线配对。不对齐时尺寸
+        通常一样，**不会**报错，只会静默偏一个视差量 —— 所以这里只拦得住
+        「尺寸都不一致」这种明显情形。
+        """
+        img, dt_c = self._nearest_color(stamp_sec)
+        if img is None:
+            self.get_logger().warn(
+                '点云模式需要彩色图，但还没收到彩色帧 —— 检查 color_topic。'
+                '本批跳过。', throttle_duration_sec=5.0
+            )
+            return None
+        if stamp_sec > 0.0 and dt_c > self.max_sync_dt:
+            self.get_logger().warn(
+                f'彩色与检测时间差 {dt_c * 1000:.0f} ms 超过 max_sync_dt'
+                f'（{self.max_sync_dt * 1000:.0f} ms），本批跳过。',
+                throttle_duration_sec=5.0
+            )
+            return None
+        if img.shape[:2] != depth_m.shape[:2]:
+            self.get_logger().error(
+                f'彩色 {img.shape[:2]} 与深度 {depth_m.shape[:2]} 尺寸不一致：'
+                f'点云模式要求两者**逐像素对齐**（真机开 align_depth.enable，'
+                f'并对齐深度话题）。本批跳过。', throttle_duration_sec=5.0
+            )
+            return None
+
+        tr = transform.transform
+        R = self._quat_to_matrix(tr.rotation)
+        t = np.array([tr.translation.x, tr.translation.y, tr.translation.z])
+        K = self._K()
+        # float64：平面拟合走 SVD，float32 在 0.7 m 的小 ROI 上会把法向
+        # 抖到 0.1° 量级 —— 顶面法向直接乘进 x/y 的定位误差。
+        P, valid = pc_grasp.base_cloud(depth_m.astype(np.float64), K, R, t)
+        gp = pc_grasp.global_table_plane(P, valid, table_hint=self.pc_table_hint)
+        if gp is None:
+            self.get_logger().warn(
+                '点云模式：整帧兜底桌面拟合失败（深度太差或 pcloud 全空），'
+                '本批跳过。', throttle_duration_sec=5.0
+            )
+            return None
+        return {'P': P, 'valid': valid, 'global_plane': gp,
+                'R': R, 't': t, 'K': K, 'img': img}
+
+    def _pc_top_pose(self, u, v, size_x, size_y, score, state, stamp):
+        """点云模式的一条检测 → 顶面中心（target_frame）或 ``None``。
+
+        数学全在 ``pc_grasp.estimate_top_point()``（与离线评估同一份）。
+        这里只做三件节点侧的事：分数闸门、局部桌面拟合、装成 PoseStamped。
+
+        为什么分数闸门在这里而不在上游：低阈值下 ChArUco 板/支架会出框，
+        它们的顶面就是桌面，本该被高度闸门挡掉；但分数闸门更便宜、也让
+        ``pc_min_score`` 这一个旋钮能同时控制两条路的候选数（实测 0.20–0.35
+        同结果）。
+        """
+        if score < self.pc_min_score:
+            return None
+        det = {'cx': u, 'cy': v, 'size_x': size_x, 'size_y': size_y,
+               'best': {'score': score}}
+        # ⚠️ 这里传的是**未外扩**的检测框：local_table_plane 自己按
+        # LOCAL_PAD_PX 外扩（离线评估也是这么调的，两边必须一致）。
+        # 2026-10-25 自检抓到过一版先外扩一次、函数里再外扩一次，ROI 变成
+        # 检测框外 80 px —— 局部桌面被拟到别的块顶上，偏差 1–2 mm 且**静默**。
+        box = (int(round(u - size_x / 2)), int(round(u + size_x / 2)),
+               int(round(v - size_y / 2)), int(round(v + size_y / 2)))
+        plane = pc_grasp.local_table_plane(
+            state['P'], state['valid'], box,
+            global_plane=state['global_plane'])
+        out = pc_grasp.estimate_top_point(
+            state['P'], state['valid'], state['img'], det, plane,
+            state['K'], state['R'], state['t'])
+        if out is None:
+            return None
+        pose = PoseStamped()
+        pose.header.stamp = stamp
+        pose.header.frame_id = self.target_frame
+        pose.pose.position = Point(x=float(out['p_base'][0]),
+                                   y=float(out['p_base'][1]),
+                                   z=float(out['p_base'][2]))
+        # 朝向沿用本节点一直以来的约定（单位四元数）：规划器自己按「从上往下
+        # 抓」构造姿态。顶面法向**不**从 z 轴改用这里给 —— 台面倾斜 0.15°，
+        # 28.5 mm 的块上那是 0.07 mm，不值得在这个接口上多一套约定。
+        pose.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+        return pose
+
+    # ------------------------------------------------------------------
     # 主回调
     # ------------------------------------------------------------------
     def _lookup_tf_at(self, target_frame, source_frame, stamp):
@@ -552,6 +825,8 @@ class Perception3D(Node):
 
         if len(msg.detections) == 0:
             return
+
+        self._warn_if_normalized(msg)
 
         camera_frame = msg.header.frame_id  # e.g. camera_color_optical_frame
         stamp = msg.header.stamp
@@ -614,6 +889,15 @@ class Perception3D(Node):
             return
         self.tf_fail_streak = 0
 
+        # ---- 点云模式：整批只建一次云 ----
+        # 1280×720×3 的 float64 点云是 22 MB。逐条检测各建一次会把单帧回调
+        # 拖到几百毫秒，`/tf` 又排不上队（与 P3-6 那条实测同一个病因）。
+        pc_state = None
+        if self.grasp_point_mode == 'pc_top':
+            pc_state = self._pc_batch_state(depth_m, transform, stamp_sec)
+            if pc_state is None:
+                return
+
         for detection in msg.detections:
             # ---- Step 1: 提取检测框 ----
             u = detection.bbox.center.position.x
@@ -621,88 +905,23 @@ class Perception3D(Node):
             size_x = detection.bbox.size_x
             size_y = detection.bbox.size_y
 
-            # D7 运行时护栏：上游若误发**归一化**坐标，投影会静默算错
-            # （x/y 全落在 0~1，深度取到图像左上角而非目标）。历史上真有过
-            # 一份这样的实现（已删的 yolo_vision），接口一样、语义不同。
-            # 这里只提示一次，避免刷屏。
-            if (not self._warned_normalized
-                    and 0.0 < u < 1.0 and 0.0 < v < 1.0
-                    and 0.0 < size_x <= 1.0 and 0.0 < size_y <= 1.0):
-                self._warned_normalized = True
-                self.get_logger().error(
-                    f'检测框看起来是**归一化**坐标（center=({u:.3f},{v:.3f}), '
-                    f'size=({size_x:.3f},{size_y:.3f})），而本节点按**像素**处理。'
-                    f'上游若确实发了归一化坐标，3D 投影会静默算错（D7）。'
-                    f'请确认 /detections 的发布者遵守像素约定。'
-                )
-
-            # ---- Step 2: 取稳健深度（最近簇中位数）----
-            depth_val = self._robust_depth(depth_m, u, v, size_x, size_y)
-
-            # 注意 `not math.isfinite` 这一条：NaN 比较恒为 False，所以单写
-            # `depth_val <= 0.0` 是拦不住 NaN 的，NaN 会一路投影成 NaN 位姿发布
-            # 出去。目前 `_robust_depth()` 的采样已用 np.isfinite 过滤，**不会**
-            # 返回 NaN（已实测），这条属于发布边界的兜底：真机上下游拿到 NaN
-            # 目标位姿，轻则 MoveIt 报错，重则规划出一条 NaN 轨迹。
-            if depth_val is None or not math.isfinite(depth_val) or depth_val <= 0.0:
-                self.get_logger().debug(
-                    f'Invalid depth at ({u:.1f}, {v:.1f}), skipping.'
-                )
-                continue
-
-            # ---- Step 3: 针孔投影 (u,v,Z) → (X_c, Y_c, Z_c) ----
-            # 这一组是**深度反投影点**。两种定位模式都要先算它：
-            #   · 深度模式（默认）：它就是最终位置；
-            #   · 平面模式：只借它表达射线方向 (x/z, y/z, 1)，位置另由
-            #     射线与已知平面求交得到（见 _ray_plane_pose 的说明）。
-            # X = (u - cx) * Z / fx
-            # Y = (v - cy) * Z / fy
-            x = (u - self.camera_model.cx()) * depth_val / self.camera_model.fx()
-            y = (v - self.camera_model.cy()) * depth_val / self.camera_model.fy()
-            z = depth_val
-
-            # ---- Step 4 已在循环外完成：整批共用同一时刻的变换 ----
-            if self.target_plane_z is not None:
-                # 框中心 ≠ 顶面中心（斜视下差十几毫米，见 grasp_point_mode）。
-                # 默认 'bbox_center' 保持老行为；切到 'top_face_center' 时
-                # 只换**定位用的那个 (x,y)**，深度校验一点没动。
-                grasp_xy = None
-                if self.grasp_point_mode == 'top_face_center':
-                    grasp_xy = self._top_face_xy(u, v, size_y, transform)
-                    if grasp_xy is None:
-                        # 求不出顶面中心：宁可不发，也不要退回框中心发一个
-                        # 已知偏十几毫米的点 —— 那正是这次要修的东西。
-                        self.get_logger().warn(
-                            f'top_face_center：({u:.1f},{v:.1f}) 两条棱求不出'
-                            f'与已知平面的交点，跳过本目标。'
-                            f'（常见原因：table_plane_z/target_plane_z 配置反了）',
-                            throttle_duration_sec=5.0
-                        )
-                        continue
-
-                base_pose = self._ray_plane_pose(x, y, z, transform, u, v, stamp,
-                                                 grasp_xy=grasp_xy)
-                if base_pose is None:
-                    # 平面在相机背后，或深度校验没过（例如空台面被判成方块）
-                    continue
-            else:
-                cam_pose = PoseStamped()
-                cam_pose.header.stamp = stamp
-                cam_pose.header.frame_id = camera_frame
-                cam_pose.pose.position = Point(x=x, y=y, z=z)
-                cam_pose.pose.orientation = Quaternion(
-                    x=0.0, y=0.0, z=0.0, w=1.0)
-                base_pose = self._transform_pose(cam_pose, transform)
-            base_pose.header.stamp = self.get_clock().now().to_msg()
-            base_pose.header.frame_id = self.target_frame
-
-            self.tf_fail_streak = 0
-
             class_name = ''
             score = 0.0
             if len(detection.results) > 0:
                 class_name = detection.results[0].hypothesis.class_id
                 score = detection.results[0].hypothesis.score
+
+            # ---- Step 2–4: 定位（两条路，几何细节见各自的方法）----
+            if self.grasp_point_mode == 'pc_top':
+                base_pose = self._pc_top_pose(u, v, size_x, size_y, score,
+                                              pc_state, stamp)
+            else:
+                base_pose = self._depth_pose(depth_m, transform, camera_frame,
+                                             u, v, size_x, size_y, stamp)
+            if base_pose is None:
+                continue
+            base_pose.header.stamp = self.get_clock().now().to_msg()
+            base_pose.header.frame_id = self.target_frame
 
             # ---- Step 5: 收进本批候选集（P3-6）----
             # id 透传上游；上游没填时用序号兜底，保证每条都可区分。
@@ -732,11 +951,10 @@ class Perception3D(Node):
             self.get_logger().debug(
                 f'Target [{class_name}] projected: '
                 f'uv=({u:.1f},{v:.1f}) size=({size_x:.1f}×{size_y:.1f}) '
-                f'{"[平面模式 " + format(self.target_plane_z, ".4f") + "]" if self.target_plane_z is not None else "[深度模式]"} '
-                f'cam=({x:.3f},{y:.3f},{z:.3f}) → '
-                f'base=({base_pose.pose.position.x:.3f},'
-                f'{base_pose.pose.position.y:.3f},'
-                f'{base_pose.pose.position.z:.3f})'
+                f'{self._mode_label()} → '
+                f'base=({base_pose.pose.position.x:.4f},'
+                f'{base_pose.pose.position.y:.4f},'
+                f'{base_pose.pose.position.z:.4f})'
             )
 
 
