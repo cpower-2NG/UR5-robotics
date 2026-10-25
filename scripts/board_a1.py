@@ -244,11 +244,11 @@ def build_cmd(a):
         # target_plane_z=0.0285「台面 + 方块高」的口径一致。
         # ⚠️ 只在 `use_target_plane=true` 时有意义：深度模式高度未知，两条棱
         #    所在的平面无从谈起（那时本键被忽略，不报错）。
-        # ⚠️ 这两行必须与 `docs/待执行命令.md` A1 一节那三块**同时**改：
+        # ⚠️ 这两行必须与 `docs/A1现场runbook.md` 那三块**同时**改：
         #    `scripts/test_startup_docs.py` 拿本函数当**真值**比对文档，
         #    只改一边就判红（那正是要的）。同理，改了这里要回头看
         #    `board_run.py` 的 `LAUNCHED_ONLY_OK` —— 两边都有这个键时，
-        #    那边就得把理由撤掉（表会自己查过时）。
+        #    那边就得把理由撤掉（表自己会查过时）。
         "grasp_point_mode:=top_face_center", "table_plane_z:=0.0",
         "publish_camera_tf:=true",
         # 规划器推迟启动：`start_delay` 包的是 [realsense, detector, perception,

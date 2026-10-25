@@ -245,13 +245,13 @@ sudo ufw status verbose            # 需要 sudo；权威
 > **它不是本项目的启动序列**，别拿它上机抓取。
 >
 > 本项目真机启动的唯一权威序列见
-> [`docs/待执行命令.md`](../待执行命令.md) 的 **A1 一节**：
+> [`docs/A1现场runbook.md`](../A1现场runbook.md)：
 > 起栈（`yolo_bringup bringup.launch.py camera_source:=realsense` + 全套参数）
 > → 按 PLAY → 把控制器拉回来 → 预检四项。**顺序反了会「连接被拒绝」**，
 > 控制器停在 STOPPED —— 详见该节的 `switch_controller` 闸门。
 >
 > 本节仍然有用：它解释**为什么**要装 External Control URCap、切 Remote Control、
-> 标定为什么不能跳。这些前提 A1 一节默认已经满足，不会重讲。
+> 标定为什么不能跳。这些前提 [`A1现场runbook.md`](../A1现场runbook.md) 默认已经满足，不会重讲。
 >
 > ⚠️ **还有一条不报错的差别：几何。** 上游 `ur_control.launch.py` 用它自己那份
 > **出厂标称** URDF；本仓的 `real.launch.py` 把 `description_package` 显式设成

@@ -4,14 +4,14 @@
 为什么要它
 ==========
 本仓有五份以上文档各讲一套「真机怎么起」：README、阶段 1 技术文档、机械臂系统
-参考、TECHNICAL_SPEC、两块 board 文档，加上 `docs/待执行命令.md` 的 A1 一节。
-其中**只有 A1 那一节真机跑通过**（2026-10-05，4/4）。2026-10-06 把它们收敛成
+参考、TECHNICAL_SPEC、两块 board 文档，加上 `docs/A1现场runbook.md`。
+其中**只有那份 runbook 真机跑通过**（2026-10-05，4/4）。2026-10-06 把它们收敛成
 「A1 是唯一权威序列，其余改成指针」，代价是十三条互相矛盾的说法 —— 而**光靠
 自觉，指针迟早在某次编辑里重新长成第二份参数集**。
 
 它判五条
 ========
-  1. **参数集对齐（核心）**：A1 一节里的每一条 `ros2 launch` 命令，它的
+  1. **参数集对齐（核心）**：runbook里的每一条 `ros2 launch` 命令，它的
      `key:=value` **键集合**必须与启动器 `scripts/board_a1.py::build_cmd()`
      实际下发的键集合**逐项相等**（允许的差别只有一处：只走位那一段没有
      `start_delay`）。值也要比对，只有三个「随调用而变」的键例外：
@@ -21,10 +21,10 @@
      起来的规划器解不出任何 IK 且不报错。（引用块里的「别这么起」不受此限。）
   3. **`robot_ip` 不许漏**：受约束的文档里每一条 `camera_source:=realsense`
      的启动命令都必须带 `robot_ip:=`，否则 `real.launch.py::_check` 直接抛错。
-  4. **`ROS_DOMAIN_ID=99` 不许漏**：A1 一节的起栈块必须显式 `export
+  4. **`ROS_DOMAIN_ID=99` 不许漏**：runbook的起栈块必须显式 `export
      ROS_DOMAIN_ID=99`。板子上这条漏了会看到「话题列表是空的」，极容易误判。
   5. **指针不许缺**：任何一份写了真机启动命令的文档，必须同时提到
-     `待执行命令.md`（也就是「权威序列在那边」）。这条防的是「第六份参数集」。
+     `A1现场runbook.md`（也就是「权威序列在那边」）。这条防的是「第六份参数集」。
 
 ⚠️ 本脚本**自带变异测试**（同 `test_board_a1.py` 的先例）：判据函数是纯函数，
    跑完真文件之后立刻拿五份**故意改坏**的文本再跑一遍，**每一份都必须判红**。
@@ -48,10 +48,12 @@ sys.dont_write_bytecode = True  # 防 .pyc 假绿（本仓约定）
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HERE = os.path.join(REPO, 'scripts')
 
-RUNBOOK = os.path.join('docs', '待执行命令.md')
-# A1 一节的起点；终点是它之后的第一个二级标题。
-RUNBOOK_SECTION_RX = re.compile(r'^##\s+🟢\s*A1\s')
-H2_RX = re.compile(r'^##\s')
+RUNBOOK = os.path.join('docs', 'A1现场runbook.md')
+# ⚠️ 2026-10-08：runbook 从 `待执行命令.md` 拆出来**独立成一份**（390 行，占队列
+#    六分之一，把队列顶得离它自己写的「两屏」很远）。于是「这一节」＝**整份文件**，
+#    判据仍然要认标题在不在 —— 一份被改名或清空的文件会让守卫**静默地**什么都没查
+#    就报绿，那正是本仓栽过的「绿的测试可能是因为判据没在看而绿」。
+RUNBOOK_SECTION_RX = re.compile(r'^#\s+A1\s')
 HEADING_RX = re.compile(r'^#{1,6}\s')
 
 # 受本守卫约束的「启动文档」集合。**故意写死**，不自动扫全仓：
@@ -72,6 +74,10 @@ LAUNCH_RX = re.compile(r'ros2\s+launch\s+yolo_bringup\s+(\S+)')
 ARG_RX = re.compile(r'([A-Za-z_][A-Za-z0-9_]*):=(\S+)')
 
 REAL_CAMERA = 'camera_source:=realsense'
+# 权威启动序列的**文件名**。凡写了真机启动命令的文档，必须提到它 —— 这条防的是
+# 「第六份参数集」。⚠️ 2026-10-08 起权威序列是拆出去的 `A1现场runbook.md`，
+# **不再是** `待执行命令.md`：指针指错地方等于把人送到一份没有 runbook 的队列里。
+AUTHORITY = 'A1现场runbook.md'
 # 这三个键的「值」随调用而变，不参与值比对（键仍然必须出现）。
 FREE_KEYS = {'robot_ip', 'planner_params_file', 'start_delay'}
 
@@ -175,9 +181,9 @@ def launcher_param_set(mod):
     # （2026-10-06：不再回落作废的 `CAM`，理由见 `board_a1.py` 模块顶部）。
     # ⚠️ 这里**从模块的 `CAM` 取**，不把七个值抄进本文件：抄一份就是给自己再造
     #   一个会烂的真值来源，而这份守卫的全部意义就是防那件事。
-    #   于是本判据实际钉住的是「**A1 一节记的那组外参 == 旧入口 `CAM` 记的那组**」
-    #   —— 两组都是 2026-10-05 那次验收的**同一条历史记录**（A1 一节自带横幅说
-    #   它已作废、别照抄），一致才是对的。若哪天更新 A1 一节的值，这里会红：
+    #   于是本判据实际钉住的是「**runbook记的那组外参 == 旧入口 `CAM` 记的那组**」
+    #   —— 两组都是 2026-10-05 那次验收的**同一条历史记录**（runbook自带横幅说
+    #   它已作废、别照抄），一致才是对的。若哪天更新 runbook的值，这里会红：
     #   那正是要的 —— 权威序列动了，守卫必须跟着过一遍。
     args.cam = dict(mod.CAM)
     cmd = mod.build_cmd(args)
@@ -188,33 +194,32 @@ def launcher_param_set(mod):
 
 
 def runbook_section(text):
-    """切出 A1 一节（含起始行号）。切不出来返回 (None, 0)。"""
+    """切出 runbook（含起始行号）。切不出来返回 (None, 0)。
+
+    2026-10-08 起 runbook 是**独立一份文件** ⇒ 切出来的就是**整份文本**。
+    这里**不用**「切到下一个二级标题为止」那套了：拆出来之后文件内部就有二级标题
+    （第一步/第二步/…），照老逻辑会在第一个 `## 第一步` 处截断，剩下 300 行**一个字
+    都不查**却仍报 PASS —— 典型的「判据没在看而绿」。
+    """
     lines = text.splitlines()
-    start = None
     for i, line in enumerate(lines):
         if RUNBOOK_SECTION_RX.match(line):
-            start = i
-            break
-    if start is None:
-        return None, 0
-    for j in range(start + 1, len(lines)):
-        if H2_RX.match(lines[j]):
-            return '\n'.join(lines[start:j]), start + 1
-    return '\n'.join(lines[start:]), start + 1
+            return '\n'.join(lines), i + 1
+    return None, 0
 
 
 # ---------------------------------------------------------------- 判据（纯函数）
 
 def check_runbook(section, offset, entry, keys, values):
-    """A1 一节的判据。`section` 为 None 表示没切到这一节。"""
+    """runbook 的判据。`section` 为 None 表示没切出这一份。"""
     bad = []
     if section is None:
-        return ['切不出 A1 一节（找不到 `## 🟢 A1` 标题）—— 守卫失效，'
-                '别把「没找到」当成「没问题」']
+        return [f'切不出 runbook（`{RUNBOOK}` 里找不到以 `# A1` 开头的一级标题）'
+                '—— 守卫失效，别把「没找到」当成「没问题」']
 
     cmds = [c for c in launch_cmds(section, offset)]
     if len(cmds) < 3:
-        bad.append(f'A1 一节只解析出 {len(cmds)} 条 launch 命令，少于 3 条'
+        bad.append(f'runbook 里只解析出 {len(cmds)} 条 launch 命令，少于 3 条'
                    '（第一段 / 第二段 / 录像各一条）—— 解析结果可疑，先修守卫')
 
     seen_keys = set()
@@ -273,12 +278,12 @@ def check_runbook(section, offset, entry, keys, values):
             detail.append(f'少 {missing}')
         if extra:
             detail.append(f'多 {extra}')
-        bad.append(f'A1 一节所有 launch 块合起来与启动器不一致：'
+        bad.append(f'runbook 三块合起来与启动器不一致：'
                    f'{"、".join(detail)}')
 
     # ⑤ ROS_DOMAIN_ID 必须显式导出
     if 'ROS_DOMAIN_ID=99' not in section:
-        bad.append(f'{RUNBOOK}: A1 一节里没有 `ROS_DOMAIN_ID=99` —— 现场跑在 99，'
+        bad.append(f'{RUNBOOK}: 起栈块里没有 `ROS_DOMAIN_ID=99` —— 现场跑在 99，'
                    '漏了会看到「话题列表是空的」并被误判成「栈没起来」')
     return bad
 
@@ -301,9 +306,9 @@ def check_startup_doc(path, text, skip_blockquote=True):
             bad.append(f'{path}:{ln} 是真机命令却没有 `robot_ip:=`'
                        f'（`real.launch.py::_check` 会直接抛错，什么都不起）')
 
-    if has_real and '待执行命令.md' not in text:
-        bad.append(f'{path} 写了真机启动命令，却没有指向 `docs/待执行命令.md` '
-                   f'的 A1 一节 —— 那等于又开了一份参数集的头')
+    if has_real and AUTHORITY not in text:
+        bad.append(f'{path} 写了真机启动命令，却没有指向 `docs/{AUTHORITY}` '
+                   f'—— 那等于又开了一份参数集的头')
     return bad, has_real
 
 
@@ -315,7 +320,7 @@ MUTATIONS = [
     ('多一个参数（加 foo:=1）',
      lambda s: s.replace('publish_camera_tf:=true',
                          'publish_camera_tf:=true foo:=1', 1)),
-    # ⚠️ 这一条**故意不带 `count=1`**：那个字面量在 A1 一节的**文案里也被引用**
+    # ⚠️ 这一条**故意不带 `count=1`**：那个字面量在 runbook的**文案里也被引用**
     # （2026-10-06 新增的那条「下面三处 `camera_x:=…` 已作废」的提醒就引了它）。
     # 按「第一处」替换会打在**文案**上、三个命令块一字不动 ⇒ 变异体存活，
     # 而报告会把它说成「判据没在看这件事」——**反过来诬告判据**。
@@ -341,8 +346,8 @@ DOC_MUTATIONS = [
                          'pipeline.launch.py \\\n    camera_source:=realsense', 1),
      lambda probs: any('D45' in p for p in probs)),
     ('删掉指向权威序列的指针',
-     lambda s: s.replace('待执行命令.md', '别的文件.md'),
-     lambda probs: any('A1 一节' in p for p in probs)),
+     lambda s: s.replace(AUTHORITY, '别的文件.md'),
+     lambda probs: any(AUTHORITY in p for p in probs)),
 ]
 
 
@@ -374,7 +379,7 @@ def doc_mutation_selftest(sample_path, sample_text):
 
 
 def mutation_selftest(section, offset, entry, keys, values, n_cmds):
-    """把 A1 一节故意改坏五遍，每一遍都必须判红。"""
+    """把 runbook故意改坏五遍，每一遍都必须判红。"""
     print('\n[变异测试] 判据函数必须对下列五种改坏都判红：')
     ok = True
 
@@ -433,10 +438,10 @@ def main():
 
     problems = []
 
-    # ---- A1 一节 ----
+    # ---- runbook ----
     section, offset = runbook_section(runbook_text)
     n_cmds = len(launch_cmds(section, offset)) if section else 0
-    print(f'\n[1/3] runbook（{RUNBOOK} 的 A1 一节）：{n_cmds} 条 launch 命令'
+    print(f'\n[1/3] runbook（{RUNBOOK}）：{n_cmds} 条 launch 命令'
           f'（起始行 {offset}）')
     problems += check_runbook(section, offset, entry, keys, values)
 
@@ -460,7 +465,7 @@ def main():
     # ---- 变异测试 ----
     print('[3/3] 变异测试')
     if section is None:
-        problems.append('变异测试跳过：切不出 A1 一节')
+        problems.append('变异测试跳过：切不出 runbook')
         selftest_ok = False
     else:
         selftest_ok = mutation_selftest(section, offset, entry, keys, values, n_cmds)
@@ -474,7 +479,7 @@ def main():
     # ---- 结论 ----
     print('\n' + '=' * 68)
     if not problems and selftest_ok:
-        print(f'PASS：A1 一节的参数集与启动器一致（{len(keys)} 个键）；'
+        print(f'PASS：runbook 的参数集与启动器一致（{len(keys)} 个键）；'
               f'{len(STARTUP_DOCS) - 1} 份启动文档里 {n_real} 份含真机命令、'
               f'全部带 robot_ip 且指向权威序列；变异测试 8/8 判红。')
         return 0
