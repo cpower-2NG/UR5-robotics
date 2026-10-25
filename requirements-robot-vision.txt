@@ -5,3 +5,4 @@ colcon-common-extensions
 pytest
 transforms3d
 pyquaternion
+scipy

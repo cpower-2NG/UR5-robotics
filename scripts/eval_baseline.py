@@ -9,19 +9,29 @@
     每帧画面里同时有 ChArUco 板（方格 30.93 mm，见下）和积木。
       · 板 → 相机：16 个棋盘内角点 + 12 个 ArUco 码的 ID 解掉方形板的
         8 重对称歧义，再 solvePnP；
-      · 积木真值：**按深度分层**找每块积木的顶面质心 —— 与颜色无关、与
-        YOLO 也无关（见 `segment_blocks_depth()` 的说明）；
-      · 质心像素射线 ∩「板面 + 方块高」平面 → 真值（板系）。
+      · 积木真值（两种，`--truth` 选）：
+        - `color`（**高位俯拍默认**）：HSV 饱和度分割彩色积木 → 每块拟合
+          一个「边长 = 高 = 方块高」的立方体，优化投影轮廓 IoU；x/y 直接
+          落在板系（`segment_blocks_color()`）。深度的**绝对高度**在 0.7 m
+          处会漂 10–30 mm，高位不能按固定层高分割；
+        - `depth`（近距可用）：按深度分层找顶面质心，射线 ∩「板面 + 方块
+          高」平面（`segment_blocks_depth()`）。
 
 ⚠️ 真值**绝不能从 YOLO 检测框里取**（2026-10-25 改）：旧实现拿检测框当 ROI
 再按颜色分割，于是「YOLO 没检到的块」根本没有真值 —— 「第 4 块是没看见还是
 分数低」这个问题**永远答不了**；而误检会反过来变成真值。实测那一帧 22 个检测
 里有 13 个落在 ChArUco 板上，其中 1 个还成了「真值」。颜色分割本身也不稳：
-紫色块暗部色相漂移、亮色块顶面饱和度掉到 60 以下，逐色调参必然反复。
+紫色块暗部色相漂移、亮色块顶面饱和度掉到 60 以下，**逐色调参**必然反复——
+所以现在的颜色真值不认色相、也不逐色调参：只看「饱和度够不够」，再由立方体
+模型把颜色区域几何化（见 `segment_blocks_color()`）。
 
 估计值同样进板系：`/targets_3d`（base 系）用**同一帧记录的 TF** 逆变换回
-相机系，再用同一帧的板位姿进板系。手眼标定的误差在两边同时出现，
-比较时**抵消**——所以这份误差量的是「感知定位」，不是「手眼」。
+相机系，再用同一帧的板位姿进板系。**TF 往返本身抵消**（估计的 base 坐标
+就是用这份 TF 算出来的），所以这条链量的是**端到端抓取点误差**，不是手眼
+标定误差。⚠️ 但它**不是纯像素误差**：管线把射线截在 base 系的固定平面
+`target_plane_z` 上，这个平面相对桌面的高度由手眼决定；平面错了会原样进
+误差（2026-10-25 实测 Z 偏 11–16 mm，正是这个平面偏高）。要分离「像素
+定位」与「平面高度」，看 `report.json` 里的 XY/Z 分量。
 
 用法
 ====
@@ -261,6 +271,152 @@ def segment_blocks_depth(depth, K, D, R_cb, t_cb,
     return out
 
 
+# ─────────────── 颜色轮廓 + 立方体模型（高位俯拍用） ───────────────
+
+CUBE_MIN_AREA_PX = 250
+CUBE_MIN_IOU = 0.5
+CUBE_MIN_Z_MM = 8.0
+CUBE_SAT_MIN = 55
+
+
+def _cube_corners(x, y, yaw, s, h):
+    """板系立方体 8 角点（米）：底面中心 (x, y)，边长 s，高 h。"""
+    c, sn = np.cos(yaw), np.sin(yaw)
+    base = np.array([[-s / 2, -s / 2], [s / 2, -s / 2],
+                     [s / 2, s / 2], [-s / 2, s / 2]])
+    rot = np.array([[c, -sn], [sn, c]])
+    base = base @ rot.T
+    P = np.zeros((8, 3))
+    P[:4, 0] = x + base[:, 0]
+    P[:4, 1] = y + base[:, 1]
+    P[4:, 0] = P[:4, 0]
+    P[4:, 1] = P[:4, 1]
+    P[4:, 2] = h
+    return P
+
+
+def _project_board(P, K, R_cb, t_cb):
+    pc = P @ R_cb.T + t_cb
+    uv = (K @ pc.T).T
+    return uv[:, :2] / uv[:, 2:3]
+
+
+def _cube_hull(P, K, R_cb, t_cb):
+    import cv2
+    uv = _project_board(P, K, R_cb, t_cb)
+    return cv2.convexHull(uv.astype(np.float32)).reshape(-1, 2)
+
+
+def _fit_cube(mask, K, R_cb, t_cb, s, h, xy0, yaw0=0.0):
+    """板系里拟合 (x, y, yaw)，使立方体投影轮廓与 mask 的 IoU 最大。
+
+    底面中心初值 `xy0`（板系，米）由掩膜质心射线 ∩ 半高平面给出。
+    方位角有 90° 对称，种子取 0..π/2 四等分，取 IoU 最好的一个。
+    """
+    import cv2
+    from scipy.optimize import minimize
+    h_img, w_img = mask.shape
+    x0_mm = np.array(xy0, float) * 1000.0
+
+    def cost(p):
+        P = _cube_corners(p[0] * 1e-3, p[1] * 1e-3, p[2], s, h)
+        hull = _cube_hull(P, K, R_cb, t_cb)
+        m = np.zeros((h_img, w_img), np.uint8)
+        cv2.fillConvexPoly(m, np.round(hull).astype(np.int32), 1)
+        inter = np.count_nonzero(m & mask)
+        uni = np.count_nonzero(m | mask)
+        return 1.0 - inter / max(uni, 1)
+
+    best = None
+    seeds = [float(yaw0)] + [float(a) for a in np.arange(0.0, np.pi / 2,
+                                                        np.pi / 8)]
+    for yaw in seeds:
+        r = minimize(cost, [x0_mm[0], x0_mm[1], yaw], method="Nelder-Mead",
+                     options=dict(xatol=0.3, fatol=1e-4, maxiter=600))
+        if best is None or r.fun < best.fun:
+            best = r
+    return {"x": float(best.x[0] * 1e-3), "y": float(best.x[1] * 1e-3),
+            "yaw_deg": float(np.degrees(best.x[2])),
+            "iou": float(1.0 - best.fun)}
+
+
+def segment_blocks_color(img, depth, K, D, R_cb, t_cb, block_mm,
+                         sat_min=CUBE_SAT_MIN, min_area=CUBE_MIN_AREA_PX):
+    """颜色轮廓 + 立方体模型找每块积木的顶面中心（板系，米）。
+
+    什么时候用（2026-10-25）
+    ========================
+    高位俯拍整张桌面时，深度的**绝对高度**随距离漂：同一张台面在 0.43 m
+    读 +7 mm、0.70 m 读 +28 mm（板系）。按「板面 + 16–45 mm」固定分层会
+    整片漏块或把台面残差当块。颜色轮廓只看「哪些像素是彩色的」，不用绝对
+    深度；深度只用来把画面限制在桌面附近（−10..+50 mm）。
+
+    做法
+    ====
+      1. HSV 饱和度 + 亮度阈值分割彩色积木（ChArUco 板是黑白，S 很低）；
+      2. 连通域面积 ≥ min_area，且该域板系中位高度 ≥ CUBE_MIN_Z_MM
+         （排除纸面上的彩色标记）；
+      3. 每个连通域拟合一个「边长 = 高 = block_mm」的立方体 —— 在板系里
+         优化 (x, y, yaw)，最大化**投影轮廓 vs 掩膜**的 IoU。透视下顶面 +
+         侧面一起投，质心/外接框的视角偏差被模型吸收。
+      4. IoU < CUBE_MIN_IOU 的丢掉。
+
+    返回 [{"x","y","yaw_deg","iou","u","v","area","z_med_mm","n_top",
+    "truncated","z_top_mm"}]；x/y 是**底面中心**（板系，米），u/v 是顶面
+    中心投影像素（调试用）。`truncated` 的含义与深度法一致：连通域贴边。
+    """
+    import cv2
+    h, w = depth.shape
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    us, vs = np.meshgrid(np.arange(w, dtype=np.float64),
+                         np.arange(h, dtype=np.float64))
+    d = depth.astype(np.float64) / 1000.0
+    p = np.stack([(us - cx) / fx * d, (vs - cy) / fy * d, d], axis=-1)
+    z = ((p - t_cb) @ R_cb)[:, :, 2] * 1000.0
+    on = (d > 0) & (z > -10.0) & (z < 50.0)
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    m = ((hsv[:, :, 1] > sat_min) & (hsv[:, :, 2] > 40) & on).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+
+    out = []
+    for k in range(1, n):
+        area = int(stats[k, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        comp = (lab == k)
+        z_med = float(np.median(z[comp & on]))
+        if z_med < CUBE_MIN_Z_MM:
+            continue
+        ys, xs = np.nonzero(comp)
+        p0 = ray_plane_board(float(xs.mean()), float(ys.mean()), K, D,
+                             R_cb, t_cb, block_mm / 2000.0)
+        if p0 is None:
+            continue
+        fit = _fit_cube(comp.astype(np.uint8), K, R_cb, t_cb,
+                        block_mm / 1000.0, block_mm / 1000.0, p0[:2])
+        if fit["iou"] < CUBE_MIN_IOU:
+            continue
+        top_uv = _project_board(
+            np.array([[fit["x"], fit["y"], block_mm / 1000.0]]),
+            K, R_cb, t_cb)[0]
+        left = stats[k, cv2.CC_STAT_LEFT]
+        top = stats[k, cv2.CC_STAT_TOP]
+        bw = stats[k, cv2.CC_STAT_WIDTH]
+        bh = stats[k, cv2.CC_STAT_HEIGHT]
+        out.append({"x": fit["x"], "y": fit["y"],
+                    "yaw_deg": fit["yaw_deg"], "iou": fit["iou"],
+                    "u": float(top_uv[0]), "v": float(top_uv[1]),
+                    "area": area, "z_med_mm": round(z_med, 2),
+                    "z_top_mm": round(block_mm, 2), "n_top": area,
+                    "truncated": bool(left <= 1 or top <= 1
+                                      or left + bw >= w - 1
+                                      or top + bh >= h - 1)})
+    return out
+
+
 def ray_plane_board(u, v, K, D, R_cb, t_cb, z_plane):
     """像素 → 射线 ∩ 板系平面 `z = z_plane` 的点（板系，米）。"""
     import cv2
@@ -320,6 +476,17 @@ def targets_to_board(frame, R_cb, t_cb):
     return out
 
 
+def board_to_base(frame, R_cb, t_cb, p_board):
+    """板系点 → base 系，用**同一帧记录的 TF**（与估计值同一条往返）。"""
+    tf_ok = (frame["tf"].get("ok") or {})
+    key = "base_link:camera_color_optical_frame"
+    if key not in tf_ok:
+        raise SystemExit("帧 %s 缺 %s 的 TF（记录到的有：%s）"
+                         % (frame["dir"], key, ", ".join(sorted(tf_ok))))
+    R_bc, t_bc = _tf_matrix(tf_ok[key])
+    return R_bc @ (R_cb @ p_board + t_cb) + t_bc
+
+
 # ─────────────────────────────── 一帧 ───────────────────────────────
 
 def assoc(truths, ests, max_mm):
@@ -341,7 +508,8 @@ def assoc(truths, ests, max_mm):
             [j for j in range(len(ests)) if j not in used_e])
 
 
-def eval_frame(f, square_mm, block_h_mm, max_assoc_mm, debug_dir=None):
+def eval_frame(f, square_mm, block_h_mm, max_assoc_mm, debug_dir=None,
+               truth_method="color"):
     board = make_board(square_mm)
     pose = board_pose(f["img"], f["K"], f["D"], board)
     if pose is None:
@@ -350,15 +518,24 @@ def eval_frame(f, square_mm, block_h_mm, max_assoc_mm, debug_dir=None):
     R_cb, t_cb = pose["R"], pose["t"]
     z_top = block_h_mm / 1000.0
 
-    # ---- 真值：深度分层找块 → 顶面质心射线 ∩「板面 + 块高」 ----
-    blocks = segment_blocks_depth(f["depth"], f["K"], f["D"], R_cb, t_cb)
-    truths, truth_meta = [], []
-    for b in blocks:
-        p = ray_plane_board(b["u"], b["v"], f["K"], f["D"], R_cb, t_cb, z_top)
-        if p is None:
-            continue
-        truths.append(p)
-        truth_meta.append(b)
+    # ---- 真值 ----
+    if truth_method == "color":
+        truth_meta = segment_blocks_color(f["img"], f["depth"], f["K"], f["D"],
+                                          R_cb, t_cb, block_h_mm)
+        truths = [np.array([b["x"], b["y"], z_top]) for b in truth_meta]
+    elif truth_method == "depth":
+        blocks = segment_blocks_depth(f["depth"], f["K"], f["D"], R_cb, t_cb)
+        truths, truth_meta = [], []
+        for b in blocks:
+            p = ray_plane_board(b["u"], b["v"], f["K"], f["D"], R_cb, t_cb,
+                                z_top)
+            if p is None:
+                continue
+            truths.append(p)
+            truth_meta.append(b)
+    else:
+        raise SystemExit("未知的 --truth：%r（只支持 color / depth）"
+                         % truth_method)
 
     # ---- 估计：落在**板矩形**内的候选单列 ----
     # ChArUco 板摆在视野里当尺子，YOLO 会对板的黑白图案出框（实测一帧 13 个），
@@ -378,7 +555,13 @@ def eval_frame(f, square_mm, block_h_mm, max_assoc_mm, debug_dir=None):
     pairs, miss_t, miss_e = assoc(truths, ests, max_assoc_mm)
     rows = []
     for i, j, d in pairs:
+        # base 系分量：XY 是「像素定位 + 投影平面横向」，Z 主要是
+        # `target_plane_z` 相对真实顶面的高度差。分开记，别混成一个数。
+        dv = (ests_kept[j]["p_base"]
+              - board_to_base(f, R_cb, t_cb, truths[i])) * 1000.0
         rows.append({"err_mm": round(d, 3),
+                     "err_xy_mm": round(float(np.hypot(dv[0], dv[1])), 3),
+                     "err_z_mm": round(float(dv[2]), 3),
                      "truth_mm": (truths[i] * 1000.0).round(1).tolist(),
                      "est_mm": (ests[j] * 1000.0).round(1).tolist(),
                      "score": ests_kept[j]["score"],
@@ -395,7 +578,7 @@ def eval_frame(f, square_mm, block_h_mm, max_assoc_mm, debug_dir=None):
            "class_id": ests_kept[j]["class_id"]} for j in miss_e]
 
     out = {
-        "dir": f["dir"], "ok": True,
+        "dir": f["dir"], "ok": True, "truth_method": truth_method,
         "board": {k: pose[k] for k in ("rms_med_px", "rms_max_px",
                                        "marker_med_px", "n_markers", "sym")},
         "n_detections": len(f["detections"]["detections"]),
@@ -464,11 +647,13 @@ def summarize(frames):
     ok = [f for f in frames if f.get("ok")]
     if not ok:
         return {"frames": len(frames), "ok": 0}
-    all_err, scores = [], []
+    all_err, all_xy, all_z, scores = [], [], [], []
     n_matched = 0
     for f in ok:
         use = [r for r in f["matched"] if not r["truth_truncated"]]
         all_err += [r["err_mm"] for r in use]
+        all_xy += [r["err_xy_mm"] for r in use]
+        all_z += [r["err_z_mm"] for r in use]
         n_matched += len(use)
         scores += f["scores"]["all_targets"]
     sweep = {}
@@ -495,6 +680,13 @@ def summarize(frames):
         "errors_mm": {"median": float(np.median(all_err)) if all_err else None,
                       "p95": float(np.percentile(all_err, 95)) if all_err else None,
                       "max": float(max(all_err)) if all_err else None},
+        "errors_xy_mm": {"median": float(np.median(all_xy)) if all_xy else None,
+                         "p95": float(np.percentile(all_xy, 95)) if all_xy else None,
+                         "max": float(max(all_xy)) if all_xy else None},
+        "errors_z_mm": {"median": float(np.median(all_z)) if all_z else None,
+                        "p95": float(np.percentile(all_z, 95)) if all_z else None,
+                        "max": float(max(all_z)) if all_z else None,
+                        "min": float(min(all_z)) if all_z else None},
         "score_sweep": sweep,
     }
 
@@ -506,6 +698,9 @@ def main(argv=None):
                     help="帧目录（可重复）；也接受通配符")
     ap.add_argument("--square-mm", type=float, default=SQUARE_MM_DEFAULT)
     ap.add_argument("--block-h-mm", type=float, default=BLOCK_H_MM_DEFAULT)
+    ap.add_argument("--truth", choices=("color", "depth"), default="color",
+                    help="真值方法：color=颜色轮廓+立方体（高位俯拍默认），"
+                         "depth=深度分层（近距）")
     ap.add_argument("--max-assoc-mm", type=float, default=40.0,
                     help="真值与估计配对的最近邻上限（毫米）")
     ap.add_argument("--debug-dir", default=None, help="把叠加图写到这个目录")
@@ -523,7 +718,7 @@ def main(argv=None):
     for d in dirs:
         f = load_frame(d)
         r = eval_frame(f, args.square_mm, args.block_h_mm,
-                       args.max_assoc_mm, args.debug_dir)
+                       args.max_assoc_mm, args.debug_dir, args.truth)
         frames.append(r)
         print(_fmt_frame(r))
 
@@ -540,6 +735,13 @@ def main(argv=None):
     if e["median"] is not None:
         print("误差（板系，毫米）：中位 %.2f / p95 %.2f / 最大 %.2f"
               % (e["median"], e["p95"], e["max"]))
+    xy = s.get("errors_xy_mm") or {}
+    z = s.get("errors_z_mm") or {}
+    if xy.get("median") is not None:
+        print("  base 分量：XY 中位 %.2f / p95 %.2f / 最大 %.2f；"
+              "Z 中位 %.2f（范围 %.2f..%.2f）"
+              % (xy["median"], xy["p95"], xy["max"],
+                 z["median"], z["min"], z["max"]))
     print("分数扫描（阈值 → 命中/候选，精度）：")
     for th, v in s["score_sweep"].items():
         print("  ≥%s: %d/%d  精度 %s" % (th, v["matched"], v["targets"],
@@ -549,6 +751,7 @@ def main(argv=None):
         doc = {"frames": frames, "summary": s,
                "params": {"square_mm": args.square_mm,
                           "block_h_mm": args.block_h_mm,
+                          "truth": args.truth,
                           "max_assoc_mm": args.max_assoc_mm}}
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, ensure_ascii=False, indent=1)

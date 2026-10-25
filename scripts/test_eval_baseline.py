@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""`eval_baseline.py` 的自检：**合成深度图**，已知块在哪。
+"""`eval_baseline.py` 的自检：**合成图**，已知块在哪。
 
 为什么单列
 ==========
-真值分割换了原理（2026-10-25：从「YOLO 框里按颜色分」改成「按深度分层」），
-而那一步错了**不会报错**：它会安安静静地多数一块、少数一块，误差统计照样
-给出好看的数字。所以这里用合成图把「找到几块、质心在哪、贴边怎么算」钉住。
+真值分割换过原理（2026-10-25：从「YOLO 框里按颜色分」→「按深度分层」，
+再补「颜色轮廓 + 立方体拟合」），而那一步错了**不会报错**：它会安安静静
+地多数一块、少数一块，误差统计照样给出好看的数字。所以这里用合成图把
+「找到几块、中心在哪、贴边怎么算」钉住。
 
 ⚠️ 合成图只验**逻辑**，验不了真相机。真帧的分割只能用真实帧看（见台账）。
 """
@@ -98,6 +99,68 @@ check("60 mm 的块不算（>45）", len(got) == 0)
 got = eb.segment_blocks_depth(synth([(200, 280, 300, 380, 0.008)]),
                               K, D, R_CB, T_CB)
 check("8 mm 的块不算（<16）", len(got) == 0)
+
+
+# ─────────────────── 颜色轮廓 + 立方体模型 ───────────────────
+
+def synth_color(cubes, w=1280, h=720, side_mm=28.5):
+    """cubes: [(x_m, y_m, yaw_rad)]（板系）。
+
+    彩色图：白底 + 纯红立方体投影；深度图：桌面 400 mm，块面 400 − 高。
+    ⚠️ 块面深度是「整块同一个值」，只为了让 z_med 过 8 mm 的门；
+    拟合只读彩色掩膜，不读深度数值。
+    """
+    import cv2
+    img = np.full((h, w, 3), 255, np.uint8)
+    depth = np.full((h, w), 400, np.uint16)
+    for x, y, yaw in cubes:
+        P = eb._cube_corners(x, y, yaw, side_mm / 1000.0, side_mm / 1000.0)
+        hull = np.round(eb._cube_hull(P, K, R_CB, T_CB)).astype(np.int32)
+        mask = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(mask, hull, 1)
+        img[mask == 1] = (0, 0, 255)              # BGR 纯红 → S=255
+        depth[mask == 1] = np.uint16(round(400 - side_mm))
+    return img, depth
+
+
+section("[6] 颜色轮廓：一个立方体，x/y 恢复到 ±2 mm")
+img, d = synth_color([(0.100, 0.050, np.radians(20.0))])
+got = eb.segment_blocks_color(img, d, K, D, R_CB, T_CB, 28.5)
+check("找到 1 块", len(got) == 1, str(len(got)))
+if len(got) == 1:
+    g = got[0]
+    check("x 恢复（100 mm）", abs(g["x"] - 0.100) * 1000 <= 2.0,
+          "%.2f mm" % (g["x"] * 1000))
+    check("y 恢复（50 mm）", abs(g["y"] - 0.050) * 1000 <= 2.0,
+          "%.2f mm" % (g["y"] * 1000))
+    check("IoU ≥ 0.8", g["iou"] >= 0.8, "%.3f" % g["iou"])
+    check("不算贴边", not g["truncated"])
+
+section("[7] 颜色轮廓：两块分开的立方体都找到")
+img, d = synth_color([(0.100, 0.050, 0.3), (0.220, 0.150, 0.8)])
+got = eb.segment_blocks_color(img, d, K, D, R_CB, T_CB, 28.5)
+check("找到 2 块", len(got) == 2, str(len(got)))
+if len(got) == 2:
+    got.sort(key=lambda g: g["x"])
+    check("按 x 排序后 100/220 mm",
+          abs(got[0]["x"] - 0.100) * 1000 <= 2.0
+          and abs(got[1]["x"] - 0.220) * 1000 <= 2.0,
+          str([round(g["x"] * 1000, 1) for g in got]))
+
+section("[8] 纯白桌面：一块都没有")
+img = np.full((720, 1280, 3), 255, np.uint8)
+d = np.full((720, 1280), 400, np.uint16)
+got = eb.segment_blocks_color(img, d, K, D, R_CB, T_CB, 28.5)
+check("0 块", len(got) == 0, str(len(got)))
+
+section("[9] 低于板面 9 mm 的彩色斑不算积木（z_med < 8 mm）")
+import cv2                                                     # noqa: E402
+img = np.full((720, 1280, 3), 255, np.uint8)
+d = np.full((720, 1280), 400, np.uint16)
+cv2.rectangle(img, (400, 300), (480, 380), (0, 0, 255), -1)
+d[300:380, 400:480] = 409                  # z_board = −9 mm
+got = eb.segment_blocks_color(img, d, K, D, R_CB, T_CB, 28.5)
+check("0 块", len(got) == 0, str(len(got)))
 
 print("\n" + "=" * 66)
 if _failed:
