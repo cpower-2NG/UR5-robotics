@@ -148,22 +148,36 @@ def tf_dict(tf_msg):
             "child_frame_id": str(tf_msg.child_frame_id)}
 
 
+def _best_hypothesis(det):
+    """取分数最高的那条假设 → `{"score", "class_id"}`（没有假设时 None）。
+
+    ⚠️ 字段路径是 `results[i].hypothesis.score` / `.hypothesis.class_id`，
+    **不是** `results[i].score`。2026-10-25 实测：旧实现用
+    `getattr(hyp, "score", 0.0)` 读顶层属性，真实消息里根本没有 —— 于是
+    **每一框都静默记成 score=0.0、class_id=""**；而单元测试造的假消息恰好
+    是扁平结构，测试一路绿。分数分布是这一轮要回答的核心问题之一，
+    「写下来全是 0」的数据事后救不回来，所以这里**不给默认值兜底**：
+    字段形状不对就当场抛，别写半截数据集。
+    """
+    best = None
+    for hyp in det.results:
+        score = float(hyp.hypothesis.score)
+        class_id = str(hyp.hypothesis.class_id)
+        if best is None or score > best["score"]:
+            best = {"score": score, "class_id": class_id}
+    return best
+
+
 def detections_dict(msg):
     """`vision_msgs/Detection2DArray` → 每框一条（中心/尺寸/分数/类别）。"""
     out = []
     for det in msg.detections:
         box = det.bbox
-        best = None
-        for hyp in det.results:
-            score = float(getattr(hyp, "score", 0.0))
-            if best is None or score > best["score"]:
-                best = {"score": score,
-                        "class_id": str(getattr(hyp, "id", ""))}
         out.append({"cx": float(box.center.position.x),
                     "cy": float(box.center.position.y),
                     "theta": float(getattr(box.center, "theta", 0.0)),
                     "size_x": float(box.size_x), "size_y": float(box.size_y),
-                    "best": best})
+                    "best": _best_hypothesis(det)})
     return {"frame_id": str(msg.header.frame_id),
             "stamp_ns": stamp_ns(msg.header.stamp), "detections": out}
 
@@ -172,11 +186,7 @@ def targets_dict(msg):
     """`vision_msgs/Detection3DArray` → 每目标一条（位姿 + 尺寸 + 分数）。"""
     out = []
     for det in msg.detections:
-        best = None
-        for hyp in det.results:
-            score = float(getattr(hyp, "score", 0.0))
-            if best is None or score > best["score"]:
-                best = {"score": score, "class_id": str(getattr(hyp, "id", ""))}
+        best = _best_hypothesis(det)
         p = det.bbox.center.position
         q = det.bbox.center.orientation
         out.append({"x": float(p.x), "y": float(p.y), "z": float(p.z),

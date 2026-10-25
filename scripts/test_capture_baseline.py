@@ -83,12 +83,20 @@ check("深度编码原样记（16UC1 与 32FC1 的数值含义不同，不能糊
 check("step 也记（行对齐不总是 width×bpp）", im["step"] == 1280)
 
 section("[4] 检测/投影：分数取最大的那条假设，类别从它取")
+# ⚠️ 假消息必须长得像**真消息**：`results[i]` 是 ObjectHypothesisWithPose，
+#    分数/类别在 `.hypothesis.score` / `.hypothesis.class_id` 里。
+#    2026-10-25 前这里是扁平的 `.score`/`.id`，于是实现读 `getattr(hyp,
+#    "score", 0.0)` 一直读到 0.0、测试却一直是绿的（真数据集里分数全 0）。
+def _hyp(score, class_id):
+    return SimpleNamespace(
+        hypothesis=SimpleNamespace(score=score, class_id=class_id))
+
+
 det = SimpleNamespace(
     bbox=SimpleNamespace(center=SimpleNamespace(
         position=SimpleNamespace(x=10.0, y=20.0), theta=0.1),
         size_x=30.0, size_y=31.0),
-    results=[SimpleNamespace(score=0.4, id="1"),
-             SimpleNamespace(score=0.9, id="3")])
+    results=[_hyp(0.4, "1"), _hyp(0.9, "3")])
 d2 = cb.detections_dict(SimpleNamespace(header=_header(), detections=[det]))
 check("两个框只出一条（这里给的是一个检测）", len(d2["detections"]) == 1)
 best = d2["detections"][0]["best"]
@@ -103,12 +111,14 @@ det3 = SimpleNamespace(
             position=SimpleNamespace(x=0.1, y=0.2, z=0.3),
             orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)),
         size=SimpleNamespace(x=0.0285, y=0.0285, z=0.0285)),
-    results=[SimpleNamespace(score=0.7, id="blk")])
+    results=[_hyp(0.7, "blk")])
 d3 = cb.targets_dict(SimpleNamespace(header=_header(), detections=[det3]))
 t = d3["targets"][0]
 check("3D 位置/四元数/尺寸都在",
       (t["x"], t["y"], t["z"]) == (0.1, 0.2, 0.3)
       and t["qw"] == 1.0 and t["size_z"] == 0.0285)
+check("3D 目标的分数/类别也读出来了（旧实现这里是 0.0/''）",
+      t["best"] == {"score": 0.7, "class_id": "blk"}, str(t["best"]))
 
 section("[5] 预检：缺哪条话题要说得出是哪条")
 ok, missing = cb.judge_topics({"/a": 1, "/b": 0}, ["/a", "/b", "/c"])
