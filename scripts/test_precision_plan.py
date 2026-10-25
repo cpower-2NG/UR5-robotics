@@ -114,6 +114,16 @@ def test_grasp_formula_and_clamp(chain):
     assert abs(meta["grasp_z"] - 0.2177) < 1e-9, meta["grasp_z"]
     assert pp.GRASP_Z_MIN <= meta["grasp_z"] <= pp.GRASP_Z_MAX
 
+    # 台面读数比几何零点高 6 mm（2026-10-25 实测）：wz 必须用**相对高度 h**，
+    # 不是绝对 top。用 top 的话整条抓取链会凭空抬高 6 mm，而现场看不出来。
+    rel = dict(blocks[0], top=38.0, h=32.0)
+    _, _, m_rel = pp.build_pick(chain, q0, cand, rel, [rel], (0.45, -0.25))
+    assert abs(m_rel["wz_used_mm"] - 32.0) < 1e-9, m_rel["wz_used_mm"]
+    assert abs(m_rel["wz_measured_mm"] - 38.0) < 1e-9, m_rel["wz_measured_mm"]
+    assert abs(m_rel["grasp_z"] - 0.2177) < 1e-9, "h 没被用上：%s" % m_rel["grasp_z"]
+    # 名义抓取深度 ≈18.5 mm（与块高无关，这是参数 0.1757 的含义）
+    assert abs(m_rel["grasp_depth_mm"] - 18.5) < 1e-6, m_rel["grasp_depth_mm"]
+
     # 矮块：算出来低于下限 ⇒ 抬到 0.2142
     low = dict(blocks[0], top=2.0, h=2.0)
     _, _, m_low = pp.build_pick(chain, q0, cand, low, [low], (0.45, -0.25))
@@ -182,8 +192,11 @@ def test_candidate_anchor_guard(chain):
 @case
 def test_split_jumps(chain):
     # 两条航点之间一个 2.5 rad 的跳变 ⇒ 至少要插 2 个点，且插完每段 ≤ 1.0 rad
-    wps = [{"name": "a", "q": [0.0] * 6, "duration": 2.0},
-           {"name": "b", "q": [2.5, 0, 0, 0, 0, 0], "duration": 2.0}]
+    # 基准姿态用 0.5 rad 而不是全零：全零正好是腕 2 = 0 的奇异位形，
+    # 腕护栏会（正确地）把它拦下 —— 那样测到的是护栏，不是插点。
+    base = [0.5] * 6
+    wps = [{"name": "a", "q": list(base), "duration": 2.0},
+           {"name": "b", "q": [base[0] + 2.5] + base[1:], "duration": 2.0}]
     out, added = pp.split_jumps(wps, chain, max_jump=1.0)
     assert added == 2, "2.5 rad / 1.0 ⇒ 应插 2 个点，实际 %d" % added
     assert [w["name"] for w in out] == ["a", "b_split1", "b_split2", "b"], \
@@ -192,10 +205,32 @@ def test_split_jumps(chain):
              for i in range(len(out) - 1)]
     assert max(jumps) <= 1.0 + 1e-9, jumps
     # 插出来的点必须落在原来的关节直线上（JTC 本来就是直线，插点不改轨迹形状）
-    assert np.allclose(out[1]["q"], [2.5 / 3, 0, 0, 0, 0, 0])
+    assert np.allclose(out[1]["q"], [base[0] + 2.5 / 3] + base[1:])
     # 不超阈值时不插
     out2, added2 = pp.split_jumps(wps, chain, max_jump=3.0)
     assert added2 == 0 and out2 == wps
+
+
+@case
+def test_wrist_guard(chain):
+    """腕 2 过 0（奇异位形）必须判红 —— 包括**插点插出来**的过 0。"""
+    i = chain.move_joints.index("wrist_2_joint")
+    bad = [0.5] * 6
+    bad[i] = 0.05
+    hit = pp.check_wrist(chain, bad)
+    assert hit is not None and abs(hit[0] - np.degrees(0.05)) < 0.01, hit
+    good = [0.5] * 6
+    good[i] = 0.6
+    assert pp.check_wrist(chain, good) is None, "0.6 rad 不该判红"
+    # 从 +0.6 走到 −0.6：两端都合法，但直线插值会穿过 0 —— 必须拦
+    wps = [{"name": "a", "q": good, "duration": 2.0},
+           {"name": "b", "q": [0.5] * i + [-0.6] + [0.5] * (5 - i), "duration": 2.0}]
+    try:
+        pp.split_jumps(wps, chain, max_jump=1.0)
+    except pp.PlanError:
+        pass
+    else:
+        raise AssertionError("插值穿过腕 2 = 0，护栏没拦")
 
 
 # ---------------------------------------------------------------- 变异测试

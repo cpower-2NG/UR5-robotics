@@ -35,6 +35,8 @@ import subprocess
 import sys
 import time
 
+import numpy as np
+
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,7 +61,10 @@ export ROS_DOMAIN_ID=99
 . "$HOME/yolo_ros_original/ros2_ws/install/setup.bash"
 exec python3 "$@"
 """
-PICK_ZONE = (0.38, 0.62, 0.22, 0.45)     # x_min, x_max, y_min, y_max（米）
+# 拾取区（米）。y_min 从 0.22 收到 0.25 是**实测**定的：巡检位地面足迹只到
+# y=225.0 mm（2026-10-25，survey_footprint.py），0.22 那一角在画面外 15.5 px。
+# 板上 yaml 写的 pick_zone 是 y≥0.00 —— 那段相机根本看不见，照抄就会悄悄漏块。
+PICK_ZONE = (0.38, 0.62, 0.25, 0.45)     # x_min, x_max, y_min, y_max（米）
 MAX_CAND_MM = 12.0
 
 
@@ -205,6 +210,22 @@ def pick_next(analysis, state):
 
 
 # ---------------------------------------------------------------- 步骤
+def frame_lighting(frame_dir):
+    """彩色帧够不够亮到能判色。返回 (ok, 诊断行)。
+
+    为什么要在候选之前单独查：2026-10-25 20:25 那帧彩色均值 112.6，13 分钟后
+    同一台臂同一批块降到 6.4（顶面 RGB 只有 [10,2,2]）—— 顶面像素的 V 全低于
+    判色阈 40，于是每块都变成 ``class="unknown"`` 且**票数为 0**。几何（深度是
+    结构光打的）照常出块，所以整个链看起来没坏，只是类别全丢；再往后会以
+    「类别 unknown 没有空槽」这个名字莫名其妙地收工。
+    """
+    from PIL import Image               # robot-pose venv 自带
+    a = np.asarray(Image.open(os.path.join(frame_dir, "color.png")).convert("RGB"))
+    p99 = float(np.percentile(a.max(axis=2), 99))
+    ok = p99 >= 60                      # 判色阈是 v≥40 / s≥60，留一档余量
+    return ok, "彩色帧 p99 亮度 %.0f（阈 60）" % p99
+
+
 def do_survey(args, board, state, which):
     tmp = os.path.join(args.run_dir, "tmp")
     os.makedirs(tmp, exist_ok=True)
@@ -242,6 +263,31 @@ def do_cycle(args, board, state):
     if args.go:
         state["pose"] = "survey_pick"
 
+    # 2b) 视野闸门：拾取区四角必须落在画面内（含 40 px 边距）。
+    # 阈值不是「按理说看得见」算的 —— 是逐帧把四角投到地面反投影回去算的。
+    # 没 --go 时臂不在巡检位，这个判据没有意义，所以只记录、不拦。
+    fjson = os.path.join(fdir, "footprint.json")
+    rf = sh([PY_SELF, os.path.join(HERE, "survey_footprint.py"),
+             "--frame", fdir, "--zone", ",".join("%.3f" % v for v in PICK_ZONE),
+             "--json", fjson], check=False)
+    foot_ok = None
+    if os.path.exists(fjson):
+        foot_ok = json.load(open(fjson)).get("ok")
+    if args.go and rf.returncode != 0:
+        state["stop_reason"] = "拾取区出了画面（survey_footprint rc=%d）" % rf.returncode
+        save_state(args.state, state)
+        print("\n!! %s —— 调整巡检位或缩小 PICK_ZONE，不发轨迹。" % state["stop_reason"])
+        return rf.returncode
+
+    # 2c) 光照闸门：太暗就停下来开灯，别让类别一路变成 unknown 再以别的名义收工
+    light_ok, light_note = frame_lighting(fdir)
+    print("  " + light_note + ("  ✓" if light_ok else "  ✗ **太暗**"))
+    if not light_ok:
+        state["stop_reason"] = "彩色帧太暗：%s —— 开灯后重跑本步" % light_note
+        save_state(args.state, state)
+        print("\n!! %s" % state["stop_reason"])
+        return 3
+
     # 3) 候选
     cand_json = os.path.join(fdir, "candidates.json")
     sh([PY_GRASPNET, os.path.join(HERE, "graspnet_candidates.py"), fdir,
@@ -259,7 +305,9 @@ def do_cycle(args, board, state):
     # 4) 槽位
     slot_idx = pick_slot(state["used"], state["slot_classes"], cls)
     if slot_idx is None:
-        state["stop_reason"] = "类别 %s 没有空槽" % cls
+        state["stop_reason"] = "类别 %s 没有空槽%s" % (
+            cls, "（unknown 多半是太暗或顶面花了 —— 先看 color.png）"
+            if cls == "unknown" else "")
         save_state(args.state, state)
         return 0
 
@@ -277,7 +325,7 @@ def do_cycle(args, board, state):
            "cand_dist_mm": p["dist_mm"], "cand_score": p["best"]["score"],
            "cand_width_mm": p["best"]["width_mm"],
            "slot_idx": slot_idx, "plan": os.path.relpath(plan, args.run_dir),
-           "ok": False}
+           "foot_ok": foot_ok, "ok": False}
     # 抓帧时臂是不是静止的 —— 不是的话，位置精度那一栏的读数不可信
     fjs = json.load(open(os.path.join(fdir, "joint_states.json")))
     rec["frame_still"] = fjs.get("still")

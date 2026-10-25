@@ -13,7 +13,12 @@
 
 几何约定（**全部来自规划器，别在这里另立一套**）
 ------------------------------------------------
-    tool0 指尖偏置        0.1757 m   (= 204.2 闭合针长 − 28.5 法兰→针尖)
+    tool0 指尖偏置        0.1757 m   (= 裸指尖 204.2 − A1 方块高 28.5)
+                                    ⚠️ 这是**参数**不是尺寸：式子 wz + 0.1757 + c 里的
+                                    「指尖」在顶面以下，夹持深度与块高无关。
+                                    裸指尖（闭合）是 0.2042 m，报深度时用它。
+    wz 用**相对台面的高度** `h`，不用绝对顶面 z —— 腕部深度实测把台面读高
+    ~6 mm（本轮 table_z=+6.0），而几何锚在 table_plane_z=0。
     抓取抬升              0.01 m
     接近余量              0.05 m
     搬运高度              0.15 m
@@ -32,8 +37,9 @@ A/B 把腕转 180° 仍然抓成功，说明当前方块尺度下朝向不敏感
    关节空间逐段采样 8 点。指尖单独查，是因为夹着块横移时先碰台面的是它，
    而肘、腕 1 都还在高处 —— 只查连杆等于没查。
 4. 段内最大关节跳变 ≤ 1.0 rad，超过就插中间航点
-5. 高度钳制：抓取 z ∈ [0.2142, 0.2242]（不低于已验证的放置深度）
-6. 邻块间距 ≥ 60 mm（夹爪全开 95 mm；A/B 实测 77 mm 不碰）
+5. 腕 2 离 0 至少 0.15 rad（0 是腕奇异；插点也要查 —— 端点远离不等于插值点远离）
+6. 高度钳制：抓取 z ∈ [0.2142, 0.2242]（不低于已验证的放置深度）
+7. 邻块间距 ≥ 60 mm（夹爪全开 95 mm；A/B 实测 77 mm 不碰）
 
 用法：
   # 走到抓取巡检位 / 放置巡检位
@@ -60,6 +66,11 @@ from scipy.spatial.transform import Rotation as Rot               # noqa: E402
 import urkin                                                      # noqa: E402
 
 # ---- 几何常量（出处见模块 docstring）
+# `TOOL0_TO_FINGERTIP` 这个**参数** = 裸指尖（闭合，tool0→指尖 204.2 mm）减去
+# A1 那批方块的高度 28.5 mm。所以 `wz + TOOL0_TO_FINGERTIP + c` 这个式子里的
+# 「指尖」落在**顶面以下 (204.2 − 28.5 − ...) **，夹持深度与块高无关。
+# 要报「指尖在顶面下多深」时必须用**裸指尖**这个数，不能用参数。
+TOOL0_TO_BARE_FINGERTIP = 0.2042
 TOOL0_TO_FINGERTIP = 0.1757
 APPROACH_CLEARANCE = 0.05
 GRASP_CLEARANCE = 0.01
@@ -70,6 +81,9 @@ PLACE_DESCEND_Z = PLACE_Z + TOOL0_TO_FINGERTIP + PLACE_RELEASE_LIFT   # 0.2142
 PLACE_APPROACH_Z = PLACE_Z + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE  # 0.2542
 GRASP_Z_MIN = PLACE_DESCEND_Z          # 别比已验证过的放置深度更低
 GRASP_Z_MAX = GRASP_Z_MIN + 0.010      # 上限给 10 mm：块高 30~35 mm，实测够用
+# 腕 2（第 5 关节）离 0 至少这么远。0 就是腕奇异（1、3 轴重合），
+# A/B 两次实测腕 2 = −89.8°，余量极大；这个数只是防止 IK 挑到另一支解。
+WRIST_MIN_RAD = 0.15
 
 # 巡检位（tool0，m）。相机相对 tool0 的偏置是 (−31.9, +85.3, −24.2) mm，
 # 由 live-04 的 URDF FK 与帧内 TF 逐位对上（差 0.0 mm）。
@@ -108,6 +122,21 @@ def duration_for(q0, q1, seconds_per_rad=3.0, base=1.5, lo=2.0, hi=12.0):
     """运动时长：按最大关节角走 3 s/rad，再加 1.5 s 底 —— 宁可慢。"""
     d = float(np.max(np.abs(np.asarray(q1) - np.asarray(q0))))
     return float(min(hi, max(lo, base + seconds_per_rad * d)))
+
+
+def check_wrist(chain, q, tol=WRIST_MIN_RAD):
+    """腕 2（第 5 关节）过零 ⇒ 腕奇异：第 1 与第 3 关节轴重合，关节速度发散。
+    JTC 为了保持末端走直线会把腕甩起来，夹着块横移时尤其危险。
+    返回 None 或 (实际角度, 下限角度)，单位都是度。
+    """
+    try:
+        i = chain.move_joints.index("wrist_2_joint")
+    except (ValueError, AttributeError):
+        i = 4
+    v = float(q[i])
+    if abs(v) >= tol:
+        return None
+    return round(float(np.degrees(v)), 2), round(float(np.degrees(tol)), 2)
 
 
 def check_limits(chain, q):
@@ -171,6 +200,10 @@ def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
     bad = check_limits(chain, q)
     if bad:
         raise PlanError("航点 %s 超出软限位：%s" % (name, bad))
+    ws = check_wrist(chain, q)
+    if ws:
+        raise PlanError("航点 %s 的腕 2 只有 %.2f°，离奇异位形不足 %.2f°（下限）"
+                        % (name, ws[0], ws[1]))
     ok, worst = check_guard(chain, q_seed, q, table_z)
     if not ok:
         raise PlanError("航点 %s 的段内高度护栏不过：t=%.2f 处 %s z=%.1f mm"
@@ -207,6 +240,12 @@ def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP):
                 n = int(np.ceil(jump / max_jump))
                 for i in range(1, n):
                     qi = prev_q + (q - prev_q) * (i / n)
+                    # 端点都远离奇异，**插值点**不一定：q5 一过零就落在奇异上
+                    ws = check_wrist(chain, qi)
+                    if ws:
+                        raise PlanError("插点 %s_split%d 的腕 2 只有 %.2f°，"
+                                        "离奇异位形不足 %.2f°（下限）"
+                                        % (w["name"], i, ws[0], ws[1]))
                     out.append({"name": "%s_split%d" % (w["name"], i),
                                 "q": [float(v) for v in qi],
                                 "duration": float(duration_for(prev_q, qi))})
@@ -246,7 +285,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。"""
     gx, gy = cand["xyz_base"][0], cand["xyz_base"][1]
-    wz = block["top"] / 1000.0
+    # 用**相对台面的高度** `h`，不用绝对顶面 z：
+    # 腕部深度实测把台面读高 ~6 mm（本轮帧 table_z=+6.0 mm，真块高 = top − table_z
+    # = 24.3~26.0 mm），而本规划器的整个几何都锚在 table_plane_z=0（放置高度、
+    # PLACE_DESCEND_Z 都按台面建）。拿绝对 top 当 wz 会把那 6 mm 原样带进抓取高度，
+    # 指尖就少抓 6 mm —— 正好是用户说的「抓得更浅」那一类误差。
+    wz = (block["h"] if block.get("h") is not None else block["top"]) / 1000.0
     approach_z = wz + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE
     grasp_z = float(np.clip(wz + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE,
                             GRASP_Z_MIN, GRASP_Z_MAX))
@@ -280,6 +324,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
 
     meta = {"kind": "pick", "block_idx": block["idx"], "class": block["class"],
             "block_top_mm": round(block["top"], 2),
+            "block_h_mm": round(wz * 1000, 2),
+            "wz_measured_mm": round(block["top"], 2),
+            "wz_used_mm": round(wz * 1000, 2),
+            "table_z_mm": round(block["top"] - wz * 1000, 2),
+            "grasp_depth_mm": round(wz * 1000 - (grasp_z * 1000
+                                                 - TOOL0_TO_BARE_FINGERTIP * 1000), 2),
             "block_xy_mm": [round(block["cx"], 2), round(block["cy"], 2)],
             "grasp_point": [gx, gy], "grasp_z": round(grasp_z, 4),
             "approach_z": round(approach_z, 4), "lift_z": round(lift_z, 4),
