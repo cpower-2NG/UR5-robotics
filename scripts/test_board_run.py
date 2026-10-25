@@ -2874,13 +2874,15 @@ try:
     check("参数文件没有 serial_no ⇒ FAIL（会按枚举顺序认相机）",
           st == board_run.FAIL and "没有 serial_no" in det, det)
 
+    # ⚠️ 用**编造**的 12 位数，不用真序列号：真值属设备身份，不能进仓库
+    # （140 轮：这里曾写着腕部相机的真号，被本机 denylist 逮到）。
     unq = _cam_yaml("wrist_unquoted.yaml",
-                    '/**:\n  ros__parameters:\n    serial_no: 036222071094\n')
+                    '/**:\n  ros__parameters:\n    serial_no: 123456789012\n')
     st, det = board_run.judge_camera_params_file(unq)
     check("serial_no 丢了引号（PyYAML 当字符串、rcl 当数字）⇒ FAIL，"
           "**不改写成字符串**硬跑",
           st == board_run.FAIL and "没带引号" in det, det)
-    check("  这条也不打印那个数（它正是序列号）", "036222071094" not in det, det)
+    check("  这条也不打印那个数（它正是序列号）", "123456789012" not in det, det)
 
 finally:
     shutil.rmtree(tmpdir, ignore_errors=True)
