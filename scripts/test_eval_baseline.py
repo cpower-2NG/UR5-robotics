@@ -9,6 +9,9 @@
 「找到几块、中心在哪、贴边怎么算」钉住。
 
 ⚠️ 合成图只验**逻辑**，验不了真相机。真帧的分割只能用真实帧看（见台账）。
+
+后三节（[10]–[12]）另把 `--est pc` 的点云估计钉住：平面拟合、三块立方体的
+板系 x/y/顶面高、以及「贴桌面的彩色块必须被高度闸门拒掉」。
 """
 
 import os
@@ -161,6 +164,141 @@ cv2.rectangle(img, (400, 300), (480, 380), (0, 0, 255), -1)
 d[300:380, 400:480] = 409                  # z_board = −9 mm
 got = eb.segment_blocks_color(img, d, K, D, R_CB, T_CB, 28.5)
 check("0 块", len(got) == 0, str(len(got)))
+
+# ─────────────────── 点云估计（--est pc）───────────────────
+# 合成帧让 base 系与板系**差一个非对称的刚体变换**：若 p_base↔板系 的某次
+# 变换写反（R 用成 R.T、平移符号反），round-trip 就不再抵消，这里会红。
+# 渲染仍按正俯视做（板→相机用 R_CB/T_CB），避免斜视时「侧面混进顶面」的
+# 投影误差干扰判定。
+
+def _Rz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])
+
+
+def _Ry(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+
+R_BC = _Rz(np.radians(37.0)) @ _Ry(np.radians(12.0)) @ np.diag([1.0, -1, -1])
+T_BC = -R_BC @ T_CB                     # 板原点 → base 原点，桌面落在 base z≈0
+
+
+def synth_pc(objs, w=1280, h=720, side_mm=28.5):
+    """objs: [(x_m, y_m, yaw, 顶面高_m)]（板系）→ (img, depth, boxes)。
+
+    顶面高 = 0 表示「贴在桌上的彩色块」——用来验高度闸门。
+
+    ⚠️ 不能把整块轮廓填成同一个颜色/同一个深度：相机在光轴外俯视立方体时，
+    近侧（顶面）在像面里被放大，轮廓里会露出一圈**侧面**。第一版整块填纯红 +
+    顶面深度，结果顶面的「最亮层」把侧面也算进去，质心被拉向光心 3–7 mm
+    —— 测试自己错了。现在顶面亮（V=255）、侧面暗（V=128），侧面深度给
+    半高（真实值介于桌面与顶面之间），Otsu 能分开两者。
+    """
+    import cv2
+    img = np.full((h, w, 3), 255, np.uint8)
+    depth = np.full((h, w), 400, np.uint16)
+    boxes = []
+    for x, y, yaw, hm in objs:
+        P = eb._cube_corners(x, y, yaw, side_mm / 1000.0, hm)
+        hull_all = eb._cube_hull(P, K, R_CB, T_CB)
+        hull_top = eb._cube_hull(P[4:], K, R_CB, T_CB)     # 顶面与像面平行
+        mask = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(mask, np.round(hull_all).astype(np.int32), 1)
+        img[mask == 1] = (0, 0, 128)                       # 暗红 → 侧面
+        depth[mask == 1] = np.uint16(round(400 - hm * 500.0))
+        top = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(top, np.round(hull_top).astype(np.int32), 1)
+        img[top == 1] = (0, 0, 255)                        # 亮红 → 顶面
+        depth[top == 1] = np.uint16(round(400 - hm * 1000.0))
+        boxes.append((int(hull_all[:, 0].min()), int(hull_all[:, 0].max()),
+                      int(hull_all[:, 1].min()), int(hull_all[:, 1].max())))
+    return img, depth, boxes
+
+
+def _make_pc_frame(img, depth):
+    """最小可用帧：点云 + 板位姿 + 非对称 TF（base 系与板系不同）。
+
+    TF 用四元数写（真实帧的样子），这里顺带验一次换算。
+    """
+    (m00, m01, m02), (m10, m11, m12), (m20, m21, m22) = R_BC
+    qw = np.sqrt(max(0.0, 1.0 + m00 + m11 + m22)) / 2.0
+    qx = np.sqrt(max(0.0, 1.0 + m00 - m11 - m22)) / 2.0 * np.sign(m21 - m12)
+    qy = np.sqrt(max(0.0, 1.0 - m00 + m11 - m22)) / 2.0 * np.sign(m02 - m20)
+    qz = np.sqrt(max(0.0, 1.0 - m00 - m11 + m22)) / 2.0 * np.sign(m10 - m01)
+    entry = {"rotation": {"x": qx, "y": qy, "z": qz, "w": qw},
+             "translation": {k: float(v) for k, v in
+                             zip(("x", "y", "z"), T_BC)}}
+    f = {"dir": "<synth>", "K": K, "D": D, "img": img, "depth": depth,
+         "tf": {"ok": {"base_link:camera_color_optical_frame": entry}}}
+    R_chk, t_chk = eb._tf_matrix(entry)
+    if not (np.allclose(R_chk, R_BC, atol=1e-6) and np.allclose(t_chk, T_BC)):
+        raise AssertionError("四元数↔矩阵换算不对：\n%s\nvs\n%s" % (R_chk, R_BC))
+    f["_cloud"] = eb.point_cloud(f)
+    f["_board_pose"] = (R_CB, T_CB)
+    return f
+
+
+section("[10] _fit_plane：桌面上 20% 野值，仍恢复 z=12 mm 平面（±1.5 mm）")
+rng = np.random.default_rng(3)
+P_in = np.column_stack([rng.uniform(-0.2, 0.2, 4000),
+                        rng.uniform(-0.2, 0.2, 4000),
+                        rng.normal(0.012, 0.0008, 4000)])
+P_out = np.column_stack([rng.uniform(-0.2, 0.2, (400, 2))])
+P_out = np.column_stack([P_out, rng.uniform(-0.05, 0.06, len(P_out))])
+fit = eb._fit_plane(np.vstack([P_in, P_out]))
+check("有解", fit is not None)
+if fit is not None:
+    n_f, c_f, cnt_f = fit
+    check("法向竖直（|n_z| > 0.99）", abs(n_f[2]) > 0.99, "%.4f" % n_f[2])
+    check("平面高度 12 mm（±1.5）", abs(abs(c_f) - 0.012) * 1000 <= 1.5,
+          "%.2f mm" % (abs(c_f) * 1000))
+    check("内点 ≥ 3500", cnt_f >= 3500, str(cnt_f))
+
+section("[11] 点云估计：三块立方体，板系 x/y/顶面高都恢复（±2 mm）")
+img, d, boxes = synth_pc([(0.100, 0.050, np.radians(20.0), 0.0285),
+                          (-0.180, -0.060, 0.0, 0.0285),
+                          (0.220, -0.090, np.radians(55.0), 0.0285)])
+f = _make_pc_frame(img, d)
+P, valid = f["_cloud"]
+gp = eb._global_table_plane(P, valid)
+check("全局兜底桌面存在", gp is not None)
+for (bx0, bx1, by0, by1), (tx, ty, tyaw, th) in zip(
+        boxes, [(0.100, 0.050, 0.0, 0.0285),
+                (-0.180, -0.060, 0.0, 0.0285),
+                (0.220, -0.090, 0.0, 0.0285)]):
+    det = {"cx": 0.5 * (bx0 + bx1), "cy": 0.5 * (by0 + by1),
+           "size_x": bx1 - bx0, "size_y": by1 - by0,
+           "best": {"score": 0.9, "class_id": "cube"}}
+    plane = eb._local_table_plane(P, valid, (bx0, bx1, by0, by1),
+                                  global_plane=gp)
+    e = eb.estimate_grasp_pc(f, det, plane)
+    tag = "(%.0f, %.0f) mm" % (tx * 1000, ty * 1000)
+    check("块 %s 有估计" % tag, e is not None)
+    if e is not None:
+        pb = e["p_board"]
+        check("  板系 x/y（±2 mm）",
+              abs(pb[0] - tx) * 1000 <= 2.0 and abs(pb[1] - ty) * 1000 <= 2.0,
+              "(%+.2f, %+.2f) mm" % ((pb[0] - tx) * 1000,
+                                     (pb[1] - ty) * 1000))
+        check("  顶面高 28.5 mm（±2）", abs(pb[2] - th) * 1000 <= 2.0,
+              "%.2f mm" % (pb[2] * 1000))
+        check("  离桌面高度 ≈ 28.5 mm", abs(e["z_above_mm"] - 28.5) <= 2.0,
+              "%.2f mm" % e["z_above_mm"])
+
+section("[12] 贴桌面的彩色块（高 0）被高度闸门拒掉")
+img, d, boxes = synth_pc([(0.100, 0.050, 0.0, 0.0)])
+f = _make_pc_frame(img, d)
+P, valid = f["_cloud"]
+gp = eb._global_table_plane(P, valid)
+bx0, bx1, by0, by1 = boxes[0]
+det = {"cx": 0.5 * (bx0 + bx1), "cy": 0.5 * (by0 + by1),
+       "size_x": bx1 - bx0, "size_y": by1 - by0,
+       "best": {"score": 0.9, "class_id": "cube"}}
+plane = eb._local_table_plane(P, valid, (bx0, bx1, by0, by1), global_plane=gp)
+e = eb.estimate_grasp_pc(f, det, plane)
+check("返回 None", e is None, "" if e is None else str(e["z_above_mm"]))
 
 print("\n" + "=" * 66)
 if _failed:
