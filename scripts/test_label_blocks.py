@@ -135,8 +135,12 @@ def main():
         m = import_labeler(img_dir, lbl_dir, classes='cyan,red,yellow')
         check('类别表就是传进去的顺序',
               m.CLASS_NAMES == ['cyan', 'red', 'yellow'], str(m.CLASS_NAMES))
-        check('默认类别表是 block_classes.DEFAULT_CLASSES',
-              m.DEFAULT_CLASSES == ['red', 'orange', 'yellow', 'cyan', 'purple'],
+        # 2026-10-05 把用户那批积木逐块量过：实测 7 色（红/橙/棕/黄/黄绿/青/紫），
+        # 旧默认 5 色是没量过的估计，漏掉了棕与黄绿。这里故意写死一份副本 ——
+        # 若哪天有人把 block_classes 的顺序改了，这个断言要跟着响。
+        check('默认类别表是 block_classes.DEFAULT_CLASSES（2026-10-05 实测 7 色）',
+              m.DEFAULT_CLASSES == ['red', 'orange', 'tan', 'yellow',
+                                    'yellowgreen', 'cyan', 'purple'],
               str(m.DEFAULT_CLASSES))
         check('导入后已装好第一张图（img_list 非空）', len(m.img_list) == 1)
 
