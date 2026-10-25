@@ -49,7 +49,7 @@ detections.json / targets_3d.json / tf.json）。
   · `pc`：不看 `/targets_3d`，改用同一帧的对齐深度图逐块估计：在检测框
     外一圈拟合**局部桌面** → 框内高出桌面 >8 mm 的连通域 → 最高层点拟合
     顶面 → 抓取点的 x/y 取**彩色顶面的亮层质心**（Otsu 分亮/暗），再沿该
-    像素射线交到顶面平面上。`--pc-min-score` 过滤低分检测（默认 0.35）。
+    像素射线交到顶面平面上。`--pc-min-score` 过滤低分检测（默认 0.30；0.20–0.35 实测同结果）。
     为什么要分两路取 x/y：0.7 m 处深度有位置相关的偏置，顶面被压成几度
     的斜坡，按固定层高选点的质心会偏 5–10 px；彩色亮层质心与立方体真值
     差 1–2 px。
@@ -518,7 +518,7 @@ def board_to_base(frame, R_cb, t_cb, p_board):
 # ⚠️ 0.7 m 是 D435i 最差的量程：顶面 3D 点自身的重复性 ~1 mm，但
 # **绝对深度**仍有几毫米的偏置（它修不了）；精度验收要回近距（~0.35 m）。
 
-PC_MIN_SCORE = 0.35          # 低于这个分数不进点云估计（板/支架的误检多在 0.05–0.4）
+PC_MIN_SCORE = 0.30          # 低于这个分数不进点云估计（板/支架的误检多在 0.05–0.4）
 PC_TOP_POINTS_MIN = 200      # 顶面点过少 = 不是一块积木的顶面
 PC_TOP_BAND_MM = 2.5         # 顶面层厚：取「最高层 ±2.5 mm」
 PC_MIN_HEIGHT_MM = 15.0      # 顶面高出局部桌面不到 15 mm 的，不是积木
@@ -593,28 +593,37 @@ def _global_table_plane(P, valid):
     return None if fit is None else (fit[0], fit[1])
 
 
-def _local_table_plane(P, valid, box, pad_px=4, ring_px=12,
+def _local_table_plane(P, valid, box, pad_px=40, band_mm=8.0,
                        global_plane=None):
-    """在检测框**外一圈**拟合局部桌面（框内是块，不能进拟合）。"""
+    """在检测框外扩 `pad_px` 的 ROI 里拟合局部桌面。
+
+    为什么不是「框外一圈」：YOLO 框常比块**小**（rep-06 一块 39×51 px，块
+    实际 ~64 px），贴着框的那一圈其实还在块顶上；于是「局部桌面」被拟成块
+    顶，高度闸门随机误杀 —— 2026-10-25 rep-06/07 各漏 2 块就是这么来的。
+
+    改用中位带：ROI 里桌面占绝大多数，块顶高出桌面 28.5 mm ⇒ 取 ROI 中位
+    z 附近 ±`band_mm` 的点只含桌面，块在带外。ROI 内倾角很小（~0.15 m 上
+    1.3° 只有 3 mm），带内取全后再拟合不会把倾斜抹平。
+    """
     h, w = valid.shape
     x0, x1, y0, y1 = box
-    bx0 = max(0, x0 - pad_px); bx1 = min(w, x1 + pad_px)
-    by0 = max(0, y0 - pad_px); by1 = min(h, y1 + pad_px)
-    rx0 = max(0, bx0 - ring_px); rx1 = min(w, bx1 + ring_px)
-    ry0 = max(0, by0 - ring_px); ry1 = min(h, by1 + ring_px)
-    ring = np.ones((ry1 - ry0, rx1 - rx0), bool)
-    ring[by0 - ry0:by1 - ry0, bx0 - rx0:bx1 - rx0] = False
-    rv = valid[ry0:ry1, rx0:rx1] & ring
-    pts = P[ry0:ry1, rx0:rx1][rv]
-    if len(pts) >= 200:
-        zmed = np.median(pts[:, 2])
-        pts = pts[np.abs(pts[:, 2] - zmed) < 0.035]
-        fit = _fit_plane(pts)
-        if fit is not None and fit[2] >= 120:
-            n, c, _ = fit
-            if abs(n[2]) > 0.985:          # 环上的平面倾角 < 10°
-                return n, c
-    return global_plane
+    x0 = max(0, x0 - pad_px); x1 = min(w, x1 + pad_px)
+    y0 = max(0, y0 - pad_px); y1 = min(h, y1 + pad_px)
+    rv = valid[y0:y1, x0:x1]
+    pts = P[y0:y1, x0:x1][rv]
+    if len(pts) < 500:
+        return global_plane
+    zmed = float(np.median(pts[:, 2]))
+    pts = pts[np.abs(pts[:, 2] - zmed) < band_mm / 1000.0]
+    if len(pts) < 300:
+        return global_plane
+    fit = _fit_plane(pts)
+    if fit is None or fit[2] < 200:
+        return global_plane
+    n, c, _ = fit
+    if abs(n[2]) <= 0.985:             # 局部桌面倾角 < 10°
+        return global_plane
+    return n, c
 
 
 def _plane_height(P, n, c):
