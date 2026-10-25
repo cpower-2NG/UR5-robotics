@@ -731,6 +731,14 @@ def resolve_launch_params(task, site):
     params, src = task_params(task)
     conflicts = []
 
+    # 任务描述里的路径参数要**在这里**展开 `~`。launch_ros / rclpy 都不展开它
+    # （实测两边都没有 expanduser）：`realsense_params_file:=~/...` 会变成字面量
+    # 路径，节点打不开参数文件后**静默**退回「枚举到的第一台」相机 —— 插着两台
+    # D435i 时就是随机认一台（腕部/俯视轮换时正是这个形状）。
+    for _k in ("realsense_params_file",):
+        if _k in params:
+            params[_k] = os.path.expanduser(params[_k])
+
     ssrc = "站点 %s" % site.path
     _put(params, src, "robot_ip", site.robot_ip, "%s:robot_ip（或 $UR_ROBOT_IP）" % ssrc)
     _put(params, src, "planner_params_file", site.planner_params,
@@ -1569,6 +1577,85 @@ def path_in_repo(path, repo=REPO):
     p = os.path.abspath(os.path.expanduser(str(path)))
     r = os.path.abspath(repo)
     return p == r or p.startswith(r + os.sep)
+
+
+CAM_PARAMS_ITEM = "P0.相机参数文件"
+
+
+def _find_serial(doc):
+    """从一份 RealSense 参数文件里取出 `serial_no`。→ 值，或 ``None``。纯函数。"""
+    if not isinstance(doc, dict):
+        return None
+    for node in doc.values():
+        if not isinstance(node, dict):
+            continue
+        rp = node.get("ros__parameters")
+        if isinstance(rp, dict) and "serial_no" in rp:
+            return rp["serial_no"]
+    return None
+
+
+def judge_camera_params_file(path):
+    """`realsense_params_file` 指的那份文件**现在能不能用**。→ ``(status, detail)``。
+
+    **只读**。为什么要在 P0 判（两种失败都不报错）：
+      · 不给这个参数 ⇒ 驱动取「枚举到的第一台」，插着两台 D435i 时就是随机认一台；
+      · 给了但文件不在 / 还是占位符 ⇒ `pipeline.launch.py` 只**警告**（占位符才会
+        当场抛），驱动同样退回枚举。
+    腕部/俯视轮换正是会踩到这两种的形状：相机认错时图像照样有，只是拍到的是
+    **另一台**的视角 —— 检测、投影、日志全都正常。
+
+    ⚠️ 不打印 `serial_no` 的值（红线 3：序列号是设备身份）。
+    """
+    if not path:
+        return PASS, ("没给 realsense_params_file —— 走 launch 的默认解析；"
+                      "插着两台 D435i 时驱动可能按枚举顺序认错一台")
+    p = os.path.expanduser(str(path))
+    if not os.path.exists(p):
+        return FAIL, (
+            "文件不在：%s\n      ⇒ 驱动会**静默**退回「枚举到的第一台」相机。"
+            "腕部路线可能因此打开俯视那台（或反过来），而画面、检测、日志全都正常。\n"
+            "      模板：ros2_ws/src/yolo_bringup/config/realsense_wrist.yaml" % p)
+    try:
+        import yaml
+    except ImportError as exc:                      # noqa: BLE001
+        return FAIL, "缺 PyYAML（%s）—— 读不了相机参数文件" % exc
+    try:
+        with open(p, encoding="utf-8") as fh:
+            text = fh.read()
+        doc = yaml.safe_load(text)
+    except Exception as exc:                        # noqa: BLE001
+        return FAIL, "读不了 / 不是合法 YAML：%s：%s" % (p, exc)
+
+    if _find_serial(doc) is None:
+        return FAIL, ("%s 里没有 serial_no（要放在 `/**` → `ros__parameters` 下）"
+                      "⇒ 驱动取枚举到的第一台" % p)
+
+    # ⚠️ **不能只看 PyYAML 的类型**：这一行的判据是「文件里有没有引号」，
+    # 而 PyYAML 与节点侧 rcl 的 C 版解析器**判断相反**（见
+    # `config/realsense_camera.yaml` 文件头）：`serial_no: 036…` 在 PyYAML
+    # 眼里是字符串（含 8/9，不是合法八进制），在 rcl 眼里是 double ⇒ 节点
+    # 报 invalid type 并退出。所以这里**直接看原文**。
+    line = re.search(r"^\s*serial_no\s*:\s*(?P<v>[^#\n]*?)\s*(?:#.*)?$",
+                     text, re.M)
+    if line is None:
+        return FAIL, "%s 里找不到 serial_no 那一行（解析器看到的是嵌套键？）" % p
+    raw_value = line.group("v").strip()
+    quoted = len(raw_value) >= 2 and raw_value[0] == raw_value[-1] \
+        and raw_value[0] in ("'", '"')
+    if not quoted:
+        return FAIL, (
+            "%s 的 serial_no **没带引号**。PyYAML 可能把它当字符串，但节点侧 "
+            "rcl 的 C 版解析器会把纯数字读成 int/double ⇒ 节点报 invalid type "
+            "并退出。**引号要留着**（这是功能性的，不是风格）" % p)
+    serial = raw_value[1:-1].strip()
+    if not serial:
+        return FAIL, "%s 的 serial_no 是空串" % p
+    if serial.startswith("<") and serial.endswith(">"):
+        return FAIL, (
+            "%s 的 serial_no 还是占位符 %s。填**相机外壳标签上的 SDK 号**"
+            "（不是 /sys/bus/usb 里的 ASIC 号），引号要留着" % (p, serial))
+    return PASS, "serial_no 已填且带引号（值不打印：红线 3）"
 
 
 def collect_preflight(site, do_net=True, override=None, env=None):
@@ -2444,6 +2531,8 @@ def run(argv=None, *, prompt_fn=input, isatty=None, clock=time.time):
         params, sources, conflicts = resolve_launch_params(task, site)
         add(S0, Item("P0.参数拼装", *judge_problems("参数拼装", conflicts)))
         _print_plan(params, sources)
+        add(S0, Item(CAM_PARAMS_ITEM,
+                     *judge_camera_params_file(params.get("realsense_params_file"))))
     elif task is not None:
         # 站点读不到 ⇒ 拼不出完整参数集，但**已经知道的那些**还是要摆出来：
         # 否则「我到底会发什么」在最需要它的时候（配置没配好）反而看不见。

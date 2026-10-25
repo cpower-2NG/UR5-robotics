@@ -1,0 +1,84 @@
+# 腕部相机路线的任务描述 —— **模板，尚未在真机上验收**
+#
+# **这是什么**：`scripts/board_run.py` 读的数据文件。与 `a1.yaml` 同一套判分
+# （`board_a1:grade`），差别只在**视觉入口换成了腕部相机**：
+#
+#   · `publish_camera_tf: "false"` —— 相机 TF 不由 launch 发，由
+#     `scripts/wrist_tf_publish.py` 发 `tool0 → camera_link`（手眼标定在
+#     `docs/calib/wrist_eih_camlink-2026-10-24.json`）。两边都发 = `camera_link`
+#     两个父节点，TF 树会时对时错。
+#   · `realsense_params_file` 指向**腕部**那台的参数文件 —— 不指的话
+#     `pipeline.launch.py` 的默认顺序会拿到**俯视**那台（插着两台时按枚举顺序，
+#     而且不报错）。
+#
+# ⚠️ **腕部路线与 A1 有一个结构差别，跑之前必须知道**：A1 的俯视相机是固定的，
+#    规划器在 HOME 就能看见抓取区；腕部相机是**装在臂上**的，臂停在 HOME 时
+#    **看不到**抓取区。所以本任务只在「臂已经被摆到能看见抓取区的位姿」时才有
+#    候选。`board_run` 的 P4 会先用 `/targets_3d` 的候选数判，看不到就会 FAIL ——
+#    不会静默地「什么都没抓但报绿」。要真正的巡察/扫描动作，是阶段 3 的事，
+#    不在本模板里。
+#
+# ⚠️ **第一轮先 `carry_objects: "false"`**：只走位、不夹持，先确认感知链路
+#    （TF + 腕部相机 + 候选）通。`true` 要等这一档验过之后再改。
+#
+# 仓内这一份**不含任何现场真值**（红线 3）：控制柜 IP、外参、参数文件路径一律从
+# 站点配置推导。出口判据见 `docs/阶段/阶段1-点对点抓放/契约.md`。
+
+task: a1_wrist
+
+launch:
+  # 真机的**唯一**入口。⚠️ 不要写成 pipeline.launch.py：只起 pipeline 时规划器
+  # 解不出任何 IK，而且**不报错**（现象是臂完全不动）。
+  entry: yolo_bringup/bringup.launch.py
+  camera_source: realsense
+
+  # 声明集的取法同 a1.yaml（入口故意不声明真机细分项，靠 launch_configurations 直通）。
+  declared_entries:
+    - yolo_bringup/bringup.launch.py
+    - yolo_bringup/real.launch.py
+    - yolo_bringup/pipeline.launch.py
+
+  # 驱动立刻起 → 留 120 s 去示教器按 PLAY → 规划器才起（与 a1.yaml 同口径）。
+  start_delay: 120
+
+  trajectory_action: /scaled_joint_trajectory_controller/follow_joint_trajectory
+
+params:
+  # ⚠️ 一律写成字符串：`true`（YAML 布尔）会被拼成 `carry_objects:=True`，
+  #    与 `:=true` 不是同一个字符串，而且不报错。
+  carry_objects: "false"        # 第一轮只走位；验过感知再改 "true"
+  gripper_backend: "ag95"
+
+  # 腕部路线必须显式指参数文件（理由见文件头）。`~` 由 board_run 展开；
+  # 直接 `ros2 launch` 时请写 `$HOME/...`。文件里 serial_no 必须是**外壳标签上的
+  # SDK 号**，且**带引号** —— 模板见
+  # `ros2_ws/src/yolo_bringup/config/realsense_wrist.yaml`。
+  realsense_params_file: "~/.config/ur5-vision-grasp/wrist_camera.yaml"
+
+  # 相机 TF 由 wrist_tf_publish.py 发 ⇒ **必须**关掉 launch 那份。
+  publish_camera_tf: "false"
+
+  # 投影：像素射线 ∩ 已知平面（XY 不经深度，正是不把腕部 ~1.2% 深度偏差带进 XY）。
+  use_target_plane: "true"
+  target_plane_z: "0.0285"      # 方块高 28.5 mm（2026-10-24 撤回「21 mm」假设后）
+  grasp_point_mode: "top_face_center"
+  table_plane_z: "0.0"
+
+  # ⚠️ `plane_depth_tol` **故意不写**：a1.yaml 的 0.06 是**俯视相机在 830 mm
+  #    高处**量出来的（深度读远 ~1.9%）。腕部相机在 ~600 mm、读远 ~1.2%，口径
+  #    不同；先用 launch 默认 0.03，等腕部路线实测出残差再定，别照抄另一个数。
+
+model: block_best.pt
+
+expect:
+  slots_total: 4
+  min_candidates: 4
+  finish_marker: "收工："
+  timeout: 900
+  params:
+    carry_objects: "false"
+    gripper_backend: "ag95"
+
+score:
+  callable: "board_a1:grade"
+  explain: "board_a1:explain"

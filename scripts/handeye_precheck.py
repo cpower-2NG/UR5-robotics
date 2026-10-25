@@ -149,13 +149,14 @@ def main() -> int:
 
     rclpy.init()
     node = Precheck(args)
+    bad = 0
     try:
         if not args.watch:
             # 只报一次：先让 TF buffer 攒一会儿，否则刚起来的 listener 必然空手
             t0 = time.time()
             while rclpy.ok() and time.time() - t0 < 2.0:
                 rclpy.spin_once(node, timeout_sec=0.1)
-            node.report()
+            bad = node.report()
         else:
             last = 0.0
             while rclpy.ok():
@@ -175,7 +176,12 @@ def main() -> int:
                 rclpy.shutdown()
         except Exception:
             pass
-    return 0
+    # ⚠️ 退出码是**判据的一部分**（2026-10-25 修）：旧版无论体检结果如何都 `return 0`，
+    # 于是它能被人/脚本当成「通过了」—— 「退出码只说它自己，不说体检结果」正是本仓
+    # 反复栽的那类假绿。只报一次时按 `bad` 定；`--watch` 是盯着看的，Ctrl-C 收场算 0。
+    if args.watch:
+        return 0
+    return 0 if bad == 0 else 1
 
 
 if __name__ == "__main__":

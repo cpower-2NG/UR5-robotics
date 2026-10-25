@@ -663,7 +663,7 @@ try:
                  "find_authorization_keys", "task_dotted_paths", "judge_write_path",
                  "judge_repair_outcome", "switch_payload_lines", "repair_hint",
                  "print_repair_hint", "task_params", "judge_entry_parity",
-                 "resolve_launch_params"):
+                 "resolve_launch_params", "judge_camera_params_file"):
         check("  纯函数 %s() 在（判定是算出来的，不是散在 if 里的）" % want,
               want in funcs)
 
@@ -2770,6 +2770,75 @@ try:
     np_, _, _ = board_run.resolve_launch_params(task_a1, nos)
     check("  站点一个外参都没给 ⇒ 不擅自开发布器（缺项由 P0.站点配置 报，不重复喊）",
           "publish_camera_tf" not in np_)
+
+    # =================================================================
+    # 15. 腕部路线：a1_wrist 模板 + 相机参数文件闸门
+    # =================================================================
+    section("[15] 腕部路线：~ 展开、参数文件认得出、a1_wrist 模板立得住")
+
+    wrist_path = os.path.join(REPO, "config", "tasks", "a1_wrist.yaml")
+    task_wrist = board_run.load_task_file(wrist_path)
+    check("a1_wrist.yaml 读得进且零毛病",
+          board_run.validate_task(task_wrist.raw) == [],
+          str(board_run.validate_task(task_wrist.raw)))
+    check("  相机 TF 由仓库内发布器发 ⇒ launch 那份必须显式关掉"
+          "（两边都发 = camera_link 两个父节点）",
+          task_wrist.params.get("publish_camera_tf") == "false",
+          "publish_camera_tf=%r" % task_wrist.params.get("publish_camera_tf"))
+    check("  第一轮 carry_objects=false（先验感知，不夹持）",
+          task_wrist.params.get("carry_objects") == "false")
+    check("  参数文件指向腕部那份，而不是俯视的 realsense_camera.yaml",
+          "wrist" in task_wrist.params.get("realsense_params_file", ""),
+          task_wrist.params.get("realsense_params_file"))
+
+    pw, _sw, cw = board_run.resolve_launch_params(task_wrist, site)
+    check("★ `~` 在 P0 **展开成绝对路径**（launch_ros/rclpy 都不展开它；"
+          "不展开 = 文件打不开 ⇒ 驱动静默退回枚举第一台）",
+          pw.get("realsense_params_file")
+          == os.path.expanduser("~/.config/ur5-vision-grasp/wrist_camera.yaml"),
+          "得到 %r" % pw.get("realsense_params_file"))
+    check("  显式 `publish_camera_tf: false` **不会**被站点外参推导翻成 true",
+          pw.get("publish_camera_tf") == "false",
+          "得到 %r" % pw.get("publish_camera_tf"))
+    check("  与站点拼装零冲突", cw == [], str(cw))
+
+    def _cam_yaml(name, text):
+        path = os.path.join(tmpdir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    good = _cam_yaml("wrist_camera.yaml",
+                     '/**:\n  ros__parameters:\n    serial_no: "012345678901"\n')
+    st, det = board_run.judge_camera_params_file(good)
+    check("参数文件：serial_no 是带引号的字符串 ⇒ PASS", st == board_run.PASS, det)
+    check("  且**不打印** serial_no 的值（红线 3：序列号是设备身份）",
+          "012345678901" not in det, det)
+
+    miss = os.path.join(tmpdir, "nope", "wrist_camera.yaml")
+    st, det = board_run.judge_camera_params_file(miss)
+    check("参数文件不在 ⇒ FAIL（否则驱动静默认第一台）",
+          st == board_run.FAIL and "文件不在" in det, det)
+
+    ph = _cam_yaml("wrist_ph.yaml",
+                   '/**:\n  ros__parameters:\n    serial_no: "<wristcam-serial>"\n')
+    st, det = board_run.judge_camera_params_file(ph)
+    check("参数文件还是占位符 ⇒ FAIL 并点名", st == board_run.FAIL
+          and "占位符" in det, det)
+
+    noser = _cam_yaml("wrist_noser.yaml",
+                      '/**:\n  ros__parameters:\n    align_depth.enable: true\n')
+    st, det = board_run.judge_camera_params_file(noser)
+    check("参数文件没有 serial_no ⇒ FAIL（会按枚举顺序认相机）",
+          st == board_run.FAIL and "没有 serial_no" in det, det)
+
+    unq = _cam_yaml("wrist_unquoted.yaml",
+                    '/**:\n  ros__parameters:\n    serial_no: 036222071094\n')
+    st, det = board_run.judge_camera_params_file(unq)
+    check("serial_no 丢了引号（PyYAML 当字符串、rcl 当数字）⇒ FAIL，"
+          "**不改写成字符串**硬跑",
+          st == board_run.FAIL and "没带引号" in det, det)
+    check("  这条也不打印那个数（它正是序列号）", "036222071094" not in det, det)
 
 finally:
     shutil.rmtree(tmpdir, ignore_errors=True)

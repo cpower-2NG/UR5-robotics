@@ -1,28 +1,40 @@
 #!/bin/bash
-# 把手眼标定发成 TF：`tool0 → camera_color_optical_frame`。
+# 把手眼标定发成 TF：`tool0 → camera_link`（腕部相机的树与臂的树靠这一条接上）。
 #
-# ⚠️ 这条 TF 就是**腕部相机能不能用**的开关。没有它，相机那棵树和机械臂那棵树
-#    是**两棵断开的树**（`tf2_echo` 会报 "two or more unconnected trees"），
-#    相机看到的东西算出来的坐标落不进基座系，下游一步都走不了。
-#    它由 easy_handeye2 的 `handeye_publisher` 发，读的是
-#    `~/.ros2/easy_handeye2/calibrations/wrist_eih.calib` —— 2026-10-10 标定，
-#    算法 **Tsai-Lenz**（算法名**不进**存盘文件，所以记在这里）。
+# ✅ 2026-10-25 起**不再依赖** `~/handeye_ws/scripts/publish_on.sh` 与
+#    easy_handeye2 的 `handeye_publisher`：直接跑仓库内的
+#    `scripts/wrist_tf_publish.py`，标定值取自
+#    `docs/calib/wrist_eih_camlink-2026-10-24.json`（纯数字，无序列号）。
 #
-# ⚠️ **不要**改用 `calibrate.launch.py` 起服务端：它第 14-17 行会发一条拿
-#    `tracking_base_frame` 当子帧的**假 TF**，正好和这条打架。
+# ⚠️ 为什么是 `camera_link` 而不是 `camera_color_optical_frame`：
+#    RealSense 驱动自己会发 `camera_link → camera_color_optical_frame`。发到
+#    光学帧会让它**有两个父节点**，而且绕过驱动内部那一段平移（两块板的实测
+#    间距约 15 mm；俯视相机上它造成过 17.46 mm 的落地误差，见
+#    `docs/当前状态.md` §3）。
 #
-# ⚠️ `handeye_publisher` 只发**静态** TF（就一条），所以它是「起一次就不用管」的；
-#    但也正因为是静态的，标定文件**换了它不会自己重读** —— 重标之后必须重启它。
-source /opt/ros/humble/setup.bash
-source ~/handeye_ws/install/setup.bash
-export ROS_DOMAIN_ID=99
+# ⚠️ 标定文件是**派生量**（由 `wrist_eih.calib` 的 tool0→光学帧合成），
+#    不是一次独立标定。重标之后要重新生成这份 JSON，别只替换一半。
+#
+# ⚠️ 别同时起第二个发同一对帧的东西（`real.launch.py publish_camera_tf:=true`、
+#    easy_handeye2 的 `handeye_publisher`）—— `camera_link` 两个父节点，
+#    TF 树会时对时错。
+#
+# 用法（板上，仓库根目录）：
+#     ./docs/board/publish_on.sh                   # 发 TF，前台常驻
+#     python3 scripts/wrist_tf_publish.py --check  # 只验标定文件（不碰 ROS）
+#     python3 scripts/wrist_tf_publish.py --verify # 直查 TF，对不上就退 1
+set -euo pipefail
 
-CAL=~/.ros2/easy_handeye2/calibrations/wrist_eih.calib
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CAL="$REPO/docs/calib/wrist_eih_camlink-2026-10-24.json"
+
 if [ ! -f "$CAL" ]; then
     echo "❌ 标定文件不在：$CAL"
     echo "   ⇒ 别用默认值往下跑（那会发一条**错的** TF，而且不报错）。"
-    echo "     先确认标定做没做、文件名对不对。"
     exit 1
 fi
 
-exec ros2 launch easy_handeye2 publish.launch.py name:=wrist_eih
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-99}"
+
+exec python3 "$REPO/scripts/wrist_tf_publish.py" --calib "$CAL" "$@"

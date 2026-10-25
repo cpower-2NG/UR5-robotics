@@ -1,0 +1,55 @@
+# 腕部 RealSense D435i 的参数文件 —— **模板**。
+#
+# 与同目录 `realsense_camera.yaml`（俯视那份）是**两份**，不是一份的两个副本：
+# 腕部路线要显式把这一份传给 launch，理由见下面「为什么不能共用一份」。
+#
+# ⚠️ 仓库里这份是模板，`serial_no` 是占位符，**直接用会让你没有图像**（而且不报错）。
+#    先照「怎么填」做一份自己的，再上真机。
+#
+# ── 怎么填 ──────────────────────────────────────────────────────────────
+#   1. 放到本机未跟踪位置（序列号不进仓库）：
+#        mkdir -p ~/.config/ur5-vision-grasp
+#        cp <这个文件> ~/.config/ur5-vision-grasp/wrist_camera.yaml
+#        然后编辑它，把 serial_no 换成**腕部那台**的 SDK 号（引号要留着）
+#
+#   2. 起栈时显式指过去（二选一）：
+#        ros2 launch ... realsense_params_file:=$HOME/.config/ur5-vision-grasp/wrist_camera.yaml
+#      或写进任务描述 `config/tasks/a1_wrist.yaml` 的 `params.realsense_params_file`
+#      （`scripts/board_run.py` 会展开 `~`；**直接** `ros2 launch` 时请写 `$HOME`）
+#
+# 号从哪来：**看相机外壳标签上印的那个**，即 SDK 号，`serial_no` 认的就是它。
+# ⚠️ 别用 /sys/bus/usb/devices/*/serial 里的 ASIC 号 —— 用错**不报错退出**，
+#    而是驱动每 6 秒重试一次、永不退出 ⇒「进程都在、永远没有图像」。
+#    本机两台 D435i：腕部 `<wristcam-serial>`、俯视 `<topcam-serial>`。
+#    认相机只看外壳标签；两个号不是一回事（见 `docs/机械臂系统参考.md`）。
+#
+# ⚠️⚠️ 引号是**功能性的**：`serial_no: 0362…` 不带引号会被 rcl 的 C 版 YAML
+#     解析器读成数字（全 0-7 → 八进制 int；含 8/9 → double），节点报
+#     `invalid type` 并退出。完整推导见 `realsense_camera.yaml` 的文件头。
+#
+# ── 为什么不能共用一份 ────────────────────────────────────────────────
+# `pipeline.launch.py` 的默认解析顺序是「`UR5_REALSENSE_PARAMS` → 本机
+# `realsense_camera.yaml` → 包内 `realsense_camera.yaml`」。最后那份是**俯视**
+# 的模板；腕部路线若不给 `realsense_params_file`，驱动就会去开**俯视**那台
+# （插着两台时它还会按枚举顺序挑，**不报错**）。所以腕部路线**必须**显式传。
+#
+# ⚠️ 也不要用 `UR5_REALSENSE_PARAMS` 环境变量：它是全局的，会同时把俯视路线
+#    也指到腕部这台。腕部与俯视在同一台板上轮流用时，显式参数更不容易串。
+
+# 用 `/**` 而不是 `/camera/camera`：跟 launch 里改节点名走，不会静默失去作用。
+/**:
+  ros__parameters:
+    # ↓↓ 引号是功能性的，理由见文件头。换成腕部相机外壳标签上的号。 ↓↓
+    serial_no: "<wristcam-serial>"
+
+    # 开流前先复位相机。现场这份是 `true`（2026-10-07 俯视踩过「上一次不干净的
+    # kill 把相机留在卡住状态」——症状是 `Depth stream start failure`、
+    # 彩色正常、`/targets_3d` 恒空，换相机也一样，看起来像硬件坏了）。
+    initial_reset: true
+
+    # 深度对齐到彩色。**硬要求**：投影节点用彩色内参做针孔投影，不开它
+    # `/camera/aligned_depth_to_color/image_raw` 不存在（pipeline 的默认深度话题）。
+    align_depth.enable: true
+
+    # 抗闪烁。现场这份是 0（Disabled）；照抄现场值，不在仓库里另立一个结论。
+    rgb_camera.power_line_frequency: 0

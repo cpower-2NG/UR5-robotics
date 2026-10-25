@@ -6,6 +6,11 @@
 **来源**：2026-09-27 通过 `ssh jetson` **只读**取回（`scp`），内容未做任何修改。
 连接方式见 [`../JETSON_SSH.md`](../JETSON_SSH.md)。
 
+⚠️ **例外（2026-10-25）**：`camera_on.sh` 与 `publish_on.sh` 是后加的**腕部相机**
+脚本，不属那次留档。其中 `publish_on.sh` 已**重写**成调用仓库内的
+`scripts/wrist_tf_publish.py`（不再依赖 `~/handeye_ws`）——它是**在仓库里维护的**，
+不是板上下来的原样副本。
+
 ## 文件
 
 | 文件 | 是什么 | 要不要 sudo |
@@ -18,6 +23,8 @@
 | `arm-grow-root.sh` | 单独把根分区扩到整块 NVMe（清单 **B8**），含分区表备份与失败回滚 | **要** |
 | `机械臂板卡-体检与改造清单.md` | **母文档**（305 行）。上面几个脚本逐条对应它的 A/B/C/D 项；`arm-isolation-sudo.sh` 头部「体检清单 D4」指的就是它 | — |
 | `UR5接入方案.md` | UR5 真机接入方案：网络两种接法、板端要装什么、示教器侧做什么、联调顺序、**WSL2 侧 DDS 发现不到板子的坑** | — |
+| `camera_on.sh` | 起腕部 RealSense（`/wrist` 命名空间；标定会话用，参数文件在仓库外） | 不要 |
+| `publish_on.sh` | 发手眼静态 TF `tool0 → camera_link`（调用 `scripts/wrist_tf_publish.py`） | 不要 |
 
 ## ⚠️ 安全须知
 

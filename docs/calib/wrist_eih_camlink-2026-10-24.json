@@ -1,0 +1,25 @@
+{
+  "_comment": "腕部手眼标定（eye-in-hand）：tool0 -> camera_link。⚠️ 派生量，不是独立标定：由 wrist_eih.calib 的 tool0 -> camera_color_optical_frame 合成，见 source。它只含数字，不含序列号/主机名。",
+  "schema": "ur5-vision-grasp/static-tf/1",
+  "parent_frame": "tool0",
+  "child_frame": "camera_link",
+  "translation": {
+    "x": -0.01719532050638018,
+    "y": -0.08505261092609769,
+    "z": 0.024676314093344632
+  },
+  "rotation": {
+    "x": 0.49717858964140965,
+    "y": -0.4977730714841242,
+    "z": 0.5049210844151582,
+    "w": 0.5000901097007026
+  },
+  "source": {
+    "date": "2026-10-24",
+    "kind": "derived",
+    "derived_from": "wrist_eih.calib（tool0 -> camera_color_optical_frame，Tsai-Lenz）",
+    "method": "X_tool_link = X_tool_optical @ inv(T_camera_link_optical)",
+    "why": "腕部 RealSense 自己会发 camera_link -> camera_color_optical_frame。直接发 tool0 -> camera_color_optical_frame 会让光学帧有两个父节点，且绕过驱动内部那一段。",
+    "validated": "待板端验收：scripts/wrist_tf_publish.py --verify（逐项比对 tool0 -> camera_link，并确认 base_link -> camera_color_optical_frame 可达）"
+  }
+}
