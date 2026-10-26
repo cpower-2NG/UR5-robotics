@@ -37,4 +37,4 @@
 - 与迁移直接相关的是 `UR5接入方案.md` 与 `机械臂板卡-体检与改造清单.md` 的
   §3（UR5 接入）与 §5-C（逐项确认）。
 - 板子的版本事实（22.04 / Humble / aarch64）是**本项目全线用 Humble 的依据**，
-  见 [`../MIGRATION_HANDOFF.md`](../MIGRATION_HANDOFF.md) 与 [`../RESTRUCTURE_PLAN.md`](../RESTRUCTURE_PLAN.md) §3 P4。
+  见 [`../archive/MIGRATION_HANDOFF.md`](../MIGRATION_HANDOFF.md) 与 [`../RESTRUCTURE_PLAN.md`](../RESTRUCTURE_PLAN.md) §3 P4。

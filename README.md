@@ -47,7 +47,7 @@
 | Python | **3.10.21**，conda 环境 `robot-vision` | `~/robotics/venvs/robot-vision/bin/python --version` |
 | 关键包 | numpy 1.26.4 / torch 2.5.1+cu121 / ultralytics 8.3.99 | 该环境内 `python -c "import numpy,torch,ultralytics"` |
 
-> ⚠️ 本仓库的 `docs/TECHNICAL_SPEC.md` 写作时假定的是 **Jazzy / 24.04 / Python 3.12**，
+> ⚠️ 本仓库的 `docs/archive/TECHNICAL_SPEC.md`（已退役）写作时假定的是 **Jazzy / 24.04 / Python 3.12**，
 > 与上表**不符**。该文档顶部有完整对照表，请对照阅读。
 
 **两个解释器问题（必须理解，否则节点起不来）**：`ultralytics`/`torch` 装在 conda 环境里，
@@ -115,7 +115,7 @@ colcon build --packages-up-to gz_ros2_control
 
 ### 训练数据（方阵世界，可选）
 
-`docs/GRID_ENV_DESIGN.md` 的训练流水线（采集图 → 标注 → 训 YOLO）需要**没有机械臂**
+`docs/archive/GRID_ENV_DESIGN.md`（已退役，暂存档）的训练流水线（采集图 → 标注 → 训 YOLO）需要**没有机械臂**
 的方阵世界：
 
 ```bash
@@ -201,16 +201,18 @@ yolo_ros/
 │   └── yolo_bringup/      # 唯一入口 bringup + pipeline + 方阵世界
 ├── scripts/               # 自检、训练、数据合成脚本
 └── docs/
-    ├── RESTRUCTURE_PLAN.md   # ★ 缺陷台账 + 改造计划 + 验收证据（先读这个）
-    ├── 待执行命令.md         # ★ 要**你亲自执行**的命令 —— 只放「还没做的」，一屏
-    ├── 待执行命令-留档.md     # 上面那份的全部历史（甲-1…甲-33）+ 每条背后的论证
-    ├── TECHNICAL_SPEC.md     # 设计稿（含环境对照表，注意其前提已过时）
-    ├── GRID_ENV_DESIGN.md    # 方阵世界与训练流水线
-    ├── MIGRATION_HANDOFF.md  # Orin 迁移交接
-    ├── JETSON_SSH.md         # 板子 SSH 连接方式（含连接信息与字段说明）
-    ├── board/                # 板端资产留档：6 个 arm-*.sh + 体检清单 + UR5 接入方案
-    ├── YOLO_TUTORIAL.md, YOLO_VISION_DESIGN.md
-    └── reference/            # 外部参考项目（不入库）
+    ├── AGENTS.md             # ★ 项目核心约定（AI/新人先读）；仓库根 CLAUDE.md 指向它
+    ├── 当前状态.md            # ★ 唯一写「现在」的地方（开工先读）
+    ├── 待执行命令.md          # ★ 要**你亲自执行**的命令 —— 只放「还没做的」
+    ├── 事实源登记.md          # 某个会变的事实该信谁（一个事实一个家）
+    ├── 真机起栈runbook.md     # 真机启动序列的唯一权威
+    ├── 阶段/                  # 阶段梯子 + 各阶段契约/技术文档/实验记录（写完冻结）
+    ├── archive/              # 退役文档（设计稿/交接/教程；仍旧有效时才引用）
+    ├── 机械臂系统参考.md       # 硬件/网络/接口事实集中页
+    ├── 经验总结-问题模式与处置.md
+    ├── JETSON_SSH.md         # 板子 SSH 连接方式
+    ├── calib/ board/         # 标定与板端资产留档
+    └── 文档地图.md            # 全部文档的索引与旧名别名
 ```
 
 ---
@@ -575,16 +577,16 @@ python3 scripts/ag95_probe.py --port /dev/ttyTHS1 --slave 1 --watch   # 用手�
 ⚠️ 2026-09-27 在板子上实测过 `--frames` / `--list-ports`（能跑，且如实报「没有发现任何串口」，
 与 `lsusb` 无 USB-串口芯片一致）；**`--scan-slaves` / `--dump` / `--watch` 还没有真设备可验**。
 
-详见 [`docs/MIGRATION_HANDOFF.md`](docs/MIGRATION_HANDOFF.md) 与
-[`docs/RESTRUCTURE_PLAN.md`](docs/RESTRUCTURE_PLAN.md)（P4/P5 组）。
+详见 [`docs/archive/MIGRATION_HANDOFF.md`](docs/archive/MIGRATION_HANDOFF.md)（已退役）与
+[`docs/RESTRUCTURE_PLAN.md`](docs/RESTRUCTURE_PLAN.md)（**桩**：台账正身已移仓外，见该桩）。（P4/P5 组）
 
 ---
 
 ## 参考资料
 
-- [改造计划与缺陷台账](docs/RESTRUCTURE_PLAN.md) ← **先读这个**
-- [技术方案文档](docs/TECHNICAL_SPEC.md)（设计稿，注意顶部前提对照）
-- [方阵环境与训练流水线](docs/GRID_ENV_DESIGN.md)
+- [项目核心约定](AGENTS.md)（路由表在这）与[当前状态](docs/当前状态.md) ← **先读这两个**
+- [技术方案文档](docs/archive/TECHNICAL_SPEC.md)（已退役的设计稿，注意顶部前提对照）
+- [方阵环境与训练流水线](docs/archive/GRID_ENV_DESIGN.md)（已退役，暂存档）
 - [Gazebo Harmonic 文档](https://gazebosim.org/docs/harmonic)
 - [MoveIt2 文档](https://moveit.picknik.ai/)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/)

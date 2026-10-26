@@ -2,7 +2,7 @@
 
 用途
 ====
-给 `docs/GRID_ENV_DESIGN.md` 的**训练流水线**用——采集训练图 → 自动标注 →
+给 `docs/archive/GRID_ENV_DESIGN.md` 的**训练流水线**用——采集训练图 → 自动标注 →
 训练 YOLO。这条链只需要「相机画面」和「方块位姿」，不需要机械臂，所以本文件
 **刻意不起** UR5 / MoveIt / ros2_control（那些在 `arm_grasp_sim/sim.launch.py`）。
 

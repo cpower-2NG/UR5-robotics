@@ -26,7 +26,7 @@
   （每条含 ``id`` / ``hypothesis.class_id`` / ``hypothesis.score`` / 3D 位姿），
   规划器只消费它、**不再自己做任何投影**。
   ``/target_3d`` 保留为「最高分那个」，以免破坏既有测试与文档契约
-  （``scripts/test_pipeline_e2e.py``、``docs/TECHNICAL_SPEC.md``）。
+  （``scripts/test_pipeline_e2e.py``、``docs/archive/TECHNICAL_SPEC.md``）。
 
 输入约定（**依赖 yolo_detector 冻结的像素约定**，见 P2-5 / D7）:
   ``/detections`` 的 ``bbox`` 必须是**像素**坐标、原点在图像左上角；
