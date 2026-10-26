@@ -383,8 +383,11 @@ def main():
     ok_all = True
     closed_at = None       # 闭合后的回读，抬升后拿它比
     lifted_at = None
-    # 动臂之前先证明夹爪链路通（i0==0 = 从计划起点开始，指尖一定在巡检位悬空）
-    if args.go and i0 == 0 and not args.dry_run_gripper:
+    # 动臂之前先证明夹爪链路通（i0==0 = 从计划起点开始，指尖一定在巡检位悬空）。
+    # 只对**真的要用夹爪**的计划做：巡检计划没有夹爪动作，多一次全行程纯属噪声
+    # （2026-10-26 第一版就在 survey_pick 上也跑了一遍，多花 3 秒）。
+    needs_grip = any(w.get("before") or w.get("after") for w in plan["waypoints"])
+    if args.go and i0 == 0 and needs_grip and not args.dry_run_gripper:
         try:
             gripper_selftest()
         except ga.GripperActionError as exc:

@@ -244,6 +244,8 @@ def do_survey(args, board, state, which):
 
 def do_cycle(args, board, state):
     n = len(state["cycles"]) + 1
+    # 上一轮的红字不能挂在新一轮头上：人在场、改了东西、重新开一轮，就是新的判决。
+    state["stop_reason"] = None
     cdir = os.path.join(args.run_dir, "cycles", "%02d" % n)
     os.makedirs(cdir, exist_ok=True)
     os.makedirs(os.path.join(args.run_dir, "frames"), exist_ok=True)
