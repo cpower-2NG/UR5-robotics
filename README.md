@@ -529,6 +529,9 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 **外链（Google Drive，「知道链接者可查看」；2026-10-26 已下载逐字节核对）**：
 <https://drive.google.com/drive/folders/1tS_qhhTXuWsXZyb-3976I2oHSJJJ7Yru>
 
+> 约定（2026-10-26 起）：本项目的模型权重与其他重资产**都放在这个文件夹**；
+> 由于本仓公开并指向它，放进去即等同公开。
+
 | 文件 | 身份（sha256 / md5，前 8 位） | 是什么 |
 |---|---|---|
 | [block_best.pt](https://drive.google.com/uc?export=download&id=1jIv0I4sGhP5QL7LtIEqjsEqEMdW794AT) | `79403188` / `74bd8557`（2026-10-02 21:23 训练） | **现行**：真机数据集（6 排布 210 帧）训练，`names={0:'block'}`；A1/A3 检测用的就是它 |
