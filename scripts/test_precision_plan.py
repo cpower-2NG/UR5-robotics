@@ -341,6 +341,86 @@ def test_fingertip_guard_direct(chain):
     assert worst2[1] == "fingertip", "判红的应该是指尖，实际 %s" % (worst2[1],)
 
 
+# ---------------------------------------------------------------- 编排的日志拼接
+@case
+def test_split_exec_log_keeps_first_half():
+    """把一条计划切成两段跑时，本地日志必须留下**完整的一份**。
+
+    第二段跑完`板上`的 JSONL 是「第一段 + 第二段」。拉回来如果直接覆盖，
+    第一段的闭合/抬升回读就没了 —— 而滑移判据正是拿那两个数算的，
+    症状是「本轮 slipped=None」，看起来像没滑，实际是**没读到**。
+    所以这里同时钉住两件事：追加模式不能多也不能少，非追加模式必须覆盖。
+    """
+    import subprocess
+    import tempfile
+    import precision_round as pr
+
+    d = tempfile.mkdtemp()
+    local = os.path.join(d, "exec.jsonl")
+    remote = os.path.join(d, "remote.jsonl")
+    with open(local, "w") as f:
+        f.write("a\nb\n")                      # 第一段已经拉回来
+    with open(remote, "w") as f:
+        f.write("a\nb\nc\nd\n")                # 板上：第一段 + 第二段
+
+    b = pr.Board.__new__(pr.Board)             # 不走 __init__，不需要真的板子
+    b.alias = "board"
+    orig = pr.sh
+    pr.sh = lambda cmd, **kw: subprocess.run(["cp", remote, cmd[-1]], check=True)
+    try:
+        b._pull_log("remote.jsonl", local, append=True)
+        got = open(local).read()
+        assert got == "a\nb\nc\nd\n", "追加后应恰好多出二段两行，实际 %r" % got
+
+        with open(remote, "w") as f:
+            f.write("c\nd\n")                  # 新一轮：板上只有这一次的
+        b._pull_log("remote.jsonl", local, append=False)
+        got = open(local).read()
+        assert got == "c\nd\n", "非追加必须整体覆盖，实际 %r" % got
+    finally:
+        pr.sh = orig
+
+
+@case
+def test_split_run_command_shape():
+    """两段跑的命令行本身要写对 —— 写错了不是报错，是**臂会重跑一遍前段**。
+
+    危险具体在哪：第二段若漏了 ``--from``，执行器会从 approach 开始再来一次，
+    夹着块的爪会被重新下探到台面、重新闭合。所以这条测试钉住三件事：
+    第一段 ``--upto lift``、第二段 ``--from to_slot``、第二段**不**清板上日志。
+    """
+    import subprocess
+    import tempfile
+    import types
+    import precision_round as pr
+
+    d = tempfile.mkdtemp()
+    plan = os.path.join(d, "pick.json")
+    open(plan, "w").write("{}")
+    log = os.path.join(d, "exec.jsonl")
+
+    b = pr.Board.__new__(pr.Board)
+    b.alias = "board"
+    seen = []
+    orig_sh, orig_ssh = pr.sh, pr.Board.ssh
+    pr.sh = lambda cmd, **kw: subprocess.run(["true"], capture_output=True)
+    pr.Board.ssh = lambda self, cmd, **kw: (
+        seen.append(cmd),
+        types.SimpleNamespace(returncode=0, stdout=""))[1]
+    try:
+        b.exec_plan(plan, log, True, upto=pr.HELD_SPLIT_AFTER)
+        b.exec_plan(plan, log, True, from_=pr.HELD_SPLIT_NEXT, append=True)
+    finally:
+        pr.sh, pr.Board.ssh = orig_sh, orig_ssh
+
+    run = [c for c in seen if "precision_exec.py" in c]
+    assert len(run) == 2, "应有两次执行，实际 %r" % (seen,)
+    assert "--upto lift" in run[0], "第一段没在 lift 停：%r" % run[0]
+    assert "--from to_slot" in run[1], "第二段没从 to_slot 接上：%r" % run[1]
+    assert "rm -f" in seen[0], "第一段必须清板上日志，否则混进上一轮的"
+    assert "rm -f" not in seen[1], "第二段不能清板上日志 —— 会把第一段的回读删掉"
+
+
 # ---------------------------------------------------------------- runner
 def main():
     urdf = find_urdf()

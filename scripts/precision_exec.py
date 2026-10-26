@@ -70,6 +70,9 @@ def main():
     ap.add_argument("--check", action="store_true", help="只查闸门，不发轨迹")
     ap.add_argument("--only", default=None, help="只跑这一条航点")
     ap.add_argument("--upto", default=None, help="跑到这一条为止（含）")
+    ap.add_argument("--from", dest="from_", default=None,
+                    help="从这一条开始跑（含）。配合 --upto 可把一段循环切开，"
+                         "中间插一次抓帧（例如抓住块之后、放下之前看它夹在哪）")
     ap.add_argument("--settle", type=float, default=1.5, help="每条轨迹完成后再等几秒")
     ap.add_argument("--log", default=None,
                     help="JSONL 日志路径（默认：计划同目录、同名的 .jsonl）")
@@ -97,6 +100,16 @@ def main():
         order = names[:names.index(args.upto) + 1]
     else:
         order = names
+    if args.from_:
+        if args.from_ not in names:
+            print("!! 计划里没有航点 %r（有 %s）" % (args.from_, names))
+            return 2
+        j = names.index(args.from_)
+        order = [n for n in order if names.index(n) >= j]
+        if not order:
+            print("!! --from %s 在 --upto %s 之后，没有航点可跑"
+                  % (args.from_, args.upto))
+            return 2
     wr = {w["name"]: w for w in plan["waypoints"]}
     meta = plan.get("meta", {})
     log_path = args.log or os.path.splitext(args.plan)[0] + ".jsonl"

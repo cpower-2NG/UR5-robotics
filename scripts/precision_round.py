@@ -13,6 +13,10 @@
           → place_approach → place(张开) → retreat → [巡检位 place]
         → 抓帧 → 量放置误差
 
+加 `--held-capture` 时执行被切成两段：跑到 lift 停住、抓一帧（块还夹在爪里）、
+再从 to_slot 接着跑。这一帧是给 `measure_held.py` 用的 —— 分开「抓的时候就没抓正」
+与「抓完到放下之间滑了」，见该文件的说明。
+
 `--go` 之前的每一步都是只读的。**执行一次也不自动重试**：任何一条判红就停在原地，
 把失败航点与日志留给现场判断。
 
@@ -67,6 +71,10 @@ exec python3 "$@"
 # 板上 yaml 写的 pick_zone 是 y≥0.00 —— 那段相机根本看不见，照抄就会悄悄漏块。
 PICK_ZONE = (0.38, 0.62, 0.25, 0.45)     # x_min, x_max, y_min, y_max（米）
 MAX_CAND_MM = 12.0
+# --held-capture 把计划切成两段跑：第一段到 lift 停住（块已夹在爪里、臂静止），
+# 抓一帧，再从 to_slot 接着跑。名字取自 precision_plan.build_pick 的航点表。
+HELD_SPLIT_AFTER = "lift"
+HELD_SPLIT_NEXT = "to_slot"
 
 
 def sh(cmd, quiet=False, check=True):
@@ -138,26 +146,55 @@ class Board:
         if miss:
             raise SystemExit("拉回来的帧缺 %s" % miss)
 
-    def exec_plan(self, plan_local, log_local, go, upto=None):
+    def exec_plan(self, plan_local, log_local, go, upto=None, from_=None,
+                  append=False):
+        """跑一份计划。``upto``/``from_`` 把一条计划切成两段跑（例如抓住块之后
+        停一下抓帧看它夹在哪，再继续去槽位）。
+
+        ``append=True`` 表示「这是同一份计划的第二段」：板上 JSONL 不清空，
+        拉回来时只取本地还没有的那些行 —— 两段合起来仍是一份完整日志，
+        否则第二段会把第一段的闭合/抬升回读覆盖掉，滑移判据就没了。
+        """
         name = os.path.basename(plan_local)
         remote_plan = "%s/plans/%s" % (BOARD_DIR, name)
         sh(["scp", "-q", plan_local, "%s:%s" % (self.alias, remote_plan)], quiet=True)
         args = "--plan %s" % remote_plan
         if upto:
             args += " --upto %s" % upto
+        if from_:
+            args += " --from %s" % from_
         args += " --go" if go else " --list"
         # 执行器的 JSONL 写在计划旁边；拉回来另存一份到 cycles/NN/
         remote_log = os.path.splitext(remote_plan)[0] + ".jsonl"
-        self.ssh("rm -f %s" % remote_log, quiet=True)
+        if not append:
+            self.ssh("rm -f %s" % remote_log, quiet=True)
         r = self.ssh("%s/run.sh %s/precision_exec.py %s" % (BOARD_DIR, BOARD_DIR, args),
                      check=False)
-        if os.path.exists(log_local):
-            os.remove(log_local)
         # --list 预演时执行器根本不写日志，没有可拉的东西 —— 别报成"!!"让人以为坏了
         if go:
-            sh(["scp", "-q", "%s:%s" % (self.alias, remote_log), log_local],
-               quiet=True, check=False)
+            self._pull_log(remote_log, log_local, append)
         return r.returncode
+
+    def _pull_log(self, remote_log, log_local, append):
+        if append and os.path.exists(log_local):
+            tmp = log_local + ".part"
+            sh(["scp", "-q", "%s:%s" % (self.alias, remote_log), tmp],
+               quiet=True, check=False)
+            if not os.path.exists(tmp):
+                return
+            with open(tmp, encoding="utf-8") as f:
+                new = f.readlines()
+            os.remove(tmp)
+            with open(log_local, encoding="utf-8") as f:
+                have = len(f.readlines())
+            if len(new) > have:                  # 远端是「第一段 + 第二段」
+                with open(log_local, "a", encoding="utf-8") as f:
+                    f.writelines(new[have:])
+            return
+        if os.path.exists(log_local):
+            os.remove(log_local)
+        sh(["scp", "-q", "%s:%s" % (self.alias, remote_log), log_local],
+           quiet=True, check=False)
 
 
 # ---------------------------------------------------------------- 场景与状态
@@ -344,7 +381,39 @@ def do_cycle(args, board, state):
 
     # 6) 执行（--go 才真动）
     log = os.path.join(cdir, "exec.jsonl")
-    rc = board.exec_plan(plan, log, args.go)
+    if args.go and args.held_capture:
+        # 切两段跑：到 lift 停住、在**块还夹在爪里**的时候抓一帧。
+        # 为什么值得多花一帧：放置偏 9.7 mm 有两个来路 —— 抓的时候就没抓正，
+        # 或者抓正了但在途中/放下时滑了。只有「夹着的时候看一次」能分开它们。
+        rc = board.exec_plan(plan, log, True, upto=HELD_SPLIT_AFTER)
+        rec["exec_rc_first"] = rc
+        if rc == 0:
+            hdir = os.path.join(args.run_dir, "frames", "held-%02d" % n)
+            try:
+                board.capture(hdir, "held-%02d" % n)
+                rec["held_frame"] = os.path.relpath(hdir, args.run_dir)
+            except Exception as exc:                          # noqa: BLE001
+                # 抓帧失败时**不能**顺势往下放：臂停在 lift、块夹在爪里，
+                # 这时该由现场决定是接着放还是先别动。报告里别把它记成
+                # 「执行判红」—— 轨迹本身是好的。
+                print("\n!! 夹持帧没抓到：%s" % exc)
+                print("   臂现在停在 lift，块还夹在爪里，**它不会自己动**。")
+                print("   要接着放，跑这条（板上的计划已经在）：")
+                print("   %s '~/precision/run.sh ~/precision/precision_exec.py "
+                      "--plan ~/precision/plans/%s --from %s --go'"
+                      % (args.board, os.path.basename(plan), HELD_SPLIT_NEXT))
+                state["stop_reason"] = "夹持帧没抓到，块还夹在爪里（先跑 loop 的第二步）"
+                rec["exec_rc"] = 4
+                rec["exec_log"] = (os.path.relpath(log, args.run_dir)
+                                   if os.path.exists(log) else None)
+                rec["held_capture_failed"] = str(exc)
+                state["cycles"].append(rec)
+                save_state(args.state, state)
+                return 4
+            rc = board.exec_plan(plan, log, True, from_=HELD_SPLIT_NEXT,
+                                 append=True)
+    else:
+        rc = board.exec_plan(plan, log, args.go)
     rec["exec_rc"] = rc
     rec["exec_log"] = os.path.relpath(log, args.run_dir) if os.path.exists(log) else None
 
@@ -378,6 +447,25 @@ def do_cycle(args, board, state):
     rec["placed_class_colour"] = (slot_rec or {}).get("block", {}).get("class") \
         if slot_rec and slot_rec["block"] else None
 
+    # 7b) 夹持帧：块**被抓着的时候**离 tool0 轴多远。和上面的放置偏一起看，
+    # 才能分开「抓的时候就没抓正」与「抓完到放下之间滑了」。
+    if rec.get("held_frame"):
+        try:
+            from measure_held import measure as measure_held_frame
+            hv = measure_held_frame(os.path.join(args.run_dir, rec["held_frame"]),
+                                    args.urdf, cls, plan, verbose=False)
+            rec["held"] = hv
+            print("  夹持帧：块心相对 tool0 (dx, dy) = (%+.1f, %+.1f) mm%s"
+                  % (hv["block_in_tool_mm"][0], hv["block_in_tool_mm"][1],
+                     "" if "vs_plan_xy_mm" not in hv
+                     else "；计划要求 (%+.1f, %+.1f)，超出 |%.1f| mm"
+                     % (hv["plan_expected_xy_mm"][0], hv["plan_expected_xy_mm"][1],
+                        hv["vs_plan_norm_mm"])))
+        except Exception as exc:                              # noqa: BLE001
+            rec["held_error"] = "%s: %s" % (type(exc).__name__, exc)
+            print("  !! 夹持帧量不出来：%s（帧仍在 %s）"
+                  % (rec["held_error"], rec["held_frame"]))
+
     from precision_verify import summarize_exec_log
     ls = summarize_exec_log(log)
     rec.update(close_mm=ls["close_mm"], lift_mm=ls["lift_mm"], slipped=ls["slipped"])
@@ -399,6 +487,10 @@ def do_cycle(args, board, state):
     print("\n循环 %d：%s %s → 槽 %d，候选偏 %.1f mm，放置偏 %s mm，闭合回读 %s mm"
           % (n, cls, rec["block_xy_mm"], slot_idx, rec["cand_dist_mm"],
              rec["place_dist_mm"], rec["close_mm"]))
+    if rec.get("held"):
+        h = rec["held"]["block_in_tool_mm"]
+        print("        夹持时块心相对 tool0 (%+.1f, %+.1f) mm —— "
+              "这一项在放置之前就量到了" % (h[0], h[1]))
     return 0 if rec["ok"] else 1
 
 
@@ -416,6 +508,9 @@ def main():
     ap.add_argument("--cycle", action="store_true")
     ap.add_argument("--frame-dir", default=None,
                     help="复用已抓的帧目录（执行的就是预览过的那份计划）")
+    ap.add_argument("--held-capture", action="store_true",
+                    help="在 lift 停一下抓帧（块还夹在爪里），再接着去槽位；"
+                         "用来分开「抓的时候就没抓正」与「途中滑了」")
     args = ap.parse_args()
 
     os.makedirs(args.run_dir, exist_ok=True)
