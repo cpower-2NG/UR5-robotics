@@ -138,8 +138,18 @@ def summarize_exec_log(path):
                     recs.append(json.loads(line))
                 except ValueError:
                     pass
-    traj = [r for r in recs if r.get("event") == "traj"]
-    gates = [r for r in recs if r.get("event") == "gate"]
+    # 被拒的闸门之后**又跑过轨迹** ⇒ 那是另起了一段（人工 --resume 续跑）。
+    # 前一段那次拒绝是历史，不该把这一轮判成「闸门没过」—— 块其实已经放好了。
+    # 反过来，被拒的闸门之后什么都没有（正常在闸门处停住），就照常判红。
+    cut = 0
+    for i, r in enumerate(recs):
+        if r.get("event") == "gate" and not r.get("ok"):
+            if any(x.get("event") == "traj" for x in recs[i + 1:]):
+                cut = i + 1
+    # 只有闸门/轨迹按段切；夹爪回读与 grasp_check 是**整轮的证据**（闭合、抬升
+    # 都在第一段里），切掉就拿不到 close_mm / lift_mm 了。
+    traj = [r for r in recs[cut:] if r.get("event") == "traj"]
+    gates = [r for r in recs[cut:] if r.get("event") == "gate"]
     grips = [r for r in recs if r.get("event") == "gripper"]
     arrive = [r for r in recs if r.get("event") == "arrive"]
     check = next((r for r in recs if r.get("event") == "grasp_check"), None)

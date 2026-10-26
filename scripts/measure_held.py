@@ -15,7 +15,16 @@
     偏移 ≈ 计划值     ⇒ 抓的时候是正的，问题在抓之后（B）
     偏移比计划大得多 ⇒ 抓的时候就没抓正（A）
 
-`precision_round.py --held-capture` 会在这个时刻自动抓一帧（`frames/held-NN`）。
+**这个量法在腕部相机上已经不成立了**（2026-10-26 实测，第 5 个循环）：腕部相机装在
+tool0 侧面 —— 比 tool0 低 24.2 mm、横偏 91 mm，光轴竖直朝下。夹着块的时候，块顶面在
+tool0 下方 185.7 mm（= 裸指尖 204.2 − 抓深 18.5），于是它离相机只有约 161 mm 竖直、
+91 mm 横偏，**29° 偏轴、落到画面下边框之外**（把预期块心投到图像上是 (831, 840)，
+而图只有 1280×720）。实测 `frames/held-05`：全帧最近的一个深度点也有 327 mm，
+彩色图里只有台面 —— 夹爪和块一个像素都不在。这不是参数没调好，是**刚体关系**：
+抓着块时块相对相机的位姿永远不变，换哪个位姿都一样。
+
+所以 `precision_round.py` 的 `--held-capture` 现在会直接拒绝执行。要分开 A/B 只能
+换一个看得见夹爪的视角（例如俯视相机在臂把块举高时抓一帧），不要再往腕部相机上试。
 
 量法
 ----
@@ -103,7 +112,7 @@ def measure(frame_dir, urdf, want_class=None, plan_path=None, verbose=True):
     idx, _ = class_of_hue_vec(hsv_pt[0], names)
     base_mask = usable & high
     if base_mask.sum() < 200:
-        raise SystemExit("台面上方 %.0f mm 以上几乎没有彩色点（%d 个）—— "
+        raise RuntimeError("台面上方 %.0f mm 以上几乎没有彩色点（%d 个）—— "
                          "臂真的停在 lift 吗？"
                          % (HIGH_ABOVE_TABLE * 1000, int(base_mask.sum())))
 
@@ -114,10 +123,10 @@ def measure(frame_dir, urdf, want_class=None, plan_path=None, verbose=True):
             w[i] = hsv_pt[1][base_mask & (idx == i)].sum()
         want_class = names[int(w.argmax())]
     if want_class not in names:
-        raise SystemExit("类别 %r 不在表里（有 %s）" % (want_class, names))
+        raise RuntimeError("类别 %r 不在表里（有 %s）" % (want_class, names))
     sel = base_mask & (idx == names.index(want_class))
     if sel.sum() < 200:
-        raise SystemExit("高位点上没有 %s 的点（%d 个）—— 夹的是这一块吗？"
+        raise RuntimeError("高位点上没有 %s 的点（%d 个）—— 夹的是这一块吗？"
                          % (want_class, int(sel.sum())))
 
     Q = Pb[sel]
@@ -129,7 +138,7 @@ def measure(frame_dir, urdf, want_class=None, plan_path=None, verbose=True):
 
     T = tool0_pose(frame, urdf)
     if T is None:
-        raise SystemExit("帧里没有 joint_states.json —— 算不出 tool0")
+        raise RuntimeError("帧里没有 joint_states.json —— 算不出 tool0")
     Rt, tt = T[:3, :3], T[:3, 3]
     # 横向偏移投影到 tool0 系（此刻 tool0 竖直朝下 ⇒ 与 base 的 xy 同向，
     # 所以这组数可以直接和放置帧的 dx/dy 相减）。
@@ -209,7 +218,14 @@ def main():
     ap.add_argument("--plan", default=None, help="计划 JSON（比对计划要求的偏移）")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
-    out = measure(args.frame, args.urdf, args.cls, args.plan)
+    # measure() 抛 RuntimeError 而不是 SystemExit：它是被 precision_round 当库调用的，
+    # SystemExit 不属于 Exception，会**穿过**那边的 except Exception 把整轮编排打死
+    # （2026-10-26 第 5 个循环正是这么丢掉了 place_measure 之后的收尾）。
+    try:
+        out = measure(args.frame, args.urdf, args.cls, args.plan)
+    except RuntimeError as exc:
+        print("!! %s" % exc)
+        return 1
     if args.json:
         json.dump(out, open(args.json, "w"), ensure_ascii=False, indent=1)
         print("  → %s" % args.json)

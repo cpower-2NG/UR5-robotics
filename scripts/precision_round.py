@@ -14,8 +14,14 @@
         → 抓帧 → 量放置误差
 
 加 `--held-capture` 时执行被切成两段：跑到 lift 停住、抓一帧（块还夹在爪里）、
-再从 to_slot 接着跑。这一帧是给 `measure_held.py` 用的 —— 分开「抓的时候就没抓正」
-与「抓完到放下之间滑了」，见该文件的说明。
+再从下一条航点接着跑。这一帧本来要给 `measure_held.py` 用 —— 分开「抓的时候就没抓正」
+与「抓完到放下之间滑了」。**2026-10-26 实测这条路走不通**：腕部相机偏 tool0 侧面
+91 mm、低 24.2 mm、光轴竖直，夹着的块离它只有约 161 mm 竖直，29° 偏轴、落在画面外
+（见 `measure_held.py` 的说明）。所以这个开关现在**直接拒绝**，不再白跑一段动作。
+
+`--resume` 是通用的续跑：从本地执行日志里最后一个「到位」的航点之后接着跑；
+`--finish` 是只读收尾：不动机器人，只补抓放置巡检帧、量误差、写 state ——
+收尾崩了（比如上一次是量夹持帧把进程打死）用它对账，不用重跑一轮。
 
 `--go` 之前的每一步都是只读的。**执行一次也不自动重试**：任何一条判红就停在原地，
 把失败航点与日志留给现场判断。
@@ -71,10 +77,9 @@ exec python3 "$@"
 # 板上 yaml 写的 pick_zone 是 y≥0.00 —— 那段相机根本看不见，照抄就会悄悄漏块。
 PICK_ZONE = (0.38, 0.62, 0.25, 0.45)     # x_min, x_max, y_min, y_max（米）
 MAX_CAND_MM = 12.0
-# --held-capture 把计划切成两段跑：第一段到 lift 停住（块已夹在爪里、臂静止），
-# 抓一帧，再从 to_slot 接着跑。名字取自 precision_plan.build_pick 的航点表。
-HELD_SPLIT_AFTER = "lift"
-HELD_SPLIT_NEXT = "to_slot"
+# 夹持帧（在 lift 停一下抓一帧）**作废**：腕部相机看不到夹着的块，理由与实测见
+# `measure_held.py` 文件头。留着常量只为了让 --held-capture 的拒绝信息能引用它。
+HELD_CAPTURE_WAYPOINT = "lift"
 
 
 def sh(cmd, quiet=False, check=True):
@@ -147,13 +152,15 @@ class Board:
             raise SystemExit("拉回来的帧缺 %s" % miss)
 
     def exec_plan(self, plan_local, log_local, go, upto=None, from_=None,
-                  append=False):
+                  append=False, reset_remote=False):
         """跑一份计划。``upto``/``from_`` 把一条计划切成两段跑（例如抓住块之后
         停一下抓帧看它夹在哪，再继续去槽位）。
 
         ``append=True`` 表示「这是同一份计划的第二段」：板上 JSONL 不清空，
         拉回来时只取本地还没有的那些行 —— 两段合起来仍是一份完整日志，
         否则第二段会把第一段的闭合/抬升回读覆盖掉，滑移判据就没了。
+        ``reset_remote=True`` 只在**续跑**时用：板上的日志里有上一次被闸门
+        拒绝的那几行（一条轨迹都没发），留着会把整轮判成「闸门没过」。
         """
         name = os.path.basename(plan_local)
         remote_plan = "%s/plans/%s" % (BOARD_DIR, name)
@@ -166,16 +173,17 @@ class Board:
         args += " --go" if go else " --list"
         # 执行器的 JSONL 写在计划旁边；拉回来另存一份到 cycles/NN/
         remote_log = os.path.splitext(remote_plan)[0] + ".jsonl"
-        if not append:
+        if not append or reset_remote:
             self.ssh("rm -f %s" % remote_log, quiet=True)
         r = self.ssh("%s/run.sh %s/precision_exec.py %s" % (BOARD_DIR, BOARD_DIR, args),
                      check=False)
         # --list 预演时执行器根本不写日志，没有可拉的东西 —— 别报成"!!"让人以为坏了
         if go:
-            self._pull_log(remote_log, log_local, append)
+            self._pull_log(remote_log, log_local, append,
+                           remote_has_prefix=not reset_remote)
         return r.returncode
 
-    def _pull_log(self, remote_log, log_local, append):
+    def _pull_log(self, remote_log, log_local, append, remote_has_prefix=True):
         if append and os.path.exists(log_local):
             tmp = log_local + ".part"
             sh(["scp", "-q", "%s:%s" % (self.alias, remote_log), tmp],
@@ -187,9 +195,13 @@ class Board:
             os.remove(tmp)
             with open(log_local, encoding="utf-8") as f:
                 have = len(f.readlines())
-            if len(new) > have:                  # 远端是「第一段 + 第二段」
+            # remote_has_prefix: 板上是「第一段 + 第二段」，只取本地没有的那截；
+            # 续跑时板上被清过，只有第二段的行 —— 那就要**全部**追加，
+            # 按 have 去切会把第二段自己的前 have 行扔掉。
+            tail = new[have:] if remote_has_prefix else new
+            if tail:
                 with open(log_local, "a", encoding="utf-8") as f:
-                    f.writelines(new[have:])
+                    f.writelines(tail)
             return
         if os.path.exists(log_local):
             os.remove(log_local)
@@ -277,6 +289,24 @@ def do_survey(args, board, state, which):
     state["pose"] = "survey_" + which if (args.go and rc == 0) else state.get("pose")
     save_state(args.state, state)
     return rc
+
+
+def next_waypoint(plan, after):
+    """计划里 ``after`` 之后的**那一条**航点。
+
+    必须从计划里读，不能把名字写死：`precision_plan.split_jumps` 会在关节跳变
+    超过 1 rad 时插中间点（这一轮就插出了 `to_slot_split1`）。
+    2026-10-26 第 5 轮把名字写死成 `to_slot`，第二段因此**跳过了**那个插入点，
+    闸门基准对不上（34.08°）被拒 —— 拒是对的，但一轮抓放白停了：臂现在夹着块
+    悬在 lift。
+    """
+    names = [w["name"] for w in plan["waypoints"]]
+    if after not in names:
+        raise SystemExit("计划里没有航点 %r（有 %s）" % (after, names))
+    i = names.index(after) + 1
+    if i >= len(names):
+        raise SystemExit("%r 已是最后一条航点，后面没有可跑的" % after)
+    return names[i]
 
 
 def do_cycle(args, board, state):
@@ -381,39 +411,7 @@ def do_cycle(args, board, state):
 
     # 6) 执行（--go 才真动）
     log = os.path.join(cdir, "exec.jsonl")
-    if args.go and args.held_capture:
-        # 切两段跑：到 lift 停住、在**块还夹在爪里**的时候抓一帧。
-        # 为什么值得多花一帧：放置偏 9.7 mm 有两个来路 —— 抓的时候就没抓正，
-        # 或者抓正了但在途中/放下时滑了。只有「夹着的时候看一次」能分开它们。
-        rc = board.exec_plan(plan, log, True, upto=HELD_SPLIT_AFTER)
-        rec["exec_rc_first"] = rc
-        if rc == 0:
-            hdir = os.path.join(args.run_dir, "frames", "held-%02d" % n)
-            try:
-                board.capture(hdir, "held-%02d" % n)
-                rec["held_frame"] = os.path.relpath(hdir, args.run_dir)
-            except Exception as exc:                          # noqa: BLE001
-                # 抓帧失败时**不能**顺势往下放：臂停在 lift、块夹在爪里，
-                # 这时该由现场决定是接着放还是先别动。报告里别把它记成
-                # 「执行判红」—— 轨迹本身是好的。
-                print("\n!! 夹持帧没抓到：%s" % exc)
-                print("   臂现在停在 lift，块还夹在爪里，**它不会自己动**。")
-                print("   要接着放，跑这条（板上的计划已经在）：")
-                print("   %s '~/precision/run.sh ~/precision/precision_exec.py "
-                      "--plan ~/precision/plans/%s --from %s --go'"
-                      % (args.board, os.path.basename(plan), HELD_SPLIT_NEXT))
-                state["stop_reason"] = "夹持帧没抓到，块还夹在爪里（先跑 loop 的第二步）"
-                rec["exec_rc"] = 4
-                rec["exec_log"] = (os.path.relpath(log, args.run_dir)
-                                   if os.path.exists(log) else None)
-                rec["held_capture_failed"] = str(exc)
-                state["cycles"].append(rec)
-                save_state(args.state, state)
-                return 4
-            rc = board.exec_plan(plan, log, True, from_=HELD_SPLIT_NEXT,
-                                 append=True)
-    else:
-        rc = board.exec_plan(plan, log, args.go)
+    rc = board.exec_plan(plan, log, args.go)
     rec["exec_rc"] = rc
     rec["exec_log"] = os.path.relpath(log, args.run_dir) if os.path.exists(log) else None
 
@@ -431,10 +429,144 @@ def do_cycle(args, board, state):
         print("\n!! 执行判红：%s" % state["stop_reason"])
         return rc
 
+    return finish_after_exec(args, board, state, rec, cdir, plan, log, n,
+                             slot_idx, cls)
+
+
+def last_arrived(log_local):
+    """本地执行日志里**最后一个「到位」的航点**；没有就返回 None。
+
+    续跑要从这里读，不能写死航点名：计划会插中间航点（`to_slot_split1`），
+    写死 `to_slot` 会在闸门那里被判 34° 偏差（2026-10-26 第 5 轮）。
+    `arrive` 事件带航点名，是最权威的「臂真的到了」的记录 —— `traj ok` 只说明
+    控制器收下了轨迹，`arrive` 才是实测到位。
+    """
+    last = None
+    if log_local and os.path.exists(log_local):
+        for line in open(log_local):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:          # 半截行（scp 中途断掉）不算
+                continue
+            if r.get("event") == "arrive" and r.get("waypoint"):
+                last = r["waypoint"]
+    return last
+
+
+def do_resume(args, board, state):
+    """把最后一个循环从「最后一条到位的航点」之后接着跑完。
+
+    什么时候用：一段轨迹没跑成/被打断，臂停在某个航点（例如夹着块停在 lift）。
+    这时**不能**重跑整个循环 —— 那会把夹着块的手重新下探到台面。
+
+    板上的日志会先清掉：里面留着上一次被拒的那几行，会把这轮判成「闸门没过」。
+    前一段的记录已经在本地 `cycles/NN/exec.jsonl` 里了，不会丢。
+    """
+    if not state["cycles"]:
+        print("!! round.json 里没有可续跑的循环")
+        return 2
+    rec = state["cycles"].pop()          # 先摘下来，跑完由 finish_after_exec 放回
+    old_rc = rec.get("exec_rc")          # 上一次的判决 —— 预演时原样放回，别抹掉
+    n = rec["n"]
+    cdir = os.path.join(args.run_dir, "cycles", "%02d" % n)
+    plan = os.path.join(args.run_dir, rec["plan"])
+    log = os.path.join(cdir, "exec.jsonl")
+    done = last_arrived(log)
+    if done is None:
+        print("!! %s 里没有「到位」的航点 —— 不知道臂停在哪，不能瞎续" % log)
+        state["cycles"].append(rec)
+        return 2
+    nxt = next_waypoint(json.load(open(plan)), done)
+    rec["resumed_from"] = nxt
+    print("续跑循环 %d：最后一个到位的是 %s，接着跑 %s（块 %s，槽 %s）"
+          % (n, done, nxt, rec.get("class"), rec.get("slot_idx")))
+    rc = board.exec_plan(plan, log, args.go, from_=nxt, append=True,
+                         reset_remote=True)
+    rec["exec_rc_resume"] = rc
+    if not args.go:
+        rec["exec_rc"] = old_rc
+        state["cycles"].append(rec)
+        save_state(args.state, state)
+        print("\n⇒ 预演：一条轨迹都没发。真动加 --go。")
+        return 0
+    if rc != 0:
+        rec["exec_rc"] = rc
+        state["stop_reason"] = "续跑判红（rc=%d，块可能还夹在爪里）" % rc
+        state["cycles"].append(rec)
+        save_state(args.state, state)
+        print("\n!! 续跑判红：%s" % state["stop_reason"])
+        return rc
+    rec["exec_rc"] = 0
+    state["stop_reason"] = None          # 上一次的红字不算在这一轮头上
+    return finish_after_exec(args, board, state, rec, cdir, plan, log, n,
+                             rec["slot_idx"], rec["class"])
+
+
+def check_survey_pose(pdir, plan_path, urdf, tol_deg=2.0):
+    """放置巡检帧必须抓在计划的 `survey_place` 位姿上。
+
+    `--finish` 是人工触发的只读收尾：臂要是停在别处（比如中途停下的 lift），
+    帧里的块和槽位就不在同一套坐标里，量出来的「放置偏」是假的 —— 宁可不写数。
+    """
+    wr = next((w for w in json.load(open(plan_path))["waypoints"]
+               if w["name"] == "survey_place"), None)
+    if wr is None:
+        return None
+    js = json.load(open(os.path.join(pdir, "joint_states.json")))
+    have = dict(zip(js["name"], js["position"]))
+    import urkin
+    names = urkin.Chain(urdf).move_joints
+    dev = max(abs(np.degrees(have[k] - w)) for k, w in zip(names, wr["q"]))
+    if dev > tol_deg:
+        raise SystemExit(
+            "放置巡检帧不是在 survey_place 上抓的（最大差 %.1f°）—— 帧里没有"
+            "这一轮的落点。先把臂开回巡检位，再跑 --finish。" % dev)
+    return dev
+
+
+def do_finish(args, board, state):
+    """只读收尾：**不动机器人**，只补抓放置巡检帧 + 量误差 + 写 state。
+
+    什么时候用：收尾那一段崩了。2026-10-26 第 5 个循环就是这样 ——
+    `measure_held` 抛的是 SystemExit，不属于 Exception，穿过 `except Exception`
+    把进程打死：放置帧抓到了、`place_measure.json` 也写了，但 round.json 没更新，
+    这一轮仍记成「执行判红」。当时臂正好停在 survey_place，重跑收尾就能对上账。
+    """
+    if not state["cycles"]:
+        print("!! round.json 里没有循环")
+        return 2
+    if not args.urdf:
+        raise SystemExit("--finish 要 --urdf（要核对巡检位姿、算 tool0）")
+    rec = state["cycles"].pop()          # 跑完由 finish_after_exec 放回
+    n = rec["n"]
+    cdir = os.path.join(args.run_dir, "cycles", "%02d" % n)
+    plan = os.path.join(args.run_dir, rec["plan"])
+    log = os.path.join(cdir, "exec.jsonl")
+    print("收尾循环 %d：只抓巡检帧 + 量误差，**一条轨迹都不发**" % n)
+    # 上一次的红字说的是「那一段没跑成」；那一段后来续跑成功了，红字就该下账。
+    # 这一轮要是真判红，finish_after_exec 会重新写一条。
+    state["stop_reason"] = None
+    return finish_after_exec(args, board, state, rec, cdir, plan, log, n,
+                             rec["slot_idx"], rec["class"])
+
+
+def finish_after_exec(args, board, state, rec, cdir, plan, log, n, slot_idx, cls):
+    """轨迹跑完之后的部分：放置巡检帧 → 量放置误差 → 量夹持帧 → 判红 → 记 state。
+
+    单独抽出来是为了 `--resume`：第 5 轮两段跑的第二段被闸门拒了（我在
+    `--from` 上写死了航点名），臂夹着块停在 lift；续跑要跑的正是这一段，
+    而它在 `do_cycle` 的后半截。
+    """
     # 7) 放置巡检帧 + 量误差（臂此刻正停在 survey_place）
     state["pose"] = "survey_place"
     pdir = os.path.join(args.run_dir, "frames", "place-%02d" % n)
     board.capture(pdir, "place-%02d" % n)
+    dev = check_survey_pose(pdir, plan, args.urdf)
+    if dev is not None:
+        print("  巡检帧位姿核对：与计划 survey_place 最大差 %.2f° → OK" % dev)
     from precision_verify import measure_placements
     meas = measure_placements(pdir, state["slots_mm"])
     json.dump(meas, open(os.path.join(cdir, "place_measure.json"), "w"),
@@ -509,8 +641,14 @@ def main():
     ap.add_argument("--frame-dir", default=None,
                     help="复用已抓的帧目录（执行的就是预览过的那份计划）")
     ap.add_argument("--held-capture", action="store_true",
-                    help="在 lift 停一下抓帧（块还夹在爪里），再接着去槽位；"
-                         "用来分开「抓的时候就没抓正」与「途中滑了」")
+                    help="**已作废**：腕部相机看不到夹着的块（见 measure_held.py），"
+                         "这个开关现在直接拒绝，不会让臂白跑一段")
+    ap.add_argument("--resume", action="store_true",
+                    help="续跑最后一个循环：从本地执行日志里最后一个「到位」的航点"
+                         "之后接着跑，然后量放置误差。用于一段轨迹没跑成、臂停在半路")
+    ap.add_argument("--finish", action="store_true",
+                    help="只读收尾最后一个循环：不动机器人，只补抓放置巡检帧、"
+                         "量误差、写 state。收尾那段崩掉之后用它补账")
     args = ap.parse_args()
 
     os.makedirs(args.run_dir, exist_ok=True)
@@ -544,11 +682,22 @@ def main():
         return 0
     if args.survey:
         return do_survey(args, board, state, args.survey)
+    if args.held_capture:
+        raise SystemExit(
+            "--held-capture 已作废，没有执行任何动作。\n"
+            "  腕部相机看不到夹着的块：它偏 tool0 侧面 91 mm、低 24.2 mm、光轴竖直，\n"
+            "  夹着块时块离它只有约 161 mm 竖直（29° 偏轴），整个夹爪都在画面下边框外面。\n"
+            "  实测 frames/held-05：全帧最近深度点 327 mm，彩色图里只有台面。\n"
+            "  这是刚体关系，换哪个位姿都一样。要分开「没抓正/滑了」得换一台看得见夹爪的相机。")
+    if args.resume:
+        return do_resume(args, board, state)
+    if args.finish:
+        return do_finish(args, board, state)
     if args.cycle:
         if not args.urdf:
             raise SystemExit("--cycle 要 --urdf")
         return do_cycle(args, board, state)
-    ap.error("要 --push / --survey / --cycle 之一")
+    ap.error("要 --push / --survey / --cycle / --resume / --finish 之一")
 
 
 if __name__ == "__main__":
