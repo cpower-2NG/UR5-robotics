@@ -65,7 +65,9 @@ VOXEL = 0.005
 NUM_POINTS = 20000
 MIN_SCORE = 0.20
 MAX_TILT_DEG = 35.0
-TABLE_Z = 0.0285          # 规划器 place_z；块顶面实测 32–35 mm
+# 只用来圈候选的**竖直带**（table_z −30 mm … +80 mm），不是台面真值。
+# 0.0285 抄的是旧规划器的 place_z（= 台面 + 块高），**别拿它算高度**。
+TABLE_Z = 0.0285
 ANCHOR_MM = 12.0
 GRASPNET_ROOT = os.path.expanduser("~/robotics/third_party/graspness_unofficial")
 CKPT = os.path.expanduser("~/robotics/third_party/graspnet-baseline/logs/checkpoint-rs.tar")

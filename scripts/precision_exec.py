@@ -47,6 +47,9 @@ TRAJ_ACTION = "/scaled_joint_trajectory_controller/follow_joint_trajectory"
 ROBOT_MODE_RUNNING = 7
 SAFETY_MODE_NORMAL = 1
 JOINT_DRIFT_RAD = 0.05
+# 空闭合实测回读 0.0，真夹到是 24.9–26.2 mm（2026-10-25 三轮），5 mm 容差分得开。
+# 注意回读**不是**爪距：空载全开 95.0 / 全闭 0.0（两端都对），但夹住 31.5–32.3 mm
+# 的块稳定读 24.9–25.3 mm —— 偏差只长在接触段，只能当**相对判据**（没滑）用。
 AG95_EMPTY_TOL_MM = 5.0
 GRIP_OPEN_MM = 95.0
 GRIP_CLOSE_MM = 0.0
@@ -425,6 +428,7 @@ def main():
             if w.get("after"):
                 pos = do_gripper(w["after"]["gripper"], name + ".after")
                 # 手指被物体挡住 ⇒ 回读停在中间；全闭 ⇒ 空夹。
+                # 中间值**不等于**开口（见 AG95_EMPTY_TOL_MM），这里只判「夹到没」。
                 if w["after"]["gripper"] == "close":
                     closed_at = pos
                     if pos is None:
