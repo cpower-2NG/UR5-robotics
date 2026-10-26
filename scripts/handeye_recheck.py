@@ -32,6 +32,7 @@
 """
 import argparse
 import sys
+import threading
 import time
 
 import numpy as np
@@ -70,12 +71,55 @@ def is_new(sample: dict, accepted: list[dict], min_mm: float, min_deg: float):
 class TfProbe(Node):
     """直查 TF 拿「法兰位姿」和「靶板在相机里」。不需要服务端、不需要发布者。"""
 
+    # 桥发 20 Hz、驱动发 125 Hz ⇒ 超过这么久时间戳还没往前走，就是**旧的**。
+    # 取桥自己的 `--stale-s` 默认值 0.5：桥一旦判定上一帧好结果过期就不再发，
+    # 所以「0.5 s 没新帧」和「桥认为靶板已经不在了」是同一件事。
+    MAX_STALE = 0.5
+
     def __init__(self, base: str, tool: str, cam: str, marker: str) -> None:
         super().__init__("handeye_recheck")
         self.frames = (base, tool, cam, marker)
         self.buf = Buffer()
         self.listener = TransformListener(self.buf, self)
         self.call_error = ""
+        self._stamp: dict[str, float] = {}
+        self._since: dict[str, float] = {}
+        self._age: dict[str, float] = {}
+        # ⚠️ 必须**持续** spin，不能每拍 `spin_once` 一下。
+        #    后者一次只处理**一个**回调，而 /tf 上同时灌着驱动 125 Hz + 桥 ~29 Hz，
+        #    队列（深度 100）永远是满的 ⇒ 每次 lookup 拿到的是积压在最前面的那条，
+        #    差不多是 **0.65 s 之前**的位姿。2026-10-24 实测：`spin_once` 版本读到的
+        #    `base_link→tool0` 时间戳**8 秒纹丝不动**，换成后台 spin 之后每 0.5 s
+        #    正常前进 0.5 s。采到的位姿是旧数据，连「停稳 0.7 s」也是拿旧数据判的。
+        threading.Thread(target=self._spin, daemon=True).start()
+
+    def _spin(self) -> None:
+        try:
+            rclpy.spin(self)
+        except Exception:        # noqa: BLE001 —— 收尾时 shutdown 会让 spin 抛异常
+            pass
+
+    def _fresh(self, key: str, tf) -> bool:
+        """这一帧是不是**新**的。
+
+        ⚠️ TF 缓冲会把最后一帧留着（默认 10 s）。靶板一旦**移出视野**，桥就不再
+        发 TF，但 `lookup_transform(..., Time())`（= 最新可用）照样能拿到那一帧
+        **旧**值 —— 静默地拿「A 位姿时的靶板」去配「B 位姿时的法兰」，反推的靶板
+        当然到处跑。2026-10-24 第一次跑就吃了这个怀疑：5 个位姿散开 65 mm，而
+        那天的臂是**纯平移**（转角差全 0.0°），X 即便错也只会整体偏、散不开。
+
+        判据用「时间戳有没有往前走」，不用「stamp 离现在多远」：相机报的是
+        HARDWARE_CLOCK 时间域，跟 ROS 时钟不一定同源，直接相减会算出一个假年龄。
+        """
+        st = tf.header.stamp.sec + tf.header.stamp.nanosec * 1e-9
+        now = time.monotonic()
+        if self._stamp.get(key) != st:
+            self._stamp[key] = st
+            self._since[key] = now
+            self._age[key] = 0.0
+            return True
+        self._age[key] = now - self._since.get(key, now)
+        return self._age[key] <= self.MAX_STALE
 
     def current(self) -> dict | None:
         rclpy.spin_once(self, timeout_sec=0.1)
@@ -91,6 +135,14 @@ class TfProbe(Node):
         except Exception as e:
             self.call_error = (f"TF 查不到 {cam} → {marker}"
                                f"（相机没出图 / 桥没起 / 靶板不在视野？）：{type(e).__name__}")
+            return None
+        if not self._fresh("robot", a):
+            self.call_error = (f"法兰 TF 已经 {self._age['robot']:.1f}s 没更新了"
+                               f" —— 驱动断了？这一拍不算")
+            return None
+        if not self._fresh("marker", b):
+            self.call_error = (f"靶板 TF 已经 {self._age['marker']:.1f}s 没更新了"
+                               f" —— **靶板多半移出视野了**，这一拍不算")
             return None
         self.call_error = ""
         return {"robot": a.transform, "tracking": b.transform}
@@ -149,7 +201,9 @@ def main() -> int:
     p = cal.parameters
     t0 = cal.transform.translation
     q0 = cal.transform.rotation
-    X = ha.T4(ha.tf_vec(t0), ha.tf_rot(cal.transform))
+    # tf_vec 要的是**整条 Transform**（它自己去取 .translation），不是那半个 Vector3。
+    # 2026-10-24 第一次上真机就栽在这：传了 t0，`Vector3 has no attribute 'translation'`。
+    X = ha.T4(ha.tf_vec(cal.transform), ha.tf_rot(cal.transform))
     print(f"存盘的标定：{args.name}（{p.calibration_type}）")
     print(f"  t = [{t0.x*1000:+.2f}, {t0.y*1000:+.2f}, {t0.z*1000:+.2f}] mm，"
           f"|t| = {np.linalg.norm([t0.x, t0.y, t0.z])*1000:.2f} mm")
@@ -218,9 +272,15 @@ def main() -> int:
                 print(f"    …位姿够新了，等停稳（{still:.1f}s / {args.still:.1f}s）"
                       f"｜已经 {len(accepted)}/{args.poses}", flush=True)
         elif ok:
-            accepted.append({"tr": ha.tf_vec(cur["robot"]), "Rr": ha.tf_rot(cur["robot"]),
-                             "t_board": ha.tf_vec(cur["tracking"]),
-                             "Rb": ha.tf_rot(cur["tracking"])})
+            tr = ha.tf_vec(cur["robot"])
+            Rr = ha.tf_rot(cur["robot"])
+            t_board = ha.tf_vec(cur["tracking"])
+            Rb = ha.tf_rot(cur["tracking"])
+            accepted.append({"tr": tr, "Rr": Rr, "t_board": t_board, "Rb": Rb,
+                             # 顺便算一份「基座→靶板」，收尾时逐条打出来 ——
+                             # 只看最大散度看不出是**哪一拍**跑掉的（板被碰了一下
+                             # 通常会跳一次，随距离漂则是系统误差）。
+                             "P": ha.T4(tr, Rr) @ X @ ha.T4(t_board, Rb)})
             print(f"  ✅ 第 {len(accepted)}/{args.poses} 个位姿："
                   f"法兰 {np.round(ha.tf_vec(cur['robot'])*1000, 0)} mm，"
                   f"距最近的已有位姿 {d:.0f} mm / {a:.1f}°，停稳 {still:.1f}s", flush=True)
@@ -240,6 +300,18 @@ def main() -> int:
 
     print(f"\n用**存盘的 X** 反推「基座→靶板」，看 {len(accepted)} 个位姿落点散不散：")
     dmm, adeg = ha.board_fixed_spread(accepted, X)
+
+    # 逐拍打出来。最大散度只说明「散开了」，这一列才说明**是哪一拍**、往哪偏：
+    # 板被碰一下 ⇒ 某一拍之后整体跳一次；感知随距离漂 ⇒ 单调趋势。
+    ts = np.array([a["P"][:3, 3] for a in accepted])
+    mean = ts.mean(axis=0)
+    print(f"  {'#':>2}  {'法兰 (mm)':<22}{'反推靶板 (mm)':<26}{'距均值 mm':>9}")
+    for i, (a, t) in enumerate(zip(accepted, ts), 1):
+        f = np.round(a["tr"] * 1000, 0)
+        b = np.round(t * 1000, 1)
+        print(f"  {i:>2}  [{f[0]:>6.0f},{f[1]:>6.0f},{f[2]:>6.0f}]  "
+              f"[{b[0]:>8.1f},{b[1]:>8.1f},{b[2]:>8.1f}]  "
+              f"{np.linalg.norm(t - mean) * 1000:>9.2f}")
     print(f"  散开：{dmm:.2f} mm / {adeg:.2f}°（闸门 {args.gate_mm} mm）")
     ok = dmm <= args.gate_mm
     if ok:
