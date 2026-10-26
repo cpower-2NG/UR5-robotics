@@ -455,8 +455,10 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
   另缺 AG-95 侧的 `pymodbus`（⚠️ 用 `pip3 install "pymodbus>=3.6"`，**不要**用 `apt` 的
   `python3-pymodbus` —— 那是 2.1.0，API 不兼容）。
 - ✅ **检测这一半已在板上跑通**（2026-09-28 实测）：权重 `block_best.pt`
-  **不在本仓**（6 MB，属构建产物，按规范走外链；sha256 `a926d959…` 可用于核对
-  你手上那份是不是同一个）；板上 `torch 2.5.0a0+nv24.08` + `ultralytics 8.4.26`
+  **不在本仓**（6 MB，属构建产物，按规范走外链，见下面「模型权重」一节；
+  现行 sha256 `79403188…`。⚠️ 本条是 09-28 的实测，当时板上那份还是旧训练
+  （`a926d959…`，合成数据模型）；10-02 夜真机数据集重训后哈希变为现行值）；
+  板上 `torch 2.5.0a0+nv24.08` + `ultralytics 8.4.26`
   加载 0.1 s、`names={0:'block'}`、CUDA 可用；拿数据集里一张真图（9 个标注框）推理，
   **9 个框全部对上、逐对 IoU ≥ 0.966**；预热后**单帧 38 ms**（约 26 FPS）。
 - 📷 **相机话题的「两层命名空间」陷阱**（真机部署最容易白忙一场的地方）：
@@ -524,17 +526,26 @@ python3 scripts/test_pipeline_e2e.py     # 15 项断言
 
 ### 模型权重（不在本仓）
 
-`block_best.pt`（单类 `block` 检测器）是**构建产物**，按仓库约定不入库
-（`.gitignore` 里 `ros2_ws/src/yolo_detector/models/*.pt` 同理）。取到它之后：
+**外链（Google Drive，「知道链接者可查看」；2026-10-26 已下载逐字节核对）**：
+<https://drive.google.com/drive/folders/1tS_qhhTXuWsXZyb-3976I2oHSJJJ7Yru>
+
+| 文件 | 身份（sha256 / md5，前 8 位） | 是什么 |
+|---|---|---|
+| [block_best.pt](https://drive.google.com/uc?export=download&id=1jIv0I4sGhP5QL7LtIEqjsEqEMdW794AT) | `79403188` / `74bd8557`（2026-10-02 21:23 训练） | **现行**：真机数据集（6 排布 210 帧）训练，`names={0:'block'}`；A1/A3 检测用的就是它 |
+| [block_best_7cls.pt](https://drive.google.com/uc?export=download&id=1I2QBZnP7w-TJHt222ozDnlkT4m79JPyY) | `13493ca7` / `35851d9b`（2026-10-05 21:36 训练） | 7 类变体（red / orange / tan / yellow / yellowgreen / cyan / purple），A2 多类分拣线用 |
+
+取到之后：
 
 ```bash
 mkdir -p ~/models && cp block_best.pt ~/models/
 export YOLO_MODEL_DIR=~/models          # 或把绝对路径直接传给 model:=
-sha256sum ~/models/block_best.pt        # 应为 a926d959…（与本文档记录一致）
+sha256sum ~/models/block_best.pt        # 应为 79403188…（2026-10-26 核对）
 ```
 
-> 外链地址：**待补** —— 发布前请把权重放到一个可公开访问的位置并在此写明。
-> 校验和 `a926d959…` 是这份权重的身份，换文件前请先比对。
+> ⚠️ **勘误（2026-10-26）**：本文档与 `docs/archive/ATTACHMENT_MANIFEST.md` 此前登记的
+> `a926d959…` 是**旧合成数据模型**（`runs/block_detect/weights/best.pt`）的哈希，
+> **不是** `block_best.pt` 的 —— 公开仓收尾时抄错了行。现行身份以上表为准；
+> 本机正身 `~/robotics/repos/yolo_ros_original/block_best.pt`。
 
 ### 相机序列号（本机专有，不入库）
 
