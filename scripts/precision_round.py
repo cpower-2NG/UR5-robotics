@@ -51,7 +51,8 @@ PY_SELF = sys.executable
 PY_GRASPNET = os.path.expanduser("~/robotics/venvs/graspnet/bin/python")
 BOARD_DIR = "~/precision"
 BOARD_SCRATCH = "/tmp/precision"
-BOARD_PY_FILES = ("precision_capture.py", "precision_exec.py")
+BOARD_PY_FILES = ("precision_capture.py", "precision_exec.py",
+                  "gripper_action.py", "precision_grip_check.py")
 RUN_SH = """#!/bin/bash
 # 板上入口：把所有 ROS 环境一次性装好。ROS_DOMAIN_ID=99 是现场值。
 # ⚠️ 必须是 bash —— Ubuntu 的 /bin/sh 是 dash，source 不了 setup.bash
