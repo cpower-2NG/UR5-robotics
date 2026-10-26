@@ -139,12 +139,15 @@ def test_grasp_formula_and_clamp(chain):
 
 
 @case
-def test_place_target_compensates_grasp_eccentricity(chain):
-    """放置目标必须是 `slot − 抓取偏心`，不是槽位本身。
+def test_place_target_does_not_trust_grasp_eccentricity(chain):
+    """放置目标默认**就是槽位**，不拿抓取偏心去补 —— 但偏心要记下来。
 
-    候选是「夹爪该在的位置」；块心未必正好落在 tool0 轴上（第 4/5 轮实测
-    2.4 / 5.5 mm）。抓着块平移是刚体平移 ⇒ 想叫块心落在槽位上，tool0 就得让开
-    这段偏心。不补的话，这一截会**原样**出现在放置误差里（9.7 mm 里有 2.4）。
+    曾经补过（把 tool0 放在 slot−偏心）。2026-10-26 第 6 轮实测判决：
+    抓取偏心预测 6.44 mm，抓着块实际只偏 2.76 mm，补了反而多偏 4.3 mm。
+    三轮的夹持偏移 9.7 / 14.5 / 2.8 mm 跟抓取偏心 2.4 / 5.5 / 6.4 mm 不对应
+    —— 块在爪里会转、会移，抓取前的偏心预测不了它。
+    所以：默认不补（这条钉住默认值），但 meta 里必须留着 grasp_ecc_mm，
+    等有相机能看见夹着的块再拿真值来判。
     """
     blocks, cand, q0 = scene(chain)
     blk = blocks[0]
@@ -155,20 +158,33 @@ def test_place_target_compensates_grasp_eccentricity(chain):
     ex = blk["cx"] / 1000.0 - cand["xyz_base"][0]       # 测试场景里是 (−3, −1) mm
     ey = blk["cy"] / 1000.0 - cand["xyz_base"][1]
     assert abs(ex) > 1e-3 and abs(ey) > 1e-3, "测试场景本身没有偏心，测不出东西"
+    assert pp.PLACE_COMPENSATE_ECC is False, \
+        "补偿又被打开了 —— 先确认有过新的真机证据（见 PLACE_COMPENSATE_ECC）"
 
     T = chain.fk(by["place"]["q"])
-    assert abs(T[0, 3] - (slot[0] - ex)) < 1e-4, \
-        "place x 应在 %.4f（slot−偏心），实际 %.4f" % (slot[0] - ex, T[0, 3])
-    assert abs(T[1, 3] - (slot[1] - ey)) < 1e-4, \
-        "place y 应在 %.4f（slot−偏心），实际 %.4f" % (slot[1] - ey, T[1, 3])
-    # 不补（旧行为）时，块心会落在 slot + 偏心 上 —— 这一截就是白送的误差
-    assert abs(T[0, 3] - slot[0]) > 0.002, "看起来没补偿：place 就落在槽位上"
-
+    assert abs(T[0, 3] - slot[0]) < 1e-4, \
+        "place x 应在槽位 %.4f，实际 %.4f" % (slot[0], T[0, 3])
+    assert abs(T[1, 3] - slot[1]) < 1e-4, \
+        "place y 应在槽位 %.4f，实际 %.4f" % (slot[1], T[1, 3])
+    # 偏心量仍然要记下来（误差归因就靠它），只是不拿来挪目标
     assert meta["grasp_ecc_mm"] == [round(ex * 1000, 2), round(ey * 1000, 2)], \
         "meta 里的偏心与实际不符：%r" % (meta["grasp_ecc_mm"],)
-    assert meta["place_target_mm"] == [round((slot[0] - ex) * 1000, 2),
-                                       round((slot[1] - ey) * 1000, 2)], \
-        "meta 里的放置目标与实际不符：%r" % (meta["place_target_mm"],)
+    assert meta["place_target_mm"] == [round(slot[0] * 1000, 2),
+                                       round(slot[1] * 1000, 2)], \
+        "meta 里的放置目标应与槽位一致：%r" % (meta["place_target_mm"],)
+
+    # 开关打开时的行为也要是对的（不然将来想用反而用不上）：slot−偏心
+    old = pp.PLACE_COMPENSATE_ECC
+    try:
+        pp.PLACE_COMPENSATE_ECC = True
+        wps2, _, meta2 = pp.build_pick(chain, q0, cand, blk, blocks, slot)
+        T2 = chain.fk([w for w in wps2 if w["name"] == "place"][0]["q"])
+        assert abs(T2[0, 3] - (slot[0] - ex)) < 1e-4, \
+            "开关打开时 place x 应在 %.4f，实际 %.4f" % (slot[0] - ex, T2[0, 3])
+        assert meta2["place_target_mm"] == [round((slot[0] - ex) * 1000, 2),
+                                            round((slot[1] - ey) * 1000, 2)]
+    finally:
+        pp.PLACE_COMPENSATE_ECC = old
 
 
 @case
@@ -226,7 +242,8 @@ def test_ik_branch_selection_keeps_forearm_above_table(chain):
     # ② 新做法：整条计划必须生成得出来，且每个航点的前臂都在台面上方
     wps, checks, meta = pp.build_pick(chain, q_start, cand, blocks[0], blocks,
                                       slot)
-    assert meta["place_target_mm"] == [round(sx * 1000, 2), round(sy * 1000, 2)]
+    assert meta["place_target_mm"] == [round(slot[0] * 1000, 2),
+                                       round(slot[1] * 1000, 2)], meta
     for w in wps:
         if w["name"].startswith("to_slot_split") or w["name"] == "survey_place":
             continue

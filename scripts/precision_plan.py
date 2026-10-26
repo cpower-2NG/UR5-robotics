@@ -115,6 +115,16 @@ GUARD_SAMPLES = 8
 TABLE_PLANE_Z = 0.0
 MIN_BLOCK_GAP = 0.060
 
+# 放置要不要按「抓取偏心」补：**默认不补**。
+# 2026-10-26 第 6 轮实测判决：抓取偏心预测 6.44 mm，但抓着块实际只偏 2.76 mm
+# （补偿后放置误差 7.07 mm，不补偿的话同一帧量出来会是 2.76 mm）—— 补了反而
+# 多偏 4.3 mm。跨三轮看，夹持偏移 9.7 / 14.5 / 2.8 mm 与抓取偏心 2.4 / 5.5 /
+# 6.4 mm 不对应，说明「块心停在抓取时那个偏心上」这个假设不成立（块在爪里会
+# 转、会移：第 6 轮 yaw 从 91.0° 变成 25.4°，爪合到 25.3 mm 而块面宽 32~36 mm）。
+# 开关与 meta 里的 grasp_ecc_mm 都留着：等有相机能看见夹着的块、量到真的夹持
+# 偏移之后，再用它来判这块要不要开。
+PLACE_COMPENSATE_ECC = False
+
 
 class PlanError(RuntimeError):
     """预检不过。抛这个而不是 sys.exit，测试里能直接断言。"""
@@ -448,13 +458,14 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
     # 编进常量里；29.6 mm 的块会压进台面 1.1 mm）。
     grasp_depth_m = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
     place_z, place_approach_z = place_heights(wz, grasp_depth_m)
-    # 放置要把抓取时的**偏心**补掉：候选是「夹爪该在的位置」，块心未必正好在
-    # tool0 轴上（2026-10-26 第 4/5 轮实测 2.4 / 5.5 mm）。抓着块平移是刚体平移，
-    # 所以让 tool0 落在 `slot − 偏心` 上，块心才落在槽位上。
-    # 偏心在 base 系里量（块心估计 − 抓点），与放置巡检帧的 dx/dy 同一套坐标，
-    # 可以直接对账 —— 补偿对不对，就看下一轮的 dx/dy 是不是把这几个毫米收掉了。
+    # 抓取偏心（块心估计 − 抓点）。默认**不**拿它补放置目标：第 6 轮实测
+    # 这块实际只偏 2.76 mm，补了反而多偏 4.3 mm（详见 PLACE_COMPENSATE_ECC）。
+    # 量出来写进 meta，下一轮可以直接对账「夹持偏移 vs 抓取偏心」。
     ex, ey = block["cx"] / 1000.0 - gx, block["cy"] / 1000.0 - gy
-    sx, sy = slot[0] - ex, slot[1] - ey
+    if PLACE_COMPENSATE_ECC:
+        sx, sy = slot[0] - ex, slot[1] - ey
+    else:
+        sx, sy = slot
 
     gap = check_block_gap(block, blocks)
     if gap is not None and gap < MIN_BLOCK_GAP:

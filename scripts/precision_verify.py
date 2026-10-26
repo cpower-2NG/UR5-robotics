@@ -177,15 +177,19 @@ def summarize_exec_log(path):
 
 
 # ---------------------------------------------------------------- 报告
-def _class_status(colour, yolo, slot_class, yolo_ran=True):
-    """类别判定的**五态**，别把「没跑」「没检出」「判错了」混成一句 ✗：
+def _class_status(colour, yolo, slot_class, yolo_ran=True, measured=True):
+    """类别判定的**六态**，别把「没放成」「没跑」「没检出」「判错了」混成一句 ✗：
 
-    · ``ok``            YOLO == 颜色表，且槽位类别（若有限制）== YOLO
-    · ``not_run``       报告时没给权重 —— YOLO 根本没跑（**不是**结论）
-    · ``yolo_missing``  YOLO 跑了但没给框（也**不是**判错 —— 通常是模型没覆盖这种视角）
-    · ``mismatch``      YOLO 与颜色表不一致
-    · ``wrong_slot``    两者一致，但槽位类别不对
+    · ``ok``             YOLO == 颜色表，且槽位类别（若有限制）== YOLO
+    · ``not_measured``   这一轮**根本没放成**（没有放置帧/槽上没有块）——
+                         「没东西可测」不是「没检出」，更不是判错
+    · ``not_run``        报告时没给权重 —— YOLO 根本没跑（**不是**结论）
+    · ``yolo_missing``   YOLO 跑了但没给框（也**不是**判错 —— 通常是模型没覆盖这种视角）
+    · ``mismatch``       YOLO 与颜色表不一致
+    · ``wrong_slot``     两者一致，但槽位类别不对
     """
+    if not measured:
+        return "not_measured"
     if not yolo_ran:
         return "not_run"
     if not slot_class:
@@ -225,7 +229,9 @@ def build_report(run_dir, weights=None, conf=0.25, imgsz=640):
         slot_class = slot_classes[slot_idx] if slot_idx is not None else ""
         logsum = summarize_exec_log(os.path.join(run_dir, cyc["exec_log"])
                                    if cyc.get("exec_log") else None)
-        cstatus = _class_status(colour, yolo, slot_class, yolo_ran=weights is not None)
+        cstatus = _class_status(colour, yolo, slot_class,
+                                yolo_ran=weights is not None,
+                                measured=bool(place and place["block"]))
         rows.append({
             "n": cyc.get("n"), "ok": cyc.get("ok"),
             "block_idx": cyc.get("block_idx"), "pick_class": cyc.get("class"),
@@ -248,12 +254,25 @@ def build_report(run_dir, weights=None, conf=0.25, imgsz=640):
             "close_mm": logsum["close_mm"], "lift_mm": logsum["lift_mm"],
             "slipped": logsum["slipped"], "traj_ok": logsum["traj_ok"],
             "gate_all_ok": logsum["gate_all_ok"],
+            "n_traj": logsum["n_traj"], "n_gate": logsum["n_gate"],
             "arrive_err_max_deg": logsum["arrive_err_max_deg"],
         })
     placed = [r for r in rows if r["ok"] and r["placed_xy_mm"] is not None]
     dists = [r["place_dist_mm"] for r in placed if r["place_dist_mm"] is not None]
     n_slots = len(slots)
-    stop = state.get("stop_reason") or ("循环未结束" if len(rows) < n_slots else "槽位用尽")
+    used = state.get("used") or []
+    free = [i for i, u in enumerate(used) if not u] if used else []
+    # 收工原因只能照 round.json 写下来的；没写就**照实说没写完**。早先用「循环数
+    # ≥ 槽位数」推「槽位用尽」，第 6 轮跑完还有 (550,-350) 空着却被写成「用尽」。
+    stop = state.get("stop_reason")
+    if not stop:
+        if used and not free:
+            stop = "槽位用尽"
+        elif free:
+            stop = "未收工，%d 个槽还空着：%s" % (
+                len(free), ", ".join("#%d" % i for i in free))
+        else:
+            stop = "未收工，round.json 没写收工原因"
     report = {
         "run_dir": run_dir,
         "n_slots": n_slots,
@@ -270,6 +289,8 @@ def build_report(run_dir, weights=None, conf=0.25, imgsz=640):
             "class": {
                 "n": len(rows),
                 "correct": sum(1 for r in rows if r["class_ok"]),
+                "not_measured": sum(1 for r in rows
+                                    if r["class_status"] == "not_measured"),
                 "not_run": sum(1 for r in rows if r["class_status"] == "not_run"),
                 "yolo_missing": sum(1 for r in rows if r["class_status"] == "yolo_missing"),
                 "mismatch": sum(1 for r in rows if r["class_status"] == "mismatch"),
@@ -277,6 +298,15 @@ def build_report(run_dir, weights=None, conf=0.25, imgsz=640):
                 "all_ok": all(r["class_ok"] for r in rows) if rows else False,
             },
             "exec": {
+                # 整轮判决用**计数**，不用「全部为真」：中途失败的轮次（夹爪没初始化、
+                # 计划被护栏拒）和放成的轮次混在一起，一个 False 会把整轮糊成 False。
+                # 分母用 n_moved（真的发过轨迹的轮次）：计划都没生成、一条轨迹没发的
+                # 轮次不该算进「轨迹失败」。
+                "n_cycles": len(rows),
+                "n_moved": sum(1 for r in rows if r["n_traj"] > 0),
+                "n_traj_ok": sum(1 for r in rows if r["traj_ok"]),
+                "n_gate_ok": sum(1 for r in rows if r["gate_all_ok"]),
+                "n_no_slip": sum(1 for r in rows if r["slipped"] is False),
                 "all_traj_ok": all(r["traj_ok"] for r in rows) if rows else False,
                 "all_gates_ok": all(r["gate_all_ok"] for r in rows) if rows else False,
                 "none_slipped": all(r["slipped"] is False for r in rows) if rows else False,
@@ -292,37 +322,54 @@ def _md(report):
     L = ["# 精密抓取一轮 · 验收报告", "",
          "运行目录：`%s`" % report["run_dir"], "",
          "| 项 | 结果 |", "|---|---|",
-         "| 放置计数 | **%s**（收工：%s） |" % (report["placed"], report["stop_reason"]),
+         "| 放置计数 | **%s**（%s） |" % (report["placed"], report["stop_reason"]),
          "| 位置精度 中位 / 最大 | %s / %s mm（%d 块） |"
          % (report["acceptance"]["position"]["median_mm"],
             report["acceptance"]["position"]["max_mm"],
             report["acceptance"]["position"]["n"]),
-         "| 类别正确 | %d/%d（YOLO 未跑 %d，未检出 %d，不一致 %d，错槽 %d） |"
+         "| 类别正确 | %d/%d（未放成 %d，YOLO 未跑 %d，未检出 %d，不一致 %d，错槽 %d） |"
          % (report["acceptance"]["class"]["correct"],
-            report["acceptance"]["class"]["n"],
+            report["acceptance"]["class"]["n"] - report["acceptance"]["class"]["not_measured"],
+            report["acceptance"]["class"]["not_measured"],
             report["acceptance"]["class"]["not_run"],
             report["acceptance"]["class"]["yolo_missing"],
             report["acceptance"]["class"]["mismatch"],
             report["acceptance"]["class"]["wrong_slot"]),
-         "| 轨迹 / 闸门 / 无滑移 | %s / %s / %s |"
-         % (report["acceptance"]["exec"]["all_traj_ok"],
-            report["acceptance"]["exec"]["all_gates_ok"],
-            report["acceptance"]["exec"]["none_slipped"]),
+         "| 轨迹 / 闸门 / 无滑移 | %d/%d · %d/%d · %d/%d 轮（共 %d 轮，%d 轮没发轨迹） |"
+         % (report["acceptance"]["exec"]["n_traj_ok"],
+            report["acceptance"]["exec"]["n_moved"],
+            report["acceptance"]["exec"]["n_gate_ok"],
+            report["acceptance"]["exec"]["n_moved"],
+            report["acceptance"]["exec"]["n_no_slip"],
+            report["acceptance"]["exec"]["n_moved"],
+            report["acceptance"]["exec"]["n_cycles"],
+            report["acceptance"]["exec"]["n_cycles"] - report["acceptance"]["exec"]["n_moved"]),
          "",
          "位置误差的**读数下限**：" + report["acceptance"]["position"]["baseline_note"], "",
          "## 逐块", "",
-         "| # | 抓的块 | 候选偏 | 槽 | 放后中心 | Δx | Δy | 距离 | 颜色表 | YOLO | 槽类别 | 类别判定 | 闭合回读 | 抬升回读 |",
-         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
-    badge = {"ok": "✓", "not_run": "没跑YOLO", "yolo_missing": "YOLO未检出",
+         "| # | 抓的块 | 候选偏 | 槽 | 放后中心 | Δx | Δy | 距离 | 颜色表 | YOLO | 槽类别 | 类别判定 | 闭合回读 | 抬升回读 | 轨迹/闸门 |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    badge = {"ok": "✓", "not_measured": "没放成", "not_run": "没跑YOLO",
+             "yolo_missing": "YOLO未检出",
              "mismatch": "**不一致**", "wrong_slot": "**错槽**"}
+    def _v(x):
+        """表里没有的数写 ——，别写 None。"""
+        return "—" if x is None else x
+
     for r in report["rows"]:
-        L.append("| %s | #%s %s | %s | %s %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-            r["n"], r["block_idx"], r["pick_class"], r["cand_dist_mm"],
-            r["slot_idx"], r["slot_xy_mm"], r["placed_xy_mm"],
-            r["place_dx_mm"], r["place_dy_mm"], r["place_dist_mm"],
-            r["class_colour"], r["class_yolo"], r["slot_class"] or "*",
+        if r["n_traj"] == 0:
+            ex = "没发轨迹"
+        else:
+            ex = "%d 条%s / 闸门%s" % (
+                r["n_traj"], "" if r["traj_ok"] else "**有失败**",
+                "✓" if r["gate_all_ok"] else "**有拒**")
+        L.append("| %s | #%s %s | %s | %s %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            r["n"], r["block_idx"], r["pick_class"], _v(r["cand_dist_mm"]),
+            r["slot_idx"], r["slot_xy_mm"], _v(r["placed_xy_mm"]),
+            _v(r["place_dx_mm"]), _v(r["place_dy_mm"]), _v(r["place_dist_mm"]),
+            _v(r["class_colour"]), _v(r["class_yolo"]), r["slot_class"] or "*",
             badge.get(r["class_status"], r["class_status"]),
-            r["close_mm"], r["lift_mm"]))
+            _v(r["close_mm"]), _v(r["lift_mm"]), ex))
     return "\n".join(L) + "\n"
 
 
