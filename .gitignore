@@ -37,3 +37,6 @@ runs/
 # detector_node 会按 $YOLO_MODEL_DIR → CWD 逐级向上 → 包内 models/ 的顺序查找，
 # 找不到就明确报错，**不会**联网下载 COCO 权重冒充（见 D6/D24）。
 ros2_ws/src/yolo_detector/models/*.pt
+
+# Claude Code 本地 worktree/会话产物（本目录放本地 worktree 碎屑；.claude/commands/ 收束命令要入库，别整目录忽略）
+.claude/worktrees/
