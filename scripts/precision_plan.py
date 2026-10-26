@@ -48,6 +48,10 @@ A/B 把腕转 180° 仍然抓成功，说明当前方块尺度下朝向不敏感
 5. 腕 2 离 0 至少 0.15 rad（0 是腕奇异；插点也要查 —— 端点远离不等于插值点远离）
 6. 高度钳制：抓取 z ∈ [0.2142, 0.2242]（裸指尖离台面 10~20 mm）
 7. 邻块间距 ≥ 60 mm（夹爪全开 95 mm；A/B 实测 77 mm 不碰）
+8. **整链选支**：同一末端位姿常有多支 IK 解，数值 IK 从上一个航点出发会落进
+   其中一支。逐点就近选不够（2026-10-26 第 6 轮：to_slot 就近那一支下一步
+   前臂掉到 49.7 mm，再一步就钻到台面下）。改成整条航点链做一次最小总关节
+   行程的 DP，段与段之间仍逐段过高度护栏 —— 存不下任何一支就报错。
 
 用法：
   # 走到抓取巡检位 / 放置巡检位
@@ -214,10 +218,113 @@ def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200):
     return q, pe, re, nfev
 
 
+def pose_residual(chain, q, xyz, yaw_deg=0.0):
+    """已有 q 相对目标位姿的残差：位置 mm、姿态 deg。"""
+    T = chain.fk(q)
+    Tt = target_matrix(xyz, yaw_deg)
+    pe = float(np.linalg.norm(T[:3, 3] - Tt[:3, 3])) * 1000
+    re = float(np.degrees(np.linalg.norm(
+        Rot.from_matrix(Tt[:3, :3].T @ T[:3, :3]).as_rotvec())))
+    return pe, re
+
+
+def joint_dist(a, b):
+    """关节空间距离，按 2π 取最短 —— 同一个位姿的 q 与 q+2π 是同一点。"""
+    d = (np.asarray(a, float) - np.asarray(b, float) + np.pi) % (2 * np.pi) - np.pi
+    return float(np.linalg.norm(d))
+
+
+def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
+                  max_iter=400, tol=1e-3):
+    """同一个末端位姿的**多支**合格 IK 解（去重、去掉超限位与腕奇异的）。
+
+    数值 IK 是局部收敛的：种子落在哪一支就收敛到哪一支。只要一支的话，
+    2026-10-26 第 6 轮槽 2（y=−350 mm）那种目标就会落进肘朝下的分支，
+    到 place 时前臂 z=−9.8 mm 被护栏拒绝 —— 而同一目标另有一支前臂 z=498 mm。
+
+    随机种子用目标坐标算，**同输入必得同一组解**（测试要能钉住）。
+    """
+    T = target_matrix(xyz, yaw_deg)
+    key = int(round((float(xyz[0]) + float(xyz[1]) + float(xyz[2])) * 1e5)) \
+        % (2 ** 31)
+    rng = np.random.default_rng(20261026 + key)
+    all_seeds = [np.asarray(s, float) for s in seeds]
+    all_seeds += [rng.uniform(-np.pi, np.pi, 6) for _ in range(n_random)]
+    out = []
+    for s in all_seeds:
+        q, pe, re, _ = chain.ik(T, s, max_iter=max_iter)
+        if pe > 0.1 or re > 0.05:
+            continue
+        if check_limits(chain, q) or check_wrist(chain, q):
+            continue
+        if any(joint_dist(q, u) < tol for u in out):
+            continue
+        out.append(q)
+    return out
+
+
+def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
+               n_random=32):
+    """给一串末端目标选**一条前后一致的 IK 分支链**（最小总关节行程）。
+
+    `targets` 是 [(名字, xyz), ...]。每点先多起点解法拿到几支合格解，
+    再用 DP 挑一条「相邻两段都过高度护栏、总行程最短」的链 —— 逐点贪心
+    不行：就近那一支可能只是当下近，下一步就得大跳换支。
+
+    返回每点的 q。任何一点一支解都没有、或所有组合都过不了护栏 ⇒ PlanError
+    （**不静默降级**：护栏不过就是不过）。
+    """
+    sets = [ik_candidates(chain, xyz, yaw_deg, seeds=[q_start],
+                          n_random=n_random)
+            for _, xyz in targets]
+    empty = [name for (name, _), s in zip(targets, sets) if not s]
+    if empty:
+        raise PlanError("这些航点连一支合格 IK 解都没有：%s" % "、".join(empty))
+
+    INF = float("inf")
+    cost = [[INF] * len(s) for s in sets]
+    prev = [[None] * len(s) for s in sets]
+    for j, q in enumerate(sets[0]):
+        ok, _ = check_guard(chain, q_start, q, table_z)
+        if ok:
+            cost[0][j] = joint_dist(q, q_start)
+    for i in range(1, len(sets)):
+        for j, q in enumerate(sets[i]):
+            for k, qp in enumerate(sets[i - 1]):
+                if not np.isfinite(cost[i - 1][k]):
+                    continue
+                ok, _ = check_guard(chain, qp, q, table_z)
+                if not ok:
+                    continue
+                c = cost[i - 1][k] + joint_dist(q, qp)
+                if c < cost[i][j]:
+                    cost[i][j] = c
+                    prev[i][j] = k
+    ends = [(c, j) for j, c in enumerate(cost[-1]) if np.isfinite(c)]
+    if not ends:
+        raise PlanError("这些航点的所有 IK 分支组合都过不了高度护栏：%s"
+                        % "、".join(name for name, _ in targets))
+    _, j = min(ends)
+    path = []
+    for i in range(len(sets) - 1, -1, -1):
+        path.append(sets[i][j])
+        j = prev[i][j]
+    path.reverse()
+    return path
+
+
 def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
-             duration=None, before=None, after=None):
-    """解一个航点并跑单点预检，追加到 waypoints。返回该点的 q。"""
-    q, pe, re, nfev = solve_waypoint(chain, xyz, yaw_deg, q_seed)
+             duration=None, before=None, after=None, q=None):
+    """解一个航点并跑单点预检，追加到 waypoints。返回该点的 q。
+
+    ``q`` 已经解好（来自 `solve_path`）时直接用，只复核残差与各项预检。
+    """
+    if q is None:
+        q, pe, re, nfev = solve_waypoint(chain, xyz, yaw_deg, q_seed)
+    else:
+        q = np.asarray(q, float)
+        pe, re = pose_residual(chain, q, xyz, yaw_deg)
+        nfev = 0
     if pe > 0.1 or re > 0.05:
         raise PlanError("航点 %s IK 没解出来：位置残差 %.3f mm、姿态残差 %.4f° "
                         "(xyz=%s)" % (name, pe, re, xyz))
@@ -358,8 +465,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
         raise PlanError("候选离块心 %.1f mm，超过 12 mm 锚定半径" % cand["dist_mm"])
 
     wps, checks = [], []
-    q = q_start
-    for name, xyz, after, before in [
+    specs = [
         ("approach", (gx, gy, approach_z), None,
          {"gripper": "open", "readback": True}),
         ("grasp", (gx, gy, grasp_z), {"gripper": "close", "readback": True}, None),
@@ -369,9 +475,13 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
         ("place", (sx, sy, place_z), {"gripper": "open", "readback": True}, None),
         ("retreat", (sx, sy, place_approach_z), None, None),
         ("survey_place", SURVEY_TOOL0["place"], None, None),
-    ]:
+    ]
+    # 整链选一条分支（见 solve_path 的注释：逐点就近会挑到下一段过不了护栏的解）
+    qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _ in specs], q_start)
+    q = q_start
+    for (name, xyz, after, before), q_solved in zip(specs, qpath):
         q, c = add_move(wps, chain, name, xyz, q, 0.0, TABLE_PLANE_Z,
-                        after=after, before=before)
+                        after=after, before=before, q=q_solved)
         checks.append(c)
 
     meta = {"kind": "pick", "block_idx": block["idx"], "class": block["class"],

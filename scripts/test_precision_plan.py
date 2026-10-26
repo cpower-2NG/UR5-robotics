@@ -172,6 +172,76 @@ def test_place_target_compensates_grasp_eccentricity(chain):
 
 
 @case
+def test_ik_branch_selection_keeps_forearm_above_table(chain):
+    """槽 2（y=−350 mm）那类目标：单种子 IK 会钻进台面下，整链选支才不会。
+
+    2026-10-26 第 6 轮的实数：块 #2 red 高 31.9 mm、抓点 (500.2, 409.0)、
+    槽 (450, −350)。逐点用上一个航点的解当种子时，`to_slot` 落进
+    pan=−206.6° 那一支（前臂 117 mm），`place` 前臂掉到 **−9.8 mm**，
+    被高度护栏拒绝 —— 而同一目标另一支解的前臂在 **498 mm**。
+    这就是「计划生成失败、一轮白停」的来路：不是够不到，是没换支。
+    """
+    blocks = [{"idx": 2, "class": "red", "cx": 504.8, "cy": 404.5,
+               "top": 31.9, "h": 31.9}]
+    cand = {"score": 0.2417, "width_mm": 48.57, "depth": 0.01, "dist_mm": 6.4,
+            "angle_deg": -80.3, "seed": 0, "tilt_deg": 25.0,
+            "xyz_base": [0.5002, 0.4090, 0.0310],
+            "approach_base": [0.0, 0.0, -1.0]}
+    q_start = [0.293028, -1.320825, 1.459162, -1.708434, -1.568054, -1.278646]
+    slot = (0.45, -0.35)
+
+    # ① 复现旧做法（逐点用上一点的解当种子）：必须在 place 判红 ——
+    #    否则这条测试就不再证明「换支」是必要的了。
+    wz = blocks[0]["h"] / 1000.0
+    gx, gy = cand["xyz_base"][:2]
+    gz = float(np.clip(wz + pp.TOOL0_TO_FINGERTIP + pp.GRASP_CLEARANCE,
+                       pp.GRASP_Z_MIN, pp.GRASP_Z_MAX))
+    depth = wz - (gz - pp.TOOL0_TO_BARE_FINGERTIP)
+    pz, paz = pp.place_heights(wz, depth)
+    ex, ey = blocks[0]["cx"] / 1000 - gx, blocks[0]["cy"] / 1000 - gy
+    sx, sy = slot[0] - ex, slot[1] - ey
+    targets = [
+        ("approach", (gx, gy, wz + pp.TOOL0_TO_FINGERTIP + pp.APPROACH_CLEARANCE)),
+        ("grasp", (gx, gy, gz)),
+        ("lift", (gx, gy, wz + pp.TOOL0_TO_FINGERTIP + pp.LIFT_HEIGHT)),
+        ("to_slot", (sx, sy, wz + pp.TOOL0_TO_FINGERTIP + pp.LIFT_HEIGHT)),
+        ("place_approach", (sx, sy, paz)),
+        ("place", (sx, sy, pz)),
+    ]
+    q = list(q_start)
+    naive_bad = None
+    for name, xyz in targets:
+        prev = q
+        q, pe, re, _ = pp.solve_waypoint(chain, xyz, 0.0, q)
+        assert pe < 0.1 and re < 0.05, "%s 单种子都解不出：%.3f mm" % (name, pe)
+        ok, worst = pp.check_guard(chain, prev, q, pp.TABLE_PLANE_Z)
+        if not ok:
+            naive_bad = (name, worst[1], worst[2] * 1000)
+            break
+    assert naive_bad is not None, \
+        "旧做法居然过了 —— 这组数不再复现那个 bug，测试要重写"
+    assert naive_bad[0] == "place" and naive_bad[1] == "forearm_link", naive_bad
+    assert naive_bad[2] < 0, "旧做法应当让前臂钻到台面下，实际 %.1f mm" % naive_bad[2]
+
+    # ② 新做法：整条计划必须生成得出来，且每个航点的前臂都在台面上方
+    wps, checks, meta = pp.build_pick(chain, q_start, cand, blocks[0], blocks,
+                                      slot)
+    assert meta["place_target_mm"] == [round(sx * 1000, 2), round(sy * 1000, 2)]
+    for w in wps:
+        if w["name"].startswith("to_slot_split") or w["name"] == "survey_place":
+            continue
+        fz = chain.fk_link("forearm_link", w["q"])[2, 3]
+        assert fz > pp.GUARD_MARGIN, \
+            "航点 %s 的前臂只有 %.1f mm（下限 %.0f）" % (
+                w["name"], fz * 1000, pp.GUARD_MARGIN * 1000)
+    # 每一段都要真的过护栏（不只是端点高）
+    for a, b in zip(wps, wps[1:]):
+        ok, worst = pp.check_guard(chain, a["q"], b["q"], pp.TABLE_PLANE_Z)
+        assert ok, "%s→%s 段内护栏不过：%s z=%.1f" % (
+            a["name"], b["name"], worst[1], worst[2] * 1000)
+
+
+@case
 def test_place_height_follows_block(chain):
     """放置下降必须按**这一块**挂多长算：块底落在台面上方，不能被压进台面。
 
