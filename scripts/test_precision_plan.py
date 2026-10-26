@@ -139,6 +139,39 @@ def test_grasp_formula_and_clamp(chain):
 
 
 @case
+def test_place_target_compensates_grasp_eccentricity(chain):
+    """放置目标必须是 `slot − 抓取偏心`，不是槽位本身。
+
+    候选是「夹爪该在的位置」；块心未必正好落在 tool0 轴上（第 4/5 轮实测
+    2.4 / 5.5 mm）。抓着块平移是刚体平移 ⇒ 想叫块心落在槽位上，tool0 就得让开
+    这段偏心。不补的话，这一截会**原样**出现在放置误差里（9.7 mm 里有 2.4）。
+    """
+    blocks, cand, q0 = scene(chain)
+    blk = blocks[0]
+    slot = (0.45, -0.25)
+    wps, _, meta = pp.build_pick(chain, q0, cand, blk, blocks, slot)
+    by = {w["name"]: w for w in wps}
+
+    ex = blk["cx"] / 1000.0 - cand["xyz_base"][0]       # 测试场景里是 (−3, −1) mm
+    ey = blk["cy"] / 1000.0 - cand["xyz_base"][1]
+    assert abs(ex) > 1e-3 and abs(ey) > 1e-3, "测试场景本身没有偏心，测不出东西"
+
+    T = chain.fk(by["place"]["q"])
+    assert abs(T[0, 3] - (slot[0] - ex)) < 1e-4, \
+        "place x 应在 %.4f（slot−偏心），实际 %.4f" % (slot[0] - ex, T[0, 3])
+    assert abs(T[1, 3] - (slot[1] - ey)) < 1e-4, \
+        "place y 应在 %.4f（slot−偏心），实际 %.4f" % (slot[1] - ey, T[1, 3])
+    # 不补（旧行为）时，块心会落在 slot + 偏心 上 —— 这一截就是白送的误差
+    assert abs(T[0, 3] - slot[0]) > 0.002, "看起来没补偿：place 就落在槽位上"
+
+    assert meta["grasp_ecc_mm"] == [round(ex * 1000, 2), round(ey * 1000, 2)], \
+        "meta 里的偏心与实际不符：%r" % (meta["grasp_ecc_mm"],)
+    assert meta["place_target_mm"] == [round((slot[0] - ex) * 1000, 2),
+                                       round((slot[1] - ey) * 1000, 2)], \
+        "meta 里的放置目标与实际不符：%r" % (meta["place_target_mm"],)
+
+
+@case
 def test_place_height_follows_block(chain):
     """放置下降必须按**这一块**挂多长算：块底落在台面上方，不能被压进台面。
 

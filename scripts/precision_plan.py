@@ -341,7 +341,13 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
     # 编进常量里；29.6 mm 的块会压进台面 1.1 mm）。
     grasp_depth_m = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
     place_z, place_approach_z = place_heights(wz, grasp_depth_m)
-    sx, sy = slot
+    # 放置要把抓取时的**偏心**补掉：候选是「夹爪该在的位置」，块心未必正好在
+    # tool0 轴上（2026-10-26 第 4/5 轮实测 2.4 / 5.5 mm）。抓着块平移是刚体平移，
+    # 所以让 tool0 落在 `slot − 偏心` 上，块心才落在槽位上。
+    # 偏心在 base 系里量（块心估计 − 抓点），与放置巡检帧的 dx/dy 同一套坐标，
+    # 可以直接对账 —— 补偿对不对，就看下一轮的 dx/dy 是不是把这几个毫米收掉了。
+    ex, ey = block["cx"] / 1000.0 - gx, block["cy"] / 1000.0 - gy
+    sx, sy = slot[0] - ex, slot[1] - ey
 
     gap = check_block_gap(block, blocks)
     if gap is not None and gap < MIN_BLOCK_GAP:
@@ -381,7 +387,10 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
             "place_approach_z": round(place_approach_z, 4),
             "place_clearance_mm": round(PLACE_CLEARANCE * 1000, 2),
             "block_xy_mm": [round(block["cx"], 2), round(block["cy"], 2)],
-            "grasp_point": [gx, gy], "grasp_z": round(grasp_z, 4),
+            "grasp_point": [gx, gy], "grasp_ecc_mm": [round(ex * 1000, 2),
+                                                     round(ey * 1000, 2)],
+            "place_target_mm": [round(sx * 1000, 2), round(sy * 1000, 2)],
+            "grasp_z": round(grasp_z, 4),
             "approach_z": round(approach_z, 4), "lift_z": round(lift_z, 4),
             "cand_score": round(cand["score"], 4),
             "cand_width_mm": round(cand["width_mm"], 2),
