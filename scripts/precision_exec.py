@@ -37,6 +37,9 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import gripper_action as ga                                       # noqa: E402
 
 ARM = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
@@ -45,12 +48,18 @@ ROBOT_MODE_RUNNING = 7
 SAFETY_MODE_NORMAL = 1
 JOINT_DRIFT_RAD = 0.05
 AG95_EMPTY_TOL_MM = 5.0
+GRIP_OPEN_MM = 95.0
+GRIP_CLOSE_MM = 0.0
 
 
 def log_line(path, **rec):
     rec["t"] = round(time.time(), 3)
     with open(path, "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _r2(v):
+    return None if v is None else round(float(v), 2)
 
 
 def main():
@@ -244,7 +253,8 @@ def main():
             raise
         g = Ag95Gripper(node, port=args.gripper_port, baudrate=115200,
                         slave_id=args.gripper_slave, force=args.gripper_force,
-                        stroke_mm=95.0, open_mm=95.0, close_mm=0.0,
+                        stroke_mm=GRIP_OPEN_MM, open_mm=GRIP_OPEN_MM,
+                        close_mm=GRIP_CLOSE_MM,
                         dry_run=bool(args.dry_run_gripper), open_is_high=True)
         print("  夹爪：%s" % g.describe())
         log_line(log_path, event="gripper_init", desc=g.describe(),
@@ -270,24 +280,59 @@ def main():
         return last
 
     def do_gripper(kind, where):
+        """发一个夹爪动作并**证明它真的发生了**。
+
+        2026-10-26 的教训：``Ag95Gripper.close()`` 不给 ``done_cb`` 是**空操作**
+        （驱动 ``_async()`` 第一节就 return），而回读照样是 95.0 mm，日志看起来
+        和成功一样。所以这里两件事缺一不可：走 ``ga.call_sync``（带回调），
+        并且写完以后比对回读（``ga.check_moved``）。任一条不成立就抛
+        :class:`ga.GripperActionError`，让循环停在原地。
+        """
         g = gripper()
         t0 = time.time()
-        if kind == "open":
-            g.open()
-        elif kind == "close":
-            g.close()
+        before = g.current_position()
+        if kind in ("open", "close"):
+            try:
+                ga.call_sync(g, kind)
+            except ga.GripperActionError as exc:
+                print("  [%s] 夹爪 %s **失败**：%s" % (where, kind, exc))
+                log_line(log_path, event="gripper_fail", where=where, action=kind,
+                         error=str(exc), before_mm=_r2(before))
+                raise
         elif kind != "readback":
             print("!! 不认识的夹爪动作 %r" % kind)
             return None
         pos = wait_stable(g)
         dt = time.time() - t0
+        target = GRIP_OPEN_MM if kind == "open" else GRIP_CLOSE_MM
+        moved_ok, note = (True, "只读")
+        if kind in ("open", "close"):
+            moved_ok, note = ga.check_moved(before, pos, kind, target)
         print("  [%s] 夹爪 %s → 回读 %s mm（%.1f s）%s"
               % (where, kind, "None" if pos is None else "%.1f" % pos, dt,
-                 "  ⚠️ 读不到" if pos is None else ""))
+                 "  ⚠️ 读不到" if pos is None else "  " + note
+                 + ("" if moved_ok else "  **判红**")))
         log_line(log_path, event="gripper", where=where, action=kind,
-                 position_mm=None if pos is None else round(float(pos), 2),
-                 duration_s=round(dt, 2))
+                 position_mm=_r2(pos), before_mm=_r2(before),
+                 target_mm=target if kind in ("open", "close") else None,
+                 moved=bool(moved_ok), note=note, duration_s=round(dt, 2))
+        if not moved_ok:
+            raise ga.GripperActionError("%s.%s：%s" % (where, kind, note))
         return pos
+
+    def gripper_selftest():
+        """动臂**之前**先证明夹爪链路是通的：空夹闭一次、再张开。
+
+        为什么值得多花两秒：2026-10-26 第一个循环里，夹爪四段动作全是空操作，
+        臂却完整走了一趟（下探→抬→槽位→张开→撤退），白跑 21 s 还差点把
+        「夹爪没夹」记成「抓取失败」。空夹闭合在巡检位是安全的（指尖离台面
+        还有 160 mm，两指之间没有东西），代价只有一次全行程。
+        """
+        print("  夹爪自检：空夹闭合 → 张开（指尖此时悬空）")
+        do_gripper("close", "selftest.close")
+        do_gripper("open", "selftest.open")
+        print("  夹爪自检通过：写下去的位置指令确实让手指走了。")
+        log_line(log_path, event="gripper_selftest", ok=True)
 
     # ---------------------------------------------------------------- 轨迹
     def send(target, dur, what):
@@ -338,32 +383,48 @@ def main():
     ok_all = True
     closed_at = None       # 闭合后的回读，抬升后拿它比
     lifted_at = None
+    # 动臂之前先证明夹爪链路通（i0==0 = 从计划起点开始，指尖一定在巡检位悬空）
+    if args.go and i0 == 0 and not args.dry_run_gripper:
+        try:
+            gripper_selftest()
+        except ga.GripperActionError as exc:
+            print("!! 夹爪自检判红：%s —— 一条轨迹都不发" % exc)
+            node.destroy_node()
+            rclpy.shutdown()
+            return 1
     for name in order:
         w = wr[name]
         ok, _ = gate("'%s' 之前" % name)
         if not ok:
             print("!! 闸门不过，停在这里")
             return 2
-        if w.get("before"):
-            do_gripper(w["before"]["gripper"], name + ".before")
-        if w.get("q") is not None:
-            if not send(w["q"], w["duration"], name):
-                print("!! %s 失败，后续一条都不发" % name)
-                return 1
-            expected[:] = w["q"]
-        if w.get("after"):
-            pos = do_gripper(w["after"]["gripper"], name + ".after")
-            # 手指被物体挡住 ⇒ 回读停在中间；全闭 ⇒ 空夹。
-            if w["after"]["gripper"] == "close":
-                closed_at = pos
-                if pos is None:
-                    print("   ⚠️ 闭合后读不到位置 —— 判不了夹没夹住")
-                    ok_all = False
-                elif pos <= AG95_EMPTY_TOL_MM:
-                    print("   ⚠️ 闭合后回读 %.1f mm ≈ 全闭 —— **空夹**" % pos)
-                    ok_all = False
-            elif name == "lift":
-                lifted_at = pos
+        try:
+            if w.get("before"):
+                do_gripper(w["before"]["gripper"], name + ".before")
+            if w.get("q") is not None:
+                if not send(w["q"], w["duration"], name):
+                    print("!! %s 失败，后续一条都不发" % name)
+                    return 1
+                expected[:] = w["q"]
+            if w.get("after"):
+                pos = do_gripper(w["after"]["gripper"], name + ".after")
+                # 手指被物体挡住 ⇒ 回读停在中间；全闭 ⇒ 空夹。
+                if w["after"]["gripper"] == "close":
+                    closed_at = pos
+                    if pos is None:
+                        print("   ⚠️ 闭合后读不到位置 —— 判不了夹没夹住")
+                        ok_all = False
+                    elif pos <= AG95_EMPTY_TOL_MM:
+                        print("   ⚠️ 闭合后回读 %.1f mm ≈ 全闭 —— **空夹**" % pos)
+                        ok_all = False
+                elif name == "lift":
+                    lifted_at = pos
+        except ga.GripperActionError as exc:
+            # 夹爪没做成 ⇒ 停在这里。继续往下（尤其继续抬升/去槽位）没有意义。
+            print("!! 夹爪动作判红，停在「%s」：%s" % (name, exc))
+            node.destroy_node()
+            rclpy.shutdown()
+            return 1
 
     # 抬升后复读：夹住的块如果滑了，回读会往闭合位缩。
     if closed_at is not None and lifted_at is not None:

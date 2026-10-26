@@ -257,8 +257,15 @@ def do_cycle(args, board, state):
         return rc
 
     # 2) 抓帧
-    fdir = os.path.join(args.run_dir, "frames", "pick-%02d" % n)
-    board.capture(fdir, "pick-%02d" % n)
+    if args.frame_dir:
+        # 复用已抓的帧：**执行的就是刚才给人看过的那份计划**。
+        # 不加这条的话，--go 会重新抓帧、重新推理，可能选中另一块 ——
+        # 那样「批准的计划」和「真正跑的计划」不是同一个东西。
+        fdir = os.path.abspath(args.frame_dir)
+        print("  复用帧 %s（不重新抓帧）" % fdir)
+    else:
+        fdir = os.path.join(args.run_dir, "frames", "pick-%02d" % n)
+        board.capture(fdir, "pick-%02d" % n)
     # 没 --go 时臂**根本没去**巡检位，帧来自当前位姿 —— 不能记成 survey_pick。
     if args.go:
         state["pose"] = "survey_pick"
@@ -404,6 +411,8 @@ def main():
     ap.add_argument("--push", action="store_true", help="只推脚本并核对 md5")
     ap.add_argument("--survey", choices=["pick", "place"], default=None)
     ap.add_argument("--cycle", action="store_true")
+    ap.add_argument("--frame-dir", default=None,
+                    help="复用已抓的帧目录（执行的就是预览过的那份计划）")
     args = ap.parse_args()
 
     os.makedirs(args.run_dir, exist_ok=True)
