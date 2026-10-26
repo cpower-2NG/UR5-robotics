@@ -132,9 +132,45 @@ def test_grasp_formula_and_clamp(chain):
     tall = dict(blocks[0], top=200.0, h=200.0)
     _, _, m_tall = pp.build_pick(chain, q0, cand, tall, [tall], (0.45, -0.25))
     assert abs(m_tall["grasp_z"] - pp.GRASP_Z_MAX) < 1e-9, m_tall["grasp_z"]
-    assert pp.GRASP_Z_MIN == pp.PLACE_DESCEND_Z, "抓取下限必须等于放置下降高度"
-    assert abs(pp.PLACE_DESCEND_Z - 0.2142) < 1e-9
-    assert abs(pp.PLACE_APPROACH_Z - 0.2542) < 1e-9
+    # 抓取下限 = **裸指尖**离台面 10 mm，不再借用「放置下降高度」当理由
+    assert abs(pp.GRASP_Z_MIN - (pp.GRASP_TIP_MIN_Z
+                                 + pp.TOOL0_TO_BARE_FINGERTIP)) < 1e-12
+    assert abs(pp.GRASP_Z_MIN - 0.2142) < 1e-9, pp.GRASP_Z_MIN
+
+
+@case
+def test_place_height_follows_block(chain):
+    """放置下降必须按**这一块**挂多长算：块底落在台面上方，不能被压进台面。
+
+    2026-10-26 现场缺陷：放置下降写死 0.2142（= 0.0285 + 0.1757 + 0.01），
+    其中 0.0285 正好是 A1 的块高 —— 28.5 mm 的块恰好落到台面，缺陷被块高掩盖。
+    换成 29.6 mm 的块，块底压进台面 1.1 mm，现场看到的就是「下死力压住桌面」。
+    """
+    blocks, cand, q0 = scene(chain)
+    blk = dict(blocks[0], top=29.6, h=29.6)          # 本轮 #7 cyan 的实测高度
+    _, _, meta = pp.build_pick(chain, q0, cand, blk, [blk], (0.45, -0.25))
+
+    below = meta["block_below_tip_mm"] / 1000.0
+    tip_z = meta["place_z"] - pp.TOOL0_TO_BARE_FINGERTIP
+    block_bottom = tip_z - below
+    assert abs(block_bottom - pp.PLACE_CLEARANCE) < 1e-6, \
+        "块底应在台面上方 %.3f m，实际 %.4f m" % (pp.PLACE_CLEARANCE, block_bottom)
+    assert block_bottom > 0, "块底 %.1f mm 在台面**以下** —— 放置会把块压进桌面" \
+        % (block_bottom * 1000)
+
+    # 旧公式（写死 0.2142）在同一块上算出什么：这条是防常量回家的回归哨
+    old_place_z = 0.0285 + pp.TOOL0_TO_FINGERTIP + 0.01
+    old_bottom = (old_place_z - pp.TOOL0_TO_BARE_FINGERTIP) - below
+    assert old_bottom < 0, "旧公式对 29.6 mm 的块应算出 1~1.2 mm 的压入量，实际 %.4f" \
+        % old_bottom
+
+    # 块越高，放置点越高（因为挂得更长）；矮块不会低于抓取下限对应的几何
+    tall = dict(blocks[0], top=35.0, h=35.0)
+    _, _, m_tall = pp.build_pick(chain, q0, cand, tall, [tall], (0.45, -0.25))
+    assert m_tall["place_z"] > meta["place_z"], \
+        "35 mm 的块放置点反而更低：%.4f <= %.4f" % (m_tall["place_z"], meta["place_z"])
+    for m in (meta, m_tall):
+        assert m["place_approach_z"] - m["place_z"] > 0.03, m
 
 
 @case
@@ -238,14 +274,15 @@ def test_wrist_guard(chain):
 def test_mutation_lowered_waypoint_is_rejected(chain):
     """**判红的证明**：把抓取/放置航点压低 50 mm，预检必须拦住。
 
-    压低 50 mm 之后指尖已经到台面以下（z≈−8 mm / −11 mm），连杆还在高处 ——
-    所以这一项同时证明「指尖点」这条判据真的在起作用，而不是只看肘和腕 1。
+    压低 50 mm 之后**裸指尖**已经到台面以下（抓取 −40 mm / 放置 −34 mm），
+    连杆还在高处 —— 所以这一项同时证明「指尖点」这条判据真的在起作用，
+    而不是只看肘和腕 1，也不是拿 0.1757 那个参数冒充指尖。
     """
     blocks, cand, q0 = scene(chain)
     _, _, meta = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25))
     gx, gy = meta["grasp_point"]
     for label, z in (("抓取", meta["grasp_z"] - 0.050),
-                     ("放置", pp.PLACE_DESCEND_Z - 0.050)):
+                     ("放置", meta["place_z"] - 0.050)):
         try:
             pp.add_move([], chain, "mut_" + label, (gx, gy, z), q0, 0.0, 0.0)
         except pp.PlanError as e:
@@ -258,11 +295,25 @@ def test_mutation_lowered_waypoint_is_rejected(chain):
 
 @case
 def test_mutation_deep_grasp_reaches_floor(chain):
-    """再压深一点（100 mm）也必须红；顺带证明 20 mm 以内不算红。"""
+    """再压深 100 mm 也必须红；顺带证明 5 mm 以内不算红（护栏不是一碰就响）。
+
+    注意这里的余量是 5 mm 不是 20 mm：指尖下限改成**裸指尖** 0.2042 + 8 mm 之后，
+    32 mm 的块抓取时指尖只在台面上方 13.5 mm —— 再压 20 mm 是真会到台面以下，
+    那时候判红是**对的**，不该为让测试变绿放宽护栏。
+    """
     blocks, cand, q0 = scene(chain)
     _, _, meta = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25))
     gx, gy = meta["grasp_point"]
-    pp.add_move([], chain, "ok20", (gx, gy, meta["grasp_z"] - 0.020), q0, 0.0, 0.0)
+    pp.add_move([], chain, "ok5", (gx, gy, meta["grasp_z"] - 0.005), q0, 0.0, 0.0)
+    # 20 mm 更深：拿参数 0.1757 冒充指尖时这条会**放过**（那点 z=22 mm > 20 mm 下限），
+    # 只有用裸指尖 0.2042 才拦得住 —— 这一项就是「指尖用的是哪个数」的证据。
+    try:
+        pp.add_move([], chain, "mut20", (gx, gy, meta["grasp_z"] - 0.020), q0, 0.0, 0.0)
+    except pp.PlanError as e:
+        assert "fingertip" in str(e), e
+    else:
+        raise AssertionError("压深 20 mm 时**裸指尖**已在台面以下，护栏却放过 —— "
+                             "是不是又拿 0.1757 冒充指尖了？")
     try:
         pp.add_move([], chain, "mut100", (gx, gy, meta["grasp_z"] - 0.100), q0, 0.0, 0.0)
     except pp.PlanError:

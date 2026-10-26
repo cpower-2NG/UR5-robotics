@@ -22,8 +22,16 @@
     抓取抬升              0.01 m
     接近余量              0.05 m
     搬运高度              0.15 m
-    放置面 z              0.0285 m
-    放置释放余量          0.01 m   ⇒ 放置下降 z = 0.2142
+    放置：**块底**离台面  0.005 m
+
+放置下降的高度**不能写死**。夹住之后，块底挂在指尖以下「块高 − 抓取深度」那么长，
+所以要让**块底**落在台面上方 5 mm：
+
+    place_z = 台面 + (块高 − 抓取深度) + 0.005 + 裸指尖 0.2042
+
+旧做法写死成 0.0285 + 0.1757 + 0.01 = 0.2142，那三个数里 0.0285 正好是 A1 的块高，
+等价于「28.5 mm 的块恰好落到台面」。换成 29.6 mm 的块，块底就压进台面 1.1 mm ——
+2026-10-26 现场看到的就是「下放太深才松爪，把块死死压在桌上」。
 
 姿态固定为「竖直朝下」rpy=(180°,0,ψ)，ψ 默认 0：AG-95 的手指轴相对 tool0
 的方向没有文档也没实测过，本轮不跟 GraspNet 的平面内角（它只记录在 meta 里）。
@@ -33,12 +41,12 @@ A/B 把腕转 180° 仍然抓成功，说明当前方块尺度下朝向不敏感
 ----------------------------------------
 1. IK 残差 < 0.1 mm / 0.05°
 2. 软限位（URDF 的 safety_controller，不是硬限位）
-3. 高度护栏：肘 / 腕 1 与**指尖点**（tool0 + R·[0,0,0.1757]）的 z ≥ 台面 + 20 mm，
-   关节空间逐段采样 8 点。指尖单独查，是因为夹着块横移时先碰台面的是它，
-   而肘、腕 1 都还在高处 —— 只查连杆等于没查。
+3. 高度护栏：肘 / 腕 1 的 z ≥ 台面 + 20 mm；**裸指尖**（tool0 + R·[0,0,0.2042]）
+   的 z ≥ 台面 + 8 mm。关节空间逐段采样 8 点。指尖单独查，是因为夹着块横移时
+   先碰台面的是它，而肘、腕 1 都还在高处 —— 只查连杆等于没查。
 4. 段内最大关节跳变 ≤ 1.0 rad，超过就插中间航点
 5. 腕 2 离 0 至少 0.15 rad（0 是腕奇异；插点也要查 —— 端点远离不等于插值点远离）
-6. 高度钳制：抓取 z ∈ [0.2142, 0.2242]（不低于已验证的放置深度）
+6. 高度钳制：抓取 z ∈ [0.2142, 0.2242]（裸指尖离台面 10~20 mm）
 7. 邻块间距 ≥ 60 mm（夹爪全开 95 mm；A/B 实测 77 mm 不碰）
 
 用法：
@@ -75,11 +83,13 @@ TOOL0_TO_FINGERTIP = 0.1757
 APPROACH_CLEARANCE = 0.05
 GRASP_CLEARANCE = 0.01
 LIFT_HEIGHT = 0.15
-PLACE_Z = 0.0285
-PLACE_RELEASE_LIFT = 0.01
-PLACE_DESCEND_Z = PLACE_Z + TOOL0_TO_FINGERTIP + PLACE_RELEASE_LIFT   # 0.2142
-PLACE_APPROACH_Z = PLACE_Z + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE  # 0.2542
-GRASP_Z_MIN = PLACE_DESCEND_Z          # 别比已验证过的放置深度更低
+PLACE_CLEARANCE = 0.005        # 放置时**块底**离台面多高（松开后落这 5 mm）
+PLACE_APPROACH_GAP = 0.04      # 放置接近点比下降点高多少（沿旧值的 0.2542−0.2142）
+# 抓取时**裸指尖**离台面的下限。0.2142 这个老数值碰巧 = 0.2042 + 0.010，
+# 所以下限本身没变，只是不再借用「放置下降高度」当理由 —— 那两件事是独立的：
+# 抓取深度由块高/参数 0.1757 决定，放置高度由**块底挂多长**决定。
+GRASP_TIP_MIN_Z = 0.010
+GRASP_Z_MIN = GRASP_TIP_MIN_Z + TOOL0_TO_BARE_FINGERTIP   # 0.2142
 GRASP_Z_MAX = GRASP_Z_MIN + 0.010      # 上限给 10 mm：块高 30~35 mm，实测够用
 # 腕 2（第 5 关节）离 0 至少这么远。0 就是腕奇异（1、3 轴重合），
 # A/B 两次实测腕 2 = −89.8°，余量极大；这个数只是防止 IK 挑到另一支解。
@@ -94,7 +104,8 @@ SURVEY_TOOL0 = {
 }
 
 GUARD_LINKS = ("forearm_link", "wrist_1_link")
-GUARD_MARGIN = 0.02
+GUARD_MARGIN = 0.02         # 大件（肘 / 腕 1）离台面的下限
+GUARD_TIP_MARGIN = 0.008    # **裸指尖**离台面的下限（10 mm 抓取深度留 2 mm 余量）
 MAX_JOINT_JUMP = 1.0
 GUARD_SAMPLES = 8
 TABLE_PLANE_Z = 0.0
@@ -155,33 +166,46 @@ def check_limits(chain, q):
 
 
 def check_guard(chain, q0, q1, table_z=TABLE_PLANE_Z, margin=GUARD_MARGIN,
-                links=GUARD_LINKS, samples=GUARD_SAMPLES):
+                links=GUARD_LINKS, samples=GUARD_SAMPLES,
+                tip_margin=GUARD_TIP_MARGIN):
     """关节空间直线上逐点 FK，检查两件事：
 
-    · 肘 / 腕 1 这些**大件**离台面的高度（擦台的典型是它们，不是指尖）；
-    · **指尖点**的高度 —— 指尖 = tool0 + R·[0,0,0.1757]（不是简单往下减，
-      姿态不是竖直朝下时要按 R 算）。夹着块横移时真正会碰到台面/别的块的
-      是它，只查连杆查不出来。
+    · 肘 / 腕 1 这些**大件**离台面的高度（擦台的典型是它们，不是指尖），
+      下限 `table_z + margin`；
+    · **裸指尖**的高度 —— 指尖 = tool0 + R·[0,0,0.2042]（不是简单往下减，
+      姿态不是竖直朝下时要按 R 算），下限 `table_z + tip_margin`。
+      夹着块横移时真正会碰到台面/别的块的是它，只查连杆查不出来。
 
-    返回 (ok, worst)，worst = (t, 名字, z)。
+    ⚠️ 指尖必须用**裸指尖 0.2042**，不能用参数 0.1757：用 0.1757 的话这条检查实际
+    看的是「块顶面那一层」（比真指尖高 28.5 mm），真指尖掉到台面以下 8.5 mm 还判绿。
+    2026-10-26 跟放置深度一起修。
+
+    返回 (ok, worst)，worst = (t, 名字, z, 下限)：不通过时是**超出最多**的那个点，
+    通过时是最低的那个点。
     """
     q0 = np.asarray(q0, float)
     q1 = np.asarray(q1, float)
-    worst = None
+    lowest = None            # 全段最低的点（通过时报它）
+    worst = None             # 超出下限最多的点（不通过时报它）
     for i in range(samples + 1):
         q = q0 + (q1 - q0) * (i / samples)
         qd = dict(zip(chain.move_joints, q))
-        for link in links:
-            z = float(chain.fk_link(link, qd)[2, 3])
-            if worst is None or z < worst[2]:
-                worst = (i / samples, link, z)
         T = chain.fk(qd)
-        tip_z = float(T[2, 3] + T[:3, 2] @ np.array([0.0, 0.0, TOOL0_TO_FINGERTIP]))
-        if worst is None or tip_z < worst[2]:
-            worst = (i / samples, "fingertip", tip_z)
-    if worst is not None and worst[2] < table_z + margin:
+        pts = [(link, float(chain.fk_link(link, qd)[2, 3]), table_z + margin)
+               for link in links]
+        pts.append(("fingertip",
+                    float(T[2, 3] + T[:3, 2] @ np.array([0.0, 0.0,
+                                                         TOOL0_TO_BARE_FINGERTIP])),
+                    table_z + tip_margin))
+        for name, z, low in pts:
+            rec = (i / samples, name, z, low)
+            if lowest is None or z < lowest[2]:
+                lowest = rec
+            if worst is None or (low - z) > (worst[3] - worst[2]):
+                worst = rec
+    if worst is not None and worst[2] < worst[3]:
         return False, worst
-    return True, worst
+    return True, lowest
 
 
 def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200):
@@ -209,7 +233,7 @@ def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
         raise PlanError("航点 %s 的段内高度护栏不过：t=%.2f 处 %s z=%.1f mm"
                         "（下限 %.1f mm）"
                         % (name, worst[0], worst[1], worst[2] * 1000,
-                           (table_z + GUARD_MARGIN) * 1000))
+                           worst[3] * 1000))
     wp = {"name": name, "q": [float(v) for v in q],
           "duration": float(duration or duration_for(q_seed, q))}
     if before:
@@ -281,20 +305,42 @@ def build_move(chain, q_start, xyz, name="move"):
     return wps, checks, {"kind": "move", "tool0": list(xyz)}
 
 
+def place_heights(block_h_m, grasp_depth_m, table_z=TABLE_PLANE_Z,
+                  clearance=PLACE_CLEARANCE, gap=PLACE_APPROACH_GAP):
+    """放置下降 / 放置接近两处的 tool0 z —— **按这一块挂多长算**，不按 A1 块高算。
+
+    夹住之后块底在指尖以下 `block_h − grasp_depth`。要让**块底**离台面 `clearance`：
+
+        指尖 z = 台面 + (block_h − grasp_depth) + clearance
+        tool0 z = 指尖 z + 裸指尖 0.2042
+
+    返回 (place_z, place_approach_z)。指尖若因此低于护栏下限，由 `add_move` 拦下，
+    这里不自己判 —— 一处判一次。
+    """
+    below_tip = block_h_m - grasp_depth_m
+    tip_z = table_z + below_tip + clearance
+    place_z = tip_z + TOOL0_TO_BARE_FINGERTIP
+    return place_z, place_z + gap
+
+
 def build_pick(chain, q_start, cand, block, blocks, slot):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。"""
     gx, gy = cand["xyz_base"][0], cand["xyz_base"][1]
     # 用**相对台面的高度** `h`，不用绝对顶面 z：
     # 腕部深度实测把台面读高 ~6 mm（本轮帧 table_z=+6.0 mm，真块高 = top − table_z
-    # = 24.3~26.0 mm），而本规划器的整个几何都锚在 table_plane_z=0（放置高度、
-    # PLACE_DESCEND_Z 都按台面建）。拿绝对 top 当 wz 会把那 6 mm 原样带进抓取高度，
+    # = 24.3~26.0 mm），而本规划器的整个几何都锚在 table_plane_z=0（抓取高度、
+    # 放置高度都按台面建）。拿绝对 top 当 wz 会把那 6 mm 原样带进抓取高度，
     # 指尖就少抓 6 mm —— 正好是用户说的「抓得更浅」那一类误差。
     wz = (block["h"] if block.get("h") is not None else block["top"]) / 1000.0
     approach_z = wz + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE
     grasp_z = float(np.clip(wz + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE,
                             GRASP_Z_MIN, GRASP_Z_MAX))
     lift_z = wz + TOOL0_TO_FINGERTIP + LIFT_HEIGHT
+    # 放置高度按**这一块**挂多长算（旧代码写死 0.2142，等于把 A1 的 28.5 mm 块高
+    # 编进常量里；29.6 mm 的块会压进台面 1.1 mm）。
+    grasp_depth_m = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
+    place_z, place_approach_z = place_heights(wz, grasp_depth_m)
     sx, sy = slot
 
     gap = check_block_gap(block, blocks)
@@ -313,9 +359,9 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
         ("grasp", (gx, gy, grasp_z), {"gripper": "close", "readback": True}, None),
         ("lift", (gx, gy, lift_z), {"gripper": "readback"}, None),
         ("to_slot", (sx, sy, lift_z), None, None),
-        ("place_approach", (sx, sy, PLACE_APPROACH_Z), None, None),
-        ("place", (sx, sy, PLACE_DESCEND_Z), {"gripper": "open", "readback": True}, None),
-        ("retreat", (sx, sy, PLACE_APPROACH_Z), None, None),
+        ("place_approach", (sx, sy, place_approach_z), None, None),
+        ("place", (sx, sy, place_z), {"gripper": "open", "readback": True}, None),
+        ("retreat", (sx, sy, place_approach_z), None, None),
         ("survey_place", SURVEY_TOOL0["place"], None, None),
     ]:
         q, c = add_move(wps, chain, name, xyz, q, 0.0, TABLE_PLANE_Z,
@@ -330,6 +376,10 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
             "table_z_mm": round(block["top"] - wz * 1000, 2),
             "grasp_depth_mm": round(wz * 1000 - (grasp_z * 1000
                                                  - TOOL0_TO_BARE_FINGERTIP * 1000), 2),
+            "block_below_tip_mm": round((wz - grasp_depth_m) * 1000, 2),
+            "place_z": round(place_z, 4),
+            "place_approach_z": round(place_approach_z, 4),
+            "place_clearance_mm": round(PLACE_CLEARANCE * 1000, 2),
             "block_xy_mm": [round(block["cx"], 2), round(block["cy"], 2)],
             "grasp_point": [gx, gy], "grasp_z": round(grasp_z, 4),
             "approach_z": round(approach_z, 4), "lift_z": round(lift_z, 4),
