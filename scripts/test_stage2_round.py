@@ -97,10 +97,12 @@ def test_load_scene_defaults_and_shortcuts():
     # 在 θ≈22.5° 处最大（45°），橙色块就栽在那里。
     assert s["yaw_sign"] == 1.0
     assert s["blocks_per_round"] == 6
-    # 松手弹滑的四项处置（2026-10-27 用户定；5 mm 放置间隙**不动**）
+    # 松手弹滑的处置（2026-10-27 用户定；5 mm 放置间隙**不动**）。
+    # 速度寄存器默认 **None**：实机写 0x0104=40 后回读恒 100（力/位置都能读回），
+    # 这台固件不认它 —— 写它只会让第一块在合拢前 fail-closed 停下。
     assert s["grasp_at"] == "block_center", s["grasp_at"]
-    assert 1 <= s["grasp_close_speed_pct"] <= 100, s["grasp_close_speed_pct"]
-    assert 1 <= s["release_open_speed_pct"] <= 100, s["release_open_speed_pct"]
+    assert s["grasp_close_speed_pct"] is None, s["grasp_close_speed_pct"]
+    assert s["release_open_speed_pct"] is None, s["release_open_speed_pct"]
     assert s["release_dwell_s"] > 0, s["release_dwell_s"]
 
     ok = ",".join(sm.DEFAULT_ORDER)
