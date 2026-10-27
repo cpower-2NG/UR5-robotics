@@ -105,6 +105,10 @@ WRIST_MIN_RAD = 0.15
 SURVEY_TOOL0 = {
     "pick": (0.5319, 0.2747, 0.3643),     # 相机 ~(500, 360, 340) mm，三块都在画面中部
     "place": (0.5319, -0.3853, 0.3643),   # 相机 ~(500, -300, 340) mm，四个槽都在画面内
+    # 阶段 2 的第二个终态位姿：同一放置区，tool0 平移 +45/+35 mm、高度不变。
+    # 用途是「同一批已放块从**两个不同视点**各量一次」—— 同一个视点连拍两帧
+    # 证明不了多姿态一致性（误差会一起共模）。位移量按 0.34 m 处的视场留足重叠。
+    "place2": (0.5769, -0.3503, 0.3643),
 }
 
 GUARD_LINKS = ("forearm_link", "wrist_1_link")
@@ -279,19 +283,17 @@ def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
 
 
 def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
-               n_random=32):
+               n_random=32, yaws=None):
     """给一串末端目标选**一条前后一致的 IK 分支链**（最小总关节行程）。
 
-    `targets` 是 [(名字, xyz), ...]。每点先多起点解法拿到几支合格解，
-    再用 DP 挑一条「相邻两段都过高度护栏、总行程最短」的链 —— 逐点贪心
-    不行：就近那一支可能只是当下近，下一步就得大跳换支。
-
-    返回每点的 q。任何一点一支解都没有、或所有组合都过不了护栏 ⇒ PlanError
-    （**不静默降级**：护栏不过就是不过）。
+    `targets` 是 [(名字, xyz), ...]。``yaws`` 可选，逐点姿态角；缺省全用
+    ``yaw_deg``。阶段 2 需要「抓取角」和「放置角」不同（夹着块转腕），
+    所以这里必须能逐点给 yaw —— 一个全局 yaw 表达不了两段姿态。
     """
-    sets = [ik_candidates(chain, xyz, yaw_deg, seeds=[q_start],
-                          n_random=n_random)
-            for _, xyz in targets]
+    sets = [ik_candidates(chain, xyz,
+                          yaw_deg if yaws is None else yaws[i],
+                          seeds=[q_start], n_random=n_random)
+            for i, (name, xyz) in enumerate(targets)]
     empty = [name for (name, _), s in zip(targets, sets) if not s]
     if empty:
         raise PlanError("这些航点连一支合格 IK 解都没有：%s" % "、".join(empty))
@@ -445,9 +447,30 @@ def place_heights(block_h_m, grasp_depth_m, table_z=TABLE_PLANE_Z,
     return place_z, place_z + gap
 
 
-def build_pick(chain, q_start, cand, block, blocks, slot):
+def build_pick(chain, q_start, cand, block, blocks, slot,
+               yaw_grasp_deg=0.0, yaw_place_deg=None, yaw_source="zero",
+               pick_open_mm=None, place_open_mm=None):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
-    → place(张开) → retreat → survey_place。"""
+    → place(张开) → retreat → survey_place。
+
+    两段 yaw（阶段 2 需要，A3 默认都是 0）
+    ─────────────────────────────────────
+    · ``yaw_grasp_deg``：approach/grasp/lift 的 tool0 绕 z 角。几何臂取
+      「块边方向 + δ」让两指贴住块面；
+    · ``yaw_place_deg``：to_slot/place_approach/place/retreat 的角。夹住块后
+      块相对 tool0 的偏角固定，所以放平时 ``yaw_place = δ``，**不随块而变**。
+    一个全局 yaw 表达不了「先按块面抓、再把手里这块转到格线」；这里逐航点给。
+
+    ``pick_open_mm`` / ``place_open_mm``：接近/放置时用半开（如 50 mm），
+    避免全开 95 mm 的指尖伸进 60 mm 格距的邻格。``None`` = 全开（A3 行为）。
+    """
+    yaw_place = yaw_grasp_deg if yaw_place_deg is None else yaw_place_deg
+
+    def _open_action(mm):
+        if mm is None:
+            return {"gripper": "open"}
+        return {"gripper": "open_to", "mm": float(mm)}
+
     gx, gy = cand["xyz_base"][0], cand["xyz_base"][1]
     # 用**相对台面的高度** `h`，不用绝对顶面 z：
     # 腕部深度实测把台面读高 ~6 mm（本轮帧 table_z=+6.0 mm，真块高 = top − table_z
@@ -482,21 +505,24 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
 
     wps, checks = [], []
     specs = [
-        ("approach", (gx, gy, approach_z), None,
-         {"gripper": "open", "readback": True}),
-        ("grasp", (gx, gy, grasp_z), {"gripper": "close", "readback": True}, None),
-        ("lift", (gx, gy, lift_z), {"gripper": "readback"}, None),
-        ("to_slot", (sx, sy, lift_z), None, None),
-        ("place_approach", (sx, sy, place_approach_z), None, None),
-        ("place", (sx, sy, place_z), {"gripper": "open", "readback": True}, None),
-        ("retreat", (sx, sy, place_approach_z), None, None),
-        ("survey_place", SURVEY_TOOL0["place"], None, None),
+        ("approach", (gx, gy, approach_z), yaw_grasp_deg, None,
+         _open_action(pick_open_mm)),
+        ("grasp", (gx, gy, grasp_z), yaw_grasp_deg,
+         {"gripper": "close", "readback": True}, None),
+        ("lift", (gx, gy, lift_z), yaw_grasp_deg, {"gripper": "readback"}, None),
+        ("to_slot", (sx, sy, lift_z), yaw_place, None, None),
+        ("place_approach", (sx, sy, place_approach_z), yaw_place, None, None),
+        ("place", (sx, sy, place_z), yaw_place,
+         _open_action(place_open_mm), None),
+        ("retreat", (sx, sy, place_approach_z), yaw_place, None, None),
+        ("survey_place", SURVEY_TOOL0["place"], 0.0, None, None),
     ]
     # 整链选一条分支（见 solve_path 的注释：逐点就近会挑到下一段过不了护栏的解）
-    qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _ in specs], q_start)
+    qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
+                       yaws=[y for _, _, y, _, _ in specs])
     q = q_start
-    for (name, xyz, after, before), q_solved in zip(specs, qpath):
-        q, c = add_move(wps, chain, name, xyz, q, 0.0, TABLE_PLANE_Z,
+    for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
+        q, c = add_move(wps, chain, name, xyz, q, yaw, TABLE_PLANE_Z,
                         after=after, before=before, q=q_solved)
         checks.append(c)
 
@@ -523,6 +549,10 @@ def build_pick(chain, q_start, cand, block, blocks, slot):
             "cand_dist_mm": round(cand["dist_mm"], 2),
             "cand_angle_deg": round(cand["angle_deg"], 2),
             "cand_seed": cand.get("seed"),
+            "yaw_grasp_deg": round(float(yaw_grasp_deg), 3),
+            "yaw_place_deg": round(float(yaw_place), 3),
+            "yaw_source": yaw_source,
+            "pick_open_mm": pick_open_mm, "place_open_mm": place_open_mm,
             "slot": list(slot), "block_gap_mm": round(gap * 1000, 1) if gap else None}
     return wps, checks, meta
 
@@ -536,12 +566,21 @@ def main():
     ap.add_argument("--q-start", default=None, help="逗号分隔的 6 个关节角（弧度）")
     ap.add_argument("--out", required=True)
     grp = ap.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--survey", choices=["pick", "place"])
+    grp.add_argument("--survey", choices=["pick", "place", "place2"])
     grp.add_argument("--move", help="tool0 目标 x,y,z（米）")
     grp.add_argument("--pick", action="store_true")
     ap.add_argument("--candidates", default=None)
     ap.add_argument("--block", type=int, default=None)
     ap.add_argument("--slot", default=None, help="x,y（米）")
+    ap.add_argument("--yaw-grasp-deg", type=float, default=0.0,
+                    help="抓取段 tool0 绕 z（阶段 2；A3 保持 0）")
+    ap.add_argument("--yaw-place-deg", type=float, default=None,
+                    help="放置段 tool0 绕 z（缺省 = 抓取角）")
+    ap.add_argument("--yaw-source", default="zero")
+    ap.add_argument("--pick-open-mm", type=float, default=None,
+                    help="接近时半开开口；缺省全开 95")
+    ap.add_argument("--place-open-mm", type=float, default=None,
+                    help="放置时半开开口；缺省全开 95")
     args = ap.parse_args()
 
     if args.from_frame:
@@ -570,8 +609,13 @@ def main():
                                 % (args.block, cand["anchor_mm"]))
             block = next(b for b in cand["blocks"] if b["idx"] == args.block)
             slot = tuple(float(v) for v in args.slot.split(","))
-            wps, checks, meta = build_pick(chain, q_start, per[0]["best"],
-                                           block, cand["blocks"], slot)
+            wps, checks, meta = build_pick(
+                chain, q_start, per[0]["best"], block, cand["blocks"], slot,
+                yaw_grasp_deg=args.yaw_grasp_deg,
+                yaw_place_deg=args.yaw_place_deg,
+                yaw_source=args.yaw_source,
+                pick_open_mm=args.pick_open_mm,
+                place_open_mm=args.place_open_mm)
         n_before_split = len(wps)
         wps, added = split_jumps(wps, chain)
         # 每个**原始**航点都必须有一条预检记录（插出来的点继承相邻两点的检查）。

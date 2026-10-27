@@ -79,6 +79,55 @@ def call_sync(g, kind, timeout=20.0, status_ok=STATUS_SUCCEEDED):
     return status, result
 
 
+def call_move_sync(g, mm, timeout=20.0, status_ok=STATUS_SUCCEEDED):
+    """``g.move_to(mm, done_cb=...)`` 的同步版；语义与 :func:`call_sync` 相同。
+
+    阶段 2 用半开（如 50 mm）放置：全开 95 mm 的指尖会伸进 60 mm 格距的邻格。
+    """
+    move_to = getattr(g, "move_to", None)
+    if move_to is None:
+        raise GripperActionError("夹爪后端没有 move_to（不支持半开）")
+    ev = threading.Event()
+    box = {}
+
+    def cb(status, result):
+        box["status"] = status
+        box["result"] = result
+        ev.set()
+
+    move_to(float(mm), done_cb=cb)
+    if not ev.wait(timeout):
+        raise GripperActionError("AG-95 move_to(%.1f) 等完成回调超时（%.0f s）"
+                                 % (mm, timeout))
+    status = box.get("status")
+    result = box.get("result")
+    code = getattr(result, "error_code", None)
+    if status != status_ok or code != 0:
+        raise GripperActionError(
+            "AG-95 move_to(%.1f) 失败：status=%s error_code=%s %s"
+            % (mm, status, code, getattr(result, "error_string", "") or ""))
+    return status, result
+
+
+def check_moved_to(before, after, target_mm, tol_mm=MOVED_TOL_MM):
+    """``move_to`` 的「真的动了吗」：朝**目标方向**走了 ≥ tol，或本来就在目标。"""
+    if before is None or after is None:
+        return False, "读不到位置（before=%s after=%s）—— 判不了动没动" % (
+            before, after)
+    if abs(before - target_mm) <= tol_mm and abs(after - target_mm) <= tol_mm:
+        return True, "本来就在 %.1f mm（目标 %.1f mm）" % (before, target_mm)
+    moved = abs(after - before)
+    if moved < tol_mm:
+        return False, ("写了 move_to(%.1f) 但手指几乎没动（%.1f → %.1f mm，"
+                       "%.1f < 阈 %.1f）" % (target_mm, before, after, moved,
+                                            tol_mm))
+    if (after - before) * (target_mm - before) <= 0:
+        return False, ("手指朝反方向动了（%.1f → %.1f mm，目标 %.1f）"
+                       % (before, after, target_mm))
+    return True, "%.1f → %.1f mm（目标 %.1f，move_to）" % (
+        before, after, target_mm)
+
+
 def check_moved(before, after, kind, target_mm, tol_mm=MOVED_TOL_MM):
     """指令写下去以后，回读**真的**变了吗？返回 ``(ok, 说明)``。
 

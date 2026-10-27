@@ -32,6 +32,7 @@ GraspNet 的分数是「这个点像不像可抓」，不是「这是哪一块�
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -184,6 +185,97 @@ def table_plane_z(points_base):
     return float(edges[np.argmax(hist)])
 
 
+# ---------------------------------------------------------------- 顶面几何
+def convex_hull_2d(pts):
+    """单调链凸包（纯 numpy；推理环境没有 scipy/cv2）。返回逆时针顶点。"""
+    P = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+    P = np.unique(P, axis=0)
+    if len(P) <= 2:
+        return P
+    P = P[np.lexsort((P[:, 1], P[:, 0]))]
+
+    def cross(o, a, b):
+        return ((a[0] - o[0]) * (b[1] - o[1])
+                - (a[1] - o[1]) * (b[0] - o[0]))
+
+    lower = []
+    for p in P:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in P[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return np.array(lower[:-1] + upper[:-1], dtype=np.float64)
+
+
+def min_area_rect_2d(pts, trim_pct=(2.0, 98.0), step_deg=0.5,
+                     max_points=1200):
+    """平面点集的最小外接矩形（按角度扫描 + 分位裁剪）。
+
+    为什么不直接对凸包做旋转卡壳：顶面点云里总有少量飞点/边缘毛刺，凸包由
+    **极值点**定义，角度对个别飞点极其敏感。A3 存档三帧实测，同一块（黄，
+    428,256）原始凸包的 yaw 极差 8°；改成「旋转后取 2%–98% 分位边界」后
+    降到 6° 内（另一块 35×27 的遮挡帧仍 8°，标 ``yaw_trusted=false``）。
+
+    返回 ``{yaw_deg, ext_mm, fill, hull_area_mm2}``：
+      · ``yaw_deg`` —— **长边**方向，``[0,180)``；近正方块长短差很小，
+        长边方向可能在 mod 180 上翻 90°，但 mod 90 稳定（判分就是 mod 90）。
+      · ``ext_mm``   —— ``[长边, 短边]``；
+      · ``fill``     —— 全点凸包面积 / 矩形面积，近正方形顶面约 0.85–0.95；
+        点数少/被遮挡/混入侧面时会掉下来，用作 ``yaw_trusted`` 的判据。
+    """
+    P = np.asarray(pts, dtype=np.float64).reshape(-1, 2) * 1000.0
+    if len(P) < 3:
+        return {'yaw_deg': 0.0, 'ext_mm': [0.0, 0.0], 'fill': 0.0,
+                'hull_area_mm2': 0.0}
+    Ps = P
+    if len(Ps) > max_points:
+        Ps = Ps[np.linspace(0, len(Ps) - 1, max_points).astype(int)]
+    lo, hi = trim_pct
+    best = None
+    for deg in np.arange(0.0, 90.0, step_deg):
+        a = math.radians(float(deg))
+        ca, sa = math.cos(a), math.sin(a)
+        x = Ps[:, 0] * ca + Ps[:, 1] * sa
+        y = -Ps[:, 0] * sa + Ps[:, 1] * ca
+        x0, x1 = np.percentile(x, [lo, hi])
+        y0, y1 = np.percentile(y, [lo, hi])
+        w, h = float(x1 - x0), float(y1 - y0)
+        if w <= 0.0 or h <= 0.0:
+            continue
+        area = w * h
+        if best is None or area < best[0] - 1e-9:
+            best = (area, float(deg), w, h)
+    if best is None:
+        return {'yaw_deg': 0.0, 'ext_mm': [0.0, 0.0], 'fill': 0.0,
+                'hull_area_mm2': 0.0}
+    area, deg, w, h = best
+    yaw = deg if w >= h else deg + 90.0
+    yaw %= 180.0
+    hull = convex_hull_2d(P)
+    x, y = hull[:, 0], hull[:, 1]
+    hull_area = 0.5 * abs(float(np.dot(x, np.roll(y, -1))
+                                - np.dot(y, np.roll(x, -1))))
+    return {'yaw_deg': float(yaw),
+            'ext_mm': [max(w, h), min(w, h)],
+            'fill': float(hull_area / area) if area > 0 else 0.0,
+            'hull_area_mm2': float(hull_area)}
+
+
+def fold_mod90(deg):
+    """把任意角度折到 [0,90)：判分/重复性都用它，避免 90° 翻转被当误差。"""
+    return float(deg % 90.0)
+
+
+def ang_diff_mod90(a, b):
+    """两角在 mod 90 下的最小差（0…45）。"""
+    d = abs((float(a) - float(b)) % 90.0)
+    return float(min(d, 90.0 - d))
+
+
 # ---------------------------------------------------------------- 块真值
 def rgb_to_hsv255(rgb):
     """RGB(0-255) → (H 度, S 0-255, V 0-255)。与 cv2 同一定义，但不依赖 cv2
@@ -214,12 +306,153 @@ def circular_median_deg(angles):
     return float((ref + np.median(rel)) % 360.0)
 
 
-def find_blocks(frame, table_z=None):
+def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
+                legacy=False):
     """把「立在台面上的块」逐块量出来：顶面中心/高度/尺寸/yaw/颜色。
 
     与 ``find_blocks.py``（临时脚本）的区别：颜色取**顶面那 3 mm**的像素，
     不是整块。整块的平均会把侧面的阴影拉进来 —— 侧面比顶面暗，色相会往短波挪，
     而橙↔棕只差 8°。
+
+    2026-10-27 改动（合簇静默漏块）
+    ──────────────────────────────
+    旧实现先把 **z 高于台面 5 mm 的所有点**投到 4 mm 网格上做连通域。台面噪声/
+    背景会在低处把相邻的块**桥接成一个大簇**；随后 ``len(Qs) > 20000`` 把整个
+    大簇当「台面级平板」丢掉 —— 块就静默消失了。A3 存档三帧实测：大簇
+    31604 / 57537 / 46263 点，丢掉的是真实存在的块（pick-02 的 (429,257)、
+    pick-05 的 (418,329) 等）。
+
+    现在的做法：**先按高度切顶面**，再连通域。
+      · 每个 4 mm 网格取**最高点**，只保留高于台面 ``min_h_mm`` 的格子；
+      · 低处的桥接/台面噪声不进入顶面掩码，天然不会把两块粘在一起；
+      · 低处（5 mm … min_h_mm）另做一遍，只作为 ``skipped_low`` 诊断，
+        不参与抓取选块。
+    ``legacy=True`` 保留旧算法，供 A3 对照；默认走新路径。
+    """
+    if legacy:
+        return _find_blocks_legacy(frame, table_z)
+
+    R, t, K = frame["R_bc"], frame["t_bc"], frame["K"]
+    depth, color = frame["depth"], frame["color"]
+    P, pix = backproject(depth, K)
+    Pb = P @ R.T + t
+    if table_z is None:
+        table_z = table_plane_z(Pb)
+
+    m = (Pb[:, 2] > table_z + 0.005) & (Pb[:, 2] < table_z + 0.070)
+    Q, qpix = Pb[m], pix[m]
+    if len(Q) == 0:
+        return [], table_z
+
+    cell = 0.004
+    ij = np.floor(Q[:, :2] / cell).astype(np.int64)
+    ij -= ij.min(0) - 1
+    shape = tuple(ij.max(0) + 3)
+    # 每个网格的**最高点**：这是把「顶面」和「侧面/桥接」分开的关键。
+    H = np.full(shape, -np.inf, dtype=np.float64)
+    np.maximum.at(H, (ij[:, 0], ij[:, 1]), Q[:, 2])
+
+    def collect(labels, n_labels, low):
+        got = []
+        cell_lab = labels[ij[:, 0], ij[:, 1]]
+        for l in range(1, n_labels + 1):
+            sel = cell_lab == l
+            if sel.sum() < 200:
+                continue
+            Qs = Q[sel]
+            lo, hi = Qs.min(0), Qs.max(0)
+            if (hi[0] - lo[0]) < 0.010 or (hi[1] - lo[1]) < 0.010:
+                continue
+            ztop = np.percentile(Qs[:, 2], 97)
+            F = Qs[Qs[:, 2] > ztop - 0.003]
+            if len(F) < 50:
+                continue
+            c = F[:, :2].mean(0)
+            d = F[:, :2] - c
+            evals, evecs = np.linalg.eigh(d.T @ d / len(d))
+            yaw = float(np.degrees(np.arctan2(evecs[1, -1], evecs[0, -1])))
+            ext = (d @ evecs).max(0) - (d @ evecs).min(0)
+            # 边界方向比内部点更可靠（近正方块 PCA 两个特征值接近）。
+            rect = min_area_rect_2d(F[:, :2])
+
+            # 顶面像素：F 是 Qs 的子集，要回到 Q/qpix 的下标才能索引彩色图
+            sel_idx = np.where(sel)[0]
+            f_idx = sel_idx[Qs[:, 2] > ztop - 0.003]
+            f_pix = qpix[f_idx]
+            px = color[f_pix[:, 1], f_pix[:, 0]].astype(float)
+            med_rgb = np.median(px, axis=0) if len(px) else np.zeros(3)
+            hue, sat, val = rgb_to_hsv255(med_rgb)
+
+            # 逐像素判类 → **按饱和度加权**的多数票。
+            #
+            # 为什么必须加权、且要滤掉低饱和像素：灰/白/木色像素的色相是纯噪声。
+            # 本帧那块 8 mm 的平板（S=29/255）第一版就被投票判成了 cyan —— 它的
+            # 中位色相是 0°，与 cyan 的 191° 差了 169°，只有逐像素噪声能做到这种错。
+            # ``palette_survey.py`` 的直方图也是**按饱和度加权**的，同一个理由。
+            samples = px[::max(1, len(px) // 400)]
+            votes, wsum = {}, 0.0
+            for p in samples:
+                h_, s_, v_ = rgb_to_hsv255(p)
+                if s_ < 60 or v_ < 40:      # 与 palette_survey 的 s_min/v_min 同值
+                    continue
+                name, _ = block_classes.nearest_class_by_hue(h_)
+                votes[name] = votes.get(name, 0.0) + s_
+                wsum += s_
+            if wsum <= 0:
+                cls, share = "unknown", 0.0
+            else:
+                cls = max(votes, key=votes.get)
+                share = votes[cls] / wsum
+            votes = {k: int(v) for k, v in votes.items()}
+
+            # 顶面中心投到图像上：块贴边时 GraspNet 几乎给不出候选（实测 live-04
+            # 的三块都在 v≈670/720 的底边上，紫块最好候选偏 10 mm）。这个像素坐标
+            # 就是「取景够不够」的判据，别等到候选数掉了才反推原因。
+            pc = np.array([c[0], c[1], ztop])
+            uv = K @ (R.T @ (pc - t))
+            u_px, v_px = ((float(uv[0] / uv[2]), float(uv[1] / uv[2]))
+                          if uv[2] > 1e-6 else (0.0, 0.0))
+
+            got.append({
+                "cx": float(c[0] * 1000), "cy": float(c[1] * 1000),
+                "top": float(ztop * 1000), "h": float((ztop - table_z) * 1000),
+                "uv": [round(u_px, 1), round(v_px, 1)],
+                "ext": [float(v * 1000) for v in ext],
+                "yaw": yaw, "n": int(sel.sum()),
+                "yaw_rect": round(rect['yaw_deg'], 2),
+                "ext_rect": [round(v, 1) for v in rect['ext_mm']],
+                "rect_fill": round(rect['fill'], 3),
+                "yaw_trusted": bool(rect['fill'] >= 0.85),
+                "rgb": [round(float(v)) for v in med_rgb],
+                "hsv": [round(hue, 1), round(sat), round(val)],
+                "class": cls, "class_share": round(float(share), 3),
+                "votes": dict(sorted(votes.items(), key=lambda kv: -kv[1])),
+                "cells": int((labels == l).sum()),
+                "low": bool(low),
+            })
+        return got
+
+    # 顶面：高于台面 min_h_mm 的格子。低处桥接被排除，大簇不再出现。
+    high = binary_closing(H > table_z + min_h_mm / 1000.0)
+    lab_h, n_h = label4(high)
+    out = collect(lab_h, n_h, low=False)
+
+    # 低处：5 mm … min_h_mm，只用于诊断（8 mm 平板、木板边缘）。旧语义里
+    # ``analyse`` 会把它们放进 skipped_low；这里保留，不静默丢。
+    low_mask = binary_closing((H > table_z + 0.005) & (~high))
+    lab_l, n_l = label4(low_mask)
+    out.extend(collect(lab_l, n_l, low=True))
+
+    out.sort(key=lambda r: (r["cx"], r["cy"]))
+    for i, r in enumerate(out):
+        r["idx"] = i
+    return out, table_z
+
+
+def _find_blocks_legacy(frame, table_z=None):
+    """2026-10-27 之前的算法，原样保留供 A3 对照（``legacy=True``）。
+
+    已知缺陷：低处桥接会把相邻块粘成大簇，``len(Qs) > 20000`` 再整簇丢掉。
     """
     R, t, K = frame["R_bc"], frame["t_bc"], frame["K"]
     depth, color = frame["depth"], frame["color"]
@@ -261,7 +494,6 @@ def find_blocks(frame, table_z=None):
         yaw = float(np.degrees(np.arctan2(evecs[1, -1], evecs[0, -1])))
         ext = (d @ evecs).max(0) - (d @ evecs).min(0)
 
-        # 顶面像素：F 是 Qs 的子集，要回到 Q/qpix 的下标才能索引彩色图
         sel_idx = np.where(sel)[0]
         f_idx = sel_idx[Qs[:, 2] > ztop - 0.003]
         f_pix = qpix[f_idx]
@@ -269,17 +501,11 @@ def find_blocks(frame, table_z=None):
         med_rgb = np.median(px, axis=0)
         hue, sat, val = rgb_to_hsv255(med_rgb)
 
-        # 逐像素判类 → **按饱和度加权**的多数票。
-        #
-        # 为什么必须加权、且要滤掉低饱和像素：灰/白/木色像素的色相是纯噪声。
-        # 本帧那块 8 mm 的平板（S=29/255）第一版就被投票判成了 cyan —— 它的
-        # 中位色相是 0°，与 cyan 的 191° 差了 169°，只有逐像素噪声能做到这种错。
-        # ``palette_survey.py`` 的直方图也是**按饱和度加权**的，同一个理由。
         samples = px[::max(1, len(px) // 400)]
         votes, wsum = {}, 0.0
         for p in samples:
             h_, s_, v_ = rgb_to_hsv255(p)
-            if s_ < 60 or v_ < 40:          # 与 palette_survey 的 s_min/v_min 同值
+            if s_ < 60 or v_ < 40:
                 continue
             name, _ = block_classes.nearest_class_by_hue(h_)
             votes[name] = votes.get(name, 0.0) + s_
@@ -291,12 +517,10 @@ def find_blocks(frame, table_z=None):
             share = votes[cls] / wsum
         votes = {k: int(v) for k, v in votes.items()}
 
-        # 顶面中心投到图像上：块贴边时 GraspNet 几乎给不出候选（实测 live-04 的
-        # 三块都在 v≈670/720 的底边上，紫块最好候选偏 10 mm）。这个像素坐标
-        # 就是「取景够不够」的判据，别等到候选数掉了才反推原因。
         pc = np.array([c[0], c[1], ztop])
         uv = K @ (R.T @ (pc - t))
-        u_px, v_px = (float(uv[0] / uv[2]), float(uv[1] / uv[2])) if uv[2] > 1e-6 else (0.0, 0.0)
+        u_px, v_px = ((float(uv[0] / uv[2]), float(uv[1] / uv[2]))
+                      if uv[2] > 1e-6 else (0.0, 0.0))
 
         out.append({
             "cx": float(c[0] * 1000), "cy": float(c[1] * 1000),
@@ -308,6 +532,8 @@ def find_blocks(frame, table_z=None):
             "hsv": [round(hue, 1), round(sat), round(val)],
             "class": cls, "class_share": round(float(share), 3),
             "votes": dict(sorted(votes.items(), key=lambda kv: -kv[1])),
+            "cells": int((lab == l).sum()),
+            "low": False,
         })
     out.sort(key=lambda r: (r["cx"], r["cy"]))
     for i, r in enumerate(out):
@@ -413,16 +639,19 @@ def select(blocks, cands, anchor_mm=ANCHOR_MM):
 
 
 def analyse(frame_dir, run_infer=True, anchor_mm=ANCHOR_MM, seeds=(0, 1, 2),
-            min_h_mm=15.0):
+            min_h_mm=15.0, legacy=False):
     """量块 + 推理 + 锚定。
 
     ``min_h_mm=15`` 只用来把**不是积木的东西**（8 mm 平板、木板边缘）挡在外面。
     实测积木高 30–33 mm，平板 8.1 mm —— 间隔够宽，不会误伤；被挡掉的仍留在
     ``skipped_low`` 里，不是悄悄丢掉。
+
+    ``legacy=True`` 走 2026-10-27 之前的聚类（低处桥接会粘簇、大簇被丢），
+    只用于 A3 对照，别用来出新数据。
     """
     frame = load_frame(frame_dir)
     P, _ = backproject(frame["depth"], frame["K"])
-    all_blocks, table_z = find_blocks(frame)
+    all_blocks, table_z = find_blocks(frame, legacy=legacy)
     blocks = [b for b in all_blocks if b["h"] >= min_h_mm]
     skipped = [b for b in all_blocks if b["h"] < min_h_mm]
     for i, b in enumerate(blocks):
@@ -485,11 +714,14 @@ def main():
     ap.add_argument("--seeds", default="0,1,2",
                     help="采样种子列表（逗号分隔）；候选合并，抵消采样方差")
     ap.add_argument("--block", type=int, default=None, help="只看这一块（0 起）")
+    ap.add_argument("--legacy-cluster", action="store_true",
+                    help="走旧聚类（低处桥接会粘簇、大簇被丢）；只用于 A3 对照")
     args = ap.parse_args()
 
     seeds = tuple(int(x) for x in args.seeds.split(",") if x.strip())
     res = analyse(args.frame, run_infer=not args.no_infer,
-                  anchor_mm=args.anchor_mm, seeds=seeds)
+                  anchor_mm=args.anchor_mm, seeds=seeds,
+                  legacy=args.legacy_cluster)
     print("%s  相机 base_link (%7.1f, %7.1f, %7.1f) mm  台面 z=%+.1f mm  点 %d"
           % (args.frame, *res["camera_base_xyz_mm"], res["table_z_mm"], res["n_points"]))
     print("  块 %d 个：" % len(res["blocks"]))

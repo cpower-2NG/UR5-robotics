@@ -316,6 +316,67 @@ def test_pick_waypoint_order_and_actions(chain):
 
 
 @case
+def test_pick_two_stage_yaw(chain):
+    """阶段 2：抓取段按块面 yaw、放置段按格线 yaw —— 两段各自落到目标上。
+
+    两段 yaw 不同（30 / −15）才证明是真的逐航点给角，而不是一个全局值。
+    """
+    blocks, cand, q0 = scene(chain)
+    wps, _, meta = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25),
+                                 yaw_grasp_deg=30.0, yaw_place_deg=-15.0,
+                                 yaw_source="face", pick_open_mm=50.0,
+                                 place_open_mm=50.0)
+    by = {w["name"]: w for w in wps}
+    gx, gy = meta["grasp_point"]
+    sx, sy = [v / 1000.0 for v in meta["place_target_mm"]]
+    for n, xyz, yaw in (("approach", (gx, gy, meta["approach_z"]), 30.0),
+                        ("grasp", (gx, gy, meta["grasp_z"]), 30.0),
+                        ("lift", (gx, gy, meta["lift_z"]), 30.0),
+                        ("to_slot", (sx, sy, meta["lift_z"]), -15.0),
+                        ("place", (sx, sy, meta["place_z"]), -15.0),
+                        ("retreat", (sx, sy, meta["place_approach_z"]), -15.0)):
+        pe, re = pp.pose_residual(chain, by[n]["q"], xyz, yaw)
+        assert pe < 0.1 and re < 0.05, \
+            "%s 没落到 yaw %.0f°：%.3f mm / %.4f°" % (n, yaw, pe, re)
+    assert meta["yaw_grasp_deg"] == 30.0 and meta["yaw_place_deg"] == -15.0
+    assert meta["yaw_source"] == "face", meta["yaw_source"]
+    assert meta["pick_open_mm"] == 50.0 and meta["place_open_mm"] == 50.0
+    assert by["approach"]["before"] == {"gripper": "open_to", "mm": 50.0}, \
+        by["approach"]["before"]
+    assert by["place"]["after"] == {"gripper": "open_to", "mm": 50.0}, \
+        by["place"]["after"]
+    assert by["grasp"]["after"]["gripper"] == "close", "闭合不能变成半开"
+
+
+@case
+def test_mutation_yaw_ignored_is_caught(chain):
+    """**判红的证明**：yaw=30° 的抓取点拿去按 0° 量，残差必须很大。
+
+    这条挡住「参数接了但没传进 IK」—— 那种情况下上面那条会照样绿。
+    """
+    blocks, cand, q0 = scene(chain)
+    wps, _, meta = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25),
+                                 yaw_grasp_deg=30.0)
+    q_grasp = {w["name"]: w for w in wps}["grasp"]["q"]
+    gx, gy = meta["grasp_point"]
+    pe, re = pp.pose_residual(chain, q_grasp, (gx, gy, meta["grasp_z"]), 0.0)
+    assert re > 20.0, "yaw 30° 的抓取点按 0° 量只差 %.2f° —— 这条判据失灵了" % re
+    # yaw_place 缺省 = yaw_grasp（A3 单角语义），不是 0。
+    assert meta["yaw_place_deg"] == 30.0, meta["yaw_place_deg"]
+
+
+@case
+def test_exec_accepts_dict_gripper_actions():
+    """计划里的夹爪动作全链：字符串与 ``{"gripper":"open_to","mm":..}`` 都认。"""
+    import precision_exec as pe
+    assert pe._action_name("close") == "close"
+    assert pe._action_name({"gripper": "open_to", "mm": 50}) == "open_to"
+    assert pe._action_str("readback") == "readback"
+    assert pe._action_str({"gripper": "open_to", "mm": 50}) == "open_to(50.0)"
+    assert pe._action_str({"gripper": "open_to"}) == "open_to"
+
+
+@case
 def test_pick_ik_residuals(chain):
     blocks, cand, q0 = scene(chain)
     _, checks, _ = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25))

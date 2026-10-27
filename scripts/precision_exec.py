@@ -65,6 +65,22 @@ def _r2(v):
     return None if v is None else round(float(v), 2)
 
 
+def _action_name(spec):
+    """夹爪动作名（``open``/``close``/``readback``/``open_to``）。"""
+    if isinstance(spec, dict):
+        return spec.get("gripper")
+    return spec
+
+
+def _action_str(spec):
+    """把夹爪动作 spec（字符串或 ``{"gripper":..,"mm":..}``）变成一行字。"""
+    if isinstance(spec, dict):
+        mm = spec.get("mm")
+        return str(spec.get("gripper")) + (
+            "" if mm is None else "(%.1f)" % float(mm))
+    return str(spec)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True)
@@ -130,9 +146,9 @@ def main():
         w = wr[n]
         act = []
         if w.get("before"):
-            act.append("前:" + w["before"]["gripper"])
+            act.append("前:" + _action_str(w["before"]["gripper"]))
         if w.get("after"):
-            act.append("后:" + w["after"]["gripper"])
+            act.append("后:" + _action_str(w["after"]["gripper"]))
         print("  %-15s q(deg) [%s]  %4.1fs  %s"
               % (n, " ".join("%6.1f" % math.degrees(v) for v in w["q"]),
                  w["duration"], " ".join(act)))
@@ -295,7 +311,7 @@ def main():
             time.sleep(0.1)
         return last
 
-    def do_gripper(kind, where):
+    def do_gripper(spec, where):
         """发一个夹爪动作并**证明它真的发生了**。
 
         2026-10-26 的教训：``Ag95Gripper.close()`` 不给 ``done_cb`` 是**空操作**
@@ -303,7 +319,15 @@ def main():
         和成功一样。所以这里两件事缺一不可：走 ``ga.call_sync``（带回调），
         并且写完以后比对回读（``ga.check_moved``）。任一条不成立就抛
         :class:`ga.GripperActionError`，让循环停在原地。
+
+        ``spec`` 可以是字符串 ``open/close/readback``，也可以是
+        ``{"gripper":"open_to", "mm":50}``（阶段 2 半开）。
         """
+        if isinstance(spec, dict):
+            kind = spec.get("gripper")
+            open_mm = spec.get("mm")
+        else:
+            kind, open_mm = spec, None
         g = gripper()
         t0 = time.time()
         before = g.current_position()
@@ -315,22 +339,40 @@ def main():
                 log_line(log_path, event="gripper_fail", where=where, action=kind,
                          error=str(exc), before_mm=_r2(before))
                 raise
+        elif kind == "open_to":
+            if open_mm is None:
+                raise ga.GripperActionError("%s：open_to 缺 mm" % where)
+            try:
+                ga.call_move_sync(g, float(open_mm))
+            except ga.GripperActionError as exc:
+                print("  [%s] 夹爪 open_to(%.1f) **失败**：%s"
+                      % (where, float(open_mm), exc))
+                log_line(log_path, event="gripper_fail", where=where,
+                         action=kind, target_mm=float(open_mm),
+                         error=str(exc), before_mm=_r2(before))
+                raise
         elif kind != "readback":
-            print("!! 不认识的夹爪动作 %r" % kind)
+            print("!! 不认识的夹爪动作 %r" % spec)
             return None
         pos = wait_stable(g)
         dt = time.time() - t0
-        target = GRIP_OPEN_MM if kind == "open" else GRIP_CLOSE_MM
+        target = (GRIP_OPEN_MM if kind == "open" else
+                  GRIP_CLOSE_MM if kind == "close" else
+                  float(open_mm) if open_mm is not None else None)
         moved_ok, note = (True, "只读")
         if kind in ("open", "close"):
             moved_ok, note = ga.check_moved(before, pos, kind, target)
-        print("  [%s] 夹爪 %s → 回读 %s mm（%.1f s）%s"
-              % (where, kind, "None" if pos is None else "%.1f" % pos, dt,
+        elif kind == "open_to":
+            moved_ok, note = ga.check_moved_to(before, pos, target)
+        print("  [%s] 夹爪 %s%s → 回读 %s mm（%.1f s）%s"
+              % (where, kind,
+                 "" if open_mm is None else "(%.1f)" % float(open_mm),
+                 "None" if pos is None else "%.1f" % pos, dt,
                  "  ⚠️ 读不到" if pos is None else "  " + note
                  + ("" if moved_ok else "  **判红**")))
         log_line(log_path, event="gripper", where=where, action=kind,
                  position_mm=_r2(pos), before_mm=_r2(before),
-                 target_mm=target if kind in ("open", "close") else None,
+                 target_mm=target if kind in ("open", "close", "open_to") else None,
                  moved=bool(moved_ok), note=note, duration_s=round(dt, 2))
         if not moved_ok:
             raise ga.GripperActionError("%s.%s：%s" % (where, kind, note))
@@ -429,7 +471,7 @@ def main():
                 pos = do_gripper(w["after"]["gripper"], name + ".after")
                 # 手指被物体挡住 ⇒ 回读停在中间；全闭 ⇒ 空夹。
                 # 中间值**不等于**开口（见 AG95_EMPTY_TOL_MM），这里只判「夹到没」。
-                if w["after"]["gripper"] == "close":
+                if _action_name(w["after"]["gripper"]) == "close":
                     closed_at = pos
                     if pos is None:
                         print("   ⚠️ 闭合后读不到位置 —— 判不了夹没夹住")

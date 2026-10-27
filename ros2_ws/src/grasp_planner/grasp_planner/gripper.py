@@ -252,6 +252,10 @@ class GripperBackend:
     def close(self, done_cb: Optional[Callable] = None) -> None:
         raise NotImplementedError
 
+    def move_to(self, mm: float, done_cb: Optional[Callable] = None) -> None:
+        """走到**指定开口**（毫米）。阶段 2 用半开 50 mm 避免指尖伸进邻格。"""
+        raise NotImplementedError
+
     def is_empty(self) -> bool:
         """夹爪是否空夹（没夹到东西）。
 
@@ -334,6 +338,12 @@ class SimGripper(GripperBackend):
 
     def close(self, done_cb: Optional[Callable] = None) -> None:
         self._command(self._close_pos, self._once(done_cb))
+
+    def move_to(self, mm: float, done_cb: Optional[Callable] = None) -> None:
+        if not (self._close_pos <= mm <= self._open_pos):
+            raise ValueError("开口 %.1f mm 超出 [%.1f, %.1f]"
+                             % (mm, self._close_pos, self._open_pos))
+        self._command(float(mm), self._once(done_cb))
 
     def current_position(self) -> Optional[float]:
         return self._pos
@@ -692,6 +702,14 @@ class Ag95Gripper(GripperBackend):
 
     def close(self, done_cb: Optional[Callable] = None) -> None:
         self._async(lambda: self._write_position(self._close_mm), done_cb, "close")
+
+    def move_to(self, mm: float, done_cb: Optional[Callable] = None) -> None:
+        """走到指定开口（毫米）。会动手指，调用点必须已有当次授权。"""
+        validate_ag95_geometry(self._open_mm, self._close_mm, self._stroke_mm)
+        if not (self._close_mm <= float(mm) <= self._open_mm):
+            raise ValueError("开口 %.1f mm 超出 [%.1f, %.1f]"
+                             % (mm, self._close_mm, self._open_mm))
+        self._async(lambda: self._write_position(float(mm)), done_cb, "move_to")
 
     def current_position(self) -> Optional[float]:
         return self._read_position()
