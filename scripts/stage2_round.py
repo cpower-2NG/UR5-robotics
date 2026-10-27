@@ -95,6 +95,16 @@ DEFAULT_SCENE = {
     "finger_axis_delta_deg": 0.0,
     "pick_open_mm": 50.0,
     "place_open_mm": 50.0,
+    # 松手弹滑（2026-10-27 用户目视：夹爪动作快、不太平衡，块落到桌面会弹/滑）。
+    # 放置间隙 5 mm **不动**（用户决定：再小不安全）。改用四件事一起压：
+    #   · 抓**块心**（合拢时块两侧受力对称，指间转动更小）；
+    #   · 合拢、松手两个动作写 AG-95 速度寄存器 0x0104（1–100 %），慢下来；
+    #   · 松手后原地停 0.5 s 再撤，让块自己落稳。
+    # 三个数都可在 scene.json 里覆盖。
+    "grasp_at": "block_center",
+    "grasp_close_speed_pct": 40,
+    "release_open_speed_pct": 25,
+    "release_dwell_s": 0.5,
     "blocks_per_round": 6,
     # 2026-10-27 实测：用户摆的 9 块落在 base x 0.389–0.582 / y 0.176–0.399 m，
     # 旧的 pr.PICK_ZONE（y ≥ 0.25）会把下半排挡在池外。新框留 ≥20 mm 余量，
@@ -746,10 +756,15 @@ def pick_plan(plan_path, cand_json, block_idx, slot_mm, item, urdf, frame_dir,
         # 同上：负角必须用 `=` 形式，否则 argparse 把 "-0.79,…" 当选项。
         args += ["--q-start=" + ",".join("%.6f" % float(v) for v in q_start)]
     for key, flag in (("pick_open_mm", "--pick-open-mm"),
-                      ("place_open_mm", "--place-open-mm")):
+                      ("place_open_mm", "--place-open-mm"),
+                      ("grasp_close_speed_pct", "--grip-speed-pct"),
+                      ("release_open_speed_pct", "--release-speed-pct"),
+                      ("release_dwell_s", "--release-dwell-s")):
         v = item.get(key)
         if v is not None:
-            args += [flag, "%.3f" % float(v)]
+            args += [flag, "%.3f" % float(v) if isinstance(v, float) else str(v)]
+    if item.get("grasp_at"):
+        args += ["--grasp-at", str(item["grasp_at"])]
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("计划失败（块 #%d，%s）：%s"
@@ -1006,6 +1021,10 @@ def main(argv=None):
     for it in res["items"]:
         it["pick_open_mm"] = scene.get("pick_open_mm")
         it["place_open_mm"] = scene.get("place_open_mm")
+        it["grasp_at"] = scene.get("grasp_at")
+        it["grasp_close_speed_pct"] = scene.get("grasp_close_speed_pct")
+        it["release_open_speed_pct"] = scene.get("release_open_speed_pct")
+        it["release_dwell_s"] = scene.get("release_dwell_s")
     apply_resume(res["items"], resume_done)
     for a, b, d in cluster_warnings(res["items"]):
         print("⚠️ 块 #%d 与 #%d 中心距只有 %.1f mm（下限 60）—— 计划器会拒"

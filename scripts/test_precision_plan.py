@@ -374,6 +374,77 @@ def test_exec_accepts_dict_gripper_actions():
     assert pe._action_str("readback") == "readback"
     assert pe._action_str({"gripper": "open_to", "mm": 50}) == "open_to(50.0)"
     assert pe._action_str({"gripper": "open_to"}) == "open_to"
+    # 带速度的动作要在日志/控制台上分得出来（否则现场看不出这轮到底快还是慢）。
+    assert pe._action_str({"gripper": "open_to", "mm": 50,
+                           "speed": 25}) == "open_to(50.0) @25%"
+
+
+@case
+def test_grasp_at_block_center_uses_the_centroid(chain):
+    """抓块心：抓取段三个航点落在**块心**上，不是候选锚点。
+
+    2026-10-27 用户决议（松手弹滑四项处置之一）：块心更对称，合拢时两侧受力
+    均匀，块在指间转得少。默认仍是 candidate（A3 逐字节不变）。
+    """
+    blocks, cand, q0 = scene(chain)
+    blk = blocks[0]
+    wps, _, meta = pp.build_pick(chain, q0, cand, blk, blocks, (0.45, -0.25),
+                                 grasp_at="block_center")
+    assert meta["grasp_at"] == "block_center", meta["grasp_at"]
+    gx, gy = meta["grasp_point"]
+    assert abs(gx - blk["cx"] / 1000.0) < 1e-9, meta["grasp_point"]
+    assert abs(gy - blk["cy"] / 1000.0) < 1e-9, meta["grasp_point"]
+    # 抓取却拿块心 ⇒ 偏心按定义是 0（这条同时证明 ex/ey 不是抄来的常数）
+    assert meta["grasp_ecc_mm"] == [0.0, 0.0], meta["grasp_ecc_mm"]
+    by = {w["name"]: w for w in wps}
+    for n, z in (("approach", meta["approach_z"]), ("grasp", meta["grasp_z"]),
+                 ("lift", meta["lift_z"])):
+        pe, re = pp.pose_residual(chain, by[n]["q"], (gx, gy, z), 0.0)
+        assert pe < 0.1 and re < 0.05, "%s 没落在块心：%.3f mm" % (n, pe)
+    # 变异测试：默认仍是 candidate —— 块心不是默认值。
+    _, _, m_def = pp.build_pick(chain, q0, cand, blk, blocks, (0.45, -0.25))
+    assert m_def["grasp_at"] == "candidate", m_def["grasp_at"]
+    assert abs(m_def["grasp_point"][0] - cand["xyz_base"][0]) < 1e-12
+    assert abs(m_def["grasp_ecc_mm"][0] - (blk["cx"] - cand["xyz_base"][0] * 1000)) < 0.01
+
+
+@case
+def test_speed_and_dwell_land_on_the_motion_they_describe(chain):
+    """速度写成**寄存器**要挂在正确的那一下动作上；dwell 只在 place 上。
+
+    速度挂错地方不会报错、只会「看起来快了」——所以逐条断言哪个航点带它、
+    哪个航点**不带**。默认三个参数都是 None/0，A3 计划必须逐字节不变。
+    """
+    blocks, cand, q0 = scene(chain)
+    wps, _, meta = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25),
+                                 place_open_mm=50.0, grip_speed_pct=40,
+                                 release_speed_pct=25, release_dwell_s=0.5)
+    by = {w["name"]: w for w in wps}
+    assert by["grasp"]["after"] == {"gripper": "close", "readback": True,
+                                    "speed": 40}, by["grasp"]["after"]
+    assert by["place"]["after"] == {"gripper": "open_to", "mm": 50.0,
+                                    "speed": 25}, by["place"]["after"]
+    assert by["place"]["dwell_s"] == 0.5, by["place"]
+    # 挂错的三种典型：合拢速度串到松手、松手速度串到接近、dwell 串到所有点。
+    assert by["place"]["after"]["speed"] == 25, "松手用了合拢的速度"
+    assert "speed" not in by["approach"]["before"], by["approach"]["before"]
+    assert "speed" not in by["lift"]["after"], by["lift"]["after"]
+    for w in wps:
+        if w["name"] != "place":
+            assert "dwell_s" not in w, "%s 不该有 dwell" % w["name"]
+    assert meta["grip_speed_pct"] == 40 and meta["release_speed_pct"] == 25
+    assert meta["release_dwell_s"] == 0.5
+
+    # 不给 ⇒ 一个 speed / dwell 都不许出现（A3 兼容）
+    wps2, _, m2 = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25),
+                                place_open_mm=50.0)
+    for w in wps2:
+        assert "dwell_s" not in w, "%s 凭空多出 dwell" % w["name"]
+        for key in ("before", "after"):
+            if isinstance(w.get(key), dict):
+                assert "speed" not in w[key], "%s.%s 凭空多出 speed" % (w["name"], key)
+    assert m2["grip_speed_pct"] is None and m2["release_speed_pct"] is None
+    assert m2["release_dwell_s"] == 0.0
 
 
 @case

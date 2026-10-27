@@ -72,6 +72,8 @@ REG_INIT_STATE_R = 0x0200    # 疑似**真正的**初始化状态（待判决）
 REG_ARRIVED = 0x0201         # 疑似到位状态（待判决）
 REG_FORCE = 0x0101           # 力（45~160 N）
 REG_TARGET_POS = 0x0103      # 目标位置（千分位；写它会动）—— 读回来是「上次命令到哪」
+#: 速度（1–100 %）。2026-10-27 查大寰公开手册确认；**读它是只读、安全的**。
+REG_SPEED = 0x0104
 REG_ACTUAL_POS = 0x0202      # 实时位置（千分位，只读）
 REG_SAVE_FLASH = 0x0300      # 存 flash（写才有意义）
 
@@ -113,6 +115,8 @@ def candidates(fc: int) -> List[ReadCandidate]:
                       "读回来是「上一次被写到哪」，用来确认换算标定的量程"),
         ReadCandidate(REG_FORCE, fc, "力设定",
                       "45~160 N。只读回读，用来确认寄存器表与手册一致"),
+        ReadCandidate(REG_SPEED, fc, "速度设定",
+                      "1–100 %。只读回读；阶段 2 松手「弹滑」要写它（能读到当前值才敢写）"),
         ReadCandidate(REG_SAVE_FLASH, fc, "存 flash 状态",
                       "写才有意义；读它多半报非法地址 —— 报错本身也是信息（说明表对）"),
     ]

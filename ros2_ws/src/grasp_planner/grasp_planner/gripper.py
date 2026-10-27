@@ -144,6 +144,14 @@ AG95_INIT_READY = 1             # 只有等于它才算「可以发位置指令�
 AG95_INIT_IN_PROGRESS = 2       # 初始化正在做 —— **也不能发位置指令**
 AG95_REG_FORCE = 0x0101         # 力（45~160 N）
 AG95_REG_TARGET_POS = 0x0103    # 目标位置（千分位）：**写它会动**
+#: 速度（**1–100 %**）。2026-10-27 查大寰公开手册确认：AG 系列基本控制寄存器是
+#: `0x0100` 初始化 / `0x0101` 力 / `0x0103` 位置 / **`0x0104` 速度**，与现场实测的
+#: 「写 `0x0103` 手指就走到那个开口」完全吻合（`0x0102` 在 AG 系列**不是**速度 ——
+#: 个别手册正文写错过，表格与示例都是 0x0104）。
+#: 写它**本身不动手指**，但会决定**下一次**位置动作有多快，所以只在需要「慢点松开/
+#: 慢点合拢」时才写；默认 `None` = **一个字节都不写**（A3 与既有流程行为不变）。
+AG95_REG_SPEED = 0x0104         # 速度（1–100 %）
+AG95_SPEED_MIN, AG95_SPEED_MAX = 1, 100
 AG95_REG_ACTUAL_POS = 0x0202    # 实时位置（千分位）：**只读，不动**
 
 #: 从站号参数在历代 pymodbus 里的名字，**按顺序探测**，先新后旧。
@@ -390,12 +398,14 @@ class Ag95Gripper(GripperBackend):
 
     def __init__(self, node, port: str, baudrate: int, slave_id: int,
                  force: int, stroke_mm: float, open_mm: float, close_mm: float,
-                 dry_run: bool = True, open_is_high: bool = True):
+                 dry_run: bool = True, open_is_high: bool = True,
+                 speed: Optional[int] = None):
         self._node = node
         self._port = port
         self._baudrate = baudrate
         self._slave_id = slave_id
         self._force = force
+        self._speed = None if speed is None else self._check_speed(speed)
         self._stroke_mm = stroke_mm
         self._open_mm = open_mm
         self._close_mm = close_mm
@@ -549,6 +559,49 @@ class Ag95Gripper(GripperBackend):
         return permille_to_mm(int(raw), self._stroke_mm,
                               open_is_high=self._open_is_high)
 
+    @staticmethod
+    def _check_speed(pct) -> int:
+        """速度只接受 **1–100 的整数百分比**；越界直接拒，不夹到边界上。"""
+        try:
+            v = int(pct)
+        except (TypeError, ValueError):
+            raise ValueError(f"AG-95 速度要给整数百分比，收到 {pct!r}")
+        if not (AG95_SPEED_MIN <= v <= AG95_SPEED_MAX):
+            raise ValueError(
+                f"AG-95 速度 {v} 越界（手册 {AG95_SPEED_MIN}–{AG95_SPEED_MAX} %）")
+        return v
+
+    def set_speed(self, pct) -> None:
+        """写速度寄存器（`0x0104`）。**不写 `0x0100`、不动手指。**
+
+        为什么需要它：阶段 2 松手时块会「弹滑一下」——手指在分离瞬间是满速的，
+        冲量把块带转。慢速张开能砍掉这部分冲量，而力已经贴着下限（45–160 N，
+        实跑 50 N），没有别的余量可调。
+
+        dry-run 时只打日志、不写（保持「从站一个寄存器都没收到」的契约）。
+        写完**回读核对**：读回值与写下去的不一致就抛错，免得以为设了速度其实没设。
+        """
+        v = self._check_speed(pct)
+        if self._dry_run:
+            self._node.get_logger().info(
+                f"AG-95 DRY-RUN 本应写 速度 {v} % → "
+                f"0x{AG95_REG_SPEED:04X}（未写）")
+            self._speed = v
+            return
+        ok, msg = self._write_raw(AG95_REG_SPEED, v)
+        if not ok:
+            raise RuntimeError(f"AG-95 写速度失败：{msg}")
+        ok, raw = self._read_raw(AG95_REG_SPEED)
+        if not ok:
+            raise RuntimeError(f"AG-95 速度写后回读失败（0x{AG95_REG_SPEED:04X}）：{raw}")
+        if int(raw) != v:
+            raise RuntimeError(
+                f"AG-95 速度回读 {raw} ≠ 写入的 {v}（0x{AG95_REG_SPEED:04X}）"
+                f"—— 寄存器地址或固件映射可能不对，**别按「已设速度」继续跑**")
+        self._speed = v
+        self._node.get_logger().info(
+            f"AG-95 速度已设 {v} %（0x{AG95_REG_SPEED:04X}，回读核对一致）")
+
     def _write_position(self, mm: float):
         """把**毫米**开口宽度写进 AG-95。
 
@@ -595,6 +648,12 @@ class Ag95Gripper(GripperBackend):
         ok, msg = self._write_raw(AG95_REG_FORCE, int(self._force))
         if not ok:
             raise RuntimeError(f"AG-95 写力失败：{msg}")
+        # 速度排在力之后、位置之前：位置一写手指就走，前两项必须已经到位。
+        # `None` = 从来没要求过速度 ⇒ 一个字节都不写（A3 与既有流程行为不变）。
+        if self._speed is not None:
+            ok, msg = self._write_raw(AG95_REG_SPEED, int(self._speed))
+            if not ok:
+                raise RuntimeError(f"AG-95 写速度失败：{msg}")
         ok, msg = self._write_raw(AG95_REG_TARGET_POS, permille)
         if not ok:
             raise RuntimeError(f"AG-95 写目标位置失败：{msg}")
@@ -750,8 +809,9 @@ class Ag95Gripper(GripperBackend):
         mode = "DRY-RUN 只读" if self._dry_run else "真实写入"
         return (f"Ag95Gripper(port={self._port}, baudrate={self._baudrate}, "
                 f"slave_id={self._slave_id}, stroke={self._stroke_mm}mm, "
-                f"force={self._force}N, {mode}, "
-                f"open_is_high={self._open_is_high})")
+                f"force={self._force}N, "
+                f"speed={'不写' if self._speed is None else '%d%%' % self._speed}, "
+                f"{mode}, open_is_high={self._open_is_high})")
 
 
 class NullGripper(GripperBackend):

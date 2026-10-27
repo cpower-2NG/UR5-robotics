@@ -73,11 +73,13 @@ def _action_name(spec):
 
 
 def _action_str(spec):
-    """把夹爪动作 spec（字符串或 ``{"gripper":..,"mm":..}``）变成一行字。"""
+    """把夹爪动作 spec（字符串或 ``{"gripper":..,"mm":..,"speed":..}``）变成一行字。"""
     if isinstance(spec, dict):
         mm = spec.get("mm")
+        sp = spec.get("speed")
         return str(spec.get("gripper")) + (
-            "" if mm is None else "(%.1f)" % float(mm))
+            "" if mm is None else "(%.1f)" % float(mm)) + (
+            "" if sp is None else " @%d%%" % int(sp))
     return str(spec)
 
 
@@ -326,11 +328,22 @@ def main():
         if isinstance(spec, dict):
             kind = spec.get("gripper")
             open_mm = spec.get("mm")
+            speed = spec.get("speed")
         else:
-            kind, open_mm = spec, None
+            kind, open_mm, speed = spec, None, None
         g = gripper()
         t0 = time.time()
         before = g.current_position()
+        # 速度是**独立于动作**的一个寄存器（0x0104），写它本身不动手指，
+        # 但决定这次动多快。所以先设速度，再发动作。
+        if speed is not None:
+            try:
+                g.set_speed(speed)
+            except (RuntimeError, ValueError) as exc:
+                print("  [%s] 夹爪设速度 %r **失败**：%s" % (where, speed, exc))
+                log_line(log_path, event="gripper_fail", where=where,
+                         action="set_speed", speed=speed, error=str(exc))
+                raise ga.GripperActionError("%s.set_speed：%s" % (where, exc))
         if kind in ("open", "close"):
             try:
                 ga.call_sync(g, kind)
@@ -483,6 +496,15 @@ def main():
                         ok_all = False
                 elif name == "lift":
                     lifted_at = pos
+            dwell = w.get("dwell_s")
+            if dwell:
+                # 松手后**停在原地**等块落稳再撤。撤得太快时，手指还在块侧面上
+                # 蹭，块会跟着弹/滑（2026-10-27 用户目视）。计划给的秒数，
+                # 不改任何几何。
+                print("   松手后停 %.2f s 再撤（等块落稳）" % float(dwell))
+                log_line(log_path, event="dwell", waypoint=name,
+                         seconds=round(float(dwell), 3))
+                time.sleep(float(dwell))
         except ga.GripperActionError as exc:
             # 夹爪没做成 ⇒ 停在这里。继续往下（尤其继续抬升/去槽位）没有意义。
             print("!! 夹爪动作判红，停在「%s」：%s" % (name, exc))

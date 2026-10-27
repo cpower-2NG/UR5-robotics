@@ -97,6 +97,11 @@ def test_load_scene_defaults_and_shortcuts():
     # 在 θ≈22.5° 处最大（45°），橙色块就栽在那里。
     assert s["yaw_sign"] == 1.0
     assert s["blocks_per_round"] == 6
+    # 松手弹滑的四项处置（2026-10-27 用户定；5 mm 放置间隙**不动**）
+    assert s["grasp_at"] == "block_center", s["grasp_at"]
+    assert 1 <= s["grasp_close_speed_pct"] <= 100, s["grasp_close_speed_pct"]
+    assert 1 <= s["release_open_speed_pct"] <= 100, s["release_open_speed_pct"]
+    assert s["release_dwell_s"] > 0, s["release_dwell_s"]
 
     ok = ",".join(sm.DEFAULT_ORDER)
     s = sr.load_scene(grid_order=ok, block_order=" red, cyan ,,")
@@ -479,6 +484,44 @@ def test_pick_plan_passes_two_stage_yaw_and_half_open():
     assert "--survey" in a2 and a2[a2.index("--survey") + 1] == "place2"
     qs = [x for x in a2 if x.startswith("--q-start=")]
     assert qs and qs[0].count(",") == 5, a2
+
+
+@case
+def test_pick_plan_forwards_release_knobs():
+    """场景里的四项处置要**逐项**变成 precision_plan 的开关；缺省不加任何开关。
+
+    少传一项的后果是静默的：计划照出、臂照动，只是松手还是原来那么快。
+    """
+    calls = []
+
+    class R:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        return R()
+
+    base = {"yaw_grasp_deg": 0.0, "yaw_place_deg": 0.0, "yaw_source": "geometric"}
+    orig = sr.subprocess.run
+    sr.subprocess.run = fake_run
+    try:
+        sr.pick_plan(os.path.join(TMP, "p3.json"), "/tmp/c.json", 2, [450.0, -150.0],
+                     dict(base, grasp_at="block_center", grasp_close_speed_pct=40,
+                          release_open_speed_pct=25, release_dwell_s=0.5),
+                     "/tmp/r.urdf", "/tmp/frame")
+        sr.pick_plan(os.path.join(TMP, "p4.json"), "/tmp/c.json", 2, [450.0, -150.0],
+                     dict(base), "/tmp/r.urdf", "/tmp/frame")
+    finally:
+        sr.subprocess.run = orig
+    a, b = calls
+    assert a[a.index("--grasp-at") + 1] == "block_center", a
+    assert a[a.index("--grip-speed-pct") + 1] == "40", a
+    assert a[a.index("--release-speed-pct") + 1] == "25", a
+    assert float(a[a.index("--release-dwell-s") + 1]) == 0.5, a
+    for flag in ("--grasp-at", "--grip-speed-pct", "--release-speed-pct",
+                 "--release-dwell-s"):
+        assert flag not in b, "缺省却传了 %s（A3 计划不该被改动）：%s" % (flag, b)
 
 
 @case

@@ -463,7 +463,9 @@ def place_heights(block_h_m, grasp_depth_m, table_z=TABLE_PLANE_Z,
 
 def build_pick(chain, q_start, cand, block, blocks, slot,
                yaw_grasp_deg=0.0, yaw_place_deg=None, yaw_source="zero",
-               pick_open_mm=None, place_open_mm=None):
+               pick_open_mm=None, place_open_mm=None, grasp_at="candidate",
+               grip_speed_pct=None, release_speed_pct=None,
+               release_dwell_s=0.0):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -477,6 +479,17 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
 
     ``pick_open_mm`` / ``place_open_mm``：接近/放置时用半开（如 50 mm），
     避免全开 95 mm 的指尖伸进 60 mm 格距的邻格。``None`` = 全开（A3 行为）。
+
+    松手弹滑的四项处置（2026-10-27 用户定，5 mm 放置间隙**不动**）
+    ─────────────────────────────────────────────────────────────
+    · ``grasp_at``：``candidate``（A3 老行为，抓 GraspNet/几何候选给的锚点）
+      或 ``block_center``（抓块心）。块心更对称，合拢时块两侧受力均匀，松手
+      后转动/滑移更小 —— 这是 B2「抓取/松手时块被转」最便宜的解法。
+    · ``grip_speed_pct`` / ``release_speed_pct``：AG-95 速度寄存器 0x0104
+      （1–100 %），分别挂在「合拢」与「松手张开」两个动作上。默认 ``None``
+      = 不写（A3 计划逐字节不变）。
+    · ``release_dwell_s``：松手后**先停这么久再撤**，让块自己落稳。默认 0
+      （A3 不变）。
     """
     yaw_place = yaw_grasp_deg if yaw_place_deg is None else yaw_place_deg
 
@@ -485,7 +498,21 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             return {"gripper": "open"}
         return {"gripper": "open_to", "mm": float(mm)}
 
-    gx, gy = cand["xyz_base"][0], cand["xyz_base"][1]
+    def _with_speed(action, speed):
+        if action is None or speed is None:
+            return action
+        a = dict(action)
+        a["speed"] = int(speed)
+        return a
+
+    if grasp_at == "block_center":
+        # 块心 = 顶面点聚类质心（与放置目标/判分同一个量），单位 mm → m。
+        gx, gy = block["cx"] / 1000.0, block["cy"] / 1000.0
+    elif grasp_at == "candidate":
+        gx, gy = cand["xyz_base"][0], cand["xyz_base"][1]
+    else:
+        raise PlanError("grasp_at 只认 candidate / block_center，收到 %r" % (grasp_at,))
+
     # 用**相对台面的高度** `h`，不用绝对顶面 z：
     # 腕部深度实测把台面读高 ~6 mm（本轮帧 table_z=+6.0 mm，真块高 = top − table_z
     # = 24.3~26.0 mm），而本规划器的整个几何都锚在 table_plane_z=0（抓取高度、
@@ -522,12 +549,13 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
         ("approach", (gx, gy, approach_z), yaw_grasp_deg, None,
          _open_action(pick_open_mm)),
         ("grasp", (gx, gy, grasp_z), yaw_grasp_deg,
-         {"gripper": "close", "readback": True}, None),
+         _with_speed({"gripper": "close", "readback": True},
+                     grip_speed_pct), None),
         ("lift", (gx, gy, lift_z), yaw_grasp_deg, {"gripper": "readback"}, None),
         ("to_slot", (sx, sy, lift_z), yaw_place, None, None),
         ("place_approach", (sx, sy, place_approach_z), yaw_place, None, None),
         ("place", (sx, sy, place_z), yaw_place,
-         _open_action(place_open_mm), None),
+         _with_speed(_open_action(place_open_mm), release_speed_pct), None),
         ("retreat", (sx, sy, place_approach_z), yaw_place, None, None),
         ("survey_place", SURVEY_TOOL0["place"], 0.0, None, None),
     ]
@@ -539,6 +567,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
         q, c = add_move(wps, chain, name, xyz, q, yaw, TABLE_PLANE_Z,
                         after=after, before=before, q=q_solved)
         checks.append(c)
+    # 松手后停在原地等块落稳，再撤（`retreat` 是下一条）。挂在 `place` 上而不是
+    # 全局 `--settle`：`--settle` 每条航点都睡，那是时间，不是物理动作。
+    if release_dwell_s:
+        for w in wps:
+            if w["name"] == "place":
+                w["dwell_s"] = round(float(release_dwell_s), 3)
 
     meta = {"kind": "pick", "block_idx": block["idx"], "class": block["class"],
             "block_top_mm": round(block["top"], 2),
@@ -555,6 +589,11 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             "block_xy_mm": [round(block["cx"], 2), round(block["cy"], 2)],
             "grasp_point": [gx, gy], "grasp_ecc_mm": [round(ex * 1000, 2),
                                                      round(ey * 1000, 2)],
+            "grasp_at": grasp_at,
+            "grip_speed_pct": grip_speed_pct,
+            "release_speed_pct": release_speed_pct,
+            "release_dwell_s": (round(float(release_dwell_s), 3)
+                                if release_dwell_s else 0.0),
             "place_target_mm": [round(sx * 1000, 2), round(sy * 1000, 2)],
             "grasp_z": round(grasp_z, 4),
             "approach_z": round(approach_z, 4), "lift_z": round(lift_z, 4),
@@ -595,6 +634,15 @@ def main():
                     help="接近时半开开口；缺省全开 95")
     ap.add_argument("--place-open-mm", type=float, default=None,
                     help="放置时半开开口；缺省全开 95")
+    ap.add_argument("--grasp-at", choices=("candidate", "block_center"),
+                    default="candidate",
+                    help="抓取点用候选锚点（A3）还是块心（阶段 2 默认块心）")
+    ap.add_argument("--grip-speed-pct", type=int, default=None,
+                    help="合拢时的 AG-95 速度（0x0104，1–100 %）；缺省不写")
+    ap.add_argument("--release-speed-pct", type=int, default=None,
+                    help="松手张开时的 AG-95 速度（0x0104，1–100 %）；缺省不写")
+    ap.add_argument("--release-dwell-s", type=float, default=0.0,
+                    help="松手后停多少秒再撤（让块落稳）；缺省 0")
     args = ap.parse_args()
 
     if args.from_frame:
@@ -629,7 +677,11 @@ def main():
                 yaw_place_deg=args.yaw_place_deg,
                 yaw_source=args.yaw_source,
                 pick_open_mm=args.pick_open_mm,
-                place_open_mm=args.place_open_mm)
+                place_open_mm=args.place_open_mm,
+                grasp_at=args.grasp_at,
+                grip_speed_pct=args.grip_speed_pct,
+                release_speed_pct=args.release_speed_pct,
+                release_dwell_s=args.release_dwell_s)
         n_before_split = len(wps)
         wps, added = split_jumps(wps, chain)
         # 每个**原始**航点都必须有一条预检记录（插出来的点继承相邻两点的检查）。

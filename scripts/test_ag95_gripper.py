@@ -465,6 +465,98 @@ def main():
               got is not None and got[0] == OK, f"回调 {got}")
 
     # ------------------------------------------------------------------
+    # 速度寄存器 0x0104（2026-10-27 查大寰公开手册确认；阶段 2 松手弹滑要用它）。
+    # 写它**本身不动手指**，但决定下一次位置动作有多快 —— 所以三件事都要钉住：
+    #   ① dry-run 一个字节都不写；② 真写时地址/值/位置都对；③ 回读不一致必须抛错。
+    print("\n--- 5c. 速度寄存器 0x0104 ---")
+    for addr_name, addr in (("AG95_REG_SPEED", g.AG95_REG_SPEED),
+                            ("探针 REG_SPEED", getattr(probe, "REG_SPEED", None))):
+        check(f"{addr_name} == 0x{addr:04X}" if addr is not None
+              else f"{addr_name} 在探针里也定义了（两份漂移会静默）",
+              addr == 0x0104, f"{addr_name}={addr}")
+
+    with rig(dry_run=True) as (gr, slave, node, _):
+        gr.set_speed(40)
+        check("dry-run 下 set_speed() **零流量**（写没有、读也没有）",
+              slave.writes == [] and slave.seen == [],
+              f"写={slave.writes} 读={slave.seen}")
+        check("dry-run 下日志说明「本应写速度多少」",
+              "本应写 速度 40 %" in node.log.text("info"),
+              node.log.text("info")[-200:] or "（没有 info）")
+
+    for bad in (0, 101, "50%"):
+        with rig(dry_run=True) as (gr, slave, node, _):
+            try:
+                gr.set_speed(bad)
+            except (ValueError, TypeError) as exc:
+                check(f"速度 {bad!r} 越界/非整数 ⇒ 拒（不夹到边界上）",
+                      "越界" in str(exc) or "整数" in str(exc), str(exc))
+            else:
+                check(f"速度 {bad!r} 越界/非整数 ⇒ 拒", False, "居然接受了")
+            check(f"  且被拒时一个寄存器都没写（{bad!r}）",
+                  slave.writes == [], f"写={slave.writes}")
+
+    with rig(dry_run=False) as (gr, slave, node, box):
+        gr.set_speed(25)
+        check("真写：速度写到 0x0104，值 25",
+              (g.AG95_REG_SPEED, 25) in slave.writes, f"写={slave.writes}")
+        check("真写：set_speed **不碰**位置寄存器（手指不会因此动）",
+              all(a != g.AG95_REG_TARGET_POS for a, _ in slave.writes),
+              f"写={slave.writes}")
+        check("真写：回读核对一致后有 info 说明",
+              "速度已设 25 %" in node.log.text("info"),
+              node.log.text("info")[-200:] or "（没有 info）")
+
+    # 回读被固件吞掉（写进去、读回还是旧值）⇒ 必须抛错，不许「当作设好了」。
+    with rig(dry_run=False) as (gr, slave, node, box):
+        gr._speed = None
+        orig = slave._handle
+
+        def swallow(req):
+            sid, fc, addr = req[0], req[1], (req[2] << 8) | req[3]
+            if fc == 6 and addr == g.AG95_REG_SPEED:
+                slave.seen.append((fc, addr))
+                os.write(slave.fd, req)        # 回显成功，但**不**记进 regs
+                return
+            orig(req)
+
+        slave._handle = swallow
+        try:
+            gr.set_speed(30)
+        except RuntimeError as exc:
+            check("★ 速度写入后回读不一致 ⇒ 抛错（不静默按「已设」继续跑）",
+                  "回读" in str(exc) and "0x0104" in str(exc), str(exc)[:200])
+        else:
+            check("★ 速度写入后回读不一致 ⇒ 抛错", False, "居然静默通过了")
+
+    # 设过速度之后，位置指令必须**带**速度、且**排在力之后、位置之前**。
+    with rig(dry_run=False, open_is_high=True,
+             regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY,
+                   g.AG95_REG_ACTUAL_POS: 1000, g.AG95_REG_TARGET_POS: 1000,
+                   g.AG95_REG_FORCE: 50}) as (gr, slave, node, box):
+        gr.set_speed(25)
+        slave.writes.clear()
+        gr.close(done_cb=cb(box))
+        got = wait_done(box)
+        addr_seq = [a for a, _ in slave.writes]
+        check("★ 设过速度后：写序列是 力 → 速度 → 位置",
+              addr_seq == [g.AG95_REG_FORCE, g.AG95_REG_SPEED,
+                           g.AG95_REG_TARGET_POS], f"写={slave.writes}")
+        check("  动作本身仍成功（速度不改变「写位置就动」的语义）",
+              got is not None and got[0] == OK, f"回调 {got}")
+
+    # 没设过速度 ⇒ 一个速度字节都不写（A3 与既有流程逐字节不变）。
+    with rig(dry_run=False, open_is_high=True,
+             regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY,
+                   g.AG95_REG_ACTUAL_POS: 1000, g.AG95_REG_TARGET_POS: 1000,
+                   g.AG95_REG_FORCE: 50}) as (gr, slave, node, box):
+        gr.close(done_cb=cb(box))
+        wait_done(box)
+        check("★ 没设过速度：写序列里**没有** 0x0104（默认零改动）",
+              all(a != g.AG95_REG_SPEED for a, _ in slave.writes),
+              f"写={slave.writes}")
+
+    # ------------------------------------------------------------------
     print("\n--- 6. 写路径（dry_run=false）：顺序、值、到位、异步 ---")
     with rig(dry_run=False, open_is_high=True,
              regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY, g.AG95_REG_ACTUAL_POS: 1000, g.AG95_REG_TARGET_POS: 1000,
