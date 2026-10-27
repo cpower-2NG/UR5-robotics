@@ -264,6 +264,166 @@ def test_ik_branch_selection_keeps_forearm_above_table(chain):
 
 
 @case
+def test_wrist_winding_is_avoided(chain):
+    """腕 1 / 腕 3 不许停在「绕死了」的那一圈 —— 2026-10-27 线缆拧死事故。
+
+    回位那条轨迹的终点是 wrist_1=−262.6°、wrist_3=−253.4°：位姿完全正确，
+    但夹爪线缆比出事前多拧了约 285°，人只能手掰回来。判据：腕 1/腕 3 的
+    **字面角**离开 0 超过 210° 就算拧死 —— 此前跑通的计划最狠 −204.1° 要放行。
+    """
+    i1 = chain.move_joints.index("wrist_1_joint")
+    i3 = chain.move_joints.index("wrist_3_joint")
+    ok = [0.0] * 6
+    ok[i1], ok[i3] = np.radians(-204.1), np.radians(-120.0)
+    assert pp.check_winding(chain, ok) is None, "−204.1° 是跑通过的角度，不该拦"
+
+    bad = [0.0] * 6
+    bad[i1], bad[i3] = np.radians(-262.6), np.radians(-253.4)
+    hit = pp.check_winding(chain, bad)
+    assert hit is not None and hit[0] == "wrist_1_joint", hit
+
+    # 折角：离 ref 最近的那一圈是拧死的那圈 ⇒ 必须换一圈（+97.4° 同一位姿）
+    ref = [0.0] * 6
+    ref[i1] = np.radians(-117.0)
+    got = pp.unwrap_near(chain, bad, ref)
+    assert abs(np.degrees(got[i1]) - 97.4) < 0.2, np.degrees(got[i1])
+    assert pp.check_winding(chain, got) is None
+    # 位姿一个字节都不变
+    pe, re = pp.pose_residual(chain, got, tuple(chain.fk(bad)[:3, 3]), 0.0)
+    assert pe < 0.01, pe
+    # 不拧的情形仍按「离 ref 最近」走，别乱换圈
+    mild = [0.0] * 6
+    mild[i1] = np.radians(-150.0)
+    assert abs(np.degrees(pp.unwrap_near(chain, mild, ref)[i1]) + 150.0) < 0.2
+
+
+@case
+def test_no_full_circle_wrist_flip(chain):
+    """腕整圈翻转必须从根上消失 —— 2026-10-27 B2 第 5 轮块 #2 的真机事故。
+
+    实数（板上 `pick-02.json`）：抓取角 148.583°、块心 (398.1, 406.14)、
+    块高 29.26 mm、槽 (362.65, −114.66)、起点 q = [−45.52, −67.59, 72.74,
+    −95.1, −89.82, −135.56]°。同一末端位姿的一支 IK 给的是 wrist_2=+270.1°，
+    与 −89.9° 按 2π 折算距离为 0 ⇒ 整链选支以为腕不用动，实际整圈翻转；
+    臂走到第 3 个插点（wrist_2=+64.4°）时夹爪朝天，人按了示教器 STOP。
+
+    ① 把 `unwrap_near` 关掉（= 旧行为）⇒ 必须被 `MAX_JOINT_SWING` 拦下；
+    ② 正身 ⇒ 计划生成得出来，且**没有任何一段关节超过 180°**。
+    """
+    block = {"idx": 2, "class": "cyan", "cx": 398.1, "cy": 406.14,
+             "top": 29.26, "h": 29.26}
+    cand = {"score": 0.3605, "width_mm": 58.54, "depth": 0.01, "dist_mm": 1.32,
+            "angle_deg": -117.9, "seed": 1, "tilt_deg": 20.0,
+            "xyz_base": [0.3981, 0.40614, 0.0293],
+            "approach_base": [0.0, 0.0, -1.0]}
+    q_start = [np.radians(v) for v in
+               (-45.52, -67.59, 72.74, -95.1, -89.82, -135.56)]
+    slot = (0.36265, -0.11466)
+    kw = dict(yaw_grasp_deg=148.583, yaw_place_deg=0.0, yaw_source="geometric",
+              pick_open_mm=50.0, place_open_mm=50.0, grasp_at="block_center",
+              release_dwell_s=0.5)
+
+    def build():
+        wps, _, _ = pp.build_pick(chain, q_start, cand, block, [block], slot, **kw)
+        return pp.split_jumps(wps, chain)[0]
+
+    def swings(wps):
+        return [float(np.abs(np.asarray(b["q"]) - np.asarray(a["q"])).max())
+                for a, b in zip(wps, wps[1:])]
+
+    # ① 旧行为（抓取角不折 180° + 行程按 2π 折算 + 不折角）⇒ 必须被
+    #    `MAX_JOINT_SWING` 拦下，否则这条测试证明不了护栏在起作用。
+    #    `fold_yaw_180` 也要一起关掉：148.583° 折成 −31.417° 之后，腕根本不用
+    #    绕远路，单独关 unwrap/travel_cost 已经复现不出事故（2026-10-27 实测）。
+    orig = (pp.unwrap_near, pp.travel_cost, pp.fold_yaw_180)
+    pp.unwrap_near = lambda ch, q, ref: np.asarray(q, float)
+    pp.travel_cost = pp.joint_dist
+    pp.fold_yaw_180 = lambda d: float(d)
+    try:
+        try:
+            build()
+        except pp.PlanError as exc:
+            assert "整圈翻转" in str(exc), exc
+        else:
+            raise AssertionError("腕整圈翻转的计划居然生成出来了")
+    finally:
+        pp.unwrap_near, pp.travel_cost = orig[0], orig[1]
+        pp.fold_yaw_180 = orig[2]
+
+    # ② 正身
+    wps = build()
+    assert max(swings(wps)) <= pp.MAX_JOINT_SWING, \
+        "最大关节行程 %.1f°（上限 180°）" % np.degrees(max(swings(wps)))
+    i = chain.move_joints.index("wrist_2_joint")
+    w2 = [np.degrees(w["q"][i]) for w in wps]
+    assert max(w2) - min(w2) < 180.0, \
+        "wrist_2 跨 %.1f°：%s" % (max(w2) - min(w2), [round(v, 1) for v in w2])
+    # 插点从 18 个降到 ≤2 个：翻转那条路上原本每个航点都被切成 6 段，
+    # 插点只是消化跳变，不是解法 —— 真跳变（to_slot 转 68.7°）仍该插。
+    assert len(wps) - 8 <= 2, [w["name"] for w in wps]
+
+
+@case
+def test_grasp_yaw_folds_mod_180(chain):
+    """抓取角必须折到 (−90°, +90°] —— 2026-10-27 round-06 块 #4 的实数。
+
+    实数（`round-06/`）：几何 yaw 182.864°、块心 (462.38, 197.23)、块高
+    31.21 mm、槽 (362.85, −54.66)、起点 q = [10.5, −82.0, 82.4, −90.3,
+    −89.9, −79.6]°。不折角时腕 3 要先转到 +97.6° 抓（177.2°）、再转回
+    −116.0° 放（213.6°）⇒ 被 `MAX_JOINT_SWING` 拦下、整轮只剩 1 块、
+    标定判红「样本不足」。
+
+    平行两指夹爪转 180° = 两指互换、抓的仍是同一对侧面（矩形块对 180°
+    自对称），所以这是**物理等价**。折成 +2.864° 后同一块的最大单关节
+    跳变 213.6° → 55.0°，不产生插点。
+    """
+    # 折算本身：等价写法互相折到同一值
+    assert abs(pp.fold_yaw_180(182.864) - 2.864) < 1e-9
+    assert abs(pp.fold_yaw_180(-177.136) - 2.864) < 1e-9
+    assert abs(pp.fold_yaw_180(179.0) + 1.0) < 1e-9
+    assert abs(pp.fold_yaw_180(-90.0) - 90.0) < 1e-9
+    assert pp.fold_yaw_180(0.0) == 0.0
+
+    block = {"idx": 4, "class": "orange", "cx": 462.377, "cy": 197.230,
+             "top": 31.214, "h": 31.214}
+    cand = {"score": 0.2286, "width_mm": 48.48, "depth": None, "dist_mm": 1.36,
+            "angle_deg": 129.8, "seed": 1, "tilt_deg": 27.64,
+            "xyz_base": [0.4611, 0.1977, 0.0302],
+            "approach_base": [-0.359, -0.294, -0.886]}
+    q_start = [np.radians(v) for v in (10.5, -82.0, 82.4, -90.3, -89.9, -79.6)]
+    kw = dict(yaw_grasp_deg=182.864, yaw_place_deg=0.0,
+              yaw_source="geometric", pick_open_mm=50.0, place_open_mm=50.0,
+              grasp_at="block_center", release_dwell_s=0.5)
+    slot = (0.36285, -0.05466)
+
+    wps, _, meta = pp.build_pick(chain, q_start, cand, block, [block], slot, **kw)
+    wps = pp.split_jumps(wps, chain)[0]
+    assert abs(meta["yaw_grasp_deg"] - 2.864) < 1e-6, meta["yaw_grasp_deg"]
+    assert abs(meta["yaw_grasp_raw_deg"] - 182.864) < 1e-6, \
+        meta["yaw_grasp_raw_deg"]
+    swings = [float(np.abs(np.asarray(b["q"]) - np.asarray(a["q"])).max())
+              for a, b in zip([{"q": q_start}] + wps, wps)]
+    assert max(swings) <= pp.MAX_JOINT_SWING, \
+        "未折角：最大关节行程 %.1f°" % np.degrees(max(swings))
+    assert len(wps) == 8, [w["name"] for w in wps]   # 不该再有插点
+
+    # 变异：关掉折算 ⇒ 必须被护栏拦下（否则这条测试证明不了折算在起作用）
+    orig = pp.fold_yaw_180
+    pp.fold_yaw_180 = lambda d: float(d)
+    try:
+        try:
+            wps0, _, _ = pp.build_pick(chain, q_start, cand, block, [block],
+                                       slot, **kw)
+            pp.split_jumps(wps0, chain)
+        except pp.PlanError as exc:
+            assert "整圈翻转" in str(exc), exc
+        else:
+            raise AssertionError("未折角的计划居然通过了")
+    finally:
+        pp.fold_yaw_180 = orig
+
+
+@case
 def test_place_height_follows_block(chain):
     """放置下降必须按**这一块**挂多长算：块底落在台面上方，不能被压进台面。
 

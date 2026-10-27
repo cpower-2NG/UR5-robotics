@@ -219,14 +219,25 @@ def main():
         return next((c.state for c in r.controller if c.name == name), None)
 
     def program_state():
-        if not raw.wait_for_service(timeout_sec=5.0):
-            return None
-        req = RawRequest.Request()
-        req.query = "programState"
-        f = raw.call_async(req)
-        rclpy.spin_until_future_complete(node, f, timeout_sec=8.0)
-        r = f.result()
-        return None if r is None else r.answer
+        """查示教器程序状态。**一次不应答不等于没在跑** —— 重试几次再判。
+
+        2026-10-27 round-08 实测：`/dashboard_client/raw_request` 有一次 8 s
+        没回（Dashboard 服务端偶发不应答），闸门拿到 `None` 就把整轮打成
+        「程序=None → 拒发」，而示教器上程序一直是 PLAYING。重试**不放宽**判据：
+        三次都拿不到，仍然返回 None、仍然判红（fail-closed）。
+        """
+        for _ in range(3):
+            if not raw.wait_for_service(timeout_sec=5.0):
+                return None
+            req = RawRequest.Request()
+            req.query = "programState"
+            f = raw.call_async(req)
+            rclpy.spin_until_future_complete(node, f, timeout_sec=8.0)
+            r = f.result()
+            if r is not None and str(r.answer).strip():
+                return r.answer
+            time.sleep(1.0)
+        return None
 
     i0 = names.index(order[0])
     expected = list(plan["q_start"] if i0 == 0 else wr[names[i0 - 1]]["q"])

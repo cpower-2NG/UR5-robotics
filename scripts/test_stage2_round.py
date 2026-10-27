@@ -321,6 +321,52 @@ def test_build_assignments_uses_spare_wildcard():
 
 
 @case
+def test_build_assignments_respects_previous_rounds():
+    """前几轮放进去的格要绕开 —— 2026-10-27 B2 第 5 轮重跑的叠块事故。
+
+    那一轮块顺序 #9（黄色）→ 格 3，而**格 3 在第 4 轮就已经放了一块黄色**；
+    `used` 只在一轮内有意义，于是第二块黄色叠了上去。这里钉住：把 3 号格
+    声明为已占用后，两块黄色只能落到两个备用格（7、8）。
+    """
+    grid = make_grid()
+    pool = [entry(0, "yellow", 500, 300, dist=1.0),
+            entry(1, "yellow", 540, 300, dist=2.0)]
+    free = sr.build_assignments(pool, scene(blocks_per_round=2), round_no=5,
+                                grid=grid)
+    assert [it["slot_idx"] for it in free["items"]] == [3, 7], \
+        [it["slot_idx"] for it in free["items"]]
+    busy = sr.build_assignments(pool, scene(blocks_per_round=2), round_no=5,
+                                grid=grid, used_prev=[3])
+    assert [it["slot_idx"] for it in busy["items"]] == [7, 8], \
+        "3 号格已被占，黄色只能去备用格：%s" % [
+            it["slot_idx"] for it in busy["items"]]
+
+
+@case
+def test_occupied_cells_from_previous_rounds():
+    """`occupied_from_previous`：只认**真的放进去**的（exec_rc==0），且能豁免。"""
+    run = os.path.join(TMP, "occ")
+    os.makedirs(os.path.join(run, "round-01"), exist_ok=True)
+    os.makedirs(os.path.join(run, "round-02"), exist_ok=True)
+    json.dump({"items": [{"slot_idx": 3, "exec_rc": 0},
+                         {"slot_idx": 5, "exec_rc": 1},
+                         {"slot_idx": 6, "exec_rc": None}]},
+              open(os.path.join(run, "round-01", "round.json"), "w"))
+    json.dump({"items": [{"slot_idx": 1, "exec_rc": 0}]},
+              open(os.path.join(run, "round-02", "round.json"), "w"))
+    got = sr.occupied_from_previous(run)
+    assert got == [1, 3], "只认 exec_rc==0：%s" % got
+    # 人把 3 号格的块拿走了 ⇒ cells_free 声明后不再算占用
+    assert sr.occupied_from_previous(run, cells_free=[3]) == [1]
+    # 本轮自己的 round.json 不算（否则 --resume 会换格）
+    assert sr.occupied_from_previous(
+        run, exclude_dir=os.path.join(run, "round-02")) == [3]
+    # 坏文件不阻断
+    open(os.path.join(run, "round-03"), "w").close()
+    assert sr.occupied_from_previous(run) == [1, 3]
+
+
+@case
 def test_build_assignments_skips_unknown_color():
     grid = make_grid()
     pool = [entry(0, "unknown", 500, 300), entry(1, "red", 540, 300)]
@@ -716,6 +762,54 @@ def test_fuse_measurements_medians_position_and_folds_yaw():
     assert one[0]["frames_used"] == 1 and one[0]["yaw_deg"] == 98.40
 
 
+# ---------------------------------------------------------------- 逐块规划
+@case
+def test_plan_items_skips_a_failing_block_and_keeps_the_rest():
+    """一块过不了预检，**只跳这一块** —— 2026-10-27 round-06/08 的教训。
+
+    round-06 块 #4 绕 213.6° 被拦、round-08 块 #2 离邻块 22 mm 被拦，两次都是
+    「第一块失败 ⇒ 后面的块连规划都没做」，整轮只剩 1 块、标定判「样本不足」。
+    预检是逐块的物理判据；一块不合格不代表别的块也不行。
+    """
+    items = [{"block_idx": 0, "class": "cyan", "arm": "geometric",
+              "slot_idx": 7, "slot_color": "", "yaw_grasp_deg": 10.0,
+              "yaw_place_deg": 0.0, "yaw_source": "geometric"},
+             {"block_idx": 5, "class": "red", "arm": "geometric",
+              "slot_idx": 0, "slot_color": "red", "yaw_grasp_deg": 20.0,
+              "yaw_place_deg": 0.0, "yaw_source": "geometric"},
+             {"block_idx": 9, "class": "tan", "arm": "geometric",
+              "slot_idx": 2, "slot_color": "tan", "yaw_grasp_deg": 30.0,
+              "yaw_place_deg": 0.0, "yaw_source": "geometric"}]
+
+    def make_plan(path, it):
+        if it["block_idx"] == 5:
+            raise RuntimeError("计划失败（块 #5）：!! 预检不过：离邻块 22.0 mm")
+        return path
+
+    plans, failed = sr.plan_items(items, TMP, TMP, make_plan)
+    assert [p[1]["block_idx"] for p in plans] == [0, 9], plans
+    assert failed == [5], failed
+    assert "22.0 mm" in items[1]["plan_error"]
+    assert items[0]["plan"].endswith("pick-01.json")
+    assert items[2]["plan"].endswith("pick-03.json")   # 序号跟着位置走
+    assert "plan" not in items[1]
+
+
+@case
+def test_plan_items_all_failing_is_an_empty_round():
+    """全部块都规划不出来 ⇒ 0 条计划（调用方据此判「这一轮没得跑」）。"""
+    items = [{"block_idx": i, "class": "red", "arm": "geometric",
+              "slot_idx": i, "slot_color": "red", "yaw_grasp_deg": 0.0,
+              "yaw_place_deg": 0.0, "yaw_source": "geometric"}
+             for i in (1, 2)]
+
+    def boom(path, it):
+        raise RuntimeError("预检不过")
+
+    plans, failed = sr.plan_items(items, TMP, TMP, boom)
+    assert plans == [] and failed == [1, 2], (plans, failed)
+
+
 # ---------------------------------------------------------------- 续跑（--resume）
 @case
 def test_completed_items_keeps_only_rc0():
@@ -875,6 +969,37 @@ def test_cli_exit_codes_before_touching_board():
     json.dump(bad, open(p2, "w"))
     bad_grid = sr.main(["--run-dir", TMP, "--urdf", "/tmp/r.urdf", "--grid", p2])
     assert bad_grid == 2, bad_grid
+
+
+@case
+def test_measure_only_needs_a_round_and_go():
+    """`--measure-only`：没有块表 / 没 --go ⇒ 一律 rc=2，**一次 SSH 都不发**。
+
+    2026-10-27 round-09：第 5 块闸门拒发后整轮 `return`，已放好的 4 块一次没量。
+    补测量必须能在**不重新抓放**的前提下单独跑；但「没块表」和「没授权」
+    这两种情况要在碰板子之前就退出（和 `--capture-pose` 同一套纪律）。
+    """
+    p = os.path.join(TMP, "grid-mo.json")
+    json.dump(make_grid(), open(p, "w"))
+    empty_run = tempfile.mkdtemp(prefix="stage2-mo-")
+    assert sr.main(["--run-dir", empty_run, "--urdf", "/tmp/r.urdf",
+                    "--grid", p, "--round", "9", "--measure-only",
+                    "--go"]) == 2
+    # 有 round.json 但没有成功的块 ⇒ 也是 2
+    rd = os.path.join(empty_run, "round-09")
+    os.makedirs(rd, exist_ok=True)
+    json.dump({"items": [{"block_idx": 0, "class": "red", "arm": "geometric",
+                          "slot_idx": 0, "exec_rc": 2}]},
+              open(os.path.join(rd, "round.json"), "w"))
+    assert sr.main(["--run-dir", empty_run, "--urdf", "/tmp/r.urdf",
+                    "--grid", p, "--round", "9", "--measure-only",
+                    "--go"]) == 2
+    # 有成功的块但没 --go ⇒ 仍然 2（会动臂，必须当次授权）
+    json.dump({"items": [{"block_idx": 0, "class": "red", "arm": "geometric",
+                          "slot_idx": 0, "exec_rc": 0}]},
+              open(os.path.join(rd, "round.json"), "w"))
+    assert sr.main(["--run-dir", empty_run, "--urdf", "/tmp/r.urdf",
+                    "--grid", p, "--round", "9", "--measure-only"]) == 2
 
 
 # ---------------------------------------------------------------- runner

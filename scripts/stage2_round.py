@@ -325,14 +325,52 @@ def cluster_warnings(items, min_mm=60.0):
     return out
 
 
-def build_assignments(pool, scene, round_no, grid, order=None):
+def placed_cells(round_doc):
+    """一份 ``round.json`` 里**真的放进格子里**的格号（``exec_rc == 0`` 的块）。"""
+    out = []
+    for it in round_doc.get("items") or []:
+        if it.get("exec_rc") == 0 and it.get("slot_idx") is not None:
+            out.append(int(it["slot_idx"]))
+    return out
+
+
+def occupied_from_previous(run_dir, exclude_dir=None, cells_free=()):
+    """扫前几轮的 ``round.json``，把已经放进格子的格号并起来。
+
+    为什么必须这么做：`build_assignments` 的 ``used`` 原来只在一轮内有意义，
+    新一轮看不见上一轮放了什么。2026-10-27 B2 第 5 轮重跑就是这么把第二块
+    黄色叠到第 4 轮已经占了**格 3** 上的（该轮块顺序 #9 → 格 3）。
+    ``cells_free`` 是**人**的口子：真把某格的块拿走了，就在这里声明它空着。
+    """
+    used = set()
+    for d in sorted(os.listdir(run_dir)):
+        p = os.path.join(run_dir, d, "round.json")
+        if not d.startswith("round-") or not d[6:].isdigit():
+            continue
+        if exclude_dir is not None and os.path.abspath(p).startswith(
+                os.path.abspath(exclude_dir) + os.sep):
+            continue
+        if os.path.exists(p):
+            try:
+                used.update(placed_cells(json.load(open(p))))
+            except (ValueError, OSError):
+                continue                      # 坏文件不阻断：当它没放过
+    return sorted(used - {int(c) for c in cells_free})
+
+
+def build_assignments(pool, scene, round_no, grid, order=None, used_prev=()):
     """一轮的完整分配：块 → 臂 → 格 → 两段 yaw。
 
     返回 ``{'items', 'missing', 'skipped', 'stop_reason'}``。
     选格复用 ``slot_routing.pick_slot``（同色优先、备用格通配），**不改它的语义**。
+    ``used_prev``：前几轮**已经放进去**的格号（见 `occupied_from_previous`），
+    本轮必须绕开它们。
     """
     slots, classes, _cells = cell_slots(grid)
     used = [False] * len(slots)
+    for c in used_prev:
+        if 0 <= int(c) < len(used):
+            used[int(c)] = True
     n = int(scene.get("blocks_per_round", 6))
     chosen, missing, skipped = choose_blocks(pool, order=order, n=n)
     arms = scene.get("arms_order") or list(ARMS)
@@ -776,6 +814,38 @@ def pick_plan(plan_path, cand_json, block_idx, slot_mm, item, urdf, frame_dir,
     return plan_path
 
 
+def plan_items(items, cdir, rdir, make_plan):
+    """逐块生成计划；**单块失败只跳过它**，不打断整轮。
+
+    2026-10-27 round-06 与 round-08 两次都是「一块过不了预检 ⇒ 后面的块连
+    规划都没做」，一轮只剩 1 块、标定判「样本不足（1 块）」。预检是**逐块的**
+    物理判据（邻块太近、限位、绕线…），一块不合格不代表别的块也不行。
+    全部块都失败，才等于这一轮没得跑。
+
+    ``make_plan(path, item)``：真正调用 `precision_plan.py` 的东西（测试里换成假的）。
+    返回 ``(plans, failed)``：``plans`` 是 ``(序号, item, 路径)``，``failed`` 是块号。
+    """
+    plans, failed = [], []
+    for k, it in enumerate(items, 1):
+        path = os.path.join(cdir, "pick-%02d.json" % k)
+        try:
+            make_plan(path, it)
+        except RuntimeError as exc:
+            print("!! 块 #%d 计划失败，跳过它继续规划后面的：%s"
+                  % (it["block_idx"], exc))
+            it["plan_error"] = str(exc)[-400:]
+            failed.append(it["block_idx"])
+            continue
+        it["plan"] = os.path.relpath(path, rdir)
+        plans.append((k, it, path))
+        print("  块 #%-2d %-12s 臂 %-9s 格 %d(%s)  yaw 抓 %7.1f° 放 %6.1f°"
+              "  [%s]" % (it["block_idx"], it["class"], it["arm"],
+                         it["slot_idx"], it["slot_color"] or "spare",
+                         it["yaw_grasp_deg"], it["yaw_place_deg"],
+                         it["yaw_source"]))
+    return plans, failed
+
+
 def signed_err_mod90(measured, target=0.0):
     """``measured − target`` 折到 (−45°, +45°]（方块的朝向按 90° 周期）。"""
     d = (float(measured) - float(target)) % 90.0
@@ -848,6 +918,99 @@ def do_capture(board, pose, out_dir, urdf, plan_dir, tag, go=True):
 
 
 # ---------------------------------------------------------------- CLI
+def terminal_measure(board, cdir, rdir, round_no, grid, grid_path, scene,
+                 items, args):
+    """终态测量 → 标定判决 → 判分。**只走到 ≥2 个 survey 位姿，不抓不放。**
+
+    2026-10-27 round-09 的教训：脚本在「某块执行判红」时 `return`，
+    于是**已经放好的 4 块永远量不到** —— 标定缺的就是这一步。测量是独立的
+    收尾动作（只动臂、不动夹爪），不该绑在「这一轮一块都没失败」上。
+
+    ``items``：块表（通常来自本轮的 ``round.json``），测量块按位置/颜色配给它。
+    正常流程传 ``res["items"]``；``--measure-only`` 传上一轮存档里的块表。
+    """
+    # ---- 终态：≥2 个 survey 位姿各抓一帧（不同视点，不是同点连拍）
+    #      每个视点再连拍几帧、视点内融合（位置中位数 + yaw 圆均值）——
+    #      换视点看的是系统性偏差，连拍压的是随机噪声，两样都要。
+    n_term = max(1, int(scene.get("terminal_frames", 1)))
+    poses = []
+    for i, pose in enumerate(scene.get("survey_poses", ["place"])[:2], 1):
+        js = board.joints(os.path.join(cdir, "joints-pose%d" % i))
+        plan = survey_plan(os.path.join(cdir, "survey-pose%d.json" % i),
+                           pose, chain_q(js), args.urdf)
+        rc = board.exec_plan(plan, os.path.join(cdir, "survey-pose%d.jsonl" % i),
+                             go=True)
+        if rc != 0:
+            print("走到终态 survey %s 失败（rc=%d）" % (pose, rc))
+            return rc
+        frames = []
+        for j in range(n_term):
+            fdir = os.path.join(cdir, "frame-pose%d" % i if j == 0
+                                else "frame-pose%d-%s" % (i, "bcdefgh"[j - 1]))
+            board.capture(fdir, "stage2-pose-%02d-%d-%d" % (round_no, i, j + 1))
+            frames.append(measure_pose(fdir, grid, weights=args.weights))
+        merged = fuse_measurements(frames)
+        spans = [b["yaw_span_deg"] for b in merged if b.get("yaw_span_deg")]
+        print("  视点 %d（%s）：%d 块，连拍 %d 帧%s"
+              % (i, pose, len(merged), n_term,
+                 "" if not spans else "，帧内 yaw 极差中位 %.2f°"
+                 % sorted(spans)[len(spans) // 2]))
+        poses.append(merged)
+    matched = match_block_ids(poses)
+    linked, unmatched = link_poses(matched, items, grid)
+    obs = {"version": 1, "round": round_no,
+           "poses": [{"name": "pose_%d" % (i + 1), "blocks": p}
+                     for i, p in enumerate(linked)],
+           "unmatched_blocks": unmatched,
+           "arms": [it["arm"] for it in items],
+           "expected": [{"block_id": i, "arm": it["arm"],
+                         "cell_idx": it["slot_idx"], "ran": True,
+                         "exec_ok": it.get("exec_rc", 1) == 0}
+                        for i, it in enumerate(items)]}
+    obs_path = os.path.join(cdir, "observations.json")
+    json.dump(obs, open(obs_path, "w"), ensure_ascii=False, indent=1)
+    if unmatched:
+        print("⚠️ %d 个测量块配不上任何一次抓取（多出来的块/颜色不明）：%s"
+              % (len(unmatched), [b["center_pad_mm"] for b in unmatched]))
+
+    if args.calib:
+        cal = calib_report(linked, items)
+        cal["round"] = round_no
+        cal["frame_pose1"] = os.path.relpath(
+            os.path.join(cdir, "frame-pose1"), rdir)
+        json.dump(cal, open(os.path.join(cdir, "calib.json"), "w"),
+                  ensure_ascii=False, indent=1)
+        print("\n== 指轴标定 ==")
+        for b in cal.get("blocks", []):
+            print("  块 #%s yaw %7.2f°  偏差 %+6.2f°" % (b["block_id"],
+                                                       b["yaw_deg"],
+                                                       b["err_deg"]))
+        if cal.get("verdict") == "zero":
+            print("⇒ 三块偏差一致且 ≤%.0f°：δ = 0"
+                  % cal["yaw_tol_deg"])
+        elif cal.get("verdict") == "constant_offset":
+            print("⇒ 常数偏置：δ = %+.2f°（改场景里的 finger_axis_delta_deg 后再跑一遍复核）"
+                  % cal["delta_deg_estimate"])
+        else:
+            print("⇒ 标定判红：%s" % cal.get("reason", ""))
+            print("   常数偏置才改 δ；极差大先查 ψ 符号与几何 yaw，别拿中位数当 δ")
+        print("   %s" % os.path.join(cdir, "calib.json"))
+
+    score_args = [PY_SELF, os.path.join(HERE, "stage2_score.py"),
+                  "--observations", obs_path, "--grid", os.path.abspath(grid_path),
+                  "--out-report", os.path.join(cdir, "score"),
+                  "--threshold-yaw-deg",
+                  "%.2f" % scene["thresholds"]["yaw_deg"],
+                  "--threshold-pos-mm",
+                  "%.2f" % scene["thresholds"]["pos_mm"]]
+    r = subprocess.run(score_args, capture_output=True, text=True)
+    print(r.stdout.strip())
+    if r.returncode == 2:
+        print("判分数据坏：%s" % r.stderr.strip())
+    print("\n本轮归档：%s" % cdir)
+    return r.returncode
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="阶段 2 一轮宫格归位")
     ap.add_argument("--run-dir", required=True)
@@ -875,6 +1038,9 @@ def main(argv=None):
     ap.add_argument("--resume", action="store_true",
                     help="续跑同一轮：跳过该轮 round.json 里 exec_rc==0 的块，"
                          "只补没完成的，终态测量仍覆盖整轮")
+    ap.add_argument("--measure-only", action="store_true",
+                    help="只做终态测量/判分（块表取本轮的 round.json）："
+                         "已放好的块不再抓放。某块判红停在原地后补测量用")
     args = ap.parse_args(argv)
 
     # ---- 只抓帧模式（B1）：不需要 grid.json，也绝不规划抓放
@@ -905,9 +1071,12 @@ def main(argv=None):
         print("场景坏：%s" % exc)
         return 2
     if args.calib:
-        # 标定轮只有一个变量：几何臂 / 3 块 / δ 先按 0 跑
+        # 标定轮只有一个变量：几何臂 / 默认 3 块 / δ 先按 0 跑。
+        # `calib_blocks` 可以调大：单块预检不过会被跳过（见下方的计划循环），
+        # 3 块里废一块就只剩 2 块、判「样本不足」—— 多排一两块是这一轮的余量。
         scene["arms_order"] = ["geometric"]
-        scene["blocks_per_round"] = min(3, int(scene["blocks_per_round"]))
+        want = int(scene.get("calib_blocks") or 3)
+        scene["blocks_per_round"] = min(want, int(scene["blocks_per_round"]))
         scene["finger_axis_delta_deg"] = float(
             scene.get("finger_axis_delta_deg") or 0.0)
         print("标定轮：几何臂 × %d 块，δ 先按 %.2f° 跑"
@@ -947,6 +1116,31 @@ def main(argv=None):
               % (round_no, len(resume_done), sorted(resume_done)))
         if not resume_done:
             print("⚠️ 这一轮没有已完成的块，--resume 等同于整轮重跑")
+
+    # ---- 只测量模式：块表取本轮的 round.json，只做终态测量/判分
+    #      2026-10-27 round-09：第 5 块的闸门拒发后整轮 `return`，已经放进格子的
+    #      4 块**一次都没量**，标定因此又判「样本不足」。测量是收尾动作，
+    #      不该被「这一轮有没有块失败」绑住。
+    if args.measure_only:
+        prev_path = os.path.join(cdir, "round.json")
+        if not os.path.exists(prev_path):
+            print("--measure-only 要读 %s —— 没有块表就配不上测量" % prev_path)
+            return 2
+        items = json.load(open(prev_path)).get("items") or []
+        ok_items = [it for it in items if it.get("exec_rc") == 0]
+        if not ok_items:
+            print("!! round-%02d 没有成功执行的块 —— 没有可测量的东西" % round_no)
+            return 2
+        if not args.go:
+            print("--measure-only 也会动臂（走到两个 survey 位姿）。"
+                  "确认现场后加 --go；**每次都要当次授权**。")
+            return 2
+        print("只做终态测量：round-%02d 已放好 %d 块（块表 %d 条），不抓不放"
+              % (round_no, len(ok_items), len(items)))
+        board = _board(cdir)
+        board.push()
+        return terminal_measure(board, cdir, rdir, round_no, grid, grid_path,
+                                scene, items, args)
 
     # 抓帧：复用 / 板侧抓（抓之前先走到拾取巡检位）
     # stage2pick：0.40 m 高、相机 ~ (485, 292, 400) mm —— 0.52 m 高位实测块
@@ -1010,8 +1204,14 @@ def main(argv=None):
     pool = candidate_pool(analysis, scene["pick_zone"])
     print("候选块 %d 个（拾取区内、候选 ≤%.0f mm）" % (len(pool),
                                                       pr.MAX_CAND_MM))
+    prev_used = occupied_from_previous(rdir, exclude_dir=cdir,
+                                       cells_free=scene.get("cells_free") or ())
+    if prev_used:
+        print("已占用的格（前几轮真的放进去的）：%s —— 本轮绕开；"
+              "要是人已经把某格的块拿走了，在 scene.json 的 cells_free 里声明"
+              % prev_used)
     res = build_assignments(pool, scene, round_no, grid,
-                            order=scene.get("blocks_order"))
+                            order=scene.get("blocks_order"), used_prev=prev_used)
     for m in res["missing"]:
         print("⚠️ 块顺序里的 %s 没有可用块（候选/遮挡/出区）" % m)
     for x in res["skipped"]:
@@ -1034,23 +1234,20 @@ def main(argv=None):
               % (a, b, d))
 
     # 计划（每条独立文件，便于现场逐条复核）
-    plans = []
-    for k, it in enumerate(res["items"], 1):
-        path = os.path.join(cdir, "pick-%02d.json" % k)
-        try:
-            pick_plan(path, analysis["_candidates_json"], it["block_idx"],
-                      it["slot_mm"], it, args.urdf, frame_dir)
-        except RuntimeError as exc:
-            print("块 #%d 计划失败：%s" % (it["block_idx"], exc))
-            res["stop_reason"] = "计划失败（块 #%d）" % it["block_idx"]
-            break
-        it["plan"] = os.path.relpath(path, rdir)
-        plans.append((k, it, path))
-        print("  块 #%-2d %-12s 臂 %-9s 格 %d(%s)  yaw 抓 %7.1f° 放 %6.1f°"
-              "  [%s]" % (it["block_idx"], it["class"], it["arm"],
-                         it["slot_idx"], it["slot_color"] or "spare",
-                         it["yaw_grasp_deg"], it["yaw_place_deg"],
-                         it["yaw_source"]))
+    plans, failed = plan_items(
+        res["items"], cdir, rdir,
+        lambda path, it: pick_plan(path, analysis["_candidates_json"],
+                                   it["block_idx"], it["slot_mm"], it,
+                                   args.urdf, frame_dir))
+    if failed:
+        res["stop_reason"] = "有块计划失败（%s）" % ", ".join("#%d" % b for b in failed)
+    if not plans:
+        print("!! 所有块都规划不出来 —— 这一轮没得跑（检查摆件间距/遮挡）")
+        return 1
+    print("本轮能跑 %d 块%s" % (len(plans),
+                              "" if not failed else
+                              "；跳过 %d 块（%s）" % (len(failed),
+                                                     ", ".join("#%d" % b for b in failed))))
 
     round_doc = {"version": 1, "kind": "stage2-round", "round": round_no,
                  "frame_pick": os.path.relpath(frame_dir, rdir),
@@ -1105,86 +1302,8 @@ def main(argv=None):
             print("!! 块 #%d 执行判红（rc=%d），停在原地" % (it["block_idx"], rc))
             return rc
 
-    # ---- 终态：≥2 个 survey 位姿各抓一帧（不同视点，不是同点连拍）
-    #      每个视点再连拍几帧、视点内融合（位置中位数 + yaw 圆均值）——
-    #      换视点看的是系统性偏差，连拍压的是随机噪声，两样都要。
-    n_term = max(1, int(scene.get("terminal_frames", 1)))
-    poses = []
-    for i, pose in enumerate(scene.get("survey_poses", ["place"])[:2], 1):
-        js = board.joints(os.path.join(cdir, "joints-pose%d" % i))
-        plan = survey_plan(os.path.join(cdir, "survey-pose%d.json" % i),
-                           pose, chain_q(js), args.urdf)
-        rc = board.exec_plan(plan, os.path.join(cdir, "survey-pose%d.jsonl" % i),
-                             go=True)
-        if rc != 0:
-            print("走到终态 survey %s 失败（rc=%d）" % (pose, rc))
-            return rc
-        frames = []
-        for j in range(n_term):
-            fdir = os.path.join(cdir, "frame-pose%d" % i if j == 0
-                                else "frame-pose%d-%s" % (i, "bcdefgh"[j - 1]))
-            board.capture(fdir, "stage2-pose-%02d-%d-%d" % (round_no, i, j + 1))
-            frames.append(measure_pose(fdir, grid, weights=args.weights))
-        merged = fuse_measurements(frames)
-        spans = [b["yaw_span_deg"] for b in merged if b.get("yaw_span_deg")]
-        print("  视点 %d（%s）：%d 块，连拍 %d 帧%s"
-              % (i, pose, len(merged), n_term,
-                 "" if not spans else "，帧内 yaw 极差中位 %.2f°"
-                 % sorted(spans)[len(spans) // 2]))
-        poses.append(merged)
-    matched = match_block_ids(poses)
-    linked, unmatched = link_poses(matched, res["items"], grid)
-    obs = {"version": 1, "round": round_no,
-           "poses": [{"name": "pose_%d" % (i + 1), "blocks": p}
-                     for i, p in enumerate(linked)],
-           "unmatched_blocks": unmatched,
-           "arms": [it["arm"] for it in res["items"]],
-           "expected": [{"block_id": i, "arm": it["arm"],
-                         "cell_idx": it["slot_idx"], "ran": True,
-                         "exec_ok": it.get("exec_rc", 1) == 0}
-                        for i, it in enumerate(res["items"])]}
-    obs_path = os.path.join(cdir, "observations.json")
-    json.dump(obs, open(obs_path, "w"), ensure_ascii=False, indent=1)
-    if unmatched:
-        print("⚠️ %d 个测量块配不上任何一次抓取（多出来的块/颜色不明）：%s"
-              % (len(unmatched), [b["center_pad_mm"] for b in unmatched]))
-
-    if args.calib:
-        cal = calib_report(linked, res["items"])
-        cal["round"] = round_no
-        cal["frame_pose1"] = os.path.relpath(
-            os.path.join(cdir, "frame-pose1"), rdir)
-        json.dump(cal, open(os.path.join(cdir, "calib.json"), "w"),
-                  ensure_ascii=False, indent=1)
-        print("\n== 指轴标定 ==")
-        for b in cal.get("blocks", []):
-            print("  块 #%s yaw %7.2f°  偏差 %+6.2f°" % (b["block_id"],
-                                                       b["yaw_deg"],
-                                                       b["err_deg"]))
-        if cal.get("verdict") == "zero":
-            print("⇒ 三块偏差一致且 ≤%.0f°：δ = 0"
-                  % cal["yaw_tol_deg"])
-        elif cal.get("verdict") == "constant_offset":
-            print("⇒ 常数偏置：δ = %+.2f°（改场景里的 finger_axis_delta_deg 后再跑一遍复核）"
-                  % cal["delta_deg_estimate"])
-        else:
-            print("⇒ 标定判红：%s" % cal.get("reason", ""))
-            print("   常数偏置才改 δ；极差大先查 ψ 符号与几何 yaw，别拿中位数当 δ")
-        print("   %s" % os.path.join(cdir, "calib.json"))
-
-    score_args = [PY_SELF, os.path.join(HERE, "stage2_score.py"),
-                  "--observations", obs_path, "--grid", os.path.abspath(grid_path),
-                  "--out-report", os.path.join(cdir, "score"),
-                  "--threshold-yaw-deg",
-                  "%.2f" % scene["thresholds"]["yaw_deg"],
-                  "--threshold-pos-mm",
-                  "%.2f" % scene["thresholds"]["pos_mm"]]
-    r = subprocess.run(score_args, capture_output=True, text=True)
-    print(r.stdout.strip())
-    if r.returncode == 2:
-        print("判分数据坏：%s" % r.stderr.strip())
-    print("\n本轮归档：%s" % cdir)
-    return r.returncode
+    return terminal_measure(board, cdir, rdir, round_no, grid,
+                            grid_path, scene, items, args)
 
 
 if __name__ == "__main__":

@@ -129,6 +129,16 @@ GUARD_LINKS = ("forearm_link", "wrist_1_link")
 GUARD_MARGIN = 0.02         # 大件（肘 / 腕 1）离台面的下限
 GUARD_TIP_MARGIN = 0.008    # **裸指尖**离台面的下限（10 mm 抓取深度留 2 mm 余量）
 MAX_JOINT_JUMP = 1.0
+# 单个关节字面行程上限。超过它说明选支选到了「同一个位姿、绕了一圈」的那一支：
+# 2026-10-27 B2 第 5 轮块 #2 就是这么让腕整圈翻转、夹爪朝天的。这是**红线**，
+# 不是可插点消化的跳变 —— 所以不按 MAX_JOINT_JUMP 处理。
+MAX_JOINT_SWING = float(np.pi)
+# 腕 1 / 腕 3 是沿工具轴的两个可整圈关节：字面角离 0 越远，夹爪线缆拧得越死。
+# 2026-10-27 回位那次把 wrist_1 转到 −262.6°、wrist_3 到 −253.4°，人只能手掰回来。
+# 210° 这个口子卡在两处之间：出厂正常姿势都在 ±180° 内；此前跑通的计划最狠到
+# −204.1°，放行；拧死的那次是 −262.6°，拦下。
+WOUND_JOINTS = ("wrist_1_joint", "wrist_3_joint")
+MAX_WRIST_TURN = float(np.radians(210.0))
 GUARD_SAMPLES = 8
 TABLE_PLANE_Z = 0.0
 MIN_BLOCK_GAP = 0.060
@@ -248,6 +258,9 @@ def check_guard(chain, q0, q1, table_z=TABLE_PLANE_Z, margin=GUARD_MARGIN,
 def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200):
     T = target_matrix(xyz, yaw_deg)
     q, pe, re, nfev = chain.ik(T, seed, max_iter=max_iter)
+    # 数值 IK 可能收敛到「同一个位姿、差 2π」的那一支；折回离种子最近的
+    # 字面值，否则执行器会照字面整圈转过去（见 unwrap_near 的注释）。
+    q = unwrap_near(chain, q, seed)
     return q, pe, re, nfev
 
 
@@ -262,9 +275,86 @@ def pose_residual(chain, q, xyz, yaw_deg=0.0):
 
 
 def joint_dist(a, b):
-    """关节空间距离，按 2π 取最短 —— 同一个位姿的 q 与 q+2π 是同一点。"""
+    """关节空间距离，按 2π 取最短 —— 同一个位姿的 q 与 q+2π 是同一点。
+
+    ⚠️ 这个函数只配用来**判重**（「两支解其实是一支吗」）。**不能拿它算行程**：
+    执行器走的是字面值，见 `travel_cost`。
+    """
     d = (np.asarray(a, float) - np.asarray(b, float) + np.pi) % (2 * np.pi) - np.pi
     return float(np.linalg.norm(d))
+
+
+def travel_cost(a, b):
+    """关节行程按**字面值**算（欧氏、不折 2π）—— JTC 插的就是字面值。
+
+    与 `joint_dist` 的分工是硬分工：折算后的距离对「这两个 q 是不是同一个
+    位姿」是对的，对「这条命令要转多少度」是错的。
+    """
+    return float(np.linalg.norm(np.asarray(a, float) - np.asarray(b, float)))
+
+
+def unwrap_near(chain, q, ref):
+    """每个关节加减 2π 到离 `ref` **最近的等价取值**（末端位姿一个字节都不变）。
+
+    2026-10-27 B2 第 5 轮块 #2（抓取角 148.6°）的事故就出在缺这一步：
+    同一末端位姿有一支解给的是 wrist_2 = **+270.1°**，与 −89.9° 按 2π 折算
+    距离为 0 —— 整链选支以为「腕不用动」，而 JTC 收到的是字面 +270.1°，
+    于是腕整圈翻转：臂走到第 3 个插点（wrist_2=+64.4°）时夹爪朝天，
+    人按了示教器 STOP。
+
+    这里顺手守住软限位：折算后的值出界就不折（宁可让 `check_limits` 判红，
+    也不把一个关节推到限位外）。返回新的数组，不改原值。
+
+    **还要避开绕线**（2026-10-27 当天第二次事故）：腕 1 / 腕 3 是沿工具轴的
+    两个「可整圈」关节，字面值离开 0 越远，夹爪线缆拧得越死。离 `ref` 最近
+    的那一圈不一定是线松的那一圈 —— 回位那次就是挑了 wrist_1=−262.6°、
+    wrist_3=−253.4°（离当时起点最近），把线又拧了约 285°，人只能手掰回来。
+    所以腕 1 / 腕 3 额外受 `MAX_WRIST_TURN` 约束：最近的那圈超了就换一圈。
+    """
+    q = np.asarray(q, float)
+    ref = np.asarray(ref, float)
+    out = q.copy()
+    for i, name in enumerate(chain.move_joints):
+        lo, hi, _ = chain.limits.get(name, (-np.inf, np.inf, 0.0))
+        k0 = int(round((ref[i] - q[i]) / (2 * np.pi)))
+        opts = [q[i] + 2 * np.pi * k for k in (k0 - 1, k0, k0 + 1)]
+        opts = [v for v in opts if lo <= v <= hi] or [q[i]]
+        best = min(opts, key=lambda v: abs(v - ref[i]))
+        if name in WOUND_JOINTS and abs(best) > MAX_WRIST_TURN:
+            calmer = [v for v in opts if abs(v) <= MAX_WRIST_TURN]
+            if calmer:
+                best = min(calmer, key=abs)
+        out[i] = best
+    return out
+
+
+def check_winding(chain, q, limit=MAX_WRIST_TURN):
+    """腕 1 / 腕 3 的字面角离 0 太远 ⇒ 线缆在拧。返回 None 或 (关节名, 度)。"""
+    for name in WOUND_JOINTS:
+        try:
+            i = chain.move_joints.index(name)
+        except (ValueError, AttributeError):
+            continue
+        if abs(float(q[i])) > limit:
+            return name, round(float(np.degrees(q[i])), 1)
+    return None
+
+
+def fold_yaw_180(deg):
+    """抓取角折到 (−90°, +90°] —— **物理等价**，不是近似。
+
+    平行两指夹爪（AG-95）绕工具轴转 180°，只是两根手指互换位置：夹的还是
+    同一对侧面、合拢时夹爪照样闭合，块相对 tool0 的姿态也只差一个 180°
+    （矩形块对 180° 自对称，所以放置结果逐字节相同）。但对腕 3 来说，
+    这两个写法是**整整 180° 的不同行程**。
+
+    2026-10-27 round-06 块 #4 就是被这一点拦下的：几何臂给出的抓取角是
+    182.864°，腕 3 得先转到 +97.6° 抓（177.2°），再转回 −116.0° 放
+    （213.6°）—— 后者越过 `MAX_JOINT_SWING`，整轮只剩 1 块。折成 +2.864°
+    后，同一块的单关节最大跳变 **213.6° → 55.0°**，且不产生插点。
+    """
+    d = float(deg) % 180.0
+    return d - 180.0 if d > 90.0 else d
 
 
 def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
@@ -293,7 +383,13 @@ def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
         if any(joint_dist(q, u) < tol for u in out):
             continue
         out.append(q)
-    return out
+    # 判重用折算距离（上面），**选支/存盘用字面值**（这里）：
+    # 全部候选先折到离起点最近的那一圈，DP 才能按真实行程比大小。
+    ref = all_seeds[0] if all_seeds else np.zeros(len(chain.move_joints))
+    folded = [unwrap_near(chain, q, ref) for q in out]
+    # 折完要**重判一次**腕奇异：+350° 折成 −10° 之后才真正靠近奇异，
+    # 折之前那一步是看不见的。
+    return [q for q in folded if not check_wrist(chain, q)]
 
 
 def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
@@ -318,7 +414,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
     for j, q in enumerate(sets[0]):
         ok, _ = check_guard(chain, q_start, q, table_z)
         if ok:
-            cost[0][j] = joint_dist(q, q_start)
+            cost[0][j] = travel_cost(q, q_start)
     for i in range(1, len(sets)):
         for j, q in enumerate(sets[i]):
             for k, qp in enumerate(sets[i - 1]):
@@ -327,7 +423,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
                 ok, _ = check_guard(chain, qp, q, table_z)
                 if not ok:
                     continue
-                c = cost[i - 1][k] + joint_dist(q, qp)
+                c = cost[i - 1][k] + travel_cost(q, qp)
                 if c < cost[i][j]:
                     cost[i][j] = c
                     prev[i][j] = k
@@ -366,6 +462,11 @@ def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
     if ws:
         raise PlanError("航点 %s 的腕 2 只有 %.2f°，离奇异位形不足 %.2f°（下限）"
                         % (name, ws[0], ws[1]))
+    wd = check_winding(chain, q)
+    if wd:
+        raise PlanError("航点 %s 的 %s 在 %.1f°（上限 ±%.0f°）—— 这一支会把夹爪"
+                        "线缆拧死；换一圈等价解（见 unwrap_near）"
+                        % (name, wd[0], wd[1], float(np.degrees(MAX_WRIST_TURN))))
     ok, worst = check_guard(chain, q_seed, q, table_z)
     if not ok:
         raise PlanError("航点 %s 的段内高度护栏不过：t=%.2f 处 %s z=%.1f mm"
@@ -398,6 +499,11 @@ def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP):
         q = np.asarray(w["q"], float)
         if prev_q is not None:
             jump = float(np.max(np.abs(q - prev_q)))
+            if jump > MAX_JOINT_SWING:
+                raise PlanError(
+                    "航点 %s 有单个关节要转 %.1f°（上限 %.0f°）—— 整圈翻转不是解法，"
+                    "应换一支 IK 的等价角（见 unwrap_near）"
+                    % (w["name"], np.degrees(jump), np.degrees(MAX_JOINT_SWING)))
             if jump > max_jump:
                 n = int(np.ceil(jump / max_jump))
                 for i in range(1, n):
@@ -490,7 +596,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
       = 不写（A3 计划逐字节不变）。
     · ``release_dwell_s``：松手后**先停这么久再撤**，让块自己落稳。默认 0
       （A3 不变）。
+
+    抓取角先折 180°（`fold_yaw_180`）——见该函数的说明，这是**物理等价**，
+    不是近似。
     """
+    yaw_grasp_raw = float(yaw_grasp_deg)
+    yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg)
     yaw_place = yaw_grasp_deg if yaw_place_deg is None else yaw_place_deg
 
     def _open_action(mm):
@@ -603,6 +714,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             "cand_angle_deg": round(cand["angle_deg"], 2),
             "cand_seed": cand.get("seed"),
             "yaw_grasp_deg": round(float(yaw_grasp_deg), 3),
+            "yaw_grasp_raw_deg": round(yaw_grasp_raw, 3),
             "yaw_place_deg": round(float(yaw_place), 3),
             "yaw_source": yaw_source,
             "pick_open_mm": pick_open_mm, "place_open_mm": place_open_mm,
