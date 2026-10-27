@@ -79,9 +79,23 @@ def scene(**kw):
 def test_load_scene_defaults_and_shortcuts():
     s = sr.load_scene()
     assert s["arms_order"] == ["geometric", "zero", "graspnet"]
-    assert s["survey_poses"] == ["place", "place2"]
+    # 2026-10-27 起终态两视点在**垫子上方**（原 A3 的 place/place2 在旧放置区，
+    # 与垫心 (422.7,−114.9) mm 不对位）。两者必须不同、且都能解 IK。
+    # 2026-10-27 B2 第 4 轮后：不再用 stage2high —— 0.52 m 高位顶面碎、
+    # ext_rect 12–24 mm，yaw 不可信，拿它当中值会把判分污染成噪声。
+    assert s["survey_poses"] == ["stage2close", "stage2close2"]
+    assert "stage2high" not in s["survey_poses"]
+    for p in s["survey_poses"]:
+        assert p in pp.SURVEY_TOOL0, p
+    # 两个终态视点必须同高、且水平分开（同点连拍证明不了多姿态一致性）
+    a, b = [pp.SURVEY_TOOL0[p] for p in s["survey_poses"]]
+    assert abs(a[2] - b[2]) < 1e-9, (a, b)
+    assert math.hypot(a[0] - b[0], a[1] - b[1]) >= 0.03, (a, b)
+    assert s["pick_frames"] >= 2 and s["terminal_frames"] >= 2
     assert s["finger_axis_delta_deg"] == 0.0
-    assert s["yaw_sign"] == -1.0
+    # 2026-10-27 B2 实测：映射是 ψ = +θ_face。原先的 −1 是镜像，误差 |−2θ| 折叠后
+    # 在 θ≈22.5° 处最大（45°），橙色块就栽在那里。
+    assert s["yaw_sign"] == 1.0
     assert s["blocks_per_round"] == 6
 
     ok = ",".join(sm.DEFAULT_ORDER)
@@ -184,6 +198,15 @@ def test_choose_blocks_order_and_auto():
     chosen, _, _ = sr.choose_blocks(pool, order=["red", "red", "red"], n=9)
     assert len(chosen) == 2, "同色两块只该被消耗两次：%s" % chosen
 
+    # "#<idx>"：同色多块时按块序号点，而不是「候选最近」—— 指轴标定要靠它
+    # 点出 yaw 相互 ≥30° 的那三块（2026-10-27 真机：两块 cyan / 两块 purple
+    # 颜色二义，按颜色只能碰运气）。
+    chosen, missing, _ = sr.choose_blocks(pool, order=["#0", "#2", "#9"], n=3)
+    assert [x["p"]["block_idx"] for x in chosen] == [0, 2], chosen
+    assert missing == ["#9"], missing
+    chosen, missing, _ = sr.choose_blocks(pool, order=["#bogus"], n=3)
+    assert chosen == [] and missing == ["#bogus"], (chosen, missing)
+
 
 @case
 def test_assign_arm_and_round_offset():
@@ -206,8 +229,11 @@ def test_yaw_for_arm_math():
     cand = {"angle_deg": 12.0}
     s = scene()
     g, p, src, note = sr.yaw_for_arm("geometric", b, cand, s)
-    assert abs(g - 340.0) < 1e-9 and p == 0.0 and src == "geometric", (g, p, src)
-    s = scene(finger_axis_delta_deg=5.0, yaw_sign=1.0)
+    assert abs(g - 20.0) < 1e-9 and p == 0.0 and src == "geometric", (g, p, src)
+    # 镜像映射（sign=−1）只剩显式选它的场合；断言它确实是镜像，别悄悄变回默认
+    g, p, src, _ = sr.yaw_for_arm("geometric", b, cand, scene(yaw_sign=-1.0))
+    assert abs(g - 340.0) < 1e-9 and p == 0.0, (g, p)
+    s = scene(finger_axis_delta_deg=5.0)
     g, p, src, _ = sr.yaw_for_arm("geometric", b, cand, s)
     assert abs(g - 25.0) < 1e-9 and p == 5.0, (g, p)
     g, p, src, _ = sr.yaw_for_arm("zero", b, cand, s)
@@ -233,8 +259,11 @@ def test_yaw_for_arm_math():
 def test_yaw_wrap_and_moduli():
     assert abs(sr.wrap_deg(-10.0) - 350.0) < 1e-9
     assert abs(sr.wrap_deg(370.0) - 10.0) < 1e-9
-    g, _, _, _ = sr.yaw_for_arm("geometric", {"yaw_pix": 350.0}, {}, scene())
+    g, _, _, _ = sr.yaw_for_arm("geometric", {"yaw_pix": 350.0}, {},
+                                scene(yaw_sign=-1.0))
     assert abs(g - 10.0) < 1e-9, g
+    g, _, _, _ = sr.yaw_for_arm("geometric", {"yaw_pix": 350.0}, {}, scene())
+    assert abs(g - 350.0) < 1e-9, g
 
 
 # ---------------------------------------------------------------- 分配
@@ -250,8 +279,8 @@ def test_build_assignments_slots_and_order():
     assert items[0]["slot_color"] == "red" and items[0]["slot_idx"] == 0
     assert items[1]["slot_color"] == "cyan" and items[1]["slot_idx"] == 5
     assert items[0]["arm"] == "geometric" and items[1]["arm"] == "zero"
-    # 世界 yaw：red 的像素 yaw 350° → ψ = −350° = 10°
-    assert abs(items[0]["yaw_grasp_deg"] - 10.0) < 1e-9, items[0]
+    # 世界 yaw：red 的像素 yaw 350° → ψ = +350°（2026-10-27 B2 判决：不是镜像）
+    assert abs(items[0]["yaw_grasp_deg"] - 350.0) < 1e-9, items[0]
 
     res2 = sr.build_assignments(pool, scene(blocks_order=["red", "cyan"]),
                                 round_no=2, grid=grid)
@@ -370,6 +399,39 @@ def test_link_gate_is_not_vacuous():
 
 
 @case
+def test_link_poses_rejects_far_phantom():
+    """离预期格 3 个格距以外的「同色块」不许配对（幻影不能冒充放对的块）。
+
+    2026-10-27 B2 实测：紫块好好躺在 6 号格里被颜色判 unknown，而背景里一个
+    383 mm 外的蓝色盒子被认成 purple，于是它顶替了 #2 块 —— 标定只剩 1 个样本。
+    """
+    grid = make_grid()
+    cells = {c["idx"]: c for c in grid["cells"]}
+    near = list(cells[6]["center_pad_mm"])
+    far = [near[0] + 360.0, near[1] + 210.0]
+    obs = [{"block_id": 0, "class": "purple", "class_status": "ok",
+            "center_pad_mm": far, "yaw_deg": 0.0}]
+    items = [{"class": "purple", "slot_idx": 6}]
+    linked, unmatched = sr.link_poses([obs], items, grid)
+    assert linked[0] == [] and len(unmatched) == 1, (linked, unmatched)
+    obs[0]["center_pad_mm"] = [near[0] + 8.0, near[1] + 9.0]   # 放歪了，但要认
+    linked, unmatched = sr.link_poses([obs], items, grid)
+    assert [b["block_id"] for b in linked[0]] == [0], linked
+
+
+@case
+def test_block_means_prefers_known_class_over_unknown():
+    """先到的 "unknown" 不许把后一帧认出来的类卡掉（它是真值字符串）。"""
+    matched = [[{"block_id": 0, "class": "unknown",
+                 "class_status": "unknown",
+                 "center_pad_mm": [0.0, 0.0], "yaw_deg": 1.0}],
+               [{"block_id": 0, "class": "orange", "class_status": "ok",
+                 "center_pad_mm": [0.5, 0.5], "yaw_deg": 3.0}]]
+    m = sr.block_means(matched)[0]
+    assert m["class"] == "orange" and m["class_status"] == "ok", m
+
+
+@case
 def test_block_means_averages_poses():
     matched = [[{"block_id": 0, "class": "red", "class_status": "ok",
                  "center_pad_mm": [0.0, 0.0], "yaw_deg": 1.0}],
@@ -415,7 +477,42 @@ def test_pick_plan_passes_two_stage_yaw_and_half_open():
     assert a[a.index("--place-open-mm") + 1] == "50.000"
     assert a[a.index("--slot") + 1] == "0.450000,-0.250000"
     assert "--survey" in a2 and a2[a2.index("--survey") + 1] == "place2"
-    assert a2[a2.index("--q-start") + 1].count(",") == 5
+    qs = [x for x in a2 if x.startswith("--q-start=")]
+    assert qs and qs[0].count(",") == 5, a2
+
+
+@case
+def test_pick_plan_replans_from_live_joints():
+    """给了 q_start 就必须走 --q-start、**不能**再带 --from-frame。
+
+    帧只给得起一条计划的起点；一轮三块里第二块起臂已经不在抓帧位姿，
+    再拿帧里的 q_start 会被 precision_exec 的闸门按「别人动过臂」拒掉
+    （2026-10-27 B2 实测 56°）。"""
+    calls = []
+
+    class R:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(args, **kw):
+        calls.append(args)
+        return R()
+
+    orig = sr.subprocess.run
+    sr.subprocess.run = fake_run
+    try:
+        it = {"yaw_grasp_deg": 10.0, "yaw_place_deg": 0.0,
+              "yaw_source": "geometric"}
+        sr.pick_plan(os.path.join(TMP, "p2.json"), "/tmp/c.json", 1,
+                     [400.0, -200.0], it, "/tmp/r.urdf", "/tmp/frame",
+                     q_start=[0.1, -1.0, 1.2, -1.4, -1.5, 0.2])
+    finally:
+        sr.subprocess.run = orig
+    a = calls[0]
+    assert "--from-frame" not in a, a
+    qs = [x for x in a if x.startswith("--q-start=")]
+    assert qs == ["--q-start=0.100000,-1.000000,1.200000,"
+                  "-1.400000,-1.500000,0.200000"], a
 
 
 # ---------------------------------------------------------------- 指轴标定
@@ -479,6 +576,136 @@ def test_calib_report_too_few_blocks():
     assert "没有量到" in cal["reason"]
 
 
+@case
+def test_mean_yaw_mod90_folds_before_averaging():
+    """2026-10-27 B2 第 4 轮真事故：紫块两姿态 98.40° / 1.70°（mod 90 只差 6.7°），
+    算术平均成 50.05°，标定据此报 −39.95° 的假偏差。"""
+    v = sr.mean_yaw_mod90([98.40, 1.70])
+    assert abs(v - 5.05) < 1e-6 or abs(v - 95.05) < 1e-6, v
+    assert abs(sr.mean_yaw_mod90([89.658, 78.14]) - 83.899) < 1e-3
+    assert abs(sr.mean_yaw_mod90([134.67]) - 44.67) < 1e-6   # 单值也落回 [0,90)
+    assert sr.mean_yaw_mod90([]) is None
+    # 红线：直接算术平均必须给出不同的（错的）结果，否则这个测试没在测东西
+    assert abs((98.40 + 1.70) / 2 - 5.05) > 40
+
+
+@case
+def test_fold_false_keeps_the_first_branch():
+    """抓取侧的 ψ 要贴着第一帧：折进 [0,90) 会把 134.7° 变 44.7°，
+    物理等价但腕部白转 90°，没必要。"""
+    v = sr.mean_yaw_mod90([134.67, 44.0], fold=False)
+    assert abs(v - 134.335) < 1e-3, v
+    assert abs(sr.mean_yaw_mod90([134.67, 44.0]) - 44.335) < 1e-3
+    assert sr.mean_yaw_mod90([134.67], fold=False) == 134.67
+    # 红线：折叠与否必须给出不同结果，否则这个测试没在测东西
+    assert abs(sr.mean_yaw_mod90([134.67, 44.0])
+               - sr.mean_yaw_mod90([134.67, 44.0], fold=False)) > 80
+
+
+@case
+def test_yaw_span_mod90():
+    assert abs(sr.yaw_span_mod90([28.3, 33.0, 23.0]) - 10.0) < 1e-6
+    assert abs(sr.yaw_span_mod90([98.40, 1.70]) - 6.7) < 1e-6   # 不是 96.7
+    assert sr.yaw_span_mod90([5.0]) is None
+    assert sr.yaw_span_mod90([]) is None
+
+
+@case
+def test_fuse_block_yaw_uses_only_trusted_neighbours():
+    """同姿态连拍：只并 trusted 的、只并 ≤12 mm 配上的，块号/候选不动。"""
+    primary = [{"idx": 0, "cx": 100.0, "cy": 200.0, "yaw_pix": 28.3,
+                "yaw_pix_trusted": True},
+               {"idx": 1, "cx": 300.0, "cy": 200.0, "yaw_pix": 60.5,
+                "yaw_pix_trusted": False}]
+    extra = [
+        # 帧 2：块 0 挪 1.4 mm、yaw 33.0；块 1 也量到但不可信 → 不许参与
+        [{"idx": 0, "cx": 101.0, "cy": 199.0, "yaw_pix": 33.0,
+          "yaw_pix_trusted": True},
+         {"idx": 1, "cx": 300.0, "cy": 200.0, "yaw_pix": -20.0,
+          "yaw_pix_trusted": False}],
+        # 帧 3：块 0 在 100.5/200.5、yaw 23.0；另外 40 mm 外有个 5.0° 的干扰块
+        [{"idx": 0, "cx": 100.5, "cy": 200.5, "yaw_pix": 23.0,
+          "yaw_pix_trusted": True},
+         {"idx": 3, "cx": 140.0, "cy": 200.0, "yaw_pix": 5.0,
+          "yaw_pix_trusted": True}],
+    ]
+    info = sr.fuse_block_yaw(primary, extra)
+    b = primary[0]
+    assert b["yaw_pix_single"] == 28.3
+    assert b["yaw_pix_frames"] == 3
+    assert abs(b["yaw_pix"] - 28.1) < 1e-6, b["yaw_pix"]   # (28.3+33.0+23.0)/3
+    assert info[0]["n"] == 3 and abs(info[0]["span_deg"] - 10.0) < 1e-6
+    # 第一帧就不可信的块不许被融合「救活」
+    assert primary[1]["yaw_pix"] == 60.5
+    assert "yaw_pix_single" not in primary[1]
+    assert info[1] == {"n": 0, "span_deg": None}
+    # 红线：干扰块 5.0° 若被算进来，均值会明显偏离 28.1
+    assert abs((28.3 + 33.0 + 23.0 + 5.0) / 4 - b["yaw_pix"]) > 3
+
+
+@case
+def test_fuse_measurements_medians_position_and_folds_yaw():
+    """同一视点连拍：位置取中位数，yaw 折 mod 90 再平均（98.40/1.70 → 5.05）。"""
+    f1 = [{"class": "purple", "class_status": "both",
+           "center_pad_mm": [0.0, 0.0], "center_base_mm": [500.0, -300.0],
+           "yaw_deg": 98.40, "yaw_trusted": True}]
+    f2 = [{"class": "purple", "class_status": "both",
+           "center_pad_mm": [0.6, 0.4], "center_base_mm": [500.6, -299.6],
+           "yaw_deg": 1.70, "yaw_trusted": True},
+          # 30 mm 外多出来的块：不配给第一帧那块
+          {"class": "red", "class_status": "yolo",
+           "center_pad_mm": [30.0, 0.0], "center_base_mm": [530.0, -300.0],
+           "yaw_deg": 12.0, "yaw_trusted": True}]
+    f3 = [{"class": "purple", "class_status": "both",
+           "center_pad_mm": [0.3, 0.2], "center_base_mm": [500.3, -299.8],
+           "yaw_deg": 5.0, "yaw_trusted": False}]
+    out = sr.fuse_measurements([f1, f2, f3])
+    assert len(out) == 1, out
+    b = out[0]
+    assert b["center_pad_mm"] == [0.3, 0.2], b
+    assert abs(b["yaw_deg"] - 5.05) < 1e-6, b["yaw_deg"]
+    assert b["frames_used"] == 3
+    assert abs(b["yaw_span_deg"] - 6.7) < 1e-6     # 不可信的 5.0 不参与
+    assert sr.fuse_measurements([]) == []
+    one = sr.fuse_measurements([f1])
+    assert one[0]["frames_used"] == 1 and one[0]["yaw_deg"] == 98.40
+
+
+# ---------------------------------------------------------------- 续跑（--resume）
+@case
+def test_completed_items_keeps_only_rc0():
+    """2026-10-27 B2 第 4 轮：块 #0 跑完、#9 闸门拿到 program=None 判红、#5 没跑。
+
+    续跑必须只跳过 #0；把判红或没跑过的块当完成，会让终态测量少两块而谎报「样本不足」。
+    """
+    doc = {"items": [{"block_idx": 0, "exec_rc": 0, "exec_log": "a.jsonl"},
+                     {"block_idx": 9, "exec_rc": 2, "exec_log": "b.jsonl"},
+                     {"block_idx": 5}]}
+    done = sr.completed_items(doc)
+    assert sorted(done) == [0], done
+    assert done[0]["exec_log"] == "a.jsonl"
+    assert sr.completed_items(None) == {}
+    assert sr.completed_items({}) == {}
+
+
+@case
+def test_apply_resume_marks_only_finished_blocks():
+    """续跑只在已完成的块上打 ``resumed``——没跑完的必须留在执行循环里。"""
+    items = [{"block_idx": 0}, {"block_idx": 9}, {"block_idx": 5}]
+    done = sr.completed_items({"items": [{"block_idx": 0, "exec_rc": 0,
+                                          "exec_log": "a.jsonl"},
+                                         {"block_idx": 9, "exec_rc": 2}]})
+    sr.apply_resume(items, done)
+    assert items[0]["resumed"] is True and items[0]["exec_rc"] == 0
+    assert items[0]["exec_log"] == "a.jsonl"
+    assert not items[1].get("resumed") and "exec_rc" not in items[1]
+    assert not items[2].get("resumed")
+    # 没有 resume_done 时一个都不动（整轮重跑路径）
+    items2 = [{"block_idx": 0}]
+    sr.apply_resume(items2, {})
+    assert "resumed" not in items2[0]
+
+
 # ---------------------------------------------------------------- 只抓帧（B1）
 @case
 def test_do_capture_sequence_and_gate():
@@ -492,7 +719,11 @@ def test_do_capture_sequence_and_gate():
 
         def joints(self, d):
             calls.append(("joints", os.path.basename(d)))
-            return {"position": [0.0] * 6}
+            # 发布顺序（pan, w2, w3, w1, elbow, lift）刻意与链序不同：
+            # 计划必须拿到链序，否则 q_start 与实测对不上（2026-10-27 实测差 157°）。
+            return {"name": ["shoulder_pan_joint", "wrist_2_joint", "wrist_3_joint",
+                             "wrist_1_joint", "elbow_joint", "shoulder_lift_joint"],
+                    "position": [0.1, 0.5, 0.6, 0.4, 0.3, 0.2]}
 
         def exec_plan(self, plan, log, go=False):
             calls.append(("exec", os.path.basename(plan), go))
@@ -505,14 +736,21 @@ def test_do_capture_sequence_and_gate():
         returncode = 0
         stderr = ""
 
+    argv_seen = []
     orig = sr.subprocess.run
-    sr.subprocess.run = lambda *a, **k: R()
+    sr.subprocess.run = lambda *a, **k: (argv_seen.append(a[0]), R())[1]
     out = os.path.join(TMP, "cap-frame")
     try:
         rc, fdir = sr.do_capture(B(), "place", out, "/tmp/r.urdf", TMP, "tag-1")
         assert rc == 0 and fdir == out, (rc, fdir)
         assert calls == [("joints", "joints-place"), ("exec", "survey-place.json", True),
                          ("capture", "tag-1")], calls
+        qs = [x for x in argv_seen[-1] if x.startswith("--q-start=")]
+        assert qs, argv_seen[-1]
+        q_start = qs[0].split("=", 1)[1]
+        assert [round(float(v), 3) for v in q_start.split(",")] == \
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6], \
+            "关节没按 name 重排成链序：%s" % q_start
         calls.clear()
         rc, fdir = sr.do_capture(B(), "place2", out, "/tmp/r.urdf", TMP, "tag-2",
                                  go=False)
@@ -550,10 +788,29 @@ def test_place2_survey_exists_and_is_separate():
 def test_place2_survey_solves_ik(chain):
     import test_precision_plan as tp
     _blocks, _cand, q0 = tp.scene(chain)      # q0 = 拾取巡检位
-    for which in ("place", "place2"):
+    for which in ("place", "place2", "stage2close", "stage2close2"):
+        if which not in pp.SURVEY_TOOL0:
+            continue
         wps, checks, meta = pp.build_survey(chain, q0, which)
-        assert wps and all(c.get("ok", True) for c in checks), checks
+        assert wps and all(c.get("ok", True) for c in checks), (which, checks)
         assert meta["which"] == which
+
+
+@case
+def test_stage2_survey_poses_reach_from_pick_pose(chain):
+    """终态两个视点都要能从**拾取巡检位**直接解出、且护栏不报红。
+
+    ``stage2close2`` 是 2026-10-27 B2 之后新加的（替代 stage2high 当第二终态视点），
+    没有一条真机轨迹跑过它 —— 至少先证明 IK 与台面/肘部护栏都过得去。
+    """
+    import test_precision_plan as tp
+    _blocks, _cand, q0 = tp.scene(chain)
+    for which in ("stage2close", "stage2close2", "stage2pick"):
+        wps, checks, meta = pp.build_survey(chain, q0, which)
+        assert wps, which
+        bad = [c for c in checks if not c.get("ok", True)]
+        assert not bad, (which, bad)
+        assert meta["tool0"] == list(pp.SURVEY_TOOL0[which])
 
 
 @case

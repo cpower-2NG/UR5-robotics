@@ -124,6 +124,27 @@ def test_classify_blocks_returns_every_block():
 
 
 @case
+def test_classify_blocks_keeps_block_own_idx():
+    """块自带 ``idx`` 时必须沿用它 —— ``find_blocks`` 的 idx 会跳号。
+
+    2026-10-27 B2 终态测量的真实事故：``find_blocks`` 给出 idx=3,5,8,11,15,16，
+    ``classify_blocks`` 却按位置报 0..5，调用方按 idx 查表查空，四块真积木全成
+    unknown，标定直接判「样本不足」。
+    """
+    b0 = _block('red', 0.99, uv=(100, 100), cx=1, cy=2)
+    b1 = _block('purple', 0.99, uv=(200, 100), cx=3, cy=4)
+    b0['idx'], b1['idx'] = 3, 11
+    dets = [_det('red', 0.9, uv=(101, 100))]
+    out = sc.classify_blocks([b0, b1], dets)
+    assert [r['block_idx'] for r in out] == [3, 11], out
+    assert out[0]['class'] == 'red' and out[1]['class'] == 'purple'
+    # 没有 idx 的块退回位置号（candidates.json 的块就有 idx，这里测兜底）
+    del b0['idx']
+    out = sc.classify_blocks([b0, b1], dets)
+    assert [r['block_idx'] for r in out] == [0, 11], out
+
+
+@case
 def test_classify_blocks_accepts_max_uv_px():
     """``max_uv_px`` 只给分配用，不能转进 classify_block_dual（会 TypeError）。"""
     blocks = [_block('red', 0.99, uv=(100, 100))]

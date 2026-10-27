@@ -146,9 +146,9 @@ def main():
         w = wr[n]
         act = []
         if w.get("before"):
-            act.append("前:" + _action_str(w["before"]["gripper"]))
+            act.append("前:" + _action_str(w["before"]))
         if w.get("after"):
-            act.append("后:" + _action_str(w["after"]["gripper"]))
+            act.append("后:" + _action_str(w["after"]))
         print("  %-15s q(deg) [%s]  %4.1fs  %s"
               % (n, " ".join("%6.1f" % math.degrees(v) for v in w["q"]),
                  w["duration"], " ".join(act)))
@@ -461,17 +461,19 @@ def main():
             return 2
         try:
             if w.get("before"):
-                do_gripper(w["before"]["gripper"], name + ".before")
+                # 传**整个 spec**：`open_to` 的开口在 `mm` 里，只取 `["gripper"]`
+                # 会把它丢掉（2026-10-27 B2 首块就栽在这里：`open_to 缺 mm`）。
+                do_gripper(w["before"], name + ".before")
             if w.get("q") is not None:
                 if not send(w["q"], w["duration"], name):
                     print("!! %s 失败，后续一条都不发" % name)
                     return 1
                 expected[:] = w["q"]
             if w.get("after"):
-                pos = do_gripper(w["after"]["gripper"], name + ".after")
+                pos = do_gripper(w["after"], name + ".after")
                 # 手指被物体挡住 ⇒ 回读停在中间；全闭 ⇒ 空夹。
                 # 中间值**不等于**开口（见 AG95_EMPTY_TOL_MM），这里只判「夹到没」。
-                if _action_name(w["after"]["gripper"]) == "close":
+                if _action_name(w["after"]) == "close":
                     closed_at = pos
                     if pos is None:
                         print("   ⚠️ 闭合后读不到位置 —— 判不了夹没夹住")

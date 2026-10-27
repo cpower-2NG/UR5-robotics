@@ -179,7 +179,12 @@ def classify_blocks(blocks, detections, **kw):
     for i, b in enumerate(blocks):
         det, dist = assigned.get(i, (None, None))
         rec = classify_block_dual(b, det, dist, **kw)
-        rec['block_idx'] = i
+        # 配对按**位置**（``assign_yolo`` 返回的是 enumerate 下标），但对外报的 id
+        # 必须沿用块自带的 ``idx``（有就用）—— ``find_blocks`` 的 idx 会跳号
+        # （被丢掉的簇不占号），拿位置当真 id 会让调用方按 idx 查表时**查空**：
+        # 2026-10-27 B2 终态测量就是这么把 4 块真积木全判成 unknown 的。
+        own = b.get('idx')
+        rec['block_idx'] = own if isinstance(own, int) else i
         rec['block_xy'] = [b.get('cx'), b.get('cy')]
         out.append(rec)
     return out

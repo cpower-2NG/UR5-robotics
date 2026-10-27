@@ -109,6 +109,20 @@ SURVEY_TOOL0 = {
     # 用途是「同一批已放块从**两个不同视点**各量一次」—— 同一个视点连拍两帧
     # 证明不了多姿态一致性（误差会一起共模）。位移量按 0.34 m 处的视场留足重叠。
     "place2": (0.5769, -0.3503, 0.3643),
+    # ---- 阶段 2（2026-10-27 实测：垫心 base (422.7, −114.9) mm，块在拾取侧
+    # x 0.39–0.58 / y 0.18–0.40）。相机（color optical）≈ tool0 + (−31.9, +85.1,
+    # −24.7) mm（yaw 0）。三个位姿都保持俯视 yaw 0：
+    #   stage2high  —— 高位广视：两页标记 + 九格同框（B1 垫子解算；RMS 1.0 px）
+    #   stage2close —— 凑近：九格 + 块全在画面，用于终态判分（第二视点）
+    #   stage2pick  —— 拾取侧：0.40 m 高，9 块全在视场（0.34 m 装不下 y 跨度）
+    "stage2high": (0.452, -0.2000, 0.547),    # 相机 ~ (420, −115, 523) mm
+    "stage2close": (0.452, -0.2000, 0.387),   # 相机 ~ (420, −115, 362) mm
+    # 终态第二视点：与 stage2close **同高**、平移 +40/+30 mm（相机 ~ (460, −85,
+    # 362)）。2026-10-27 B2 判决：stage2high 顶面碎、yaw 不可信，终态判分不再用它；
+    # 但「同一视点连拍」证明不了多姿态一致性，所以第二视点要换个位置而不是换个高度。
+    # 0.362 m 处视场约 510×287 mm，九格 180×180 mm 平移 50 mm 仍全在画面。
+    "stage2close2": (0.492, -0.1700, 0.387),
+    "stage2pick": (0.517, 0.207, 0.425),      # 相机 ~ (485, 292, 400) mm
 }
 
 GUARD_LINKS = ("forearm_link", "wrist_1_link")
@@ -566,7 +580,7 @@ def main():
     ap.add_argument("--q-start", default=None, help="逗号分隔的 6 个关节角（弧度）")
     ap.add_argument("--out", required=True)
     grp = ap.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--survey", choices=["pick", "place", "place2"])
+    grp.add_argument("--survey", choices=sorted(SURVEY_TOOL0))
     grp.add_argument("--move", help="tool0 目标 x,y,z（米）")
     grp.add_argument("--pick", action="store_true")
     ap.add_argument("--candidates", default=None)

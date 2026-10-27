@@ -22,12 +22,13 @@
       "grid_order": ["red", …, "spare"],   # 可选；给了就必须与 grid.json 一致
       "blocks_order": ["red", "cyan", …],  # 可选；空 = 自动选块
       "arms_order": ["geometric", "zero", "graspnet"],
-      "yaw_sign": -1.0,                    # 契约 ψ = −θ_face；标定若证明反了改 +1
+      "yaw_sign": 1.0,                     # ψ = +θ_face（2026-10-27 B2 实测判决，见 DEFAULT_SCENE）
       "finger_axis_delta_deg": 0.0,        # 指轴标定（B2）的 δ
       "pick_open_mm": 50.0, "place_open_mm": 50.0,
       "blocks_per_round": 6,
-      "pick_zone": [0.38, 0.62, 0.25, 0.45],
-      "survey_poses": ["place", "place2"],
+      "pick_zone": [0.36, 0.62, 0.12, 0.45],
+      "survey_poses": ["stage2close", "stage2close2"],
+      "pick_frames": 3, "terminal_frames": 3,   # 同姿态连拍 → yaw 融合
       "thresholds": {"yaw_deg": 8.0, "pos_mm": 12.0}
     }
 
@@ -45,7 +46,7 @@
 
 两种单品模式
 ────────────
-· ``--capture-pose {pick,place,place2} --capture-out DIR --go``：只走到巡检位
+· ``--capture-pose {stage2high,stage2close,stage2pick,…} --capture-out DIR --go``：只走到巡检位
   抓一帧（B1 垫子定位用；不动夹爪、不需要 grid.json）；
 · ``--calib``：指轴标定轮 —— 只用几何臂、3 块、δ 先按 0 跑，终态量每块 yaw 偏
   差并写 ``calib.json``（``verdict``：zero / constant_offset / inconsistent）。
@@ -67,6 +68,7 @@ sys.path.insert(0, HERE)
 import numpy as np                                                # noqa: E402
 
 import graspnet_candidates as gc                                  # noqa: E402
+import precision_plan as pp                                       # noqa: E402
 import precision_round as pr                                      # noqa: E402
 import stage2_color as sc                                         # noqa: E402
 import stage2_geom as sg                                          # noqa: E402
@@ -81,13 +83,32 @@ DEFAULT_SCENE = {
     "grid_order": None,
     "blocks_order": [],
     "arms_order": list(ARMS),
-    "yaw_sign": -1.0,
+    # 2026-10-27 B2 实测判决：**+1**（即 ψ = +θ_face），不是契约原先假设的 −1。
+    # 证据：四块几何臂按 ψ=−θ 抓放后的终态块面角（target 0）：黄 −0.3°、青 −2.1°、
+    # 紫 −0.4°、橙 −37.9°。前三块的拾取角分别 169.9/179.6/35.2°，若映射是 −1，
+    # 终态应为 2θ（−20.2/−0.7/−19.5），与实际全不符；若是 +1，终态应与 θ 无关
+    # （≈ −1.3°），前三块正好对上。橙色那块拾取角 24.7°，−1 的镜像误差
+    # |−2θ| 折叠后 = 40.7°——它落在最坏点上，爪合拢时按对角接触，块在指间转不动，
+    # 于是终态偏 37.9°。这就是「橙色方块抓取转角不准」的根因：**镜像映射**，
+    # 不是标定常数偏置。δ 的估计因此回到 0（前三块 −0.3/−2.1/−0.4，极差 1.8°）。
+    "yaw_sign": 1.0,
     "finger_axis_delta_deg": 0.0,
     "pick_open_mm": 50.0,
     "place_open_mm": 50.0,
     "blocks_per_round": 6,
-    "pick_zone": list(pr.PICK_ZONE),
-    "survey_poses": ["place", "place2"],
+    # 2026-10-27 实测：用户摆的 9 块落在 base x 0.389–0.582 / y 0.176–0.399 m，
+    # 旧的 pr.PICK_ZONE（y ≥ 0.25）会把下半排挡在池外。新框留 ≥20 mm 余量，
+    # 且 x 上限 0.62 仍把画面右缘的蓝盒（x ≳ 0.63）挡在外面。
+    "pick_zone": [0.36, 0.62, 0.12, 0.45],
+    # 终态视点：**只用低视点**。2026-10-27 B2 第 4 轮的实测复核：「高位广视」
+    # （相机 ~523 mm）上顶面碎、`ext_rect` 只有 12–24 mm（真值 ~36），yaw 不可信，
+    # 黄块因此量出 −0.34° / −11.86° 的跨姿态差。两个视点都换到 ~362 mm 的
+    # stage2close / stage2close2（同高、平移 40/30 mm），保留「换视点才看得见系统
+    # 性偏差」这一层，但不再拿一个已知坏视点去污染中位数。
+    "survey_poses": ["stage2close", "stage2close2"],
+    # 同姿态连拍帧数：抓取侧（θ 单帧噪声 0–30°）与终态测量侧都取多帧再融合。
+    "pick_frames": 3,
+    "terminal_frames": 3,
     "thresholds": {"yaw_deg": 8.0, "pos_mm": 12.0},
 }
 
@@ -176,6 +197,8 @@ def choose_blocks(pool, order=None, n=6):
     """按块顺序挑，或按候选离块心最近挑。
 
     ``order`` 里的类名用一次消耗一块；同色有多块时取候选最近的那块。
+    ``"#<idx>"`` 按**块序号**指定（同色多块时颜色是二义的 —— 指轴标定要的是
+    「yaw 相互 ≥30° 的那三块」，只能按序号点）。
     返回 ``(chosen, missing, skipped)``：找不到的类名进 ``missing``，
     没有颜色判定的块进 ``skipped`` —— 都不静默跳过。
     """
@@ -191,7 +214,15 @@ def choose_blocks(pool, order=None, n=6):
         for cls in order:
             if len(chosen) >= n:
                 break
-            cands = [x for x in left if x["p"]["class"] == cls]
+            if isinstance(cls, str) and cls.startswith("#"):
+                try:
+                    idx = int(cls[1:])
+                except ValueError:
+                    missing.append(cls)
+                    continue
+                cands = [x for x in left if x["p"]["block_idx"] == idx]
+            else:
+                cands = [x for x in left if x["p"]["class"] == cls]
             if not cands:
                 missing.append(cls)
                 continue
@@ -240,6 +271,32 @@ def yaw_for_arm(arm, block, cand, scene):
         return (wrap_deg(float(cand["angle_deg"]) + delta), delta,
                 "graspnet", "")
     raise ValueError("不认识的臂 %r（只认 %s）" % (arm, list(ARMS)))
+
+
+def completed_items(round_doc):
+    """``--resume`` 用：上一版 round.json 里 ``exec_rc == 0`` 的块 → ``{block_idx: item}``。
+
+    2026-10-27 B2 第 4 轮的实况：块 #0 跑完、块 #9 在发轨迹前的闸门拿到
+    ``program=None``（Dashboard 只读查询超时，不是示教器停了），脚本按 fail-closed
+    停在原地。那一轮的三个块里已经有两个不再在原位，整轮重跑会把空位当块抓；
+    续跑只补没完成的块，终态测量仍覆盖整轮的全部块。
+    """
+    out = {}
+    for it in (round_doc or {}).get("items", []):
+        if it.get("exec_rc") == 0 and it.get("block_idx") is not None:
+            out[int(it["block_idx"])] = it
+    return out
+
+
+def apply_resume(items, resume_done):
+    """把上一版已完成的状态贴到本轮 items 上（``resumed=True`` ⇒ 执行循环跳过）。"""
+    for it in items:
+        done = resume_done.get(int(it["block_idx"]))
+        if done is not None:
+            it["exec_rc"] = 0
+            it["exec_log"] = done.get("exec_log")
+            it["resumed"] = True
+    return items
 
 
 def cluster_warnings(items, min_mm=60.0):
@@ -424,6 +481,132 @@ def match_block_ids(poses, pos_tol_mm=10.0):
     return out
 
 
+def mean_yaw_mod90(vals, period=90.0, fold=True):
+    """跨姿态合并 yaw：先把各姿态折到同一支再取均值。
+
+    块面 yaw 只有 90° 周期意义，**不能直接算术平均**。2026-10-27 B2 第 4 轮的实况：
+    紫块两个姿态量到 98.40° 与 1.70°（差 96.7°，mod 90 只差 6.7°），算术平均得
+    50.05°，标定据此报「偏差 −39.95°」——把同一个角度算成了两个，判红也是假的。
+
+    ``fold=True``（默认）把结果折进 ``[0, period)``，判分/标定要的就是这个；
+    ``fold=False`` 让结果**贴合第一个值**（只做 ±period/2 的折叠）—— 抓取侧的 ψ
+    要的是「和第一帧同一个支」，折到 0–90 会把 134.7° 变成 44.7°，物理上等价但
+    腕部要多转 90°，没必要。
+    """
+    if not vals:
+        return None
+    ref = float(vals[0])
+    acc = []
+    for v in vals:
+        d = (float(v) - ref) % period
+        if d > period / 2.0:
+            d -= period
+        acc.append(ref + d)
+    mean = sum(acc) / len(acc)
+    return round(mean % period if fold else mean, 3)
+
+
+def yaw_span_mod90(vals, period=90.0):
+    """一组 yaw 的 mod-``period`` 极差（用来量化「同一块各帧各姿态差多少」）。"""
+    if not vals or len(vals) < 2:
+        return None
+    ref = float(vals[0])
+    acc = []
+    for v in vals:
+        d = (float(v) - ref) % period
+        if d > period / 2.0:
+            d -= period
+        acc.append(d)
+    return round(max(acc) - min(acc), 3)
+
+
+#: 同姿态连拍时，同一物理块在相邻两帧的块心允许平移多少（臂不动，只差深度噪声）。
+FUSE_MATCH_MM = 12.0
+
+
+def fuse_block_yaw(primary, extra_block_lists, match_mm=FUSE_MATCH_MM):
+    """同姿态连拍 → 把额外帧的 ``yaw_pix`` 并进第一帧的块表（mod 90 圆均值）。
+
+    为什么值得多抓几帧：2026-10-27 B2 实测，同一物理块、同一姿态、相隔几分钟的
+    两帧，θ_pix 极差 0.00°–29.86°（中位约 5°），而计划只用其中一帧；抓取角因此
+    带着单帧噪声，终态判红也就分不清「映射错」还是「估计抖」。
+
+    块号、候选、颜色仍取第一帧 —— 只有 yaw 被覆盖（原值留在 ``yaw_pix_single``）。
+    配对按块心平面距离（``≤match_mm``），臂在连拍期间不动，同一块只差毫米级噪声。
+    只有**都 trusted** 的帧才参与；第一帧就不 trusted 的块不改（不靠融合「救活」
+    一个本来判不了可信的块）。
+
+    返回 ``{block_idx: {"n": 用了几帧, "span_deg": 极差}}``，写进 ``round.json``。
+    """
+    out = {}
+    for b in primary:
+        if b.get("yaw_pix") is None or b.get("yaw_pix_trusted") is False:
+            out[b["idx"]] = {"n": 0, "span_deg": None}
+            continue
+        vals = [float(b["yaw_pix"])]
+        for blist in extra_block_lists:
+            best, best_d = None, match_mm
+            for c in blist:
+                if c.get("yaw_pix") is None or c.get("yaw_pix_trusted") is False:
+                    continue
+                d = math.hypot(float(c["cx"]) - float(b["cx"]),
+                               float(c["cy"]) - float(b["cy"]))
+                if d <= best_d:
+                    best, best_d = c, d
+            if best is not None:
+                vals.append(float(best["yaw_pix"]))
+        if len(vals) > 1:
+            b["yaw_pix_single"] = b["yaw_pix"]
+            b["yaw_pix"] = mean_yaw_mod90(vals, fold=False)
+        b["yaw_pix_frames"] = len(vals)
+        out[b["idx"]] = {"n": len(vals), "span_deg": yaw_span_mod90(vals)}
+    return out
+
+
+def fuse_measurements(frames, match_mm=8.0):
+    """同一 survey 姿态连拍的多帧 → 一帧（位置取中位数，yaw 按 mod 90 圆均值）。
+
+    终态测量噪声是实打实的：2026-10-27 B2 黄块在两个视点量到 −0.34° 与 −11.86°。
+    同一视点连拍几帧能把**随机**那部分压下去；换视点才能暴露**系统性**那部分
+    （所以 ``survey_poses`` 仍然是两个不同位姿，这里只做视点内的融合）。
+    """
+    frames = [f for f in frames if f]
+    if not frames:
+        return []
+    if len(frames) == 1:
+        return [dict(b, frames_used=1) for b in frames[0]]
+    base = frames[0]
+    out = []
+    for b in base:
+        bx, by = float(b["center_pad_mm"][0]), float(b["center_pad_mm"][1])
+        hits = [b]
+        for other in frames[1:]:
+            best, best_d = None, match_mm
+            for c in other:
+                d = math.hypot(float(c["center_pad_mm"][0]) - bx,
+                               float(c["center_pad_mm"][1]) - by)
+                if d <= best_d:
+                    best, best_d = c, d
+            if best is not None:
+                hits.append(best)
+        yaws = [float(h["yaw_deg"]) for h in hits
+                if h.get("yaw_deg") is not None and h.get("yaw_trusted") is not False]
+        rec = dict(b)
+        rec["center_pad_mm"] = [
+            round(float(np.median([float(h["center_pad_mm"][k]) for h in hits])), 2)
+            for k in (0, 1)]
+        if b.get("center_base_mm"):
+            rec["center_base_mm"] = [
+                round(float(np.median([float(h["center_base_mm"][k]) for h in hits
+                                       if h.get("center_base_mm")])), 2)
+                for k in (0, 1)]
+        rec["yaw_deg"] = mean_yaw_mod90(yaws) if yaws else None
+        rec["yaw_span_deg"] = yaw_span_mod90(yaws)
+        rec["frames_used"] = len(hits)
+        out.append(rec)
+    return out
+
+
 def block_means(matched):
     """跨姿态合并：``{block_id: {class, class_status, center_pad_mm, …}}``。"""
     out = {}
@@ -435,19 +618,25 @@ def block_means(matched):
             rec["centers"].append(b["center_pad_mm"])
             if b.get("yaw_deg") is not None:
                 rec["yaws"].append(float(b["yaw_deg"]))
-            rec["class"] = rec["class"] or b.get("class")
-            rec["class_status"] = rec["class_status"] or b.get("class_status")
+            # 跨姿态合并时「unknown」必须当场次缺失：两帧里只要有一帧认出来
+            # 就该用它。用 `or` 会被先到的 "unknown"（非空字符串，真值）卡死。
+            if rec["class"] in (None, "", "unknown"):
+                rec["class"] = b.get("class") or rec["class"]
+            if rec["class_status"] in (None, "", "unknown"):
+                rec["class_status"] = b.get("class_status") or rec["class_status"]
     for bid, rec in out.items():
         cs = rec["centers"]
         rec["center_pad_mm"] = [round(sum(c[0] for c in cs) / len(cs), 2),
                                 round(sum(c[1] for c in cs) / len(cs), 2)]
-        rec["yaw_deg"] = (round(sum(rec["yaws"]) / len(rec["yaws"]), 3)
-                          if rec["yaws"] else None)
+        rec["yaw_deg"] = mean_yaw_mod90(rec["yaws"])
+        # 跨姿态极差：同样两帧「量同一块」的 yaw 差，是测量噪声的直接读数
+        # （2026-10-27 B2 黄块 −0.34° vs −11.86°，差 11.52°）。
+        rec["yaw_pose_span_deg"] = yaw_span_mod90(rec["yaws"])
         rec["n_poses"] = len(cs)
     return out
 
 
-def link_poses(matched, items, grid, class_gate=True):
+def link_poses(matched, items, grid, class_gate=True, max_mm=None):
     """测量块 → 计划里的 item 一对一配对（颜色匹配 + 离预期格最近）。
 
     返回 ``(poses, unmatched)``：``poses`` 里每块的 ``block_id`` 换成 item 下标
@@ -456,6 +645,11 @@ def link_poses(matched, items, grid, class_gate=True):
     """
     _slots, _classes, cells = cell_slots(grid)
     pad_of = {c["idx"]: c["center_pad_mm"] for c in cells}
+    if max_mm is None:
+        # 离预期格超过 3 个格距就不是「放歪了」，是另一件东西（背景/幻影）。
+        # 不设上限时，只要某颜色只剩一个幻影，它就会被硬配给同色的 item——
+        # 2026-10-27 B2 就出现过一个 383 mm 外的「purple」被配成 #2 块。
+        max_mm = 3.0 * float(grid.get("pitch_mm", 60.0))
     means = block_means(matched)
     pairs = []
     for bid, rec in means.items():
@@ -468,6 +662,8 @@ def link_poses(matched, items, grid, class_gate=True):
                 continue
             d = math.hypot(rec["center_pad_mm"][0] - cell[0],
                            rec["center_pad_mm"][1] - cell[1])
+            if d > max_mm:
+                continue
             pairs.append((d, bid, k))
     pairs.sort()
     take_b, take_k = {}, set()
@@ -495,27 +691,60 @@ def _board(run_dir):
     return pr.Board(BOARD_ALIAS, run_dir)
 
 
+# joint_states 的 position 顺序是**发布顺序**（pan, w2, w3, w1, elbow, lift），
+# 与 URDF 链序不同。直接把它当 q_start 会与实测差 157°（2026-10-27 实测：
+# 闸门 `最大差 157.76° → 拒绝`）。凡是要进 precision_plan 的关节角，先按 name 重排。
+JOINT_ORDER = ("shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+               "wrist_1_joint", "wrist_2_joint", "wrist_3_joint")
+
+
+def chain_q(js):
+    """把 precision_capture 的 joint_states.json 重排成 URDF 链序（弧度）。"""
+    by = dict(zip(js["name"], js["position"]))
+    miss = [n for n in JOINT_ORDER if n not in by]
+    if miss:
+        raise ValueError("joint_states 缺关节 %s（有 %s）" % (miss, js["name"]))
+    return [float(by[n]) for n in JOINT_ORDER]
+
+
 def survey_plan(plan_path, pose, joints, urdf):
-    """从当前关节角生成一条 survey 计划（只动臂，不碰夹爪）。"""
+    """从当前关节角生成一条 survey 计划（只动臂，不碰夹爪）。
+
+    ⚠️ ``--q-start`` 必须用 ``=`` 形式：肩关节角为负时值是 ``-0.79,…``，
+    分开写会被 argparse 当成「又一个选项」拒掉（``expected one argument``）——
+    2026-10-27 臂停在负角位姿上才暴露。
+    """
     q = ",".join("%.6f" % v for v in joints)
     r = subprocess.run([PY_SELF, os.path.join(HERE, "precision_plan.py"),
-                        "--survey", pose, "--urdf", urdf, "--q-start", q,
+                        "--survey", pose, "--urdf", urdf, "--q-start=" + q,
                         "--out", plan_path], capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError("survey %s 计划失败：%s" % (pose, r.stderr.strip()))
     return plan_path
 
 
-def pick_plan(plan_path, cand_json, block_idx, slot_mm, item, urdf, frame_dir):
-    """生成一条阶段 2 的拾放计划（两段 yaw + 半开）。"""
+def pick_plan(plan_path, cand_json, block_idx, slot_mm, item, urdf, frame_dir,
+              q_start=None):
+    """生成一条阶段 2 的拾放计划（两段 yaw + 半开）。
+
+    ``q_start``：**当前实测关节角**（URDF 链序，弧度）。给了就用 ``--q-start``，
+    不再从帧里取起点 —— 一帧只能给一条计划的起点，而一轮要连跑三块：第一块
+    放完臂已经不在抓帧位姿，后面几条计划若还拿帧里的 q_start，`precision_exec`
+    的闸门会按「别人动过臂」拒掉（2026-10-27 B2 实测最大差 56°）。
+    """
     args = [PY_SELF, os.path.join(HERE, "precision_plan.py"), "--pick",
             "--candidates", cand_json, "--block", str(block_idx),
             "--slot", "%.6f,%.6f" % (slot_mm[0] / 1000.0,
                                      slot_mm[1] / 1000.0),
-            "--urdf", urdf, "--from-frame", frame_dir, "--out", plan_path,
+            "--urdf", urdf, "--out", plan_path,
             "--yaw-grasp-deg", "%.4f" % item["yaw_grasp_deg"],
             "--yaw-place-deg", "%.4f" % item["yaw_place_deg"],
             "--yaw-source", item["yaw_source"]]
+    if q_start is None:
+        args += ["--from-frame", frame_dir]
+    else:
+        # 同上：负角必须用 `=` 形式，否则 argparse 把 "-0.79,…" 当选项。
+        args += ["--q-start=" + ",".join("%.6f" % float(v) for v in q_start)]
     for key, flag in (("pick_open_mm", "--pick-open-mm"),
                       ("place_open_mm", "--place-open-mm")):
         v = item.get(key)
@@ -591,7 +820,7 @@ def do_capture(board, pose, out_dir, urdf, plan_dir, tag, go=True):
     os.makedirs(plan_dir, exist_ok=True)
     js = board.joints(os.path.join(plan_dir, "joints-%s" % pose))
     plan = survey_plan(os.path.join(plan_dir, "survey-%s.json" % pose), pose,
-                       js["position"], urdf)
+                       chain_q(js), urdf)
     rc = board.exec_plan(plan, os.path.join(plan_dir, "survey-%s.jsonl" % pose),
                          go=go)
     if rc != 0 or not go:
@@ -608,7 +837,11 @@ def main(argv=None):
     ap.add_argument("--scene", default=None)
     ap.add_argument("--grid", default=None, help="覆盖 scene.grid_json")
     ap.add_argument("--frame", default=None, help="复用已抓的帧（不重新抓）")
-    ap.add_argument("--capture-pose", choices=["pick", "place", "place2"],
+    ap.add_argument("--extra-frame", dest="extra_frames", action="append",
+                    default=None, metavar="DIR",
+                    help="与 --frame 同姿态的另一帧；给了就做 yaw 多帧融合"
+                         "（可重复，离线复算用）")
+    ap.add_argument("--capture-pose", choices=sorted(pp.SURVEY_TOOL0),
                     default=None,
                     help="只走到巡检位抓一帧（B1 垫子定位；不动夹爪）")
     ap.add_argument("--capture-out", default=None,
@@ -621,6 +854,9 @@ def main(argv=None):
                     help="真跑；**每次都要当次授权**，闸门在 precision_exec")
     ap.add_argument("--calib", action="store_true",
                     help="指轴标定轮：只用几何臂、3 块，终态量 δ 并写 calib.json")
+    ap.add_argument("--resume", action="store_true",
+                    help="续跑同一轮：跳过该轮 round.json 里 exec_rc==0 的块，"
+                         "只补没完成的，终态测量仍覆盖整轮")
     args = ap.parse_args(argv)
 
     # ---- 只抓帧模式（B1）：不需要 grid.json，也绝不规划抓放
@@ -684,16 +920,30 @@ def main(argv=None):
     cdir = os.path.join(rdir, "round-%02d" % round_no)
     os.makedirs(cdir, exist_ok=True)
 
+    resume_done = {}
+    if args.resume:
+        prev_path = os.path.join(cdir, "round.json")
+        if os.path.exists(prev_path):
+            resume_done = completed_items(json.load(open(prev_path)))
+        print("续跑 round-%02d：已完成 %d 块 %s，只补其余"
+              % (round_no, len(resume_done), sorted(resume_done)))
+        if not resume_done:
+            print("⚠️ 这一轮没有已完成的块，--resume 等同于整轮重跑")
+
     # 抓帧：复用 / 板侧抓（抓之前先走到拾取巡检位）
+    # stage2pick：0.40 m 高、相机 ~ (485, 292, 400) mm —— 0.52 m 高位实测块
+    # 顶高偏低且碎簇多，抓帧要近；0.34 m 又装不下九块 ~0.34 m 的 y 跨度。
     board = None
+    extra_pick_frames = []
     if args.frame:
         frame_dir = os.path.abspath(args.frame)
+        extra_pick_frames = list(getattr(args, "extra_frames", None) or [])
     elif args.go:
         board = _board(cdir)
         board.push()
         js = board.joints(os.path.join(cdir, "joints-pick"))
-        plan = survey_plan(os.path.join(cdir, "survey-pick.json"), "pick",
-                           js["position"], args.urdf)
+        plan = survey_plan(os.path.join(cdir, "survey-pick.json"), "stage2pick",
+                           chain_q(js), args.urdf)
         rc = board.exec_plan(plan, os.path.join(cdir, "survey-pick.jsonl"),
                              go=True)
         if rc != 0:
@@ -701,6 +951,12 @@ def main(argv=None):
             return rc
         frame_dir = os.path.join(cdir, "frame-pick")
         board.capture(frame_dir, "stage2-pick-%02d" % round_no)
+        # 同姿态连拍：臂不动、只多按几次相机。θ_pix 的单帧噪声实测 0–30°，
+        # 抓取角就是从这里来的（见 fuse_block_yaw 的注释）。
+        for j in range(1, max(1, int(scene.get("pick_frames", 1)))):
+            fd = os.path.join(cdir, "frame-pick-%s" % "bcdefgh"[j - 1])
+            board.capture(fd, "stage2-pick-%02d-%d" % (round_no, j + 1))
+            extra_pick_frames.append(fd)
     else:
         print("没给 --frame：离线分配需要一帧 survey 图。"
               "先 --frame DIR，或加 --go 由板子抓。")
@@ -711,6 +967,26 @@ def main(argv=None):
     except (RuntimeError, OSError, ValueError) as exc:
         print("分析失败：%s" % exc)
         return 2
+    fused_yaw = {}
+    if extra_pick_frames:
+        extras = []
+        for fd in extra_pick_frames:
+            f = gc.load_frame(fd)
+            eb, _tz = gc.find_blocks(f)
+            extras.append(add_pixel_yaw(f, eb))
+        fused_yaw = fuse_block_yaw(analysis["blocks"], extras)
+        used = [v for v in fused_yaw.values() if v["n"] > 1]
+        if used:
+            print("yaw 多帧融合：%d 块用上 ≥2 帧，跨帧极差中位 %.2f°（最大 %.2f°）"
+                  % (len(used),
+                     sorted(v["span_deg"] for v in used)[len(used) // 2],
+                     max(v["span_deg"] for v in used)))
+        # 极差过大只有两种解释：那一帧的矩形估计坏了，或者**配错了块**。
+        # 连拍时臂不动、场景不动，正常应 ≤10°；超了要人看一眼再往下走。
+        for idx, v in sorted(fused_yaw.items()):
+            if v["span_deg"] is not None and v["span_deg"] > 15.0:
+                print("⚠️ 块 #%d 的 yaw 跨帧极差 %.1f°（>15°）—— 查是不是配错了块"
+                      "或某一帧的矩形估计坏了" % (idx, v["span_deg"]))
     if analysis.get("_yolo_warn"):
         print(analysis["_yolo_warn"])
     pool = candidate_pool(analysis, scene["pick_zone"])
@@ -730,6 +1006,7 @@ def main(argv=None):
     for it in res["items"]:
         it["pick_open_mm"] = scene.get("pick_open_mm")
         it["place_open_mm"] = scene.get("place_open_mm")
+    apply_resume(res["items"], resume_done)
     for a, b, d in cluster_warnings(res["items"]):
         print("⚠️ 块 #%d 与 #%d 中心距只有 %.1f mm（下限 60）—— 计划器会拒"
               % (a, b, d))
@@ -761,6 +1038,7 @@ def main(argv=None):
                           "grid_yaw_base_deg": grid["grid_yaw_base_deg"],
                           "T_base_pad": grid["T_base_pad"]},
                  "scene": scene, "items": res["items"],
+                 "pick_yaw_fusion": fused_yaw,
                  "missing_order": res["missing"],
                  "stop_reason": res["stop_reason"]}
     with open(os.path.join(cdir, "round.json"), "w") as f:
@@ -776,8 +1054,23 @@ def main(argv=None):
         board = _board(cdir)
         board.push()
     for k, it, path in plans:
+        if it.get("resumed"):
+            print("\n== 块 #%d / %s —— 上一遍已完成（exec_rc=0），跳过 =="
+                  % (it["block_idx"], it["class"]))
+            continue
         print("\n== 块 #%d / %s / 臂 %s ==" % (it["block_idx"], it["class"],
                                                it["arm"]))
+        # 逐块重规划：起点必须是**此刻实测的关节角**。三条计划共用抓帧时的
+        # q_start 会在第一块放完后全部被闸门拒掉（2026-10-27 B2 实测）。
+        js_now = board.joints(os.path.join(cdir, "joints-live-%02d" % k))
+        try:
+            pick_plan(path, analysis["_candidates_json"], it["block_idx"],
+                      it["slot_mm"], it, args.urdf, frame_dir,
+                      q_start=chain_q(js_now))
+        except (RuntimeError, ValueError) as exc:
+            print("!! 重规划失败（块 #%d）：%s" % (it["block_idx"], exc))
+            round_doc["stop_reason"] = "重规划失败（块 #%d）" % it["block_idx"]
+            return 1
         log = os.path.join(cdir, "exec-%02d.jsonl" % k)
         rc = board.exec_plan(path, log, go=True)
         it["exec_rc"] = rc
@@ -791,19 +1084,32 @@ def main(argv=None):
             return rc
 
     # ---- 终态：≥2 个 survey 位姿各抓一帧（不同视点，不是同点连拍）
+    #      每个视点再连拍几帧、视点内融合（位置中位数 + yaw 圆均值）——
+    #      换视点看的是系统性偏差，连拍压的是随机噪声，两样都要。
+    n_term = max(1, int(scene.get("terminal_frames", 1)))
     poses = []
     for i, pose in enumerate(scene.get("survey_poses", ["place"])[:2], 1):
         js = board.joints(os.path.join(cdir, "joints-pose%d" % i))
         plan = survey_plan(os.path.join(cdir, "survey-pose%d.json" % i),
-                           pose, js["position"], args.urdf)
+                           pose, chain_q(js), args.urdf)
         rc = board.exec_plan(plan, os.path.join(cdir, "survey-pose%d.jsonl" % i),
                              go=True)
         if rc != 0:
             print("走到终态 survey %s 失败（rc=%d）" % (pose, rc))
             return rc
-        fdir = os.path.join(cdir, "frame-pose%d" % i)
-        board.capture(fdir, "stage2-pose-%02d-%d" % (round_no, i))
-        poses.append(measure_pose(fdir, grid, weights=args.weights))
+        frames = []
+        for j in range(n_term):
+            fdir = os.path.join(cdir, "frame-pose%d" % i if j == 0
+                                else "frame-pose%d-%s" % (i, "bcdefgh"[j - 1]))
+            board.capture(fdir, "stage2-pose-%02d-%d-%d" % (round_no, i, j + 1))
+            frames.append(measure_pose(fdir, grid, weights=args.weights))
+        merged = fuse_measurements(frames)
+        spans = [b["yaw_span_deg"] for b in merged if b.get("yaw_span_deg")]
+        print("  视点 %d（%s）：%d 块，连拍 %d 帧%s"
+              % (i, pose, len(merged), n_term,
+                 "" if not spans else "，帧内 yaw 极差中位 %.2f°"
+                 % sorted(spans)[len(spans) // 2]))
+        poses.append(merged)
     matched = match_block_ids(poses)
     linked, unmatched = link_poses(matched, res["items"], grid)
     obs = {"version": 1, "round": round_no,
