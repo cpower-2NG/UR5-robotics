@@ -29,7 +29,7 @@
       "pick_zone": [0.36, 0.62, 0.12, 0.45],
       "survey_poses": ["stage2close", "stage2close2"],
       "pick_frames": 3, "terminal_frames": 3,   # 同姿态连拍 → yaw 融合
-      "thresholds": {"yaw_deg": 8.0, "pos_mm": 12.0}
+      "thresholds": {"yaw_deg": 6.0, "pos_mm": 10.0}   # 用户 2026-10-28 拍板
     }
 
 命令行快捷方式（优先级低于 ``--scene``）：``--grid-order`` / ``--block-order``，
@@ -126,7 +126,9 @@ DEFAULT_SCENE = {
     # 同姿态连拍帧数：抓取侧（θ 单帧噪声 0–30°）与终态测量侧都取多帧再融合。
     "pick_frames": 3,
     "terminal_frames": 3,
-    "thresholds": {"yaw_deg": 8.0, "pos_mm": 12.0},
+    # 出口阈值由用户 2026-10-28 基线后拍板（8/12 → 6/10），与 stage2_score 同值；
+    # 两份默认值必须一起改，否则判分器收到的阈值随入口而变。
+    "thresholds": {"yaw_deg": 6.0, "pos_mm": 10.0},
 }
 
 

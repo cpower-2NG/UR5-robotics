@@ -532,6 +532,21 @@ def test_block_means_keeps_a_single_pose_two_source_conflict():
     assert m["class_status"] == "conflict", m
 
 
+@case
+def test_default_thresholds_match_the_scorer():
+    """scene 默认阈值必须与判分器常数同值。
+
+    两处各写一份：`--scene` 里给了就按 scene、没给就按 DEFAULT_SCENE，而
+    `stage2_score.py` 自己还有一份默认。改一处不报错，只会让「同一批数据走不同
+    入口得到不同结论」—— 这类分歧在报告里看不出来。2026-10-28 用户把阈值从
+    8°/12 mm 改到 6°/10 mm 时就是三个地方一起改的。
+    """
+    import stage2_score as ss
+    th = sr.DEFAULT_SCENE["thresholds"]
+    assert th["yaw_deg"] == ss.YAW_TOL_DEG, (th, ss.YAW_TOL_DEG)
+    assert th["pos_mm"] == ss.POS_TOL_MM, (th, ss.POS_TOL_MM)
+
+
 # ---------------------------------------------------------------- 计划接线
 @case
 def test_pick_plan_passes_two_stage_yaw_and_half_open():
