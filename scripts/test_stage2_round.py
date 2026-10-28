@@ -176,16 +176,25 @@ def test_load_grid_requires_pad_fields():
 # ---------------------------------------------------------------- 选块
 @case
 def test_candidate_pool_filters():
-    analysis = {"blocks": [{"idx": 0, "cx": 500.0, "cy": 300.0},
-                           {"idx": 1, "cx": 300.0, "cy": 300.0},   # 出区
-                           {"idx": 2, "cx": 500.0, "cy": 300.0}],  # 无候选
-            "per_block": [{"block_idx": 0, "class": "red", "dist_mm": 3.0,
-                           "best": {"angle_deg": 1.0, "width_mm": 26.0}},
-                          {"block_idx": 1, "class": "cyan", "dist_mm": 2.0,
-                           "best": {"angle_deg": 2.0, "width_mm": 26.0}},
-                          {"block_idx": 2, "class": "purple", "dist_mm": 15.0,
-                           "best": {"angle_deg": 3.0, "width_mm": 26.0}}]}
-    pool = sr.candidate_pool(analysis, scene()["pick_zone"])
+    """池 = 「在拾取区内」×「有合格候选（≤12 mm）」，四条边各验一次。
+
+    2026-10-28 扩区（x 0.36→0.25、0.62→0.575；y 0.45→0.42）后，原先拿
+    x=300 mm 当「出区」的样本**失效了** —— 300 mm 现在在区内，这条断言会静默
+    从「过滤了出区的块」变成「过滤了没候选的块」。改成按 DEFAULT_SCENE 现算
+    四条边的越界点，下次改边界时覆盖自己跟着走。
+    """
+    zx0, zx1, zy0, zy1 = [v * 1000.0 for v in scene()["pick_zone"]]
+    blocks = [{"idx": 0, "cx": 500.0, "cy": 300.0},            # 区内 + 有候选 → 进
+              {"idx": 1, "cx": zx0 - 30.0, "cy": 300.0},       # x 下界外
+              {"idx": 2, "cx": zx1 + 30.0, "cy": 300.0},       # x 上界外
+              {"idx": 3, "cx": 500.0, "cy": zy0 - 30.0},       # y 下界外
+              {"idx": 4, "cx": 500.0, "cy": zy1 + 30.0},       # y 上界外
+              {"idx": 5, "cx": 500.0, "cy": 300.0}]            # 区内但无候选
+    per = [{"block_idx": i, "class": "red",
+            "dist_mm": 15.0 if i == 5 else 3.0,
+            "best": {"angle_deg": 1.0, "width_mm": 26.0}} for i in range(6)]
+    pool = sr.candidate_pool({"blocks": blocks, "per_block": per},
+                             scene()["pick_zone"])
     assert [x["p"]["block_idx"] for x in pool] == [0], pool
 
 
@@ -548,19 +557,26 @@ def test_default_thresholds_match_the_scorer():
 
 
 @case
-def test_pick_zone_lower_edge_stays_in_camera_view():
-    """拾取区的 y 下界必须留在腕部相机能看全的台面里。
+def test_pick_zone_edges_stay_inside_the_usable_table():
+    """拾取区四条边都必须留在「画面内 + 纸面内」，且不外扩到臂够不着的地方。
 
-    round-11 实测：抓帧的画面底边反投影到台面 = base y ≈ **134 mm**；黄绿块
-    摆在 y=151 mm 时顶面已经被画面底边切掉一半（顶面点 2349，别的块 5435–6723），
-    GraspNet 因此 **一个候选都没给**。而当时的 `pick_zone` y 下界写的是 0.12 m ——
-    比相机视场还宽 14 mm，落在这条缝里的块会被判成「块有问题」而不是「摆错地方」。
+    物理边界全部是抓帧实测（图：`round-14/pickzone-proposal.png`，1280×720）：
+      · 画面左边界 base x ≈ **196 mm**，右边界 ≈ 762 mm；
+      · **白纸右边界恒在 base x ≈ 605 mm**（v=60…700 逐行 605/606），以外是木桌面；
+      · 画面底边 base y ≈ **134 mm**，顶边 ≈ **450 mm**（y=450 正好是 v=0）。
+    块的顶面掩码半径 28 mm、块半宽 ≈18 mm ⇒ 两边各留 28 mm 才不会把块切掉。
 
-    0.17 = 134 mm 视场边 + 36 mm 块子的半宽余量（2026-10-28 用户拍板）。
-    这条断言不锁死数值，只挡住「又把它改回视场边上或更小」。
+    实测反例：round-11 黄绿块在 y=151 mm，顶面被画面底边切掉一半（顶面点 2349，
+    别的块 5435–6723），GraspNet 一个候选都没给。所以这里不用「贴着视场边」的值。
+
+    这条断言不锁死某组数，只挡住「又把这四条边改回物理边界上/外」。
+    ⚠️ 换 pick 机位就要重算这四个数 —— 现在的值全部只对 `survey-stage2pick` 成立。
     """
-    ymin = sr.DEFAULT_SCENE["pick_zone"][2]
-    assert ymin >= 0.16, ymin
+    xmin, xmax, ymin, ymax = sr.DEFAULT_SCENE["pick_zone"]
+    assert ymin >= 0.16, ymin          # 134 mm 视场边 + 块半宽
+    assert xmin >= 0.22, xmin          # 196 mm 视场边 + 28 mm 掩码
+    assert ymax <= 0.43, ymax          # 450 mm 视场边 − 28 mm 掩码
+    assert xmax <= 0.58, xmax          # 605 mm 纸边 − 28 mm 掩码
 
 
 # ---------------------------------------------------------------- 计划接线
