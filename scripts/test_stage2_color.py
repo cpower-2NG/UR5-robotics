@@ -156,6 +156,63 @@ def test_classify_blocks_accepts_max_uv_px():
     assert out2[0]['source'] == 'both'
 
 
+# ---------------------------------------------------------------- 投票
+def _rec(cls, share, status='ok'):
+    return {'class': cls, 'class_share': share, 'class_status': status}
+
+
+@case
+def test_vote_picks_by_share_not_order():
+    """两强差够大 ⇒ 票多的赢，**与出现顺序无关**（先到的赢就是原缺陷）。"""
+    a = [_rec('orange', 0.65), _rec('tan', 0.93)]
+    b = list(reversed(a))
+    for recs in (a, b):
+        cls, status, w, reason = sc.vote_class(recs)
+        assert (cls, status) == ('tan', 'ok'), (recs, cls, status, reason)
+        # 返回的权重是**赢家自己的票权**（0.93），不是两强之和 —— 调用方拿它
+        # 当「这条判定的票份额」用，跟单帧 ``class_share`` 同一量纲。
+        assert abs(w - 0.93) < 1e-9, w
+
+
+@case
+def test_vote_close_is_conflict():
+    cls, status, _w, reason = sc.vote_class([_rec('orange', 0.80),
+                                             _rec('tan', 0.75)])
+    assert cls == 'orange' and status == 'conflict', (cls, status, reason)
+    assert '票权接近' in reason, reason
+
+
+@case
+def test_vote_inner_conflict_leaks_through():
+    """某条自己就是两源冲突：它不投票，但这份不确定必须带上来。"""
+    cls, status, _w, reason = sc.vote_class([_rec('tan', 0.95),
+                                             _rec('orange', 0.4, 'conflict')])
+    assert cls == 'tan' and status == 'conflict', (cls, status, reason)
+
+
+@case
+def test_vote_ignores_self_contradictory_unknown():
+    """状态说「认不出」却带类名的记录不投票 —— 否则一条 unknown 能把整块推成 ok。
+
+    这是 ``test_summary_excludes_person_review`` 变红时定位到的：判分器会把
+    「本该人看」的块当成机器判过。
+    """
+    cls, status, _w, _r = sc.vote_class([_rec('orange', 1.0, 'unknown')])
+    assert cls is None and status == 'unknown', (cls, status)
+    # 与一条真票混在一起时，unknown 那条不参与加权
+    cls, status, w, _r = sc.vote_class([_rec('orange', 1.0, 'unknown'),
+                                        _rec('tan', 0.6)])
+    assert (cls, status) == ('tan', 'ok') and abs(w - 0.6) < 1e-9, (cls, w)
+
+
+@case
+def test_vote_missing_share_counts_as_one():
+    """老记录没有 class_share：一票就是一票，不能当 0 票丢掉。"""
+    cls, status, w, _r = sc.vote_class([{'class': 'red'},
+                                        {'class': 'cyan', 'class_share': 0.6}])
+    assert cls == 'red' and status == 'ok' and abs(w - 1.0) < 1e-9, (cls, w)
+
+
 # ---------------------------------------------------------------- runner
 def main():
     npass = nfail = 0

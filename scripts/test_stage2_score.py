@@ -145,8 +145,13 @@ def test_person_review_on_pose_disagreement():
                       _pose(0, 'red', [-60, 60], 8.0)], [_exp()]))
     assert r['status'] == 'person_review', r
     assert 'yaw 跨姿态' in r['reason']
+    # 位置门 10 mm（2026-10-28 按实测噪声放宽，原 3 mm）：8 mm 现在**不算**不一致，
+    # 12 mm 才算 —— 两边都要钉住，否则「放宽」和「门被摘掉」分不出来。
+    r_in, _ = _one(_obs([_pose(0, 'red', [-60, 60], 1.0),
+                         _pose(0, 'red', [-52, 60], 1.0)], [_exp()]))
+    assert r_in['status'] != 'person_review', r_in
     r2, _ = _one(_obs([_pose(0, 'red', [-60, 60], 1.0),
-                       _pose(0, 'red', [-52, 60], 1.0)], [_exp()]))
+                       _pose(0, 'red', [-48, 60], 1.0)], [_exp()]))
     assert r2['status'] == 'person_review', r2
     assert '位置跨姿态' in r2['reason']
 

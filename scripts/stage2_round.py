@@ -78,6 +78,10 @@ PY_GRASPNET = os.path.expanduser("~/robotics/venvs/graspnet/bin/python")
 BOARD_ALIAS = os.environ.get("STAGE2_BOARD", "jetson-hotspot")   # 与 precision_round 一致；有线备选用 STAGE2_BOARD=jetson-wifi
 
 ARMS = ("geometric", "zero", "graspnet")
+
+# 颜色投票的「说不清」带宽活在家门口 stage2_color（判分器也要用同一条规则），
+# 这里只是给本模块的调用点留个短名字。
+CLASS_VOTE_MARGIN = sc.CLASS_VOTE_MARGIN
 DEFAULT_SCENE = {
     "grid_json": None,
     "grid_order": None,
@@ -489,6 +493,9 @@ def measure_pose(frame_dir, grid, weights=None):
         out.append({
             "class": c.get("class") or "unknown",
             "class_status": c.get("status", "unknown"),
+            # 票份额要带出去：跨姿态合并按它加权投票（见 block_means），
+            # 丢了它就只能「先到的赢」。
+            "class_share": c.get("hsv_share"),
             "center_base_mm": [round(float(b["cx"]), 2),
                                round(float(b["cy"]), 2)],
             "center_pad_mm": _pad_xy(grid, [b["cx"], b["cy"]]),
@@ -614,6 +621,11 @@ def fuse_block_yaw(primary, extra_block_lists, match_mm=FUSE_MATCH_MM):
     return out
 
 
+# 颜色投票的实现在 ``stage2_color.vote_class`` —— 判分器（stage2_score）也要用
+# 同一条规则，两处各写一份迟早会分叉。这里留个别名，调用点不必改。
+vote_class = sc.vote_class
+
+
 def fuse_measurements(frames, match_mm=8.0):
     """同一 survey 姿态连拍的多帧 → 一帧（位置取中位数，yaw 按 mod 90 圆均值）。
 
@@ -653,29 +665,47 @@ def fuse_measurements(frames, match_mm=8.0):
                 for k in (0, 1)]
         rec["yaw_deg"] = mean_yaw_mod90(yaws) if yaws else None
         rec["yaw_span_deg"] = yaw_span_mod90(yaws)
+        # 颜色也要在视点内投票，不能取第一帧的：视点1 里三帧分别给了
+        # orange 0.65 / orange 0.62 / 认不出 —— 取第一帧等于把最弱的证据定成结论。
+        cls, status, share, reason = vote_class(hits)
+        rec["class"] = cls if cls else None
+        rec["class_status"] = status
+        rec["class_share"] = round(share, 3)
+        if reason:
+            rec["class_reason"] = reason
         rec["frames_used"] = len(hits)
         out.append(rec)
     return out
 
 
 def block_means(matched):
-    """跨姿态合并：``{block_id: {class, class_status, center_pad_mm, …}}``。"""
+    """跨姿态合并：``{block_id: {class, class_status, center_pad_mm, …}}``。
+
+    颜色**按票权投票**，不是「先到的赢」：每个姿态一票，权重是该姿态自己的
+    HSV 票份额。2026-10-28 round-10 就是栽在这里 —— 木棕块视点1 判 orange
+    (0.65)、视点2 判 tan (0.93)，先到的 orange 定了调，于是它配不上「tan→格2」
+    那条、被记成 ``not_measured``。两类的票权差 < ``CLASS_VOTE_MARGIN`` 才标
+    ``conflict``（交人看），不猜。
+    """
     out = {}
     for pose in matched:
         for b in pose:
             rec = out.setdefault(b["block_id"], {"centers": [], "yaws": [],
-                                                 "class": None,
-                                                 "class_status": None})
+                                                 "poses": []})
             rec["centers"].append(b["center_pad_mm"])
             if b.get("yaw_deg") is not None:
                 rec["yaws"].append(float(b["yaw_deg"]))
-            # 跨姿态合并时「unknown」必须当场次缺失：两帧里只要有一帧认出来
-            # 就该用它。用 `or` 会被先到的 "unknown"（非空字符串，真值）卡死。
-            if rec["class"] in (None, "", "unknown"):
-                rec["class"] = b.get("class") or rec["class"]
-            if rec["class_status"] in (None, "", "unknown"):
-                rec["class_status"] = b.get("class_status") or rec["class_status"]
+            # 「这一姿态说了什么」整条留着交给 vote_class —— 它按 class_share
+            # 加权，且 class_status=unknown 的姿态自然不投票（不会像 `or` 那样
+            # 被先到的 "unknown" 卡死）。
+            rec["poses"].append(b)
     for bid, rec in out.items():
+        cls, status, share, reason = vote_class(rec.pop("poses"))
+        rec["class"] = cls
+        rec["class_status"] = status
+        rec["class_share"] = round(share, 3)
+        if reason:
+            rec["class_reason"] = reason
         cs = rec["centers"]
         rec["center_pad_mm"] = [round(sum(c[0] for c in cs) / len(cs), 2),
                                 round(sum(c[1] for c in cs) / len(cs), 2)]
@@ -1098,12 +1128,21 @@ def main(argv=None):
 
     os.makedirs(args.run_dir, exist_ok=True)
     rdir = args.run_dir
-    if args.round is None:
+    if args.round is not None:
+        round_no = args.round
+    elif args.measure_only:
+        # 补测量量的是**上一轮已经放好的块**，默认要落在最后一份有块表的轮次上，
+        # 不能像正常轮那样往下开新号：2026-10-27 round-10 收尾崩掉后补测量，
+        # 默认号算成 round-11，于是去读不存在的 round-11/round.json 而 rc=2
+        # （还在 runs/ 下留了一个空 round-11 目录）。
+        have = [int(d[6:]) for d in os.listdir(rdir)
+                if d.startswith("round-") and d[6:].isdigit()
+                and os.path.exists(os.path.join(rdir, d, "round.json"))]
+        round_no = max(have) if have else 1
+    else:
         rdirs = sorted(d for d in os.listdir(rdir)
                        if d.startswith("round-") and d[6:].isdigit())
         round_no = len(rdirs) + 1
-    else:
-        round_no = args.round
     cdir = os.path.join(rdir, "round-%02d" % round_no)
     os.makedirs(cdir, exist_ok=True)
 
@@ -1303,7 +1342,7 @@ def main(argv=None):
             return rc
 
     return terminal_measure(board, cdir, rdir, round_no, grid,
-                            grid_path, scene, items, args)
+                            grid_path, scene, res["items"], args)
 
 
 if __name__ == "__main__":

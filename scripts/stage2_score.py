@@ -54,10 +54,17 @@ sys.path.insert(0, HERE)
 import cv2                                                       # noqa: E402
 import numpy as np                                               # noqa: E402
 
+import stage2_color as sc                                        # noqa: E402
+
 YAW_TOL_DEG = 8.0
 POS_TOL_MM = 12.0
-POSE_YAW_TOL_DEG = 3.0
-POSE_POS_TOL_MM = 3.0
+# 多姿态一致性门。**按实测噪声定，不是拍脑袋**：round-10（2026-10-28）同一姿态
+# 连拍 3 帧的 yaw 极差中位 4.23°（视点1）/ 2.49°（视点2），单块最大 9.48°；
+# 同一块两视点之间位置差最大 6.97 mm（黄绿块）。原来的 3°/3 mm **在噪声以下**，
+# 会把正常的测量抖动判成 person_review、机判样本一直偏少 ⇒ 用户 2026-10-28 拍板
+# 放宽到 6°/10 mm。真要更严，改这两个常数重判即可（不重跑机械臂）。
+POSE_YAW_TOL_DEG = 6.0
+POSE_POS_TOL_MM = 10.0
 CELL_RADIUS_FRAC = 0.45
 
 STATUSES = ('ok', 'color_wrong', 'wrong_cell', 'yaw_fail', 'pos_fail',
@@ -144,18 +151,26 @@ def merge_poses(poses, yaw_tol=POSE_YAW_TOL_DEG, pos_tol=POSE_POS_TOL_MM):
             rec = by_id.setdefault(bid, {
                 'block_id': bid, 'obs': [], 'class': None,
                 'class_status': None, 'center_pad_mm': [],
-                'yaw_deg': [], 'poses': [],
+                'yaw_deg': [], 'poses': [], '_recs': [],
             })
             rec['obs'].append((pi, b))
             rec['poses'].append(pi)
-            rec['class'] = rec['class'] or b.get('class')
-            rec['class_status'] = rec['class_status'] or b.get('class_status')
+            # 「这一姿态说了什么」整条留着，最后按票权投票 —— 不能先到先得：
+            # 2026-10-28 round-10 木棕块视点1 判 orange、视点2 判 tan，
+            # 先到的 orange 定调，判分把它记成 color_wrong（实物放对了）。
+            rec['_recs'].append(b)
             if b.get('center_pad_mm') is not None:
                 rec['center_pad_mm'].append([float(v) for v in b['center_pad_mm']])
             if b.get('yaw_deg') is not None:
                 rec['yaw_deg'].append(float(b['yaw_deg']))
 
     for rec in by_id.values():
+        cls, status, share, reason = sc.vote_class(rec.pop('_recs'))
+        rec['class'] = cls
+        rec['class_status'] = status
+        rec['class_share'] = round(share, 3)
+        if reason:
+            rec['class_reason'] = reason
         rec['consistent'] = True
         rec['reason'] = ''
         ys, ps = rec['yaw_deg'], rec['center_pad_mm']

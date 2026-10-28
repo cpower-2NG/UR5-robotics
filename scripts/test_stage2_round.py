@@ -496,6 +496,42 @@ def test_block_means_averages_poses():
     assert m["class"] == "red" and m["n_poses"] == 2
 
 
+@case
+def test_block_means_votes_colour_by_share_not_first_wins():
+    """跨姿态颜色按票权投票 —— 别让「先到的」定调。
+
+    2026-10-28 round-10 实测：木棕块视点1 判 orange（份额 0.65）、视点2 判 tan
+    （0.93）。旧写法（先到的非 unknown 赢）取 orange ⇒ 配不上「tan→格2」⇒
+    整块记 not_measured。按份额投票应由 tan 胜出，且**顺序反过来结果一样**。
+    """
+    def pose(cls, share):
+        return {"block_id": 0, "class": cls, "class_status": "ok",
+                "class_share": share, "center_pad_mm": [62.0, 60.0],
+                "yaw_deg": 4.0}
+
+    a = sr.block_means([[pose("orange", 0.65)], [pose("tan", 0.93)]])[0]
+    b = sr.block_means([[pose("tan", 0.93)], [pose("orange", 0.65)]])[0]
+    for m in (a, b):
+        assert m["class"] == "tan", m
+        assert m["class_status"] == "ok", m
+    # 份额接近（差 0.05 < 0.2）⇒ 说不清，标 conflict 交人看，不猜
+    c = sr.block_means([[pose("orange", 0.80)], [pose("tan", 0.75)]])[0]
+    assert c["class_status"] == "conflict", c
+    assert "orange" in c["class_reason"] and "tan" in c["class_reason"], c
+
+
+@case
+def test_block_means_keeps_a_single_pose_two_source_conflict():
+    """一个姿态内部两源冲突时它**不投票**；这份冲突不能被另一姿态的干净票盖掉。"""
+    bad = {"block_id": 0, "class": None, "class_status": "conflict",
+           "center_pad_mm": [0.0, 0.0], "yaw_deg": 1.0}
+    good = {"block_id": 0, "class": "red", "class_status": "ok",
+            "class_share": 1.0, "center_pad_mm": [1.0, 1.0], "yaw_deg": 2.0}
+    m = sr.block_means([[bad], [good]])[0]
+    assert m["class"] == "red", m
+    assert m["class_status"] == "conflict", m
+
+
 # ---------------------------------------------------------------- 计划接线
 @case
 def test_pick_plan_passes_two_stage_yaw_and_half_open():
@@ -1000,6 +1036,132 @@ def test_measure_only_needs_a_round_and_go():
               open(os.path.join(rd, "round.json"), "w"))
     assert sr.main(["--run-dir", empty_run, "--urdf", "/tmp/r.urdf",
                     "--grid", p, "--round", "9", "--measure-only"]) == 2
+
+
+@case
+def test_measure_only_defaults_to_the_last_round_with_a_block_table():
+    """不给 ``--round`` 时，``--measure-only`` 要量**最后一轮有块表的**，不是开新号。
+
+    2026-10-27 round-10 收尾崩掉后补测量：默认号算成 round-11，去读不存在的
+    ``round-11/round.json`` ⇒ rc=2，还在 runs/ 下留了个空 round-11 目录。
+    失败是 fail-closed（没动臂），但要多耗一次授权。
+    """
+    run = tempfile.mkdtemp(prefix="stage2-mo-default-", dir=TMP)
+    p = os.path.join(TMP, "grid-mo-default.json")
+    json.dump(make_grid(), open(p, "w"))
+    rd5 = os.path.join(run, "round-05")
+    os.makedirs(rd5, exist_ok=True)
+    json.dump({"items": [{"block_idx": 7, "class": "cyan", "arm": "zero",
+                          "slot_idx": 5, "exec_rc": 0}]},
+              open(os.path.join(rd5, "round.json"), "w"))
+    # 还有一个**没有**块表的更高号目录（比如某次失败留下的）
+    os.makedirs(os.path.join(run, "round-06"), exist_ok=True)
+
+    seen = {}
+
+    def fake_terminal(board, cdir, rdir, round_no, grid, grid_path, scene_,
+                      items, args):
+        seen.update(round_no=round_no, cdir=cdir,
+                    blocks=[it["block_idx"] for it in items])
+        return 0
+
+    saved = {n: getattr(sr, n) for n in ("_board", "terminal_measure",
+                                         "survey_plan")}
+    try:
+        class FakeBoard:
+            def push(self):
+                pass
+
+        sr._board = lambda _c: FakeBoard()
+        sr.survey_plan = lambda *_a, **_k: None
+        sr.terminal_measure = fake_terminal
+        rc = sr.main(["--run-dir", run, "--urdf", "/tmp/r.urdf",
+                      "--grid", p, "--measure-only", "--go"])
+    finally:
+        for n, v in saved.items():
+            setattr(sr, n, v)
+
+    assert rc == 0, rc
+    assert seen.get("round_no") == 5, seen
+    assert seen.get("blocks") == [7], seen
+    assert os.path.basename(seen["cdir"]) == "round-05", seen
+    assert not os.path.exists(os.path.join(run, "round-07")), \
+        "补测量不该再开新轮次目录"
+
+
+@case
+def test_main_hands_the_rounds_items_to_terminal_measure():
+    """跑一遍 ``main()``：终态测量拿到的必须是**这一轮真的规划出来的块表**。
+
+    2026-10-27 round-10：五块全抓放成功（每条 rc=0），收尾却
+    ``UnboundLocalError: local variable 'items'`` 崩掉 —— 抽 ``terminal_measure()``
+    时调用点漏改成 ``res["items"]``，留下一个裸 ``items``。整轮一块都没量到。
+
+    **pyflakes 抓不到这个**：``main()`` 的 ``--measure-only`` 分支里有
+    ``items = json.load(...)``，静态检查因此认为 ``items`` 是已定义的局部名，
+    真正的问题（另一条分支里没赋值）只有跑起来才暴露。所以这条用**假的板子/
+    推理/计划**把 ``main()`` 整条路走通，断言的是「交给测量的那份块表」。
+    """
+    run = tempfile.mkdtemp(prefix="stage2-e2e-", dir=TMP)
+    gp = os.path.join(run, "grid.json")
+    json.dump(make_grid(), open(gp, "w"))
+    scp = os.path.join(run, "scene.json")
+    json.dump({"grid_json": gp, "blocks_per_round": 2,
+               "pick_zone": [0.36, 0.62, 0.12, 0.45]}, open(scp, "w"))
+    frame = os.path.join(run, "frame")
+    os.makedirs(frame)
+
+    ents = [entry(0, "red", 500.0, 300.0), entry(1, "cyan", 560.0, 300.0)]
+    analysis = {"blocks": [e["block"] for e in ents],
+                "per_block": [e["p"] for e in ents],
+                "_candidates_json": None}
+
+    class FakeBoard:
+        def push(self):
+            pass
+
+        def joints(self, dest):
+            js = {"name": list(sr.JOINT_ORDER), "position": [0.0] * 6}
+            os.makedirs(dest, exist_ok=True)
+            json.dump(js, open(os.path.join(dest, "joint_states.json"), "w"))
+            return js
+
+        def exec_plan(self, plan, log, go, **_kw):
+            open(log, "w").close()
+            return 0
+
+    seen = {}
+
+    def fake_terminal(board, cdir, rdir, round_no, grid, grid_path, scene_,
+                      items, args):
+        seen["items"] = items
+        return 0
+
+    saved = {n: getattr(sr, n) for n in
+             ("_board", "analyse_frame", "pick_plan", "plan_items",
+              "terminal_measure")}
+    try:
+        sr._board = lambda _cdir: FakeBoard()
+        sr.analyse_frame = lambda *_a, **_k: analysis
+        sr.pick_plan = lambda *_a, **_k: None
+        sr.plan_items = lambda items, cdir, rdir, mk: (
+            [(k, it, os.path.join(cdir, "pick-%02d.json" % k))
+             for k, it in enumerate(items, 1)], [])
+        sr.terminal_measure = fake_terminal
+        rc = sr.main(["--run-dir", run, "--urdf", "/tmp/r.urdf",
+                      "--scene", scp, "--frame", frame, "--go"])
+        # fake_terminal 内部不打印，把 main 的输出接住丢掉（这里只看行为）
+    finally:
+        for n, v in saved.items():
+            setattr(sr, n, v)
+
+    assert rc == 0, rc
+    assert "items" in seen, "main() 根本没走到终态测量"
+    got = seen["items"]
+    assert [it["block_idx"] for it in got] == [0, 1], got
+    assert [it["slot_idx"] for it in got] == [0, 5], got
+    # 规划出的块表里带着本轮补上的执行参数（不是空壳）
+    assert all("place_open_mm" in it for it in got), got
 
 
 # ---------------------------------------------------------------- runner

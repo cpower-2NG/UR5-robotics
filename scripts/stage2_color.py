@@ -188,3 +188,44 @@ def classify_blocks(blocks, detections, **kw):
         rec['block_xy'] = [b.get('cx'), b.get('cy')]
         out.append(rec)
     return out
+
+# ---------------------------------------------------------------- 跨帧/跨姿态投票
+# 「两强票权差小于它就别猜，标 conflict 交人看」—— 2026-10-28 用户拍板。
+CLASS_VOTE_MARGIN = 0.2
+
+
+def vote_class(records):
+    """按票权投票选颜色：一条记录一票，权重是它自己的 HSV 票份额。
+
+    返回 ``(class, status, share, reason)``。两强票权差 < ``CLASS_VOTE_MARGIN``
+    ⇒ ``conflict``（交人看，不猜）；任何一条自己就是两源冲突的，也带上来。
+    缺 ``class_share`` 的旧记录按 1.0 计（一票就是一票，别当成 0 票丢掉）。
+    """
+    votes, statuses = {}, []
+    for b in records:
+        cls = b.get("class")
+        status = b.get("class_status")
+        # 自相矛盾的记录不投票：状态说「认不出」却带着类名，说明那份类名不该
+        # 被当证据（否则一条 unknown 记录能把整块推成 ok）。
+        if status == "unknown":
+            cls = None
+        if cls not in (None, "", "unknown"):
+            share = b.get("class_share")
+            votes[cls] = votes.get(cls, 0.0) + (1.0 if share is None
+                                                else float(share))
+        if status:
+            statuses.append(status)
+    if not votes:
+        return None, "unknown", 0.0, ""
+    ranked = sorted(votes.items(), key=lambda kv: (-kv[1], kv[0]))
+    cls, w = ranked[0]
+    runner = ranked[1][1] if len(ranked) > 1 else 0.0
+    if (w - runner) < CLASS_VOTE_MARGIN:
+        return cls, "conflict", w, "票权接近：%s（差 %.2f < %.2f）" % (
+            " / ".join("%s %.2f" % kv for kv in ranked), w - runner,
+            CLASS_VOTE_MARGIN)
+    if "conflict" in statuses:
+        # 某一帧/某一姿态内部两源就打起来了：它不投票，但这份不确定必须
+        # 带上来，否则会被别的干净票盖成 ok（安静地出错）。
+        return cls, "conflict", w, "其中一帧/姿态内部两源冲突"
+    return cls, "ok", w, ""
