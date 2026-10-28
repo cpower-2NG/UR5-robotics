@@ -547,6 +547,22 @@ def test_default_thresholds_match_the_scorer():
     assert th["pos_mm"] == ss.POS_TOL_MM, (th, ss.POS_TOL_MM)
 
 
+@case
+def test_pick_zone_lower_edge_stays_in_camera_view():
+    """拾取区的 y 下界必须留在腕部相机能看全的台面里。
+
+    round-11 实测：抓帧的画面底边反投影到台面 = base y ≈ **134 mm**；黄绿块
+    摆在 y=151 mm 时顶面已经被画面底边切掉一半（顶面点 2349，别的块 5435–6723），
+    GraspNet 因此 **一个候选都没给**。而当时的 `pick_zone` y 下界写的是 0.12 m ——
+    比相机视场还宽 14 mm，落在这条缝里的块会被判成「块有问题」而不是「摆错地方」。
+
+    0.17 = 134 mm 视场边 + 36 mm 块子的半宽余量（2026-10-28 用户拍板）。
+    这条断言不锁死数值，只挡住「又把它改回视场边上或更小」。
+    """
+    ymin = sr.DEFAULT_SCENE["pick_zone"][2]
+    assert ymin >= 0.16, ymin
+
+
 # ---------------------------------------------------------------- 计划接线
 @case
 def test_pick_plan_passes_two_stage_yaw_and_half_open():
