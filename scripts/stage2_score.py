@@ -34,8 +34,11 @@
 2. **yaw**：`|fold90(观测 yaw)| <= --threshold-yaw-deg`；
 3. **位置**：块心到**预期格心**的距离 <= `--threshold-pos-mm`。
 
-多姿态一致性：同一 `block_id` 在 ≥2 个 pose 的 yaw 差 ≤3°、位置差 ≤3 mm；
+多姿态一致性：同一 `block_id` 在 ≥2 个 pose 的 yaw 差 ≤`POSE_YAW_TOL_DEG`、
+位置差 ≤`POSE_POS_TOL_MM`（实测噪声定的 **6° / 10 mm**，2026-10-28 从 3°/3 mm 放宽）；
 不过 → `person_review`，不进机判统计。
+**注意**：某姿态 `yaw_deg=None`（掩码不可信）时，一致性只剩一个姿态在说话 ——
+`n_poses` 仍是 2，但真正参与 yaw 的只有 1 个（round-18 的棕块就是这样）。
 
 退出码：0 = 机判项全过；1 = 已判但有不过/待复核；2 = 数据缺失或坏。
 """
@@ -192,6 +195,9 @@ def merge_poses(poses, yaw_tol=POSE_YAW_TOL_DEG, pos_tol=POSE_POS_TOL_MM):
         rec['center_pad_mm'] = _mean_xy(ps)
         rec['yaw_deg'] = _circular_mean_deg(ys)
         rec['n_poses'] = len(set(rec['poses']))
+        # 真正给了 yaw 的姿态数：某姿态 yaw=None（掩码不可信）时小于 n_poses。
+        # 只增字段，不改判据 —— 一致性门仍按 n_poses 算（改它是设计决策）。
+        rec['n_yaw_poses'] = len(ys)
     return by_id
 
 
@@ -253,6 +259,7 @@ def score_cell(rec, exp, grid, yaw_tol=YAW_TOL_DEG, pos_tol=POS_TOL_MM,
         'center_pad_mm': rec.get('center_pad_mm'),
         'yaw_deg': rec.get('yaw_deg'),
         'n_poses': rec.get('n_poses', 0),
+        'n_yaw_poses': rec.get('n_yaw_poses', rec.get('n_poses', 0)),
         'yaw_err_deg': None, 'pos_err_mm': None, 'obs_cell_idx': None,
     }
     if not exp.get('ran', True):
@@ -441,16 +448,17 @@ def _md(res, yaw_tol, pos_tol):
         '-' if o['success_rate'] is None else '%.0f%%' % (
             o['success_rate'] * 100)), '',
         '## 逐块', '',
-        '| 块 | 臂 | 状态 | 类 | 色源 | 预期格/色 | 实测格 | yaw 误差 | 位置误差 | 姿态数 | 备注 |',
+        '| 块 | 臂 | 状态 | 类 | 色源 | 预期格/色 | 实测格 | yaw 误差 | 位置误差 | 姿态数(yaw) | 备注 |',
         '|---|---|---|---|---|---|---|---|---|---|---|']
     for r in res['rows']:
-        lines.append('| %s | %s | %s | %s | %s | %s/%s | %s | %s | %s | %d | %s |' % (
+        lines.append('| %s | %s | %s | %s | %s | %s/%s | %s | %s | %s | %d(%d) | %s |' % (
             r['block_id'], r['arm'], r['status'], r.get('class') or '-',
             r.get('class_status') or '-', r.get('cell_idx'),
             r.get('cell_color') or 'spare', r.get('obs_cell_idx'),
             '-' if r.get('yaw_err_deg') is None else '%.2f°' % r['yaw_err_deg'],
             '-' if r.get('pos_err_mm') is None else '%.2f mm' % r['pos_err_mm'],
-            r.get('n_poses', 0), r.get('reason', '')))
+            r.get('n_poses', 0), r.get('n_yaw_poses', r.get('n_poses', 0)),
+            r.get('reason', '')))
     lines += ['', '## 判读', '',
               '- `person_review` 不混进机判统计（颜色来源不明 / 多姿态不一致 / 缺 yaw）。',
               '- `not_run` 是计划没跑；`not_measured` 是跑了但终态没测到。',

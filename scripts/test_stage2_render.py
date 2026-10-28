@@ -206,6 +206,131 @@ def _run(args):
                           capture_output=True, text=True)
 
 
+def _to_stage2_layout(root, grid_path='grid.json'):
+    """把 A3 布局的 mini-run 改写成阶段 2 轮布局。
+
+    ``pick-0N.json`` / ``exec-0N.jsonl`` / ``frame-pick/`` / ``candidates.json``
+    都在轮目录根上，``round.json`` 用 ``items`` 而不是 ``cycles``，且**内嵌的 grid
+    没有 cells**（真轮只有 grid_order / 中心 / yaw / T_base_pad），逐格中心在
+    ``grid_json`` 指向的 grid.json 里。
+    """
+    cd = os.path.join(root, 'cycles', '01')
+    shutil.move(os.path.join(cd, 'pick.json'),
+                os.path.join(root, 'pick-01.json'))
+    shutil.rmtree(os.path.join(root, 'cycles'))
+    shutil.move(os.path.join(root, 'frames', 'f1'),
+                os.path.join(root, 'frame-pick'))
+    shutil.rmtree(os.path.join(root, 'frames'))
+    shutil.move(os.path.join(root, 'frame-pick', 'candidates.json'),
+                os.path.join(root, 'candidates.json'))
+    if grid_path:
+        json.dump({'version': 1, 'kind': 'grid', 'pitch_mm': 60.0,
+                   'cells': [{'idx': 0, 'row': 0, 'col': 0, 'color': 'red',
+                              'center_pad_mm': [-60.0, -60.0],
+                              'center_base_mm': [100.0, 100.0]}]},
+                  open(os.path.join(root, grid_path), 'w'))
+    json.dump({'kind': 'stage2-round',
+               'frame_pick': 'frame-pick',
+               'grid_json': grid_path,
+               'grid': {'grid_order': ['red', 'spare', 'spare', 'spare',
+                                       'spare', 'spare', 'spare', 'spare',
+                                       'spare'],
+                        'grid_center_base_mm': [160.0, 160.0],
+                        'grid_yaw_base_deg': 0.0},
+               'items': [{'block_idx': 0, 'class': 'red', 'arm': 'geometric',
+                          'slot_idx': 0, 'slot_color': 'red'}]},
+              open(os.path.join(root, 'round.json'), 'w'))
+
+
+@case
+def test_stage2_layout_renders_and_finds_grid():
+    """阶段 2 轮布局：能认、能映射条目、宫格从 grid_json 解出来、能出 MP4。"""
+    root = tempfile.mkdtemp(prefix='stage2-layout-')
+    try:
+        _write_mini_run(root)
+        assert sr._is_stage2_layout(root) is False, 'A3 布局不该被当成阶段 2'
+        _to_stage2_layout(root)
+        assert sr._is_stage2_layout(root) is True
+        m = sr.load_cycle(root, 1)
+        assert m['plan'] is not None, 'pick-01.json 没读进来'
+        assert m['entry'].get('slot_idx') == 0, m['entry']
+        assert m['entry'].get('arm') == 'geometric', m['entry']
+        assert m['frame_dir'].endswith('frame-pick'), m['frame_dir']
+        assert (m['candidates'] or {}).get('per_block'), 'candidates.json 没读进来'
+        grid = sr.resolve_grid(root)
+        assert grid and len(grid.get('cells') or []) == 1, \
+            'grid.json 没解析出来：%r' % (grid,)
+
+        out = os.path.join(root, 'render.mp4')
+        p = _run(['--run-dir', root, '--cycle', '1', '--out', out,
+                  '--fps', '10', '--max-frames', '8'])
+        assert p.returncode == 0, '退出 %d\nSTDOUT %s\nSTDERR %s' % (
+            p.returncode, p.stdout, p.stderr)
+        cap = cv2.VideoCapture(out)
+        assert cap.isOpened(), 'VideoCapture 打不开 %s' % out
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        assert n == 8, '帧数 %d（应为 8）' % n
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@case
+def test_stage2_grid_json_from_parent_dir():
+    """``grid_json`` 是相对**场景目录**的路径（轮目录是它的子目录）。"""
+    parent = tempfile.mkdtemp(prefix='stage2-parent-')
+    root = os.path.join(parent, 'round-01')
+    os.makedirs(root)
+    try:
+        _write_mini_run(root)
+        _to_stage2_layout(root, grid_path=None)
+        # grid.json 放在父目录，round.json 里写相对场景目录的名字
+        json.dump({'cells': [{'idx': 0, 'center_base_mm': [1.0, 2.0]}]},
+                  open(os.path.join(parent, 'grid.json'), 'w'))
+        rnd = json.load(open(os.path.join(root, 'round.json')))
+        rnd['grid_json'] = 'grid.json'
+        json.dump(rnd, open(os.path.join(root, 'round.json'), 'w'))
+        grid = sr.resolve_grid(root)
+        assert grid and grid['cells'][0]['center_base_mm'] == [1.0, 2.0], \
+            '没去父目录找 grid.json：%r' % (grid,)
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+@case
+def test_stage2_missing_grid_still_renders():
+    """grid.json 找不到时不许崩：画不出格子，但 MP4 照出。"""
+    root = tempfile.mkdtemp(prefix='stage2-nogrid-')
+    try:
+        _write_mini_run(root)
+        _to_stage2_layout(root, grid_path='nope.json')
+        out = os.path.join(root, 'render.mp4')
+        p = _run(['--run-dir', root, '--cycle', '1', '--out', out,
+                  '--fps', '10', '--max-frames', '6'])
+        assert p.returncode == 0, p.stderr
+        assert os.path.exists(out), p.stdout
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@case
+def test_stage2_missing_pick_exits_2():
+    """阶段 2 布局里缺 pick-02.json → 退出 2，不抛 traceback，不留半支 MP4。"""
+    root = tempfile.mkdtemp(prefix='stage2-nopick-')
+    try:
+        _write_mini_run(root)
+        _to_stage2_layout(root)
+        out = os.path.join(root, 'render.mp4')
+        p = _run(['--run-dir', root, '--cycle', '2', '--out', out])
+        assert p.returncode == 2, '应退出 2，实际 %d\n%s' % (
+            p.returncode, p.stderr)
+        assert '渲染失败' in p.stderr, p.stderr
+        assert 'Traceback' not in p.stderr, '不许抛 traceback：\n%s' % p.stderr
+        assert not os.path.exists(out), '失败时不该留下半支 MP4'
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 @case
 def test_render_mini_run_to_mp4():
     root = tempfile.mkdtemp(prefix='stage2-render-')
@@ -242,6 +367,64 @@ def test_missing_plan_exits_2_without_traceback():
         assert not os.path.exists(out), '失败时不该留下半支 MP4'
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+@case
+def test_stage2_cycle_all_concatenates():
+    """``--cycle all``：把轮目录里所有 pick-0N 连成一支（契约要求「每轮 MP4」）。"""
+    root = tempfile.mkdtemp(prefix='stage2-all-')
+    try:
+        _write_mini_run(root)
+        _to_stage2_layout(root)
+        shutil.copyfile(os.path.join(root, 'pick-01.json'),
+                        os.path.join(root, 'pick-02.json'))
+        rnd = json.load(open(os.path.join(root, 'round.json')))
+        rnd['items'].append({'block_idx': 0, 'class': 'red', 'arm': 'zero',
+                             'slot_idx': 0})
+        json.dump(rnd, open(os.path.join(root, 'round.json'), 'w'))
+        assert sr.available_cycles(root) == [1, 2], sr.available_cycles(root)
+
+        out = os.path.join(root, 'render.mp4')
+        p = _run(['--run-dir', root, '--cycle', 'all', '--out', out,
+                  '--fps', '10', '--max-frames', '5'])
+        assert p.returncode == 0, p.stderr
+        assert '2 轮' in p.stdout, p.stdout
+        cap = cv2.VideoCapture(out)
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        assert n == 10, '两轮各 5 帧应为 10，实际 %d' % n
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@case
+def test_stage2_frame_pick_from_scene_dir_and_cand_fallback():
+    """早期轮的 ``frame_pick`` 相对**场景目录**（``b2/frame-pick4`` / ``pick-now``）；
+    该轮没有轮目录根的 candidates.json 时，退回帧目录里的那一份。"""
+    parent = tempfile.mkdtemp(prefix='stage2-fp-')
+    root = os.path.join(parent, 'round-02')
+    os.makedirs(root)
+    try:
+        _write_mini_run(root)
+        _to_stage2_layout(root)
+        # 帧目录挪到场景目录下，名字改成早期轮的样子
+        shutil.move(os.path.join(root, 'frame-pick'),
+                    os.path.join(parent, 'pick-now'))
+        rnd = json.load(open(os.path.join(root, 'round.json')))
+        rnd['frame_pick'] = 'pick-now'
+        json.dump(rnd, open(os.path.join(root, 'round.json'), 'w'))
+        # candidates 只有帧目录里那份
+        shutil.move(os.path.join(root, 'candidates.json'),
+                    os.path.join(parent, 'pick-now', 'candidates.json'))
+        m = sr.load_cycle(root, 1)
+        assert m['frame_dir'] == os.path.join(parent, 'pick-now'), m['frame_dir']
+        assert (m['candidates'] or {}).get('per_block'), '没退回帧目录拿 candidates'
+        out = os.path.join(root, 'render.mp4')
+        p = _run(['--run-dir', root, '--cycle', '1', '--out', out,
+                  '--fps', '10', '--max-frames', '4'])
+        assert p.returncode == 0, p.stderr
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- runner

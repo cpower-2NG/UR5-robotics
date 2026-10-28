@@ -57,8 +57,70 @@ def _cycle_dir(run_dir, cycle):
     return os.path.join(run_dir, 'cycles', '%02d' % int(cycle))
 
 
+def _pick_path(run_dir, cycle):
+    """``pick.json`` 的实际位置（A3 在 ``cycles/NN/``；阶段 2 在轮目录根上）。"""
+    if _is_stage2_layout(run_dir):
+        return os.path.join(run_dir, 'pick-%02d.json' % int(cycle))
+    return os.path.join(_cycle_dir(run_dir, cycle), 'pick.json')
+
+
+def _is_stage2_layout(run_dir):
+    """A3 run 用 ``cycles/NN/``；阶段 2 轮用 ``pick-0N.json`` + ``exec-0N.jsonl``。
+
+    2026-10-28 加：原来只认 A3 布局，于是阶段 2 的 5 轮一支 MP4 都出不来
+    （契约 §出口要求「每轮 MP4」）。两套布局并行认，A3 路径完全不变。
+    """
+    return (not os.path.isdir(os.path.join(run_dir, 'cycles'))
+            and os.path.exists(os.path.join(run_dir, 'pick-01.json')))
+
+
+def _resolve_dir(run_dir, rel):
+    """``round.json`` 里的相对路径按**轮目录 → 场景目录（父目录）**依次试。
+
+    早期轮的 ``frame_pick`` 写的是 ``b2/frame-pick4`` / ``pick-now`` 这类相对
+    **场景目录**的路径，晚期轮写 ``round-18/frame-pick``（同样相对场景目录）。
+    """
+    if not rel:
+        return None
+    bases = [''] if os.path.isabs(rel) else [
+        run_dir, os.path.dirname(os.path.abspath(run_dir))]
+    for b in bases:
+        p = rel if not b else os.path.join(b, rel)
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def _load_stage2_cycle(run_dir, cycle, rnd):
+    """阶段 2 轮：``pick-0N.json`` + ``exec-0N.jsonl`` + 抓取帧目录。"""
+    plan = _load_json(os.path.join(run_dir, 'pick-%02d.json' % int(cycle)))
+    items = rnd.get('items') or []
+    # items 与 pick-0N.json 同序（规划时逐块写 plan），所以第 N 个 plan 对应 items[N-1]
+    entry = dict(items[cycle - 1]) if 0 < cycle <= len(items) else {}
+    frame_dir = (_resolve_dir(run_dir, rnd.get('frame_pick'))
+                 or _resolve_dir(run_dir, 'frame-pick'))
+    # 阶段 2 的 candidates.json 在轮目录根上（A3 放在帧目录里）
+    cands = (_load_json(os.path.join(run_dir, 'candidates.json'))
+             or (_load_json(os.path.join(frame_dir, 'candidates.json'))
+                 if frame_dir else None))
+    events = []
+    ep = os.path.join(run_dir, 'exec-%02d.jsonl' % int(cycle))
+    if os.path.exists(ep):
+        for ln in open(ep, encoding='utf-8'):
+            if ln.strip():
+                try:
+                    events.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    pass
+    return {'plan': plan, 'entry': entry, 'frame_dir': frame_dir,
+            'candidates': cands, 'exec_events': events, 'round': rnd}
+
+
 def load_cycle(run_dir, cycle):
     """返回 ``{plan, entry, frame_dir, candidates, exec_events}``；缺件给 None。"""
+    if _is_stage2_layout(run_dir):
+        return _load_stage2_cycle(
+            run_dir, cycle, _load_json(os.path.join(run_dir, 'round.json'), {}))
     cd = _cycle_dir(run_dir, cycle)
     plan = _load_json(os.path.join(cd, 'pick.json'))
     rnd = _load_json(os.path.join(run_dir, 'round.json'), {})
@@ -406,97 +468,171 @@ def _writer(path, fps, size):
     return None, None
 
 
-def render(run_dir, cycle, out_path, fps=DEFAULT_FPS, max_frames=0,
-           urdf=None, grid=None):
-    meta = load_cycle(run_dir, cycle)
-    if not meta['plan']:
-        raise FileNotFoundError('缺 %s/pick.json' % _cycle_dir(run_dir, cycle))
-    if not meta['frame_dir'] or not os.path.isdir(meta['frame_dir']):
-        raise FileNotFoundError('缺抓取帧目录（round.json 的 frame_pick）')
+def available_cycles(run_dir):
+    """阶段 2 轮里实际存在的 ``pick-0N.json`` 编号（升序）。"""
+    out = []
+    for name in os.listdir(run_dir):
+        if name.startswith('pick-') and name.endswith('.json'):
+            try:
+                out.append(int(name[len('pick-'):-len('.json')]))
+            except ValueError:
+                pass
+    if not out:                                  # A3 布局
+        cdir = os.path.join(run_dir, 'cycles')
+        if os.path.isdir(cdir):
+            for name in os.listdir(cdir):
+                if name.isdigit():
+                    out.append(int(name))
+    return sorted(out)
+
+
+def _render_cycles(run_dir, cycles, out_path, fps=DEFAULT_FPS, max_frames=0,
+                   urdf=None, grid=None):
+    """把若干轮次（阶段 2 = 一块一次）连成一支出 MP4。"""
     if not urdf or not os.path.exists(urdf):
         raise FileNotFoundError('缺 URDF：--urdf 或 $PRECISION_URDF')
-
-    frame = gc.load_frame(meta['frame_dir'])
-    R, t, K = frame['R_bc'], frame['t_bc'], frame['K']
-    Kt = (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2]))
-    table_z_mm = (meta['candidates'] or {}).get('table_z_mm')
-    base = cv2.cvtColor(frame['color'], cv2.COLOR_RGB2BGR)
-    base = draw_pointcloud(base, frame, table_z_mm=table_z_mm)
-
-    chain = urkin.Chain(urdf)
-    samples = trajectory_samples(meta['plan'], fps=fps)
-    if max_frames:
-        samples = samples[:max_frames]
-
-    wr, codec = _writer(out_path, fps, (base.shape[1], base.shape[0] + PANEL_H))
-    if wr is None:
-        raise RuntimeError('VideoWriter 打不开（mp4v/avc1/XVID 都失败）')
-
-    entry = meta['entry'] or {}
-    plan_meta = meta['plan'].get('meta', {})
-    cand_best = None
-    for pb in (meta['candidates'] or {}).get('per_block', []):
-        if pb.get('best'):
-            cand_best = pb['best']
-            break
+    wr = None
+    codec = None
+    total = 0
     try:
-        for i, (tt, q, wp_name, _phase) in enumerate(samples):
-            img = base.copy()
-            draw_slots(img, meta['round'], R, t, Kt, grid=grid)
-            draw_candidates(img, meta['candidates'], R, t, Kt)
-            draw_plan(img, chain, meta['plan'], R, t, Kt)
-            # 腕部相机跟 tool0 一起动：tool0 的投影只在极少数帧落进画面，
-            # 留下的残影会横贯全图且越积越久。轨迹统一画在右上俯视图里。
-            draw_skeleton(img, chain, q, R, t, Kt)
-            draw_topview(img, meta['plan'], chain, q, meta['candidates'],
-                         meta['round'], grid=grid)
+        for cycle in cycles:
+            meta = load_cycle(run_dir, cycle)
+            if not meta['plan']:
+                raise FileNotFoundError('缺 %s' % _pick_path(run_dir, cycle))
+            if not meta['frame_dir'] or not os.path.isdir(meta['frame_dir']):
+                raise FileNotFoundError('缺抓取帧目录（round.json 的 frame_pick）')
 
-            try:
-                tool = chain.fk(q)[:3, 3]
-            except Exception:                                    # noqa: BLE001
-                tool = np.zeros(3)
-            lines = [
-                '轮次 %02d · %s · 块 #%s %s' % (
-                    int(cycle),
-                    os.path.basename(meta['frame_dir'].rstrip('/')),
-                    entry.get('block_idx', plan_meta.get('block_idx', '?')),
-                    entry.get('class') or plan_meta.get('class') or '?'),
-                'waypoint %s (%d/%d)  t=%.1fs' % (
-                    wp_name, i + 1, len(samples), tt),
-                '候选 %s · 槽位 %s' % (
-                    ('score %.2f width %.1f mm angle %.1f°' % (
-                        cand_best['score'], cand_best['width_mm'],
-                        cand_best['angle_deg'])) if cand_best else '无',
-                    entry.get('slot_idx', '?')),
-                'tool0 (%+.0f, %+.0f, %+.0f) mm · 骨架/轨迹见右上俯视图 · %s' % (
-                    tool[0] * 1000, tool[1] * 1000, tool[2] * 1000, codec),
-            ]
-            wr.write(_panel(img, lines))
+            frame = gc.load_frame(meta['frame_dir'])
+            R, t, K = frame['R_bc'], frame['t_bc'], frame['K']
+            Kt = (float(K[0, 0]), float(K[1, 1]), float(K[0, 2]),
+                  float(K[1, 2]))
+            table_z_mm = (meta['candidates'] or {}).get('table_z_mm')
+            base = cv2.cvtColor(frame['color'], cv2.COLOR_RGB2BGR)
+            base = draw_pointcloud(base, frame, table_z_mm=table_z_mm)
+
+            chain = urkin.Chain(urdf)
+            samples = trajectory_samples(meta['plan'], fps=fps)
+            if max_frames:
+                samples = samples[:max_frames]
+
+            if wr is None:
+                wr, codec = _writer(out_path, fps,
+                                    (base.shape[1], base.shape[0] + PANEL_H))
+                if wr is None:
+                    raise RuntimeError(
+                        'VideoWriter 打不开（mp4v/avc1/XVID 都失败）')
+
+            entry = meta['entry'] or {}
+            plan_meta = meta['plan'].get('meta', {})
+            cand_best = None
+            for pb in (meta['candidates'] or {}).get('per_block', []):
+                if pb.get('best'):
+                    cand_best = pb['best']
+                    break
+            for i, (tt, q, wp_name, _phase) in enumerate(samples):
+                img = base.copy()
+                draw_slots(img, meta['round'], R, t, Kt, grid=grid)
+                draw_candidates(img, meta['candidates'], R, t, Kt)
+                draw_plan(img, chain, meta['plan'], R, t, Kt)
+                # 腕部相机跟 tool0 一起动：tool0 的投影只在极少数帧落进画面，
+                # 留下的残影会横贯全图且越积越久。轨迹统一画在右上俯视图里。
+                draw_skeleton(img, chain, q, R, t, Kt)
+                draw_topview(img, meta['plan'], chain, q, meta['candidates'],
+                             meta['round'], grid=grid)
+
+                try:
+                    tool = chain.fk(q)[:3, 3]
+                except Exception:                                # noqa: BLE001
+                    tool = np.zeros(3)
+                lines = [
+                    '轮次 %02d · %s · 块 #%s %s' % (
+                        int(cycle),
+                        os.path.basename(meta['frame_dir'].rstrip('/')),
+                        entry.get('block_idx',
+                                  plan_meta.get('block_idx', '?')),
+                        entry.get('class') or plan_meta.get('class') or '?'),
+                    'waypoint %s (%d/%d)  t=%.1fs' % (
+                        wp_name, i + 1, len(samples), tt),
+                    '候选 %s · 槽位 %s' % (
+                        ('score %.2f width %.1f mm angle %.1f°' % (
+                            cand_best['score'], cand_best['width_mm'],
+                            cand_best['angle_deg'])) if cand_best else '无',
+                        entry.get('slot_idx', '?')),
+                    'tool0 (%+.0f, %+.0f, %+.0f) mm · 骨架/轨迹见右上俯视图 · %s'
+                    % (tool[0] * 1000, tool[1] * 1000, tool[2] * 1000, codec),
+                ]
+                wr.write(_panel(img, lines))
+                total += 1
     finally:
-        wr.release()
-    return {'out': out_path, 'frames': len(samples), 'fps': fps,
-            'codec': codec}
+        if wr is not None:
+            wr.release()
+    return {'out': out_path, 'frames': total, 'fps': fps,
+            'codec': codec, 'cycles': len(cycles)}
+
+
+def render(run_dir, cycle, out_path, fps=DEFAULT_FPS, max_frames=0,
+           urdf=None, grid=None):
+    return _render_cycles(run_dir, [cycle], out_path, fps=fps,
+                          max_frames=max_frames, urdf=urdf, grid=grid)
+
+
+def resolve_grid(run_dir, grid_arg=None):
+    """宫格来源：``--grid`` → ``round.json`` 内嵌（**带 cells 才用**）→ ``grid_json`` 指路。
+
+    阶段 2 轮的 ``round.json`` 只内嵌 ``grid_order`` / ``grid_center_base_mm`` /
+    ``grid_yaw_base_deg`` / ``T_base_pad``，**没有 cells**；逐格中心在 ``grid.json``
+    （``grid_json`` 字段给的是相对场景目录的路径，轮目录是它的子目录）。
+    """
+    if grid_arg:
+        return _load_json(grid_arg)
+    rnd = _load_json(os.path.join(run_dir, 'round.json'), {}) or {}
+    g = rnd.get('grid')
+    if g and g.get('cells'):
+        return g
+    rel = rnd.get('grid_json')
+    if rel:
+        paths = [rel] if os.path.isabs(rel) else [
+            os.path.join(run_dir, rel),
+            os.path.join(os.path.dirname(os.path.abspath(run_dir)), rel)]
+        for p in paths:
+            if os.path.exists(p):
+                return _load_json(p)
+    return g
 
 
 def main():
     ap = argparse.ArgumentParser(description='阶段 2 离线渲染器')
     ap.add_argument('--run-dir', required=True)
-    ap.add_argument('--cycle', type=int, required=True)
+    ap.add_argument('--cycle', required=True,
+                    help='轮次号；阶段 2 轮可写 all = 已有的 pick-0N 全连成一支')
     ap.add_argument('--out', required=True)
     ap.add_argument('--fps', type=float, default=DEFAULT_FPS)
-    ap.add_argument('--max-frames', type=int, default=0)
+    ap.add_argument('--max-frames', type=int, default=0,
+                    help='每轮最多帧数（0 = 不限）')
     ap.add_argument('--urdf', default=os.environ.get('PRECISION_URDF'))
     ap.add_argument('--grid', default=None, help='grid.json（阶段 2 宫格）')
     a = ap.parse_args()
+    if str(a.cycle).lower() == 'all':
+        cycles = available_cycles(a.run_dir)
+        if not cycles:
+            print('渲染失败：%s 里没有可渲染的轮次' % a.run_dir, file=sys.stderr)
+            return 2
+    else:
+        try:
+            cycles = [int(a.cycle)]
+        except ValueError:
+            print('渲染失败：--cycle 要轮次号或 all，收到 %r' % a.cycle,
+                  file=sys.stderr)
+            return 2
     urdf = a.urdf or os.path.join(a.run_dir, 'robot.urdf')
-    grid = _load_json(a.grid) if a.grid else None
+    grid = resolve_grid(a.run_dir, a.grid)
     try:
-        r = render(a.run_dir, a.cycle, a.out, fps=a.fps,
-                   max_frames=a.max_frames, urdf=urdf, grid=grid)
+        r = _render_cycles(a.run_dir, cycles, a.out, fps=a.fps,
+                           max_frames=a.max_frames, urdf=urdf, grid=grid)
     except Exception as e:                                       # noqa: BLE001
         print('渲染失败：%s: %s' % (type(e).__name__, e), file=sys.stderr)
         return 2
-    print('MP4：%(out)s (%(frames)d 帧, %(codec)s)' % r)
+    print('MP4：%(out)s (%(frames)d 帧, %(codec)s, %(cycles)d 轮)' % r)
     return 0
 
 
