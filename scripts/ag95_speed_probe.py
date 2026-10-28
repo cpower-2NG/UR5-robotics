@@ -30,6 +30,10 @@
     # 加上「初始化时给速度」这一档（会做一次全行程自检：张开+合拢）
     python3 scripts/ag95_speed_probe.py --go --with-init
 
+    # 冷启动路径：**断电重启后、0x0200 还是 0 时**先写速度再初始化
+    # （一初始化就回不去了，只有掉电后这一次机会）
+    python3 scripts/ag95_speed_probe.py --go --preinit-speed 20
+
 退出码：0 出了判决、1 有动作失败、2 环境/前置不满足。
 """
 import argparse
@@ -197,6 +201,74 @@ def run_pair(g, repeat):
     return rows
 
 
+def run_cold_start(g, args, init_state):
+    """冷启动路径：**未初始化时**先写速度、再初始化，然后按耗时判生效。
+
+    为什么要单独一条路：2026-10-27 第一百六十三轮测过「先写 0x0104、再写
+    0x0100 初始化」，但那时夹爪**已经初始化**（写速度前 0x0200 = 1）。
+    唯一没测过的路径是「**掉电后、未初始化状态下**写速度」——
+    断电重启只有一次机会，初始化一旦做过就回不去，所以这里
+    `0x0200 == 1` 直接拒，并且**不重试**（重试也测不到这条路径）。
+
+    判据沿用整文件的口径：**看耗时**，不看回读。
+    """
+    pct = args.preinit_speed
+    if not (1 <= pct <= 100):
+        print("❌ 速度只接受 1–100 %%，收到 %d" % pct)
+        return 2
+
+    if not args.go:
+        print("\n  --preinit-speed %d 会做（**未给 --go：一个寄存器都不写**）：" % pct)
+        print("    ① 写 0x0104 = %d（此刻 0x0200 ≠ 1，是冷启动状态）" % pct)
+        print("    ② 写 0x0100 = 0x01 → 全行程自检（张开+合拢），等 0x0200 变 1")
+        print("    ③ 先走到 500‰（不计时，把行程摆正），再计时 500↔950 各一次")
+        print("    ④ 判决：实测均值 / 基线 %.2f s ≥%.1f ⇒ 生效；≤%.1f ⇒ 没生效"
+              % (args.ref_s, RATIO_WORKS, RATIO_IGNORED))
+        return 0
+
+    if init_state == INIT_READY:
+        print("\n!! 0x0200 = 1（已初始化）—— **冷启动路径测不了**：初始化一旦做过就回不去。")
+        print("   这条路径要的是「掉电后、未初始化时写速度」；"
+              "「已初始化时先写速度再初始化」第一百六十三轮测过，无效。")
+        return 2
+
+    print("\n① 冷启动写 0x0104 = %d（0x0200 = %r，未初始化）" % (pct, init_state))
+    ok = g.write(REG_SPEED, pct)
+    print("    写入 %s；回读 = %s（回读只打印，不作判据）"
+          % ("成功" if ok else "**失败**", g.read(REG_SPEED)))
+    time.sleep(0.3)
+
+    print("② 写 0x0100 = 0x01 → 两指**全行程自检**（张开+合拢），等 0x0200 变 1")
+    t0 = time.time()
+    if not g.write(REG_INIT, 0x01):
+        print("❌ 初始化写失败")
+        return 1
+    st, dt = g.wait_init_done()
+    print("    0x0200 → %s（%.1f s，未计判决——初始化行程与 500↔950 不可比）"
+          % (st, dt))
+    if st != INIT_READY:
+        print("❌ 初始化没完成（0x0200 = %r）—— 别再重复写 0x0100，先查串口/电源" % st)
+        return 1
+    print("③ 初始化后回读：0x0104 = %s，0x0101 力 = %s，0x0202 = %s‰"
+          % (g.read(REG_SPEED), g.read(REG_FORCE), g.read(REG_ACTUAL)))
+
+    print("④ 先走到 %d‰（**不计时**，把下一组的行程摆正）" % CLOSE_PM)
+    pos, dt, ok = g.move_and_time(CLOSE_PM)
+    print("    → %s‰  %5.2f s  %s" % (pos, dt, "" if ok else "**没到位**"))
+
+    print("⑤ 计时：500↔950 各一次（基线 %.2f s = 第一百六十三轮同行程）" % args.ref_s)
+    rows = run_pair(g, 1)
+    got = [r[2] for r in rows if r[3]]
+    ratio, verdict = judge_ratio([args.ref_s], got)
+    print("    实测均值 %s s（n=%d）" % ("—" if not got else "%.3f" % mean(got), len(got)))
+    print("    耗时比 = %s ⇒ %s"
+          % ("—" if ratio is None else "%.2f" % ratio, verdict))
+
+    print("⑥ 收尾：0x0104 写回 100（%s，回读 %s）"
+          % (g.write(REG_SPEED, 100), g.read(REG_SPEED)))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="AG-95 速度寄存器 0x0104 生效性判决")
     ap.add_argument("--port", default=PORT, help="串口设备")
@@ -212,6 +284,13 @@ def main(argv=None):
                          "给了它就不再跑单点判决")
     ap.add_argument("--with-save", action="store_true",
                     help="--go 时：写完速度再写 0x0300=1 存 flash，然后计时")
+    ap.add_argument("--preinit-speed", type=int, default=None,
+                    help="**冷启动路径**：0x0200 仍为 0（掉电后未初始化）时，先写"
+                         "这个速度、再做初始化，然后按耗时判生效。一初始化就回不去，"
+                         "所以只有断电重启后能用一次")
+    ap.add_argument("--ref-s", type=float, default=0.42,
+                    help="冷启动路径的基线秒数（500↔950 各一次；默认取第一百六十"
+                         "三轮实测的 0.42 s）")
     args = ap.parse_args(argv)
 
     if not (1 <= args.speed_pct <= 100):
@@ -248,6 +327,10 @@ def main(argv=None):
         for k, v in snap.items():
             extra = "  （%.1f mm 开口）" % pm_to_mm(v) if k.startswith("0x0202") and v is not None else ""
             print("    %-18s = %s%s" % (k, v, extra))
+        # 冷启动路径要在「0x0200 必须是 1」那道闸门**之前**分叉：
+        # 它测的正是未初始化状态，走下面的常规路径会被直接拒。
+        if args.preinit_speed is not None:
+            return run_cold_start(g, args, snap["0x0200 初始化状态"])
         if not args.go:
             return 0
 

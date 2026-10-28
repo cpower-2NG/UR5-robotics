@@ -129,6 +129,38 @@ def main():
     check("速度 0 拒绝（退出码 2）", rc == 2, str(rc))
     check("速度 0 时零写入", fake.writes == [], str(fake.writes))
 
+    # --- 7. 冷启动路径（掉电后未初始化 → 先写速度再初始化）---
+    cold = {sp.REG_INIT_STATUS: 0, sp.REG_ACTUAL: 0, sp.REG_SPEED: 100,
+            sp.REG_FORCE: 0, sp.REG_TARGET: 1000}
+    fake = FakeGripper(cold)
+    rc, out = run_main(["--preinit-speed", "20"], fake)
+    check("冷启动**不带 --go** 退出码 0 且零写入", rc == 0 and fake.writes == [],
+          "%s %s" % (rc, fake.writes))
+    check("冷启动不带 --go 打印了会做什么", "0x0100" in out and "0x0104" in out, out[-200:])
+
+    fake = FakeGripper(dict(cold))
+    rc, out = run_main(["--go", "--preinit-speed", "20"], fake)
+    kinds = [(a, v) for (a, v) in fake.writes]
+    check("冷启动 --go 退出码 0", rc == 0, str(rc))
+    check("冷启动**先写速度、再写初始化**",
+          kinds[:2] == [(sp.REG_SPEED, 20), (sp.REG_INIT, 1)], str(kinds[:3]))
+    check("冷启动最后把速度收回 100",
+          [v for (a, v) in kinds if a == sp.REG_SPEED][-1] == 100, str(kinds))
+    check("冷启动没把回读当判据（按耗时比判决）", "耗时比" in out, out[-300:])
+
+    # 已经初始化过 ⇒ 冷启动路径没了，必须拒（且零写入）
+    fake = FakeGripper({sp.REG_INIT_STATUS: 1, sp.REG_ACTUAL: 1000, sp.REG_SPEED: 100,
+                        sp.REG_FORCE: 100, sp.REG_TARGET: 1000})
+    rc, out = run_main(["--go", "--preinit-speed", "20"], fake)
+    check("0x0200=1 时冷启动退出码 2", rc == 2, str(rc))
+    check("0x0200=1 时冷启动零写入", fake.writes == [], str(fake.writes))
+
+    # 越界速度在碰硬件之前就拒（冷启动路径同样）
+    fake = FakeGripper(dict(cold))
+    rc, out = run_main(["--go", "--preinit-speed", "0"], fake)
+    check("冷启动速度 0 拒绝且零写入", rc == 2 and fake.writes == [],
+          "%s %s" % (rc, fake.writes))
+
     print("=" * 70)
     bad = [r for r in RESULTS if not r[1]]
     print("PASS %d   FAIL %d" % (len(RESULTS) - len(bad), len(bad)))
