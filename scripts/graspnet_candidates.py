@@ -631,10 +631,14 @@ def select(blocks, cands, anchor_mm=ANCHOR_MM):
             if d <= anchor_mm:
                 near.append(dict(c, dist_mm=round(d, 2)))
         near.sort(key=lambda c: (round(c["dist_mm"]), -c["score"]))
+        # ``near``：整串近邻（同一次排序），给「按块边对齐筛候选」用 ——
+        # 最近的候选不一定贴边（round-16 青块的就是对角候选：137.2° vs 块边 5.5°，
+        # 实测放歪 42.42°）。只增字段，``best``/``dist_mm``/``n_near`` 语义不变。
         per.append({"block_idx": b["idx"], "class": b["class"],
                     "block_xy": [b["cx"], b["cy"]], "n_near": len(near),
                     "best": near[0] if near else None,
-                    "dist_mm": near[0]["dist_mm"] if near else None})
+                    "dist_mm": near[0]["dist_mm"] if near else None,
+                    "near": near})
     return per
 
 

@@ -97,6 +97,11 @@ DEFAULT_SCENE = {
     # 不是标定常数偏置。δ 的估计因此回到 0（前三块 −0.3/−2.1/−0.4，极差 1.8°）。
     "yaw_sign": 1.0,
     "finger_axis_delta_deg": 0.0,
+    # graspnet 臂的候选只接受**贴块边**的（沿用 DEFAULT_SCENE 上面那段判决的
+    # 同一个机制：按对角接触时块在指间转不动）。放置 yaw = δ，所以
+    # 「候选角 − 块边对齐 yaw」就是这一块的**预测终态 yaw 误差**；15° 是用户
+    # 2026-10-28 拍板的上限（A 案），挡住的是 30–45° 的对角候选，不是精修。
+    "graspnet_max_edge_offset_deg": 15.0,
     "pick_open_mm": 50.0,
     "place_open_mm": 50.0,
     # 松手弹滑（2026-10-27 用户目视：夹爪动作快、不太平衡，块落到桌面会弹/滑）。
@@ -281,6 +286,53 @@ def wrap_deg(a):
     return float(a) % 360.0
 
 
+#: graspnet 臂：候选的手指轴与「块边对齐 yaw」最多差多少度。超过就不抓。
+#: 对角抓的代价是**整块被转掉同样的角度**：round-16 青块候选 137.2°、块边
+#: 5.5° ⇒ 预测 41.7°、实测 42.42°，抬升回读 34.8 mm 与抓帧一致（没滑）。
+GRASPNET_MAX_EDGE_OFFSET_DEG = 15.0
+
+
+def block_edge_yaw(block, scene):
+    """块边对齐时腕部该在的 yaw（= 几何臂那支 ψ）；没有几何 yaw 时 None。"""
+    theta = block.get("yaw_pix")
+    if theta is None:
+        theta = block.get("yaw_rect")
+    if theta is None:
+        return None
+    sign = float(scene.get("yaw_sign", 1.0))
+    delta = float(scene.get("finger_axis_delta_deg", 0.0))
+    return wrap_deg(sign * float(theta) + delta)
+
+
+def choose_graspnet_cand(entry, block, scene):
+    """graspnet 臂挑候选：**只接受贴块边的**，再按 (离块心, −分数) 取第一个。
+
+    为什么筛：这条臂把**候选角**当抓取 yaw、放置 yaw 取 δ，所以
+    「候选角 − 块边对齐 yaw」（mod 90）就是这一块的**预测终态 yaw 误差**。
+    网络在别处会给对角候选 —— round-16 青块 137.2° vs 块边 5.5°，预测 41.7°、
+    实测 42.42°；同一机制在 B2 也出现过（橙块 ψ=−θ 的镜像误差 40.7° ⇒ 终态 37.9°，
+    见 ``DEFAULT_SCENE`` 的 yaw_sign 判决）。抓取点/放置运动都不动，只换候选。
+
+    返回 ``(cand, note)``。贴边的候选一个都没有时 ``cand=None`` —— 调用方按
+    「这一块不抓」处理并记原因，**不退回对角候选**（fail-closed）。
+    块没有几何 yaw 就筛不了：退回最近候选，note 里写明。
+    """
+    best = entry.get("best")
+    aligned = block_edge_yaw(block, scene)
+    if aligned is None:
+        return best, ("块没有几何 yaw，筛不了（用最近候选）" if best else "")
+    max_off = float(scene.get("graspnet_max_edge_offset_deg",
+                              GRASPNET_MAX_EDGE_OFFSET_DEG))
+    cands = entry.get("near") or ([best] if best else [])
+    if not cands:
+        return None, "块没有候选"
+    for c in cands:                       # ``near`` 已按 (dist, −score) 排好
+        if gc.ang_diff_mod90(float(c["angle_deg"]), aligned) <= max_off:
+            return c, ""
+    off = gc.ang_diff_mod90(float(cands[0]["angle_deg"]), aligned)
+    return None, ("最近的候选离块边 %.1f°（>%.0f°）" % (off, max_off))
+
+
 def yaw_for_arm(arm, block, cand, scene):
     """一条臂的 (yaw_grasp, yaw_place, source, note)。
 
@@ -400,21 +452,38 @@ def build_assignments(pool, scene, round_no, grid, order=None, used_prev=()):
     items, stop = [], None
     for x in chosen:
         cls = x["p"]["class"]
+        arm = assign_arm(len(items), arms, offset)
+        cand = x["best"]
+        if arm == "graspnet":
+            # 这条臂拿候选角当抓取 yaw ⇒ 候选必须贴块边（见 choose_graspnet_cand）。
+            # 没有贴边候选就**不抓这一块**：宁可少抓，不退回对角候选。
+            cand, why = choose_graspnet_cand(x["p"], x["block"], scene)
+            if cand is None:
+                skipped.append(dict(x, skip_reason=why))
+                continue
         slot_idx = pr.pick_slot(used, classes, cls)
         if slot_idx is None:
             stop = "类别 %s 没有空槽了" % cls
             break
-        arm = assign_arm(len(items), arms, offset)
-        yg, yp, src, note = yaw_for_arm(arm, x["block"], x["best"], scene)
+        yg, yp, src, note = yaw_for_arm(arm, x["block"], cand, scene)
+        aligned = block_edge_yaw(x["block"], scene)
+        edge_off = (gc.ang_diff_mod90(float(cand["angle_deg"]), aligned)
+                    if aligned is not None else None)
+        cdist = cand.get("dist_mm")
+        if cdist is None:                      # 测试/旧数据里的 best 不带 dist
+            cdist = x["p"]["dist_mm"]
         items.append({
             "block_idx": int(x["p"]["block_idx"]), "class": cls,
             "arm": arm, "slot_idx": int(slot_idx), "slot_color": classes[slot_idx],
             "slot_mm": slots[slot_idx],
             "yaw_grasp_deg": round(yg, 3), "yaw_place_deg": round(yp, 3),
             "yaw_source": src, "yaw_note": note,
-            "cand_dist_mm": round(float(x["p"]["dist_mm"]), 2),
-            "cand_angle_deg": round(float(x["best"]["angle_deg"]), 2),
-            "cand_width_mm": round(float(x["best"]["width_mm"]), 2),
+            "cand_dist_mm": round(float(cdist), 2),
+            "cand_angle_deg": round(float(cand["angle_deg"]), 2),
+            "cand_width_mm": round(float(cand["width_mm"]), 2),
+            "cand_index": cand.get("i"),
+            "cand_edge_offset_deg": (None if edge_off is None
+                                     else round(edge_off, 2)),
             "block_xy_mm": [round(float(x["block"]["cx"]), 2),
                             round(float(x["block"]["cy"]), 2)],
         })
@@ -1272,8 +1341,13 @@ def main(argv=None):
     for m in res["missing"]:
         print("⚠️ 块顺序里的 %s 没有可用块（候选/遮挡/出区）" % m)
     for x in res["skipped"]:
-        print("⚠️ 块 #%d 没有颜色判定（%s），本轮不抓"
-              % (x["p"]["block_idx"], x["p"].get("class_status")))
+        why = x.get("skip_reason")
+        if why:
+            print("⚠️ 块 #%d（%s）本轮不抓：%s"
+                  % (x["p"]["block_idx"], x["p"].get("class"), why))
+        else:
+            print("⚠️ 块 #%d 没有颜色判定（%s），本轮不抓"
+                  % (x["p"]["block_idx"], x["p"].get("class_status")))
     if not res["items"]:
         print("没有可抓的块%s" % ("" if not res["stop_reason"]
                                   else "：" + res["stop_reason"]))
@@ -1316,6 +1390,12 @@ def main(argv=None):
                  "scene": scene, "items": res["items"],
                  "pick_yaw_fusion": fused_yaw,
                  "missing_order": res["missing"],
+                 # 本轮**没抓**的块与原因（没有颜色判定 / graspnet 臂没有贴边候选）。
+                 # 落盘是为了事后能分清「少抓」与「没看见」。
+                 "skipped": [{"block_idx": int(x["p"]["block_idx"]),
+                              "class": x["p"].get("class"),
+                              "reason": x.get("skip_reason") or "没有颜色判定"}
+                             for x in res["skipped"]],
                  "stop_reason": res["stop_reason"]}
     with open(os.path.join(cdir, "round.json"), "w") as f:
         json.dump(round_doc, f, ensure_ascii=False, indent=1)

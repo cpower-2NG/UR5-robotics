@@ -223,6 +223,29 @@ def test_fold_and_diff_mod90():
     assert abs(gc.ang_diff_mod90(10.0, 10.0)) < 1e-9
 
 
+@case
+def test_select_keeps_the_whole_near_list():
+    """``select`` 除了 ``best`` 还要留下整串近邻 —— graspnet 臂按块边筛候选靠它。
+
+    ``best``/``dist_mm``/``n_near`` 的语义**不变**（A3 与判分器都在用）。
+    """
+    blocks = [{"idx": 0, "class": "cyan", "cx": 500.0, "cy": 300.0}]
+    cands = [{"i": 1, "score": 0.30, "angle_deg": 137.2,
+              "xyz_base": [0.520, 0.300, 0.0]},      # 离块心 20 mm，对角
+             {"i": 2, "score": 0.25, "angle_deg": 5.0,
+              "xyz_base": [0.500, 0.301, 0.0]},      # 离块心 1 mm，贴边
+             {"i": 3, "score": 0.28, "angle_deg": 5.5,
+              "xyz_base": [0.500, 0.304, 0.0]}]      # 离块心 4 mm
+    per = gc.select(blocks, cands, anchor_mm=25.0)
+    p = per[0]
+    assert p["n_near"] == 3 and [c["i"] for c in p["near"]] == [2, 3, 1], p
+    assert p["best"]["i"] == 2 and abs(p["dist_mm"] - 1.0) < 1e-9
+    assert all("dist_mm" in c for c in p["near"])
+    # 锚定半径外的候选不进 near
+    per = gc.select(blocks, cands, anchor_mm=5.0)
+    assert [c["i"] for c in per[0]["near"]] == [2, 3], per[0]["near"]
+
+
 # ---------------------------------------------------------------- runner
 def main():
     npass = nfail = 0

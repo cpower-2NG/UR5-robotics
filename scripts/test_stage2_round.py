@@ -282,6 +282,77 @@ def test_yaw_wrap_and_moduli():
     assert abs(g - 350.0) < 1e-9, g
 
 
+# ---------------------------------------------------------------- graspnet 候选筛边
+def _cand(i, angle, dist, width=26.0):
+    return {"i": i, "angle_deg": angle, "width_mm": width, "dist_mm": dist}
+
+
+@case
+def test_graspnet_cand_must_be_edge_aligned():
+    """round-16 青块的教训：最近候选是对角的（137.2° vs 块边 5.5°）⇒ 换贴边的那个。
+
+    这条臂拿候选角当抓取 yaw、放置 yaw 取 δ，所以「候选角 − 块边」**就是**
+    预测终态误差：青块预测 41.7°、实测 42.42°。筛的正是这一个数。
+    """
+    a = entry(3, "cyan", 500, 300, dist=2.0, angle=137.2, yaw_pix=5.5)
+    a["p"]["near"] = [_cand(7, 137.2, 2.0), _cand(9, 4.0, 4.2), _cand(11, 40.0, 9.0)]
+    got, note = sr.choose_graspnet_cand(a["p"], a["block"], scene())
+    assert got["i"] == 9 and note == "", (got, note)
+    assert abs(sr.block_edge_yaw(a["block"], scene()) - 5.5) < 1e-9
+    # 阈值是活的：放到 45° 就退回「最近」（对角）那个 —— 变异检查这条测试不是摆设
+    got, _ = sr.choose_graspnet_cand(
+        a["p"], a["block"], scene(graspnet_max_edge_offset_deg=45.0))
+    assert got["i"] == 7, got
+    # 贴边候选排在后面也照样能选到（不是只看第一个）
+    a["p"]["near"] = [_cand(7, 137.2, 2.0), _cand(11, 40.0, 9.0)]
+    assert sr.choose_graspnet_cand(a["p"], a["block"], scene())[0] is None
+    # 没有几何 yaw ⇒ 筛不了，退回最近候选并把原因写在 note 里（不静默）
+    b = entry(4, "red", 520, 300, angle=10.0, yaw_pix=None)
+    b["p"]["near"] = [_cand(1, 10.0, 3.0)]
+    got, note = sr.choose_graspnet_cand(b["p"], b["block"], scene())
+    assert got is b["best"] and note, (got, note)
+
+
+@case
+def test_build_assignments_graspnet_uses_aligned_cand():
+    grid = make_grid()
+    a = entry(0, "cyan", 500, 300, dist=2.0, angle=137.2, yaw_pix=5.5)
+    a["p"]["near"] = [_cand(7, 137.2, 2.0), _cand(9, 4.0, 4.2)]
+    res = sr.build_assignments([a], scene(arms_order=["graspnet"],
+                                          blocks_per_round=1),
+                               round_no=1, grid=grid)
+    it = res["items"][0]
+    assert it["arm"] == "graspnet"
+    assert it["cand_index"] == 9 and abs(it["cand_angle_deg"] - 4.0) < 1e-9, it
+    assert abs(it["cand_edge_offset_deg"] - 1.5) < 1e-9, it
+    assert abs(it["yaw_grasp_deg"] - 4.0) < 1e-9 and it["yaw_place_deg"] == 0.0, it
+    assert abs(it["cand_dist_mm"] - 4.2) < 1e-9, it
+    # 几何臂/对照臂不受影响：它们本来就不看候选角
+    other = entry(1, "red", 540, 300, dist=1.0, angle=88.0, yaw_pix=10.0)
+    res = sr.build_assignments([other], scene(arms_order=["geometric"],
+                                              blocks_per_round=1),
+                               round_no=1, grid=grid)
+    assert abs(res["items"][0]["yaw_grasp_deg"] - 10.0) < 1e-9, res["items"][0]
+
+
+@case
+def test_build_assignments_skips_block_without_aligned_cand():
+    """没有贴边候选 = 这一块**不抓**（记原因），绝不退回对角候选。"""
+    grid = make_grid()
+    a = entry(0, "cyan", 500, 300, dist=2.0, angle=137.2, yaw_pix=5.5)
+    a["p"]["near"] = [_cand(7, 137.2, 2.0), _cand(8, 50.0, 3.0)]
+    b = entry(1, "red", 540, 300, dist=3.0, angle=12.0, yaw_pix=10.0)
+    b["p"]["near"] = [_cand(3, 12.0, 1.0)]
+    res = sr.build_assignments([a, b], scene(arms_order=["graspnet"]),
+                               round_no=1, grid=grid)
+    assert [it["block_idx"] for it in res["items"]] == [1], res["items"]
+    assert [x["p"]["block_idx"] for x in res["skipped"]] == [0]
+    why = res["skipped"][0]["skip_reason"]
+    assert "离块边" in why, why
+    # 被跳过的块不占格
+    assert res["items"][0]["slot_color"] == "red"
+
+
 # ---------------------------------------------------------------- 分配
 @case
 def test_build_assignments_slots_and_order():
