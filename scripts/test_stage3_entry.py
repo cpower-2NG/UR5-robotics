@@ -575,7 +575,9 @@ def _release_stubs(calls, merged_msg):
 
     saved = {n: getattr(e, n) for n in
              ("measure_tower", "return_to_pick", "clear_tower_step",
-              "capture_pick", "analyse_pick", "pick_item", "place_one")}
+              "capture_pick", "analyse_pick", "pick_item", "place_one",
+              "ask")}
+    e.ask = lambda *a, **k: None                  # 测试里不等回车
     e.measure_tower = fake_measure
     e.return_to_pick = fake_return
     e.clear_tower_step = fake_clear

@@ -762,6 +762,10 @@ def mode_release(args, ctx):
     groups = {}
     order = [(("open%.0f_dwell%.2f" % (op, dw)), op, dw)
              for op in opens for dw in dwells]
+    ask("确认急停就绪、两指整个行程内无手无遮挡：接下来连续夹放 %d 次"
+        "（%d 组 × %d 次，最优组再补 %s 次），每次都由机器人自己把块拆回拾取区"
+        % (int(args.reps) * len(order) + int(args.confirm or 0), len(order),
+           int(args.reps), args.confirm or 0))
     resume = bool(getattr(args, "resume", False))
     done = {name: {row["rep"]: row for row in load_rows(os.path.join(cdir, name))}
             for name, _op, _dw in order}
