@@ -359,8 +359,16 @@ def test_place_clearance_knob(chain):
               place_open_mm=50.0, release_dwell_s=0.0)
     _, _, m5 = pp.build_stack(chain, q0, cand, dict(blocks[0]), blocks, slot,
                               **kw)
-    _, _, m3 = pp.build_stack(chain, q0, cand, dict(blocks[0]), blocks, slot,
-                              place_clearance=0.003, **kw)
+    # 走**真入口那条路**（stage3_entry.place_one → layer_plan → build_stack）：
+    # 只测 build_stack 会漏掉「中间层没透传」这种坑，2026-10-31 真机上就踩过。
+    item = {"block": dict(blocks[0]), "block_h_used_mm": 29.5,
+            "cand": cand, "yaw_grasp_deg": 0.0, "yaw_place_deg": 0.0,
+            "yaw_source": "zero", "grasp_at": "block_center"}
+    plan3 = s3r.layer_plan(chain, q0, item, blocks, slot, surf,
+                           survey_tool0=pair[0],
+                           carry_z=kw["carry_z"], place_open_mm=50.0,
+                           release_dwell_s=0.0, place_clearance=0.003)
+    m3 = plan3["meta"]
     assert_close(m5["place_clearance_mm"], 5.0, why="不给参数 = 老行为 5 mm")
     assert_close(m3["place_clearance_mm"], 3.0, why="meta 要记实际间隙")
     assert_close(m5["place_z"] - m3["place_z"], 0.002, tol=1e-4,

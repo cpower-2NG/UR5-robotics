@@ -89,7 +89,7 @@ def layer_plan(chain, q_start, item, blocks, slot_m, surface_m,
                tower_xy_mm=None, tower_top_mm=None, survey_tool0=None,
                carry_z=None, scene=None, place_open_mm=None,
                release_dwell_s=None, tower_half_edge=0.020,
-               pick_open_mm=None):
+               pick_open_mm=None, place_clearance=None):
     """一层 = 抓 ``item["block"]`` 放到 ``slot_m`` 的 ``surface_m`` 上。"""
     scene = scene or {}
     block = dict(item["block"])
@@ -111,7 +111,8 @@ def layer_plan(chain, q_start, item, blocks, slot_m, surface_m,
         grip_speed_pct=scene.get("grasp_close_speed_pct"),
         release_speed_pct=scene.get("release_open_speed_pct"),
         release_dwell_s=(release_dwell_s if release_dwell_s is not None
-                         else scene.get("release_dwell_s", 0.0)))
+                         else scene.get("release_dwell_s", 0.0)),
+        place_clearance=place_clearance)
     return _finish_plan(wps, checks, meta, q_start, chain)
 
 
