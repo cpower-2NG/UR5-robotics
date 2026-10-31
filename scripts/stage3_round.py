@@ -65,7 +65,8 @@ def load_zcal(path):
     doc["pick"] = float(site.get("pick", raw.get("pick_bias_mm", 0.0)))
     doc.update({"source": os.path.abspath(path),
                 "model": raw.get("model", "constant"),
-                "residual_mm": raw.get("residual_mm")})
+                "residual_mm": raw.get("residual_mm"),
+                "pass": raw.get("pass")})
     return doc
 
 

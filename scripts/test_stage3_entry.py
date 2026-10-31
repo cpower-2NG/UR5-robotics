@@ -7,8 +7,10 @@
 不碰相机、不碰板子、不动臂：只喂合成数据。
 真机路径（``--go``）在这里一律跑不到。
 """
+import json
 import os
 import sys
+import types
 
 sys.dont_write_bytecode = True
 
@@ -508,6 +510,171 @@ def test_pick_item_converts_runtime_error():
         assert e.pick_item(args, {}, {}, {})[0]["block_idx"] == 3
     finally:
         s3r.build_items = orig
+
+
+# ---------------------------------------------------------------- 释放续跑
+@case
+def test_resume_tower_action_three_ways():
+    merged = {"top_mm": 32.0}
+    assert e.resume_tower_action("", {}, None, False) == "empty"
+    assert e.resume_tower_action("塔上有块", {}, None, False) == "stop"
+    # 续跑时塔上就是上次刚放下去那块：实测结构优先
+    assert e.resume_tower_action("塔上有块", {"merged": merged}, None, True) == "return"
+    # 实测没结构 ⇒ 退回上次行里的 merged
+    assert e.resume_tower_action("塔上有块", {}, merged, True) == "return"
+    # 两样都没有 ⇒ 停（不瞎摸）
+    assert e.resume_tower_action("塔上有块", {}, None, True) == "stop"
+
+
+def _release_env(td, reps=3, resume=True, opens="50", dwells="0"):
+    args = types.SimpleNamespace(
+        run_dir=td, opens=opens, dwells=dwells, reps=reps, confirm=0,
+        resume=resume, tower_half_edge=0.02, tower_cell_idx=4,
+        d_mm=331.0, arm="geometric", no_self_return=False)
+    ctx = (None, None, {"terminal_frames": 1}, {"cells": [{"idx": 4}]},
+           [422.65, -114.86], 2.344, {"tower": 1.266, "pick": 0.816})
+    return args, ctx
+
+
+def _seed_release_rows(td, name, reps):
+    for rep in reps:
+        d = os.path.join(td, "entry-release", name, "%s-%02d" % (name, rep))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "row.json"), "w") as fh:
+            json.dump({"rep": rep, "dxy_mm": 1.0, "dyaw_deg": 0.1,
+                       "dz_mm": 0.1,
+                       "measured": {"top_mm": 32.0,
+                                    "center_base_mm": [420.0, -114.0],
+                                    "yaw_deg": 0.0}}, fh)
+
+
+def _release_stubs(calls, merged_msg):
+    """把臂/相机全换成记账替身；返回还原函数。"""
+    def fake_measure(*a, **k):
+        if merged_msg is None:
+            return {}, ""
+        return {"merged": {"top_mm": 32.0, "center_base_mm": [420.0, -114.0],
+                           "yaw_deg": 0.0}}, merged_msg
+
+    def fake_return(*a, **k):
+        calls.append(("return", a[5]))
+
+    def fake_clear(*a, **k):
+        calls.append(("clear", a[5], bool(a[8])))   # (…, cdir, tag, grid, slot, placed, …)
+
+    def fake_capture(*a, **k):
+        return "frame", {}
+
+    def fake_place(*a, **k):
+        calls.append(("place", k["plan_kwargs"]["place_open_mm"]))
+        return {"measured": {"merged": {"top_mm": 32.0,
+                                        "center_base_mm": [420.0, -114.0],
+                                        "yaw_deg": 0.0}},
+                "predicted_place_mm": [420.0, -114.0],
+                "predicted_top_mm": 31.9}
+
+    saved = {n: getattr(e, n) for n in
+             ("measure_tower", "return_to_pick", "clear_tower_step",
+              "capture_pick", "analyse_pick", "pick_item", "place_one")}
+    e.measure_tower = fake_measure
+    e.return_to_pick = fake_return
+    e.clear_tower_step = fake_clear
+    e.capture_pick = fake_capture
+    e.analyse_pick = lambda *a, **k: {}
+    e.pick_item = lambda *a, **k: [{"block_idx": 0, "yaw_place_deg": 0.0,
+                                    "h": 29.5}]
+    e.place_one = fake_place
+
+    def restore():
+        for n, fn in saved.items():
+            setattr(e, n, fn)
+    return restore
+
+
+@case
+def test_release_resume_returns_stuck_block_then_skips_done_reps():
+    import tempfile
+    name = "open50_dwell0.00"
+    with tempfile.TemporaryDirectory() as td:
+        _seed_release_rows(td, name, (1, 2))
+        args, ctx = _release_env(td, reps=3, resume=True)
+        calls = []
+        restore = _release_stubs(calls, "塔上还有块")
+        try:
+            rc = e.mode_release(args, ctx)
+        finally:
+            restore()
+        assert rc == 0, rc
+        # 开工先由机器人把上次那块拆回
+        assert ("return", "resume-clear") in calls, calls
+        # 已完成的 1、2 次不重跑：只放第 3 次
+        assert [c for c in calls if c[0] == "place"] == [("place", 50.0)], calls
+        # 第 3 次之前塔是空的（placed=False），收尾才由机器人拆回
+        assert ("clear", "open50_dwell0.00-03", False) in calls, calls
+        assert ("clear", "release-end", True) in calls, calls
+        with open(os.path.join(td, "entry-release", "summary.json")) as fh:
+            doc = json.load(fh)
+        assert len(doc["groups_raw"][name]) == 3, doc["groups_raw"][name]
+
+
+@case
+def test_release_resume_all_done_does_no_motion():
+    import tempfile
+    name = "open50_dwell0.00"
+    with tempfile.TemporaryDirectory() as td:
+        _seed_release_rows(td, name, (1, 2, 3))
+        args, ctx = _release_env(td, reps=3, resume=True)
+        calls = []
+        restore = _release_stubs(calls, None)     # 塔位空着
+        try:
+            rc = e.mode_release(args, ctx)
+        finally:
+            restore()
+        assert rc == 0, rc
+        assert calls == [], calls                  # 不拆、不放、不重复收尾
+        with open(os.path.join(td, "entry-release", "summary.json")) as fh:
+            doc = json.load(fh)
+        assert len(doc["groups_raw"][name]) == 3, doc["groups_raw"][name]
+
+
+@case
+def test_release_fresh_run_refuses_non_empty_tower():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        args, ctx = _release_env(td, reps=3, resume=False)
+        calls = []
+        restore = _release_stubs(calls, "塔上还有块")
+        try:
+            rc = e.mode_release(args, ctx)
+        finally:
+            restore()
+        assert rc == 2, rc
+        assert calls == [], calls                  # 非续跑：不动臂、不瞎拆
+
+
+# ---------------------------------------------------------------- z 标定来源
+@case
+def test_resolve_zcal_path_fail_closed():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        # 显式路径：原样返回（存在与否交给 load_zcal 报错）
+        assert e.resolve_zcal_path(td, "/x/zcal.json", "release") == "/x/zcal.json"
+        # 标定模式自己没有输入
+        assert e.resolve_zcal_path(td, None, "zcal") is None
+        # release 缺文件 ⇒ 停，不许按 0 偏差静默跑
+        try:
+            e.resolve_zcal_path(td, None, "release")
+        except e.EntryStop as exc:
+            assert "缺 z 标定" in exc.why, exc.why
+            assert exc.rc == 2
+        else:
+            raise AssertionError("缺 z 标定却没停")
+        # 按约定位置放进一份 ⇒ 自动用它
+        d = os.path.join(td, "entry-zcal")
+        os.makedirs(d)
+        p = os.path.join(d, "zcal.json")
+        open(p, "w").write("{}")
+        assert e.resolve_zcal_path(td, None, "release") == p
 
 
 # ---------------------------------------------------------------- 协议

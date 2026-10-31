@@ -276,8 +276,8 @@ def tower_occupancy_verdict(merged, cell_idx=m3.TOWER_CELL_IDX):
             % (int(cell_idx), merged["top_mm"], merged["center_base_mm"]))
 
 
-def tower_precheck(args, board, chain, scene, grid, cdir, tag="precheck"):
-    """塔位必须是**空的** —— 非空立刻停（fail-closed）。
+def measure_tower(args, board, chain, scene, grid, cdir, tag="precheck"):
+    """量一次塔位，**无论空不空**都返回 ``(meas, msg)``（``msg`` 为空 = 空位）。
 
     2026-10-31 现状层记着：垫上格 0/1/2/4/5/6/7 各一块，塔位（中心格 idx4）
     上正压着阶段 2 的一块。第 1 层计划按「表面 = 垫面」算 ``place_z``，
@@ -290,9 +290,29 @@ def tower_precheck(args, board, chain, scene, grid, cdir, tag="precheck"):
                         layer=0, z_bias_mm=0.0, require_found=False,
                         radius_mm=TOWER_CLEAR_RADIUS_MM)
     msg = tower_occupancy_verdict(meas.get("merged"), args.tower_cell_idx)
+    return meas, msg
+
+
+def tower_precheck(args, board, chain, scene, grid, cdir, tag="precheck"):
+    """塔位必须是**空的** —— 非空立刻停（fail-closed）。"""
+    meas, msg = measure_tower(args, board, chain, scene, grid, cdir, tag)
     if msg:
         raise EntryStop(msg + " —— 先清空再跑")
     return meas
+
+
+def resume_tower_action(msg, meas, last_merged, resume):
+    """开工时塔位该怎么处理：``empty``（空）/ ``return``（自己拆回）/ ``stop``。
+
+    续跑时塔上压着「上一次刚放下去、还没来得及拆」的那块是**正常**的：用
+    当次实测当抓取目标（``meas["merged"]``），量不到结构才退回上次行里的
+    ``last_merged``；两样都没有就停（fail-closed，不瞎摸）。
+    """
+    if not msg:
+        return "empty"
+    if not resume:
+        return "stop"
+    return "return" if ((meas or {}).get("merged") or last_merged) else "stop"
 
 
 def tower_clear_now(board, scene, cdir, tag, grid, window_xy_mm,
@@ -742,23 +762,43 @@ def mode_release(args, ctx):
     groups = {}
     order = [(("open%.0f_dwell%.2f" % (op, dw)), op, dw)
              for op in opens for dw in dwells]
+    resume = bool(getattr(args, "resume", False))
+    done = {name: {row["rep"]: row for row in load_rows(os.path.join(cdir, name))}
+            for name, _op, _dw in order}
+    stop, placed, last_merged = None, False, None
     try:
-        tower_precheck(args, board, chain, scene, grid, cdir)
+        meas, msg = measure_tower(args, board, chain, scene, grid, cdir,
+                                  tag=("resume-precheck" if resume else "precheck"))
+        if resume:
+            for name, _op, _dw in order:
+                if done[name]:
+                    last_merged = done[name][max(done[name])].get("measured")
+        act = resume_tower_action(msg, meas, last_merged, resume)
+        if act == "stop":
+            raise EntryStop(msg + " —— 先清空再跑")
+        if act == "return":
+            print("  续跑：塔位非空 → 机器人自己把上次那块拆回拾取区")
+            return_to_pick(args, board, chain, scene, cdir, "resume-clear",
+                           grid, slot_mm, meas.get("merged") or last_merged,
+                           zcal)
+        # 走到这里塔位一定是空的（刚拆回或本来就空）
+        placed, last_merged = False, None
     except EntryStop as exc:
         print("!! " + exc.why)
         return exc.rc
-    stop, placed, last_merged = None, False, None
     for name, op, dw in order:
         if stop:
             break
         reps = int(args.reps)
         gdir = os.path.join(cdir, name)
         os.makedirs(gdir, exist_ok=True)
-        rows = groups.setdefault(name, [])
+        rows = groups[name] = [done[name][rep] for rep in sorted(done[name])]
         for r in range(1, reps + 1):
             tag = "%s-%02d" % (name, r)
             rdir = os.path.join(gdir, tag)
             os.makedirs(rdir, exist_ok=True)
+            if r in done[name]:
+                continue
             try:
                 clear_tower_step(args, board, chain, scene, cdir, tag, grid,
                                  slot_mm, placed, merged=last_merged,
@@ -801,6 +841,8 @@ def mode_release(args, ctx):
             tag = "%s-confirm-%02d" % (best, r)
             rdir = os.path.join(gdir, tag)
             os.makedirs(rdir, exist_ok=True)
+            if (int(args.reps) + r) in done[best]:
+                continue
             try:
                 clear_tower_step(args, board, chain, scene, cdir, tag, grid,
                                  slot_mm, placed, merged=last_merged,
@@ -826,7 +868,8 @@ def mode_release(args, ctx):
             print("  确认 %d/%d：Δxy %.2f mm，Δyaw %s°"
                   % (r, int(args.confirm), row["dxy_mm"], row["dyaw_deg"]))
     if placed and stop is None:
-        # 收尾：最后一块也由机器人拿回拾取区（塔位留给下一项实验）
+        # 收尾：最后一块也由机器人拿回拾取区（塔位留给下一项实验）。
+        # 只在本轮**新放**过块时才有块要收；续跑时塔位在开工处已被核空。
         try:
             clear_tower_step(args, board, chain, scene, cdir, "release-end",
                              grid, slot_mm, True, merged=last_merged, zcal=zcal)
@@ -1037,6 +1080,23 @@ def mode_tolerance(args, ctx):
 
 
 # ---------------------------------------------------------------- 上下文/CLI
+def resolve_zcal_path(run_dir, explicit, mode):
+    """z 标定文件从哪来：显式 > ``<run-dir>/entry-zcal/zcal.json`` > **停**。
+
+    忘了传 ``--zcal`` 时宁可停，也不能按 0 偏差静默跑 40 次放置 ——
+    这类「没报错但用了默认值」的失效本项目吃过大亏（0x0100 读状态、死键）。
+    """
+    if explicit:
+        return explicit
+    if mode == "zcal":
+        return None                       # 标定模式本身在产出它
+    cand = os.path.join(run_dir, "entry-zcal", "zcal.json")
+    if not os.path.isfile(cand):
+        raise EntryStop("缺 z 标定（%s）—— 先跑 --mode zcal，或用 --zcal 指一份"
+                        % cand)
+    return cand
+
+
 def load_ctx(args):
     """场景 / 网格 / 塔位 / z 标定 / URDF —— 四个模式共用。"""
     global _URDF
@@ -1055,7 +1115,10 @@ def load_ctx(args):
         raise EntryStop("网格坏：%s" % exc)
     slot_mm = m3.grid_center(grid, args.tower_cell_idx)
     pad_mm = m3.pad_z_mm(grid)
-    zcal = s3r.load_zcal(args.zcal)
+    zcal = s3r.load_zcal(resolve_zcal_path(args.run_dir, args.zcal, args.mode))
+    if args.mode != "zcal" and zcal.get("pass") is False:
+        raise EntryStop("z 标定未过（残差 >%.1f mm）—— 先补测，别带偏差跑"
+                        % float(ZCAL_TOL_MM))
     chain = urkin.Chain(args.urdf)
     return scene, grid, slot_mm, pad_mm, zcal, chain
 
@@ -1101,7 +1164,8 @@ def main(argv=None):
     ap.add_argument("--no-self-return", action="store_true",
                     help="把「塔上那块」交回人手动拿走；默认由机器人自己抓回拾取区")
     ap.add_argument("--resume", action="store_true",
-                    help="zcal：复用 run-dir 里已有的 row.json，从下一位接着跑")
+                    help="zcal/release：复用 run-dir 里已有的 row.json，从没做的那一位接着跑；"
+                         "塔上若还压着上次那块，先由机器人自己拆回")
     ap.add_argument("--go", action="store_true",
                     help="真跑；**每次都当次授权**，闸门在 precision_exec")
     args = ap.parse_args(argv)
