@@ -61,9 +61,11 @@ TOWER_CLEAR_RADIUS_MM = 40.0
 #: 半块高 14.75 mm，取 12 mm：漏一层（29.5）必被拦，读数偏差 +1~2 mm 不拦。
 TOWER_HEIGHT_TOL_MM = 12.0
 
-#: **机器人自己回位**（拆塔）时，回位块离拾取区已有块中心的最小距离 ——
-#: 与场景里块间距同一口径（`precision_plan.MIN_BLOCK_GAP` = 60 mm）。
-PICK_RETURN_GAP_MM = 60.0
+#: **机器人自己回位**（拆塔）时，回位块离拾取区已有块中心的最小距离。
+#: 取 85 mm 而不是 `precision_plan.MIN_BLOCK_GAP`（60 mm）：后者是**规划**下限，
+#: 回位按它贴边放，几毫米放置误差一加就变成 54–58.7 mm，零落地余量；
+#: 2026-11-01 实测跑到第 6 次就再也选不出块。85 = 60 + 25 的落地余量。
+PICK_RETURN_GAP_MM = 85.0
 #: 回位块中心离拾取区边界的最小余量（块心，不是块边；`in_zone` 也按块心算）。
 PICK_RETURN_MARGIN_MM = 25.0
 #: 塔上那块在计划里的伪块序号 —— 拾取区的真 idx 从 0 起，−1 不会撞。
@@ -147,6 +149,9 @@ def release_summary(groups):
             "n": len(rows),
             "dxy_mm": group_stats([r["dxy_mm"] for r in rows]),
             "dyaw_deg": group_stats([r["dyaw_deg"] for r in rows]),
+            # 彩色掩码的并行读数（与深度无关）；老行没有这个键，按缺数据处理。
+            "dyaw_color_deg": group_stats([r.get("dyaw_color_deg")
+                                           for r in rows]),
             "dz_mm": group_stats([r["dz_mm"] for r in rows]),
         }
 
@@ -765,16 +770,25 @@ def mode_zcal(args, ctx):
 
 
 def _release_row(item, rec, rep):
-    """一次放置的「实测 − 预测」：Δxy、Δyaw（mod 90）、Δz（落稳下沉）。"""
+    """一次放置的「实测 − 预测」：Δxy、Δyaw（mod 90）、Δz（落稳下沉）。
+
+    Δyaw 记**两套**：``dyaw_deg`` 走深度 ``yaw_rect``（老口径，契约现用），
+    ``dyaw_color_deg`` 走彩色掩码（独立于深度）。两套都进表，事后对比再定用哪套。
+    """
     merged = rec["measured"]["merged"]
     dx = merged["center_base_mm"][0] - rec["predicted_place_mm"][0]
     dy = merged["center_base_mm"][1] - rec["predicted_place_mm"][1]
     dyaw = (None if merged.get("yaw_deg") is None else
             round(float(s2.signed_err_mod90(
                 merged["yaw_deg"], float(item["yaw_place_deg"]))), 3))
+    dyaw_color = (None if merged.get("yaw_color_deg") is None else
+                  round(float(s2.signed_err_mod90(
+                      merged["yaw_color_deg"], float(item["yaw_place_deg"]))),
+                        3))
     return {"rep": rep, "dxy_mm": round(math.hypot(dx, dy), 3),
             "dx_mm": round(dx, 3), "dy_mm": round(dy, 3),
             "dyaw_deg": dyaw,
+            "dyaw_color_deg": dyaw_color,
             "dz_mm": round(merged["top_mm"] - rec["predicted_top_mm"], 3),
             "measured": merged,
             "predicted_place_mm": rec["predicted_place_mm"],

@@ -14,7 +14,10 @@
 · 塔窗：第 1 层 = 中心格心 ±``radius_mm``（默认 50 mm），第 k≥2 层 = 上一层
   实测中心 ±``radius_mm``；窗内取**最高**的合格簇（``top`` 是 base 系绝对 z，
   97 分位，与 ``find_blocks`` 同一口径）；
-· yaw 用 ``yaw_rect``（最小外接矩形），``yaw_trusted`` 为假 ⇒ 该层转人评；
+· yaw **两套并行记录**：深度 ``yaw_rect``（``yaw_deg``）与彩色掩码最小外接矩形
+  （``yaw_color_deg``）。2026-11-01 实测深度那套会被侧面污染（同一次放置两视点
+  差到 26°），所以在换判据之前先两套都记、事后对比。``yaw_trusted`` /
+  ``yaw_color_trusted`` 为假 ⇒ 该层转人评；
 · z 标定：``surface = top − block_h − z_bias``。``z_bias`` 的定义是
   「同一位置单块实测顶高 − 真高」，塔位侧由入口实验 1 标定（扣掉垫厚）。
 
@@ -30,6 +33,7 @@ import json
 import math
 import os
 import sys
+from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -38,6 +42,7 @@ sys.dont_write_bytecode = True
 import numpy as np                                                # noqa: E402
 
 import graspnet_candidates as gc                                   # noqa: E402
+import stage2_geom as sg                                           # noqa: E402
 import stage2_round as s2                                          # noqa: E402
 
 #: 同一批方块的**真高**（用户多次实测 29.5 mm，2026-10 定）。
@@ -70,6 +75,72 @@ def pad_z_mm(grid):
     """垫面高度（base 系 z，mm）：``T_base_pad[2,3]``。"""
     T = np.asarray(grid["T_base_pad"], dtype=np.float64)
     return round(float(T[2, 3]) * 1000.0, 3)
+
+
+#: 颜色掩码：从块中心 9×9 中位色出发做 4 连通生长，通道最大差 < 这个值。
+COLOR_TOL = 45.0
+#: 颜色掩码的搜索半窗（像素）。块在 1280×720 里约 76–82 px 宽，80 px 够。
+COLOR_HALF_PX = 80
+#: 颜色掩码可信门槛：轮廓填充率 + 像素数。
+COLOR_FILL_MIN = 0.85
+COLOR_MIN_PIXELS = 300
+
+
+def color_face_mask(frame, uv, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
+    """块中心邻域内、与中心色相近的 4 连通区域（**只用彩色图**）。
+
+    为什么不直接用 ``stage2_geom.top_face_mask``：那是**深度**掩码，会把斜视时
+    探出顶面轮廓的可见侧面一起收进来；近正方形上做最小外接矩形是病态的
+    （2026-11-01 实测同一次放置两个视点差到 26.2°，点云外形 32×25 mm）。
+    颜色掩码只认顶面同色区域，输入与深度无关，才能当独立估计器。
+    """
+    img = frame["color"]
+    h, w = img.shape[:2]
+    u, v = int(round(float(uv[0]))), int(round(float(uv[1])))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if not (0 <= u < w and 0 <= v < h):
+        return mask
+    u0, u1 = max(0, u - half_px), min(w, u + half_px)
+    v0, v1 = max(0, v - half_px), min(h, v + half_px)
+    sub = img[v0:v1, u0:u1].astype(np.int16)
+    sh, sw = sub.shape[:2]
+    cu, cv = u - u0, v - v0
+    if not (0 <= cu < sw and 0 <= cv < sh):
+        return mask
+    patch = sub[max(0, cv - 4):cv + 5, max(0, cu - 4):cu + 5]
+    seed = np.median(patch.reshape(-1, 3), axis=0)
+    local = np.zeros((sh, sw), dtype=bool)
+    local[cv, cu] = True
+    q = deque([(cv, cu)])
+    while q:
+        y, x = q.popleft()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < sh and 0 <= nx < sw and not local[ny, nx]:
+                if np.abs(sub[ny, nx] - seed).max() < tol:
+                    local[ny, nx] = True
+                    q.append((ny, nx))
+    mask[v0:v1, u0:u1] = local.astype(np.uint8)
+    return mask
+
+
+def color_rect_yaw(frame, block, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
+    """颜色掩码 → 最小外接矩形 → **base 系** yaw（复用 ``sg.mask_rect_yaw``）。
+
+    与深度 ``yaw_rect`` 并行记录、事后对比；两者不一致时以本值为主 ——
+    它的输入与深度无关，不会被侧面污染。
+    """
+    mask = color_face_mask(frame, block["uv"], half_px=half_px, tol=tol)
+    z_top = float(block["top"]) / 1000.0
+    r = sg.mask_rect_yaw(mask, frame["K"], frame["R_bc"], frame["t_bc"],
+                         z_top)
+    if r is None:
+        return {"yaw_deg": None, "ext_mm": [0.0, 0.0], "fill": 0.0,
+                "n_pixels": 0, "trusted": False, "reason": "掩码/轮廓太小"}
+    r["trusted"] = bool(r["fill"] >= COLOR_FILL_MIN
+                        and r["n_pixels"] >= COLOR_MIN_PIXELS)
+    r["reason"] = ""
+    return r
 
 
 def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
@@ -129,6 +200,7 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
     if top is None:
         return out
     yaw = top.get("yaw_rect")
+    cyaw = color_rect_yaw(frame, top)
     out.update({
         "center_base_mm": [round(float(top["cx"]), 2),
                            round(float(top["cy"]), 2)],
@@ -138,6 +210,13 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
         "h_mm": round(float(top["h"]), 2),
         "yaw_deg": None if yaw is None else round(float(yaw), 3),
         "yaw_trusted": bool(top.get("yaw_trusted")),
+        # 颜色掩码的并行读数（与深度无关的独立估计器，2026-11-01 起记录）。
+        "yaw_color_deg": (None if cyaw["yaw_deg"] is None
+                          else round(float(cyaw["yaw_deg"]), 3)),
+        "yaw_color_trusted": bool(cyaw["trusted"]),
+        "yaw_color_ext_mm": cyaw["ext_mm"],
+        "yaw_color_fill": round(float(cyaw["fill"]), 3),
+        "yaw_color_n_px": int(cyaw["n_pixels"]),
         "ext_rect_mm": top.get("ext_rect"),
         "rect_fill": top.get("rect_fill"),
         "class": top.get("class"),
@@ -163,6 +242,10 @@ def fuse_frames(records):
     yaws = [r["yaw_deg"] for r in found if r.get("yaw_deg") is not None]
     yaw = s2.mean_yaw_mod90(yaws) if yaws else None
     yaw_span = s2.yaw_span_mod90(yaws) if len(yaws) > 1 else None
+    cyaws = [r["yaw_color_deg"] for r in found
+             if r.get("yaw_color_deg") is not None]
+    cyaw = s2.mean_yaw_mod90(cyaws) if cyaws else None
+    cyaw_span = s2.yaw_span_mod90(cyaws) if len(cyaws) > 1 else None
     tops = [r["top_mm"] for r in found]
     dists = [math.hypot(r["center_base_mm"][0] - cx,
                         r["center_base_mm"][1] - cy) for r in found]
@@ -176,6 +259,11 @@ def fuse_frames(records):
             # 任一帧不可信就不进机判：宁可人评，别把烂 yaw 当数据。
             "yaw_trusted": bool(found) and all(r.get("yaw_trusted")
                                                for r in found),
+            # 颜色掩码的并行读数（独立于深度）。
+            "yaw_color_deg": cyaw,
+            "yaw_color_span_deg": cyaw_span,
+            "yaw_color_trusted": bool(found) and all(
+                r.get("yaw_color_trusted") for r in found),
             "frames_used": [r.get("frame") for r in found]}
 
 
@@ -191,7 +279,7 @@ def pose_consistency(fused_poses, xy_tol_mm=POSE_XY_TOL_MM,
                 "n_poses": len(fused_poses)}
     if len(found) < 2:
         return {"ok": None, "reason": "single_pose", "n_poses": len(found)}
-    dxy = dyaw = dz = 0.0
+    dxy = dyaw = dz = dyaw_color = 0.0
     for i in range(len(found)):
         for j in range(i + 1, len(found)):
             a, b = found[i], found[j]
@@ -203,10 +291,19 @@ def pose_consistency(fused_poses, xy_tol_mm=POSE_XY_TOL_MM,
             if a.get("yaw_deg") is not None and b.get("yaw_deg") is not None:
                 dyaw = max(dyaw, abs(s2.signed_err_mod90(a["yaw_deg"],
                                                          b["yaw_deg"])))
+            if (a.get("yaw_color_deg") is not None
+                    and b.get("yaw_color_deg") is not None):
+                dyaw_color = max(dyaw_color, abs(s2.signed_err_mod90(
+                    a["yaw_color_deg"], b["yaw_color_deg"])))
     ok = dxy <= xy_tol_mm and dz <= z_tol_mm and dyaw <= yaw_tol_deg
+    # 颜色读数的独立判定：只报告，暂不改 ``ok`` 的语义（换判据要用户拍板）。
+    ok_color = (dxy <= xy_tol_mm and dz <= z_tol_mm
+                and dyaw_color <= yaw_tol_deg)
     return {"ok": bool(ok), "n_poses": len(found),
             "dxy_mm": round(dxy, 2), "dyaw_deg": round(dyaw, 2),
             "dz_mm": round(dz, 2),
+            "dyaw_color_deg": round(dyaw_color, 2),
+            "ok_color": bool(ok_color),
             "tol": {"xy_mm": xy_tol_mm, "yaw_deg": yaw_tol_deg,
                     "z_mm": z_tol_mm},
             "reason": "ok" if ok else "pose_mismatch"}
