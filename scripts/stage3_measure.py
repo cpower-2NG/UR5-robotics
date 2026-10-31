@@ -272,6 +272,14 @@ def pose_consistency(fused_poses, xy_tol_mm=POSE_XY_TOL_MM,
     """两（或多）视点融合值 → 两两最大差 + 是否过门。
 
     只有一个视点能测到时 ``ok=None``（**证明不了**一致性，转人评）。
+
+    **yaw 判据走彩色掩码**（2026-11-01 用户拍板）。同一批 15 次放置上，深度
+    ``yaw_rect`` 与彩色掩码逐次相关 r=0.897、颜色 ≈ 0.70 × 深度 ⇒ 深度法把偏差
+    放大约 1.43 倍，且组内散差 6.5–15.5°（彩色 0.3–2.1°）。拿深度当 ``ok`` 的
+    判据会把合格放置判红。深度值继续报告（``dyaw_deg``），只是不进 ``ok``。
+
+    彩色 yaw 缺失时 ``ok=None``（reason ``no_color_yaw``）——证明不了就转人评，
+    既不拿深度顶替，也不把缺数据当合格。
     """
     found = [p for p in fused_poses if p.get("found")]
     if not found:
@@ -280,6 +288,7 @@ def pose_consistency(fused_poses, xy_tol_mm=POSE_XY_TOL_MM,
     if len(found) < 2:
         return {"ok": None, "reason": "single_pose", "n_poses": len(found)}
     dxy = dyaw = dz = dyaw_color = 0.0
+    n_color = 0            # 有多少对真的比过彩色 yaw（缺数据不能当 0 差）
     for i in range(len(found)):
         for j in range(i + 1, len(found)):
             a, b = found[i], found[j]
@@ -293,20 +302,19 @@ def pose_consistency(fused_poses, xy_tol_mm=POSE_XY_TOL_MM,
                                                          b["yaw_deg"])))
             if (a.get("yaw_color_deg") is not None
                     and b.get("yaw_color_deg") is not None):
+                n_color += 1
                 dyaw_color = max(dyaw_color, abs(s2.signed_err_mod90(
                     a["yaw_color_deg"], b["yaw_color_deg"])))
-    ok = dxy <= xy_tol_mm and dz <= z_tol_mm and dyaw <= yaw_tol_deg
-    # 颜色读数的独立判定：只报告，暂不改 ``ok`` 的语义（换判据要用户拍板）。
-    ok_color = (dxy <= xy_tol_mm and dz <= z_tol_mm
-                and dyaw_color <= yaw_tol_deg)
-    return {"ok": bool(ok), "n_poses": len(found),
-            "dxy_mm": round(dxy, 2), "dyaw_deg": round(dyaw, 2),
-            "dz_mm": round(dz, 2),
-            "dyaw_color_deg": round(dyaw_color, 2),
-            "ok_color": bool(ok_color),
+    base = {"n_poses": len(found), "dxy_mm": round(dxy, 2),
+            "dyaw_deg": round(dyaw, 2), "dz_mm": round(dz, 2),
             "tol": {"xy_mm": xy_tol_mm, "yaw_deg": yaw_tol_deg,
-                    "z_mm": z_tol_mm},
-            "reason": "ok" if ok else "pose_mismatch"}
+                    "z_mm": z_tol_mm}}
+    if n_color == 0:
+        return dict(base, ok=None, dyaw_color_deg=None, ok_color=None,
+                    reason="no_color_yaw")
+    ok = dxy <= xy_tol_mm and dz <= z_tol_mm and dyaw_color <= yaw_tol_deg
+    return dict(base, ok=bool(ok), dyaw_color_deg=round(dyaw_color, 2),
+                ok_color=bool(ok), reason="ok" if ok else "pose_mismatch")
 
 
 def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,

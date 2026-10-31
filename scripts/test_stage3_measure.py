@@ -119,12 +119,13 @@ def test_fuse_frames_median_and_yaw():
 @case
 def test_pose_consistency_states():
     a = {"found": True, "center_base_mm": [422.0, -115.0], "top_mm": 31.0,
-         "yaw_deg": 1.0}
+         "yaw_deg": 1.0, "yaw_color_deg": 0.5}
     b = {"found": True, "center_base_mm": [424.0, -116.0], "top_mm": 32.0,
-         "yaw_deg": 2.5}
+         "yaw_deg": 2.5, "yaw_color_deg": 1.5}
     ok = m3.pose_consistency([a, b])
     assert ok["ok"] is True, ok
     assert_close(ok["dxy_mm"], np.hypot(2.0, 1.0), 0.01)
+    assert_close(ok["dz_mm"], 1.0, 0.01)
     far = dict(b, center_base_mm=[445.0, -115.0])
     bad = m3.pose_consistency([a, far])
     assert bad["ok"] is False and bad["reason"] == "pose_mismatch", bad
@@ -132,12 +133,38 @@ def test_pose_consistency_states():
     assert one["ok"] is None and one["reason"] == "single_pose", one
 
 
+@case
+def test_pose_consistency_yaw_uses_color():
+    """yaw 判据 = 彩色（用户 2026-11-01 拍板）；深度再离谱也不能翻红，反之亦然。"""
+    # 深度两视点差 20°（噪声大），彩色只差 0.5° ⇒ 应判合格
+    a = {"found": True, "center_base_mm": [422.0, -115.0], "top_mm": 31.0,
+         "yaw_deg": 0.0, "yaw_color_deg": 1.0}
+    b = {"found": True, "center_base_mm": [422.5, -115.5], "top_mm": 31.4,
+         "yaw_deg": 20.0, "yaw_color_deg": 1.5}
+    r = m3.pose_consistency([a, b])
+    assert r["ok"] is True, r
+    assert r["dyaw_deg"] == 20.0 and r["dyaw_color_deg"] == 0.5, r
+    # 反过来：彩色差 8°（超 5° 门），深度只差 0.2° ⇒ 应判不合格
+    c = dict(b, yaw_deg=0.2, yaw_color_deg=9.0)
+    r2 = m3.pose_consistency([a, c])
+    assert r2["ok"] is False and r2["reason"] == "pose_mismatch", r2
+    # 彩色 yaw 缺失 ⇒ ok=None（不拿深度顶替，也不当合格）
+    d = {"found": True, "center_base_mm": [422.0, -115.0], "top_mm": 31.0,
+         "yaw_deg": 1.0}
+    e = dict(d)
+    r3 = m3.pose_consistency([d, e])
+    assert r3["ok"] is None and r3["reason"] == "no_color_yaw", r3
+    assert r3["dyaw_color_deg"] is None, r3
+
+
 # ---------------------------------------------------------------- 表面语义
 FAKE = {
     "p1": {"found": True, "frame": "p1", "center_base_mm": [422.0, -115.0],
-           "top_mm": 32.0, "yaw_deg": 0.5, "yaw_trusted": True},
+           "top_mm": 32.0, "yaw_deg": 0.5, "yaw_color_deg": 0.6,
+           "yaw_trusted": True},
     "p2": {"found": True, "frame": "p2", "center_base_mm": [423.0, -115.0],
-           "top_mm": 32.4, "yaw_deg": 1.0, "yaw_trusted": True},
+           "top_mm": 32.4, "yaw_deg": 1.0, "yaw_color_deg": 1.0,
+           "yaw_trusted": True},
 }
 
 
