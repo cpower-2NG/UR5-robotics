@@ -662,7 +662,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
                grip_speed_pct=None, release_speed_pct=None,
                release_dwell_s=0.0, surface_z=None, carry_z=None,
                survey_tool0=None, tower_box=None, held_half_edge=0.020,
-               held_off_xy=None):
+               held_off_xy=None, place_clearance=None):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -703,6 +703,10 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
       撞塔**护栏：`check_guard` 之外再查夹着的块有没有进箱。
     · ``held_half_edge`` / ``held_off_xy``：持块包络的半边长（块半宽 + 余量）
       与块心相对 tool0 的 xy 偏置（已按放置 yaw 旋转）。
+    · ``place_clearance``：放置那一刻**块底离表面**的间隙（m）。默认
+      `PLACE_CLEARANCE` = 5 mm，阶段 2 逐字节不变。入口实测（2026-11-01）：
+      5 mm 时块是**自由落体砸在垫子上**（五次 Δz 极差 0.15 mm，落 3.8 mm），
+      落定后的 xy/yaw 散乱；3/4 mm 是「放下去」而不是「掉下去」的对照。
     """
     yaw_grasp_raw = float(yaw_grasp_deg)
     yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg)
@@ -744,7 +748,11 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     # 编进常量里；29.6 mm 的块会压进台面 1.1 mm）。
     grasp_depth_m = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
     table_z = TABLE_PLANE_Z if surface_z is None else float(surface_z)
-    place_z, place_approach_z = place_heights(wz, grasp_depth_m, table_z=table_z)
+    clearance_m = (PLACE_CLEARANCE if place_clearance is None
+                   else float(place_clearance))
+    place_z, place_approach_z = place_heights(wz, grasp_depth_m,
+                                              table_z=table_z,
+                                              clearance=clearance_m)
     # 抓取偏心（块心估计 − 抓点）。默认**不**拿它补放置目标：第 6 轮实测
     # 这块实际只偏 2.76 mm，补了反而多偏 4.3 mm（详见 PLACE_COMPENSATE_ECC）。
     # 量出来写进 meta，下一轮可以直接对账「夹持偏移 vs 抓取偏心」。
@@ -829,7 +837,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             "block_below_tip_mm": round((wz - grasp_depth_m) * 1000, 2),
             "place_z": round(place_z, 4),
             "place_approach_z": round(place_approach_z, 4),
-            "place_clearance_mm": round(PLACE_CLEARANCE * 1000, 2),
+            "place_clearance_mm": round(clearance_m * 1000, 2),
             "block_xy_mm": [round(block["cx"], 2), round(block["cy"], 2)],
             "grasp_point": [gx, gy], "grasp_ecc_mm": [round(ex * 1000, 2),
                                                      round(ey * 1000, 2)],

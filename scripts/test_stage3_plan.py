@@ -341,6 +341,32 @@ def test_check_held_block_direct(chain):
 
 
 # ---------------------------------------------------------------- 跑
+@case
+def test_place_clearance_knob(chain):
+    """放置间隙可调：3 mm 的 place_z 比默认 5 mm 低 2 mm，meta 记的是**实际值**。
+
+    两个断言各堵一个老坑：
+    · 参数没传进 `place_heights` ⇒ 差值断言红；
+    · meta 写死模块常量 `PLACE_CLEARANCE`（改之前就是这样）⇒ 记录值断言红。
+    """
+    blocks, cand, q0 = scene(chain)
+    surf = surface_for(1)
+    slot = (SLOT_MM[0] / 1000.0, SLOT_MM[1] / 1000.0)
+    pair = pp.stage3_survey_tool0(surf + H_BLK, slot)
+    kw = dict(surface_z=surf, survey_tool0=pair[0],
+              carry_z=pp.stage3_carry_z(H_BLK, surf),
+              yaw_grasp_deg=0.0, yaw_place_deg=0.0, yaw_source="zero",
+              place_open_mm=50.0, release_dwell_s=0.0)
+    _, _, m5 = pp.build_stack(chain, q0, cand, dict(blocks[0]), blocks, slot,
+                              **kw)
+    _, _, m3 = pp.build_stack(chain, q0, cand, dict(blocks[0]), blocks, slot,
+                              place_clearance=0.003, **kw)
+    assert_close(m5["place_clearance_mm"], 5.0, why="不给参数 = 老行为 5 mm")
+    assert_close(m3["place_clearance_mm"], 3.0, why="meta 要记实际间隙")
+    assert_close(m5["place_z"] - m3["place_z"], 0.002, tol=1e-4,
+                 why="间隙少 2 mm，place_z 正好低 2 mm")
+
+
 def main():
     urdf = find_urdf()
     failed = skipped = 0

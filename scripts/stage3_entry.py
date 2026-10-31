@@ -549,8 +549,12 @@ def place_one(args, board, chain, scene, grid, analysis, item, slot_mm,
                round(v * 1000.0, 2)
                for v in s3r.predicted_place(
                    item, [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0])[0]],
+           # 间隙取**这份计划实际用的**（plan meta），不取模块常量：
+           # 否则换了 `place_clearance` 之后 Δz 会凭空多出 (5−实际) mm。
            "predicted_top_mm": round(float(surface_mm)
-                                     + pp.PLACE_CLEARANCE * 1000.0
+                                     + plan["meta"].get(
+                                         "place_clearance_mm",
+                                         pp.PLACE_CLEARANCE * 1000.0)
                                      + m3.BLOCK_TRUE_H_MM, 2),
            "exec_rc": rc, "pair": pair, "plan": os.path.basename(plan_path)}
     if rc != 0:
@@ -785,22 +789,32 @@ def mode_release(args, ctx):
     os.makedirs(cdir, exist_ok=True)
     opens = [float(v) for v in str(args.opens).split(",") if v]
     dwells = [float(v) for v in str(args.dwells).split(",") if v]
+    # 放置间隙（mm）。默认只跑 5 mm（`PLACE_CLEARANCE`，阶段 2 的老值）。
+    clr_arg = getattr(args, "place_clearances", None)
+    clearances = ([float(v) for v in str(clr_arg).split(",") if v]
+                  if clr_arg else [5.0])
     groups = {}
-    order = [(("open%.0f_dwell%.2f" % (op, dw)), op, dw)
-             for op in opens for dw in dwells]
+    order = []
+    for op in opens:
+        for dw in dwells:
+            for cl in clearances:
+                # 5 mm 是默认值，组名保持老样子（已有 run 目录不用改名）
+                name = ("open%.0f_dwell%.2f" % (op, dw) if cl == 5.0
+                        else "open%.0f_dwell%.2f_clr%.1f" % (op, dw, cl))
+                order.append((name, op, dw, cl))
     ask("确认急停就绪、两指整个行程内无手无遮挡：接下来连续夹放 %d 次"
         "（%d 组 × %d 次，最优组再补 %s 次），每次都由机器人自己把块拆回拾取区"
         % (int(args.reps) * len(order) + int(args.confirm or 0), len(order),
            int(args.reps), args.confirm or 0))
     resume = bool(getattr(args, "resume", False))
     done = {name: {row["rep"]: row for row in load_rows(os.path.join(cdir, name))}
-            for name, _op, _dw in order}
+            for name, _op, _dw, _cl in order}
     stop, placed, last_merged = None, False, None
     try:
         meas, msg = measure_tower(args, board, chain, scene, grid, cdir,
                                   tag=("resume-precheck" if resume else "precheck"))
         if resume:
-            for name, _op, _dw in order:
+            for name, _op, _dw, _cl in order:
                 if done[name]:
                     last_merged = done[name][max(done[name])].get("measured")
         act = resume_tower_action(msg, meas, last_merged, resume)
@@ -816,7 +830,7 @@ def mode_release(args, ctx):
     except EntryStop as exc:
         print("!! " + exc.why)
         return exc.rc
-    for name, op, dw in order:
+    for name, op, dw, cl in order:
         if stop:
             break
         reps = int(args.reps)
@@ -842,6 +856,7 @@ def mode_release(args, ctx):
                                 plan_kwargs={
                                     "place_open_mm": op,
                                     "release_dwell_s": dw,
+                                    "place_clearance": cl / 1000.0,
                                     "tower_half_edge": args.tower_half_edge})
             except EntryStop as exc:
                 stop = exc.why
@@ -864,7 +879,7 @@ def mode_release(args, ctx):
     if stop is None and best and args.confirm and int(args.confirm) > 0:
         print("最优组是 %s；接下来补 %d 次确认（每次仍由机器人自己回位）"
               % (best, int(args.confirm)))
-        op, dw = [(o, d) for n, o, d in order if n == best][0]
+        op, dw, cl = [(o, d, c) for n, o, d, c in order if n == best][0]
         gdir = os.path.join(cdir, best)
         rows = groups.setdefault(best, [])
         for r in range(1, int(args.confirm) + 1):
@@ -886,6 +901,7 @@ def mode_release(args, ctx):
                                 plan_kwargs={
                                     "place_open_mm": op,
                                     "release_dwell_s": dw,
+                                    "place_clearance": cl / 1000.0,
                                     "tower_half_edge": args.tower_half_edge})
             except EntryStop as exc:
                 stop = exc.why
@@ -907,7 +923,8 @@ def mode_release(args, ctx):
             stop = "收尾回位失败：%s" % exc.why
     summ = release_summary(groups)
     doc = {"kind": "stage3-entry-release", "grid_center_base_mm": slot_mm,
-           "opens": opens, "dwells": dwells, "reps": int(args.reps),
+           "opens": opens, "dwells": dwells, "clearances": clearances,
+           "reps": int(args.reps),
            "confirm": int(args.confirm) if args.confirm else 0,
            "groups_raw": groups, "summary": summ, "stop_reason": stop}
     path = _dump(os.path.join(cdir, "summary.json"), doc)
@@ -1187,6 +1204,8 @@ def main(argv=None):
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--opens", default="50,70,95")
     ap.add_argument("--dwells", default="0,0.5")
+    ap.add_argument("--place-clearances", default=None,
+                    help="放置时块底离表面的间隙（mm，逗号分隔）；不给=5 mm 老行为")
     ap.add_argument("--confirm", type=int, default=10)
     ap.add_argument("--heights", default="1,3,5")
     ap.add_argument("--offsets", default="0,3,5,8")
