@@ -307,7 +307,7 @@ def circular_median_deg(angles):
 
 
 def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
-                legacy=False):
+                max_h_mm=70.0, legacy=False):
     """把「立在台面上的块」逐块量出来：顶面中心/高度/尺寸/yaw/颜色。
 
     与 ``find_blocks.py``（临时脚本）的区别：颜色取**顶面那 3 mm**的像素，
@@ -327,6 +327,8 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
       · 低处的桥接/台面噪声不进入顶面掩码，天然不会把两块粘在一起；
       · 低处（5 mm … min_h_mm）另做一遍，只作为 ``skipped_low`` 诊断，
         不参与抓取选块。
+    ``max_h_mm``：切顶面的高度上限（相对台面，毫米）。默认 70 mm 只容单块；
+    阶段 3 要把塔身整根容进来，传 220。
     ``legacy=True`` 保留旧算法，供 A3 对照；默认走新路径。
     """
     if legacy:
@@ -339,7 +341,9 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
     if table_z is None:
         table_z = table_plane_z(Pb)
 
-    m = (Pb[:, 2] > table_z + 0.005) & (Pb[:, 2] < table_z + 0.070)
+    # 高度上限：单块（阶段 2）用 70 mm 足够；塔顶要能把整根柱子容进来
+    # （5 层 ≈ 150 mm），阶段 3 传 max_h_mm=220。单位与 min_h_mm 一致，都是毫米。
+    m = (Pb[:, 2] > table_z + 0.005) & (Pb[:, 2] < table_z + max_h_mm / 1000.0)
     Q, qpix = Pb[m], pix[m]
     if len(Q) == 0:
         return [], table_z

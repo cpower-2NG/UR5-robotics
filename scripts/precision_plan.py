@@ -143,6 +143,17 @@ GUARD_SAMPLES = 8
 TABLE_PLANE_Z = 0.0
 MIN_BLOCK_GAP = 0.060
 
+# ---- 阶段 3（堆叠）用的几何常量
+# 相机（color optical）相对 tool0 的偏置（m，yaw 0）；出处见 SURVEY_TOOL0 的注释。
+STAGE3_CAMERA_OFFSET = (-0.0319, 0.0851, -0.0247)
+# 高度跟踪巡检位：**相机到塔顶**的距离恒定。默认值复现 stage2close 在垫上的距离
+# （tool0 387 − 相机下移 24.7 − 第 1 层顶 ~31.5 ≈ 331 mm）；入口在
+# {300, 331, 365} mm 三档实测后定档。固定 stage2high 不可用（顶面碎、yaw 不可信）。
+STAGE3_SURVEY_DEFAULT_D = 0.331
+STAGE3_SURVEY_SECOND_OFFSET = (0.040, 0.030)   # 第二位姿相对第一位姿的平移（m）
+TOWER_BOX_MARGIN = 0.002       # 塔体 box 半边长 = 块半边长 + 2 mm
+HELD_BLOCK_MARGIN = 0.002      # 持块包络再放的余量
+
 # 放置要不要按「抓取偏心」补：**默认不补**。
 # 2026-10-26 第 6 轮实测判决：抓取偏心预测 6.44 mm，但抓着块实际只偏 2.76 mm
 # （补偿后放置误差 7.07 mm，不补偿的话同一帧量出来会是 2.76 mm）—— 补了反而
@@ -253,6 +264,59 @@ def check_guard(chain, q0, q1, table_z=TABLE_PLANE_Z, margin=GUARD_MARGIN,
     if worst is not None and worst[2] < worst[3]:
         return False, worst
     return True, lowest
+
+
+def check_held_block(chain, q0, q1, half_edge, block_h, below_tip, box,
+                     off_xy=(0.0, 0.0), samples=GUARD_SAMPLES,
+                     margin=HELD_BLOCK_MARGIN):
+    """夹着的块沿关节段移动时，是否撞进**塔体 box**。
+
+    ``box = (x0, x1, y0, y1, z0, z1)``（base 系，米）。每个采样点用 FK 取 tool0：
+    块心 xy = tool0_xy + ``off_xy``（抓取偏心，已按放置 yaw 旋转），
+    块底 z = tool0_z − ``below_tip``（= 块高 − 抓取深度 + 裸指尖）。
+    水平用**外接圆** ``half_edge·√2 + margin`` 判，宁严勿松。
+
+    返回 ``(ok, worst)``；``worst = (t, "held_block@tower", clearance_m, 0.0)``，
+    clearance < 0 即侵入量。
+    """
+    q0 = np.asarray(q0, float)
+    q1 = np.asarray(q1, float)
+    r = float(half_edge) * np.sqrt(2.0) + margin
+    x0, x1b, y0, y1b, z0, z1b = [float(v) for v in box]
+    ox, oy = float(off_xy[0]), float(off_xy[1])
+    worst = None
+    for i in range(samples + 1):
+        q = q0 + (q1 - q0) * (i / samples)
+        T = chain.fk(dict(zip(chain.move_joints, q)))
+        cx, cy = float(T[0, 3]) + ox, float(T[1, 3]) + oy
+        zb = float(T[2, 3]) - float(below_tip)
+        zt = zb + float(block_h)
+        if zt <= z0 or zb >= z1b:
+            continue                      # 高度不重叠，水平再近也不算撞
+        dx = max(x0 - cx, 0.0, cx - x1b)
+        dy = max(y0 - cy, 0.0, cy - y1b)
+        clearance = float(np.hypot(dx, dy)) - r
+        rec = (i / samples, "held_block@tower", clearance, 0.0)
+        if worst is None or clearance < worst[2]:
+            worst = rec
+    if worst is not None and worst[2] < 0.0:
+        return False, worst
+    return True, worst
+
+
+def stage3_survey_tool0(top_z_m, tower_xy_m, distance=STAGE3_SURVEY_DEFAULT_D,
+                        second_offset=STAGE3_SURVEY_SECOND_OFFSET):
+    """阶段 3 的**高度跟踪**巡检位对（tool0，m）。
+
+    相机到**塔顶**的距离恒为 ``distance``：``tool0_z = top_z + 24.7 mm + distance``。
+    xy 让相机正对塔心；第二位姿再平移 ``second_offset``（换视点，防共模误差）。
+    """
+    dx, dy, dz = STAGE3_CAMERA_OFFSET
+    z = float(top_z_m) - dz + float(distance)
+    x = float(tower_xy_m[0]) - dx
+    y = float(tower_xy_m[1]) - dy
+    return [(x, y, z),
+            (x + second_offset[0], y + second_offset[1], z)]
 
 
 def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200):
@@ -393,7 +457,7 @@ def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
 
 
 def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
-               n_random=32, yaws=None):
+               n_random=32, yaws=None, guard=None):
     """给一串末端目标选**一条前后一致的 IK 分支链**（最小总关节行程）。
 
     `targets` 是 [(名字, xyz), ...]。``yaws`` 可选，逐点姿态角；缺省全用
@@ -408,11 +472,16 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
     if empty:
         raise PlanError("这些航点连一支合格 IK 解都没有：%s" % "、".join(empty))
 
+    def _guard(qa, qb):
+        if guard is not None:
+            return guard(qa, qb)
+        return check_guard(chain, qa, qb, table_z)
+
     INF = float("inf")
     cost = [[INF] * len(s) for s in sets]
     prev = [[None] * len(s) for s in sets]
     for j, q in enumerate(sets[0]):
-        ok, _ = check_guard(chain, q_start, q, table_z)
+        ok, _ = _guard(q_start, q)
         if ok:
             cost[0][j] = travel_cost(q, q_start)
     for i in range(1, len(sets)):
@@ -420,7 +489,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
             for k, qp in enumerate(sets[i - 1]):
                 if not np.isfinite(cost[i - 1][k]):
                     continue
-                ok, _ = check_guard(chain, qp, q, table_z)
+                ok, _ = _guard(qp, q)
                 if not ok:
                     continue
                 c = cost[i - 1][k] + travel_cost(q, qp)
@@ -441,7 +510,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
 
 
 def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
-             duration=None, before=None, after=None, q=None):
+             duration=None, before=None, after=None, q=None, guard=None):
     """解一个航点并跑单点预检，追加到 waypoints。返回该点的 q。
 
     ``q`` 已经解好（来自 `solve_path`）时直接用，只复核残差与各项预检。
@@ -467,7 +536,10 @@ def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
         raise PlanError("航点 %s 的 %s 在 %.1f°（上限 ±%.0f°）—— 这一支会把夹爪"
                         "线缆拧死；换一圈等价解（见 unwrap_near）"
                         % (name, wd[0], wd[1], float(np.degrees(MAX_WRIST_TURN))))
-    ok, worst = check_guard(chain, q_seed, q, table_z)
+    if guard is None:
+        ok, worst = check_guard(chain, q_seed, q, table_z)
+    else:
+        ok, worst = guard(q_seed, q)
     if not ok:
         raise PlanError("航点 %s 的段内高度护栏不过：t=%.2f 处 %s z=%.1f mm"
                         "（下限 %.1f mm）"
@@ -567,11 +639,30 @@ def place_heights(block_h_m, grasp_depth_m, table_z=TABLE_PLANE_Z,
     return place_z, place_z + gap
 
 
+def stage3_carry_z(block_h_m, surface_z_m, grasp_gap=0.05):
+    """阶段 3 的载运高度：**先高过塔顶放置接近点 50 mm，再横移**。
+
+    原 `lift_z = 块高 + 0.1757 + 0.15` 按台面算；第 5 层时它低于
+    `place_approach_z`，`to_slot` 会先在塔侧横移再上升 —— 正是持块包络
+    最可能撞塔的路径。这里取 `max(lift_z, place_approach_z + grasp_gap)`。
+    """
+    wz = float(block_h_m)
+    grasp_z = float(np.clip(wz + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE,
+                            GRASP_Z_MIN, GRASP_Z_MAX))
+    grasp_depth = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
+    _, place_approach = place_heights(wz, grasp_depth,
+                                      table_z=float(surface_z_m))
+    lift_z = wz + TOOL0_TO_FINGERTIP + LIFT_HEIGHT
+    return max(lift_z, place_approach + float(grasp_gap))
+
+
 def build_pick(chain, q_start, cand, block, blocks, slot,
                yaw_grasp_deg=0.0, yaw_place_deg=None, yaw_source="zero",
                pick_open_mm=None, place_open_mm=None, grasp_at="candidate",
                grip_speed_pct=None, release_speed_pct=None,
-               release_dwell_s=0.0):
+               release_dwell_s=0.0, surface_z=None, carry_z=None,
+               survey_tool0=None, tower_box=None, held_half_edge=0.020,
+               held_off_xy=None):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -599,6 +690,19 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
 
     抓取角先折 180°（`fold_yaw_180`）——见该函数的说明，这是**物理等价**，
     不是近似。
+
+    阶段 3（堆叠）的可选参数（默认全部不改变阶段 2 的计划）
+    ────────────────────────────────────────────────────
+    · ``surface_z``：放置表面高度（默认 `TABLE_PLANE_Z`）。第 1 层传垫面
+      （`grid.json` 的 `T_base_pad[2,3]`），第 k≥2 层传上一层实测顶面。
+    · ``carry_z``：载运高度。实际用 ``max(lift_z, carry_z)``——原 `lift_z`
+      按台面算，第 5 层时低于 `place_approach_z`，会先横移再上升。
+    · ``survey_tool0``：收尾巡检位（默认 `SURVEY_TOOL0["place"]`）。阶段 3 传
+      高度跟踪位姿对里的第一个。
+    · ``tower_box``：``(x0,x1,y0,y1,z0,z1)``（m，base 系）。给了就开**持块包络
+      撞塔**护栏：`check_guard` 之外再查夹着的块有没有进箱。
+    · ``held_half_edge`` / ``held_off_xy``：持块包络的半边长（块半宽 + 余量）
+      与块心相对 tool0 的 xy 偏置（已按放置 yaw 旋转）。
     """
     yaw_grasp_raw = float(yaw_grasp_deg)
     yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg)
@@ -634,14 +738,23 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     grasp_z = float(np.clip(wz + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE,
                             GRASP_Z_MIN, GRASP_Z_MAX))
     lift_z = wz + TOOL0_TO_FINGERTIP + LIFT_HEIGHT
+    # 阶段 3：载运高度必须先高过塔顶的放置接近点，否则 to_slot 会在塔侧横移。
+    lift_used = lift_z if carry_z is None else max(lift_z, float(carry_z))
     # 放置高度按**这一块**挂多长算（旧代码写死 0.2142，等于把 A1 的 28.5 mm 块高
     # 编进常量里；29.6 mm 的块会压进台面 1.1 mm）。
     grasp_depth_m = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
-    place_z, place_approach_z = place_heights(wz, grasp_depth_m)
+    table_z = TABLE_PLANE_Z if surface_z is None else float(surface_z)
+    place_z, place_approach_z = place_heights(wz, grasp_depth_m, table_z=table_z)
     # 抓取偏心（块心估计 − 抓点）。默认**不**拿它补放置目标：第 6 轮实测
     # 这块实际只偏 2.76 mm，补了反而多偏 4.3 mm（详见 PLACE_COMPENSATE_ECC）。
     # 量出来写进 meta，下一轮可以直接对账「夹持偏移 vs 抓取偏心」。
     ex, ey = block["cx"] / 1000.0 - gx, block["cy"] / 1000.0 - gy
+    if held_off_xy is None:
+        # 持块包络要用「放置那一刻」块心相对 tool0 的偏置：抓取时的 (ex, ey)
+        # 随夹着块转腕一起转，转角 = yaw_place − yaw_grasp。
+        dyaw = np.radians(float(yaw_place) - float(yaw_grasp_deg))
+        held_off_xy = (ex * np.cos(dyaw) - ey * np.sin(dyaw),
+                       ex * np.sin(dyaw) + ey * np.cos(dyaw))
     if PLACE_COMPENSATE_ECC:
         sx, sy = slot[0] - ex, slot[1] - ey
     else:
@@ -655,6 +768,25 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     if cand["dist_mm"] > 12.0:
         raise PlanError("候选离块心 %.1f mm，超过 12 mm 锚定半径" % cand["dist_mm"])
 
+    # 阶段 3：夹着的块也要算碰撞（原 check_guard 只查肘/腕/裸指尖）。
+    guard = None
+    if tower_box is not None:
+        # 块底相对 tool0 的距离：裸指尖 204.2 mm + 夹持深度。
+        # 少了裸指尖这一项，块会被当成贴在法兰下，塔体护栏等于没开。
+        below_tip = wz - grasp_depth_m + TOOL0_TO_BARE_FINGERTIP
+
+        def guard(qa, qb, _below=below_tip):
+            ok, worst = check_guard(chain, qa, qb, TABLE_PLANE_Z)
+            if not ok:
+                return False, worst
+            ok2, w2 = check_held_block(chain, qa, qb, held_half_edge, wz,
+                                       _below, tower_box, held_off_xy)
+            if not ok2:
+                return False, w2
+            return True, worst
+
+    survey_xyz = (SURVEY_TOOL0["place"] if survey_tool0 is None
+                  else tuple(survey_tool0))
     wps, checks = [], []
     specs = [
         ("approach", (gx, gy, approach_z), yaw_grasp_deg, None,
@@ -662,21 +794,22 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
         ("grasp", (gx, gy, grasp_z), yaw_grasp_deg,
          _with_speed({"gripper": "close", "readback": True},
                      grip_speed_pct), None),
-        ("lift", (gx, gy, lift_z), yaw_grasp_deg, {"gripper": "readback"}, None),
-        ("to_slot", (sx, sy, lift_z), yaw_place, None, None),
+        ("lift", (gx, gy, lift_used), yaw_grasp_deg, {"gripper": "readback"},
+         None),
+        ("to_slot", (sx, sy, lift_used), yaw_place, None, None),
         ("place_approach", (sx, sy, place_approach_z), yaw_place, None, None),
         ("place", (sx, sy, place_z), yaw_place,
          _with_speed(_open_action(place_open_mm), release_speed_pct), None),
         ("retreat", (sx, sy, place_approach_z), yaw_place, None, None),
-        ("survey_place", SURVEY_TOOL0["place"], 0.0, None, None),
+        ("survey_place", survey_xyz, 0.0, None, None),
     ]
     # 整链选一条分支（见 solve_path 的注释：逐点就近会挑到下一段过不了护栏的解）
     qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
-                       yaws=[y for _, _, y, _, _ in specs])
+                       yaws=[y for _, _, y, _, _ in specs], guard=guard)
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
         q, c = add_move(wps, chain, name, xyz, q, yaw, TABLE_PLANE_Z,
-                        after=after, before=before, q=q_solved)
+                        after=after, before=before, q=q_solved, guard=guard)
         checks.append(c)
     # 松手后停在原地等块落稳，再撤（`retreat` 是下一条）。挂在 `place` 上而不是
     # 全局 `--settle`：`--settle` 每条航点都睡，那是时间，不是物理动作。
@@ -708,6 +841,11 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             "place_target_mm": [round(sx * 1000, 2), round(sy * 1000, 2)],
             "grasp_z": round(grasp_z, 4),
             "approach_z": round(approach_z, 4), "lift_z": round(lift_z, 4),
+            "carry_z": round(lift_used, 4),
+            "surface_z_mm": round(table_z * 1000.0, 2),
+            "tower_box": ([round(float(v), 4) for v in tower_box]
+                          if tower_box is not None else None),
+            "survey_tool0": [round(float(v), 4) for v in survey_xyz],
             "cand_score": round(cand["score"], 4),
             "cand_width_mm": round(cand["width_mm"], 2),
             "cand_dist_mm": round(cand["dist_mm"], 2),
@@ -719,6 +857,36 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             "yaw_source": yaw_source,
             "pick_open_mm": pick_open_mm, "place_open_mm": place_open_mm,
             "slot": list(slot), "block_gap_mm": round(gap * 1000, 1) if gap else None}
+    return wps, checks, meta
+
+
+def build_stack(chain, q_start, cand, block, blocks, slot, surface_z,
+                tower_xy_mm=None, tower_top_mm=None, survey_tool0=None,
+                carry_z=None, tower_half_edge=0.020, **kwargs):
+    """阶段 3 的一层：抓一块 → 放到塔顶。`build_pick` 的阶段 3 封装。
+
+    ``surface_z``：本层放置表面（m，base 系）。第 1 层 = 垫面，第 k≥2 层 =
+    上一层实测顶面（已过 z 偏差校正）。
+
+    ``tower_xy_mm`` / ``tower_top_mm``：**上一层（本层放置前）实测**的塔顶中心
+    与顶高（mm）。给了就构造塔体 box、开「持块包络撞塔」护栏；第 1 层传 None。
+
+    ``survey_tool0``：收尾巡检位（通常取 `stage3_survey_tool0(...)[0]`）；
+    其余参数透传 `build_pick`。
+    """
+    tower_box = None
+    if tower_xy_mm is not None and tower_top_mm is not None:
+        cx = float(tower_xy_mm[0]) / 1000.0
+        cy = float(tower_xy_mm[1]) / 1000.0
+        half = float(tower_half_edge) + TOWER_BOX_MARGIN
+        tower_box = (cx - half, cx + half, cy - half, cy + half,
+                     0.0, float(tower_top_mm) / 1000.0)
+    wps, checks, meta = build_pick(
+        chain, q_start, cand, block, blocks, slot,
+        surface_z=surface_z, carry_z=carry_z, survey_tool0=survey_tool0,
+        tower_box=tower_box, held_half_edge=tower_half_edge, **kwargs)
+    meta["kind"] = "stack"
+    meta["layer_surface_mm"] = round(float(surface_z) * 1000.0, 2)
     return wps, checks, meta
 
 
