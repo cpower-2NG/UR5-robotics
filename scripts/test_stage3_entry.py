@@ -182,6 +182,78 @@ def test_release_row_offsets():
     assert row["dz_mm"] == -1.5
 
 
+# ---------------------------------------------------------------- 前置闸门
+@case
+def test_layer_height_check():
+    """人手摆的高度：差在容差内才算对，正负都要给出来。"""
+    ok, d = e.layer_height_check(2.0 + 29.5 + 1.3, 2.0 + 29.5)
+    assert ok is True and d == 1.3, (ok, d)
+    ok, d = e.layer_height_check(2.0 + 2 * 29.5 - 0.9, 2.0 + 2 * 29.5)
+    assert ok is True and d == -0.9, (ok, d)
+    # 漏一层（29.5 mm）必被拦
+    ok, d = e.layer_height_check(2.0 + 29.5, 2.0 + 2 * 29.5)
+    assert ok is False and d == -29.5, (ok, d)
+    # 半块高 14.75 也要拦（容差 12）
+    assert e.layer_height_check(2.0 + 29.5 + 14.75, 2.0 + 29.5)[0] is False
+
+
+@case
+def test_tower_occupancy_verdict():
+    """塔位空着返回 None；有块返回带格号的一句话。"""
+    assert e.tower_occupancy_verdict({"found": False}) is None
+    assert e.tower_occupancy_verdict({}) is None
+    msg = e.tower_occupancy_verdict(
+        {"found": True, "top_mm": 31.8, "center_base_mm": [422.7, -114.9]}, 4)
+    assert "格 4" in msg and "31.8" in msg, msg
+
+
+@case
+def test_clear_tower_step_skips_first_placement():
+    """第一次放置前不让人搬（塔位本来就该是空的），之后**每次**都要。"""
+    import types
+    calls = []
+    orig_ask, orig_clear = e.ask, e.tower_clear_now
+    e.ask = lambda text: calls.append(("ask", text))
+    e.tower_clear_now = lambda *a, **k: calls.append(("clear", k.get("cell_idx")))
+    args = types.SimpleNamespace(tower_cell_idx=4)
+    try:
+        e.clear_tower_step(args, None, None, None, "/tmp", "t", None, None,
+                           placed=False)
+        assert calls == [], calls
+        e.clear_tower_step(args, None, None, None, "/tmp", "t", None, None,
+                           placed=True)
+        assert [c[0] for c in calls] == ["ask", "clear"], calls
+        assert calls[1][1] == 4, calls
+    finally:
+        e.ask, e.tower_clear_now = orig_ask, orig_clear
+
+
+@case
+def test_pick_item_converts_runtime_error():
+    """拾取区没块 ⇒ EntryStop，不是 traceback。"""
+    import types
+    orig = s3r.build_items
+    s3r.build_items = lambda *a, **k: (_ for _ in ()).throw(
+        RuntimeError("候选池只够 0 块（要 1）"))
+    args = types.SimpleNamespace(arm="geometric")
+    try:
+        try:
+            e.pick_item(args, {}, {"pick_zone": []}, {})
+        except e.EntryStop as exc:
+            assert "拾取区没有可用块" in exc.why, exc.why
+            assert exc.rc == 2
+        else:
+            raise AssertionError("没有转成 EntryStop")
+    finally:
+        s3r.build_items = orig
+    # 正常路径原样返回
+    s3r.build_items = lambda *a, **k: [{"block_idx": 3}]
+    try:
+        assert e.pick_item(args, {}, {}, {})[0]["block_idx"] == 3
+    finally:
+        s3r.build_items = orig
+
+
 # ---------------------------------------------------------------- 协议
 @case
 def test_protocol_non_empty_for_all_modes():
