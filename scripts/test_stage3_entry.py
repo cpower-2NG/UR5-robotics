@@ -494,9 +494,10 @@ def test_pick_item_converts_runtime_error():
     s3r.build_items = lambda *a, **k: (_ for _ in ()).throw(
         RuntimeError("候选池只够 0 块（要 1）"))
     args = types.SimpleNamespace(arm="geometric")
+    empty = {"blocks": [], "per_block": []}
     try:
         try:
-            e.pick_item(args, {}, {"pick_zone": []}, {})
+            e.pick_item(args, empty, {"pick_zone": []}, {})
         except e.EntryStop as exc:
             assert "拾取区没有可用块" in exc.why, exc.why
             assert exc.rc == 2
@@ -505,9 +506,46 @@ def test_pick_item_converts_runtime_error():
     finally:
         s3r.build_items = orig
     # 正常路径原样返回
-    s3r.build_items = lambda *a, **k: [{"block_idx": 3}]
+    one = {"idx": 3, "cx": 400.0, "cy": 300.0}
+    s3r.build_items = lambda *a, **k: [{"block_idx": 3, "block": one}]
     try:
-        assert e.pick_item(args, {}, {}, {})[0]["block_idx"] == 3
+        got = e.pick_item(args, {"blocks": [one], "per_block": []},
+                          {"pick_zone": []}, {})
+        assert got[0]["block_idx"] == 3, got
+    finally:
+        s3r.build_items = orig
+
+
+@case
+def test_pick_item_skips_crowded_block():
+    """第一选被邻距护栏拒掉时换下一块；全挤在一起就干净停机。"""
+    blocks = [{"idx": 0, "cx": 400.0, "cy": 300.0},
+              {"idx": 1, "cx": 450.0, "cy": 300.0},     # 与 #0 只隔 50 mm
+              {"idx": 2, "cx": 500.0, "cy": 400.0}]     # 离两者都 >100 mm
+    analysis = {"blocks": blocks, "per_block": [
+        {"block_idx": 0, "class": "a", "best": {}, "dist_mm": 1.0},
+        {"block_idx": 1, "class": "b", "best": {}, "dist_mm": 2.0},
+        {"block_idx": 2, "class": "c", "best": {}, "dist_mm": 3.0}]}
+    scene = {"pick_zone": [0.25, 0.575, 0.17, 0.42]}
+    args = types.SimpleNamespace(arm="geometric")
+    orig = s3r.build_items
+    try:
+        s3r.build_items = lambda *a, **k: [{"block_idx": b["idx"], "block": b}
+                                           for b in blocks]
+        got = e.pick_item(args, analysis, scene, {})
+        assert got[0]["block_idx"] == 2, got       # 跳过挤在一起的前两块
+        # 全挤在一起 ⇒ EntryStop（不是把 PlanError 抛到顶）
+        s3r.build_items = lambda *a, **k: [{"block_idx": 0, "block": blocks[0]},
+                                           {"block_idx": 1, "block": blocks[1]}]
+        try:
+            e.pick_item(args, {"blocks": blocks[:2], "per_block": [
+                {"block_idx": 0, "class": "a", "best": {}, "dist_mm": 1.0},
+                {"block_idx": 1, "class": "b", "best": {}, "dist_mm": 2.0}]},
+                scene, {})
+        except e.EntryStop as exc:
+            assert "挤在一起" in exc.why, exc.why
+        else:
+            raise AssertionError("全挤在一起却没停")
     finally:
         s3r.build_items = orig
 

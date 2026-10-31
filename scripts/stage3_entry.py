@@ -337,11 +337,31 @@ def tower_clear_now(board, scene, cdir, tag, grid, window_xy_mm,
 
 
 def pick_item(args, analysis, scene, zcal, n=1):
-    """拾取帧 → 要抓的块；候选不够时转成 ``EntryStop``（不是 traceback）。"""
+    """拾取帧 → 要抓的块；候选不够 / 太挤时转成 ``EntryStop``（不是 traceback）。
+
+    顺序仍是「候选离块心最近」优先，但**跳过夹爪全开放不下的块**
+    （邻块中心距 < ``MIN_BLOCK_GAP``）。2026-10-31 实测：回位块落点比计划偏几毫米，
+    邻距从 60 缩到 59.2 mm；选到它就 PlanError，整条 40 次的扫参还没开始就废掉。
+    """
     try:
-        return s3r.build_items(analysis, scene, n, arm=args.arm, zcal=zcal)
+        pool = s2.candidate_pool(analysis, scene["pick_zone"])
+        usable = [x for x in pool
+                  if x["p"].get("class") not in (None, "", "unknown")]
+        items = s3r.build_items(analysis, scene, max(1, len(usable)),
+                                arm=args.arm, zcal=zcal)
     except RuntimeError as exc:
         raise EntryStop("拾取区没有可用块：%s" % exc)
+    ok = []
+    for it in items:
+        gap = pp.check_block_gap(it["block"], analysis.get("blocks", []))
+        if gap is None or gap >= pp.MIN_BLOCK_GAP:
+            ok.append(it)
+            if len(ok) >= n:
+                return ok
+    if not ok:
+        raise EntryStop("拾取区的块都挤在一起（最近邻 < %.0f mm）—— 挪开一块再跑"
+                        % (pp.MIN_BLOCK_GAP * 1000.0))
+    return ok
 
 
 #: `measure_pair` 里 `go_move` 要 URDF；由 `main` 设一次。
@@ -510,10 +530,13 @@ def place_one(args, board, chain, scene, grid, analysis, item, slot_mm,
     q_start = s2.chain_q(js)
     surface_m = float(surface_mm) / 1000.0
     carry_z = pp.stage3_carry_z(item["block_h_used_mm"] / 1000.0, surface_m)
-    plan = s3r.layer_plan(chain, q_start, item, analysis["blocks"],
-                          [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0],
-                          surface_m, survey_tool0=pair[0], carry_z=carry_z,
-                          scene=scene, **plan_kwargs)
+    try:
+        plan = s3r.layer_plan(chain, q_start, item, analysis["blocks"],
+                              [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0],
+                              surface_m, survey_tool0=pair[0], carry_z=carry_z,
+                              scene=scene, **plan_kwargs)
+    except pp.PlanError as exc:
+        raise EntryStop("计划期护栏拒绝（未动臂）：%s" % exc)
     plan_path = s3r.write_plan(os.path.join(cdir, "plan-%s.json" % tag), plan)
     rc = board.exec_plan(plan_path, os.path.join(cdir, "log-%s.jsonl" % tag),
                          go=True, **exec_kwargs)
@@ -581,13 +604,16 @@ def return_to_pick(args, board, chain, scene, cdir, tag, grid, slot_mm,
     q_start = s2.chain_q(js)
     carry_z = pp.stage3_carry_z(item["block_h_used_mm"] / 1000.0,
                                 pp.TABLE_PLANE_Z)
-    plan = s3r.layer_plan(chain, q_start, item, analysis["blocks"],
-                          [spot["xy_mm"][0] / 1000.0,
-                           spot["xy_mm"][1] / 1000.0],
-                          pp.TABLE_PLANE_Z, survey_tool0=pair[0],
-                          carry_z=carry_z, scene=scene,
-                          release_dwell_s=0.0,
-                          tower_half_edge=args.tower_half_edge)
+    try:
+        plan = s3r.layer_plan(chain, q_start, item, analysis["blocks"],
+                              [spot["xy_mm"][0] / 1000.0,
+                               spot["xy_mm"][1] / 1000.0],
+                              pp.TABLE_PLANE_Z, survey_tool0=pair[0],
+                              carry_z=carry_z, scene=scene,
+                              release_dwell_s=0.0,
+                              tower_half_edge=args.tower_half_edge)
+    except pp.PlanError as exc:
+        raise EntryStop("回位计划被护栏拒绝（未动臂）：%s" % exc)
     plan_path = s3r.write_plan(os.path.join(cdir, "plan-%s.json" % tag), plan)
     rec = {"tag": tag, "kind": "return",
            "spot_mm": spot["xy_mm"], "spot_gap_mm": spot["gap_mm"],
