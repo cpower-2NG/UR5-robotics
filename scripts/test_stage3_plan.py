@@ -208,6 +208,78 @@ def test_one_to_five_layers_plan(chain):
 
 
 @case
+def test_return_to_pick_plan_solves(chain):
+    """**拆塔**那条计划能解：塔上抓（h = 垫 + 块高）→ 拾取区台面放。
+
+    与叠塔是镜像：抓取 ``wz`` 多一个「垫 + 一块」，放置表面回到台面。
+    这里管的是**运动学可解 + 高度算式**；``h`` 扣没扣 z 标定由
+    ``test_stage3_entry.test_tower_block_item_uses_corrected_top`` 管。
+    """
+    import stage3_entry as se
+    merged = {"top_mm": (PAD_Z + H_BLK) * 1000.0 + 1.28,
+              "center_base_mm": list(SLOT_MM), "yaw_deg": 8.0,
+              "yaw_trusted": True}
+    item = se.tower_block_item(merged, {"yaw_sign": 1.0,
+                                        "finger_axis_delta_deg": 0.0,
+                                        "grasp_at": "block_center"},
+                               {"tower": 1.28})
+    wz = PAD_Z + H_BLK
+    assert_close(item["block_h_used_mm"], wz * 1000.0, 1e-6, "塔上块 h")
+
+    blocks, _cand, q0 = scene(chain)
+    spot = (0.34, 0.28)
+    pair = pp.stage3_survey_tool0(merged["top_mm"] / 1000.0,
+                                  (SLOT_MM[0] / 1000.0, SLOT_MM[1] / 1000.0))
+    carry = pp.stage3_carry_z(item["block_h_used_mm"] / 1000.0,
+                              pp.TABLE_PLANE_Z)
+    wps, checks, meta = pp.build_stack(
+        chain, q0, item["cand"], dict(item["block"]), blocks, spot,
+        pp.TABLE_PLANE_Z, survey_tool0=pair[0], carry_z=carry,
+        yaw_grasp_deg=item["yaw_grasp_deg"],
+        yaw_place_deg=item["yaw_place_deg"],
+        yaw_source=item["yaw_source"],
+        pick_open_mm=50.0, place_open_mm=50.0)
+    assert [w["name"] for w in wps] == [
+        "approach", "grasp", "lift", "to_slot", "place_approach",
+        "place", "retreat", "survey_place"], [w["name"] for w in wps]
+    assert len(checks) == len(wps)
+    assert meta["tower_box"] is None, "抓塔上那块时不该把塔当障碍（它就是目标）"
+
+    # 抓取高度：wz 整块抬高，不触发 GRASP_Z_MAX 的夹逼
+    grasp_z = wz + pp.TOOL0_TO_FINGERTIP + pp.GRASP_CLEARANCE
+    assert grasp_z < pp.GRASP_Z_MAX, "抓取高度被夹逼了（%.4f）" % grasp_z
+    assert_close(meta["grasp_z"], grasp_z, 1e-9, "grasp_z")
+    grasp_depth = wz - (grasp_z - pp.TOOL0_TO_BARE_FINGERTIP)
+    place_z = (pp.TOOL0_TO_BARE_FINGERTIP + pp.TABLE_PLANE_Z
+               + (wz - grasp_depth) + pp.PLACE_CLEARANCE)
+    assert_close(meta["place_z"], place_z, 1e-9, "place_z")
+    assert_close(meta["place_z"] - meta["place_approach_z"],
+                 -pp.PLACE_APPROACH_GAP, 1e-12)
+
+    by = {w["name"]: w for w in wps}
+    gx, gy = meta["grasp_point"]
+    sx, sy = [v / 1000.0 for v in meta["place_target_mm"]]
+    assert_close(sx, spot[0], 1e-4, "放回点 x")
+    # 抓取段用折过 180° 的抓取角（build_pick 里 fold_yaw_180），放置段用放置角
+    yg_f = pp.fold_yaw_180(item["yaw_grasp_deg"])
+    yp = float(item["yaw_place_deg"])
+    for n, xyz, yw in (
+            ("approach", (gx, gy, meta["approach_z"]), yg_f),
+            ("grasp", (gx, gy, meta["grasp_z"]), yg_f),
+            ("lift", (gx, gy, meta["carry_z"]), yg_f),
+            ("to_slot", (sx, sy, meta["carry_z"]), yp),
+            ("place_approach", (sx, sy, meta["place_approach_z"]), yp),
+            ("place", (sx, sy, meta["place_z"]), yp),
+            ("retreat", (sx, sy, meta["place_approach_z"]), yp)):
+        pe, re = pp.pose_residual(chain, by[n]["q"], xyz, yw)
+        assert pe < 0.1 and re < 0.05, \
+            "回位 %s 残差 %.3f mm / %.4f°" % (n, pe, re)
+    # 收尾巡检位在塔上方（= 回核塔位那一帧）
+    pe, re = pp.pose_residual(chain, by["survey_place"]["q"], pair[0], 0.0)
+    assert pe < 0.1 and re < 0.05, "回位收尾巡检位残差 %.3f mm" % pe
+
+
+@case
 def test_carry_height_mutation_would_be_caught(chain):
     """变异哨：把载运高度降回 lift_z，to_slot 就会低于放置接近点。"""
     blocks, cand, q0 = scene(chain)

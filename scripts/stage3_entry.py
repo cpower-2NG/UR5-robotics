@@ -61,6 +61,14 @@ TOWER_CLEAR_RADIUS_MM = 40.0
 #: 半块高 14.75 mm，取 12 mm：漏一层（29.5）必被拦，读数偏差 +1~2 mm 不拦。
 TOWER_HEIGHT_TOL_MM = 12.0
 
+#: **机器人自己回位**（拆塔）时，回位块离拾取区已有块中心的最小距离 ——
+#: 与场景里块间距同一口径（`precision_plan.MIN_BLOCK_GAP` = 60 mm）。
+PICK_RETURN_GAP_MM = 60.0
+#: 回位块中心离拾取区边界的最小余量（块心，不是块边；`in_zone` 也按块心算）。
+PICK_RETURN_MARGIN_MM = 25.0
+#: 塔上那块在计划里的伪块序号 —— 拾取区的真 idx 从 0 起，−1 不会撞。
+TOWER_BLOCK_IDX = -1
+
 
 class EntryStop(Exception):
     """某一步判红：停住，不续跑。``rc`` 直接当退出码。"""
@@ -359,6 +367,111 @@ def pick_bias_of(analysis, item):
     return None, None
 
 
+def load_rows(cdir):
+    """``--resume``：把已跑完的 ``<tag>/row.json`` 读回来（按 rep 排序）。
+
+    只收 ``rep`` 是整数的条目；坏文件跳过并留一句 —— 续跑宁可少一条让人补跑，
+    也不要半条脏数据混进 z 标定 / 释放统计。
+    """
+    rows = []
+    if not os.path.isdir(cdir):
+        return rows
+    for name in sorted(os.listdir(cdir)):
+        path = os.path.join(cdir, name, "row.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            row = json.load(open(path))
+        except ValueError:
+            print("  续跑：跳过坏文件 %s" % path)
+            continue
+        if isinstance(row, dict) and isinstance(row.get("rep"), int):
+            rows.append(row)
+    rows.sort(key=lambda x: x["rep"])
+    return rows
+
+
+def free_slot_mm(blocks, zone_m, gap_mm=PICK_RETURN_GAP_MM,
+                 margin_mm=PICK_RETURN_MARGIN_MM, step_mm=5.0):
+    """拾取区里给「回位的块」找一个空位（格点搜索，纯逻辑）。
+
+    ``zone_m`` = ``[x0, x1, y0, y1]``（**米**，base 系，同 ``scene["pick_zone"]``）。
+    合格 = 离**每个**已有块中心 ≥ ``gap_mm``、离区边 ≥ ``margin_mm``；
+    合格点里取**离区心最近**的（同分取离块更远者）—— 回位块尽量靠中间，
+    不往边界角上堆，也不贴着要抓的那块。
+
+    返回 ``{"xy_mm": [x, y], "gap_mm": 最近块距, "edge_mm": 离边最近}``；
+    一个合格点都没有就返回 ``None`` —— 调用方 fail-closed，不硬塞。
+    """
+    x0, x1, y0, y1 = [float(v) * 1000.0 for v in zone_m]
+    pts = [(float(b["cx"]), float(b["cy"])) for b in (blocks or [])]
+    mid_x, mid_y = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    lo_x, hi_x = x0 + float(margin_mm), x1 - float(margin_mm)
+    lo_y, hi_y = y0 + float(margin_mm), y1 - float(margin_mm)
+    if lo_x > hi_x or lo_y > hi_y:
+        return None
+    best, best_key = None, None
+    y = lo_y
+    while y <= hi_y + 1e-6:
+        x = lo_x
+        while x <= hi_x + 1e-6:
+            gap = (min(math.hypot(x - px, y - py) for px, py in pts)
+                   if pts else float("inf"))
+            edge = min(x - x0, x1 - x, y - y0, y1 - y)
+            if gap >= float(gap_mm) and edge >= float(margin_mm):
+                key = (round(math.hypot(x - mid_x, y - mid_y), 3), -gap)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best = {"xy_mm": [round(x, 2), round(y, 2)],
+                            "gap_mm": (None if gap == float("inf")
+                                       else round(gap, 2)),
+                            "edge_mm": round(edge, 2)}
+            x += float(step_mm)
+        y += float(step_mm)
+    return best
+
+
+def tower_block_item(merged, scene, zcal, arm="geometric"):
+    """把「塔上那块」的实测值包装成 ``build_items`` 同款的 item（拆塔用）。
+
+    ``merged`` = 上一轮塔顶的融合测量（``measure_pair(...)["merged"]``）。
+    中心 / yaw 直接用；``h`` 用 ``顶高 − z 标定(tower)`` —— ``build_pick``
+    的抓取高度整个锚在**台面**（``TABLE_PLANE_Z``），塔上的块只是 ``wz``
+    比台面上的块大了一个块高（垫 + 29.5）。
+
+    yaw 只有 ``yaw_rect`` 一个来源（没有像素最小外接矩形），按几何臂的
+    ``sign·θ + δ`` 走；量不到 yaw 时 ``yaw_for_arm`` 会返回 0 并标
+    ``geometric_missing`` —— 半开 50 mm 仍容得下 30 mm 方块的对角，不换全开。
+    """
+    scene = scene or {}
+    cx, cy = [float(v) for v in merged["center_base_mm"]]
+    h_mm = float(merged["top_mm"]) - float((zcal or {}).get("tower", 0.0))
+    yaw = merged.get("yaw_deg")
+    block = {"idx": TOWER_BLOCK_IDX, "cx": cx, "cy": cy,
+             "top": h_mm, "h": h_mm,
+             "yaw_pix": None, "yaw_rect": yaw,
+             # ``yaw_for_arm`` 只在**这条**为 False 时标 untrusted
+             "yaw_pix_trusted": bool(merged.get("yaw_trusted", True)),
+             "class": merged.get("class")}
+    cand = {"xyz_base": [cx / 1000.0, cy / 1000.0, h_mm / 1000.0],
+            "dist_mm": 0.0,               # 块心就是候选点（grasp_at=块心）
+            "angle_deg": 0.0 if yaw is None else float(yaw),
+            "score": 1.0,
+            # 只进计划 meta（开合宽度由 scene 的 pick/place_open_mm 定），
+            # 塔上那块没有 GraspNet 候选宽度可读，给标称值。
+            "width_mm": 30.0}
+    yg, yp, src, why = s2.yaw_for_arm(arm, block, cand, scene)
+    return {"order": 1, "block_idx": TOWER_BLOCK_IDX,
+            "class": merged.get("class"), "arm": arm,
+            "block": block, "cand": cand,
+            "grasp_at": scene.get("grasp_at", "block_center"),
+            "block_h_raw_mm": round(h_mm, 3),
+            "block_h_used_mm": round(h_mm, 3),
+            "yaw_grasp_deg": round(float(yg), 3),
+            "yaw_place_deg": round(float(yp), 3),
+            "yaw_source": src, "yaw_note": why}
+
+
 def place_one(args, board, chain, scene, grid, analysis, item, slot_mm,
               surface_mm, cdir, tag, survey_top_mm=None, view_xy_mm=None,
               z_bias_mm=0.0, plan_kwargs=None, exec_kwargs=None):
@@ -421,19 +534,90 @@ def finish_plan(board, cdir, tag, plan_path, after):
     return rc, nxt
 
 
+def return_to_pick(args, board, chain, scene, cdir, tag, grid, slot_mm,
+                   merged, zcal, rdir=None):
+    """**机器人自己**把塔上那块抓下来、放回拾取区空位，再回核塔位清空。
+
+    这是「拆塔」的最小形态，不引入新传感器：
+    · 抓哪儿 = 上一轮塔顶实测（中心 / yaw / 顶高），``tower_block_item`` 包装；
+    · 放哪儿 = **新抓一帧**拾取区，``free_slot_mm`` 选空位；
+    · 收尾 = 计划的巡检位就设在塔上方，跑完**原地**``tower_clear_now`` 核空。
+
+    计划从**当前实测关节角**起（刚在拾取巡检位抓完帧），一条计划走完
+    「拾取位 → 塔上方抓块 → 抬到载运高 → 拾取区空位放下 → 回塔上方」。
+    """
+    rdir = rdir or cdir
+    os.makedirs(rdir, exist_ok=True)
+    frame_dir, extras = capture_pick(args, board, scene, rdir, tag + "-rp")
+    analysis = analyse_pick(frame_dir, extras, rdir)
+    spot = free_slot_mm(analysis["blocks"], scene["pick_zone"])
+    if spot is None:
+        raise EntryStop("拾取区放不下回位的块：没有离块 ≥%.0f mm、离边 ≥%.0f mm "
+                        "的空位（先把块挪一挪再续跑）"
+                        % (PICK_RETURN_GAP_MM, PICK_RETURN_MARGIN_MM))
+    item = tower_block_item(merged, scene, zcal, arm="geometric")
+    pair = _survey_pair(merged["top_mm"], merged["center_base_mm"], args.d_mm)
+    js = board.joints(os.path.join(cdir, "joints-%s" % tag))
+    q_start = s2.chain_q(js)
+    carry_z = pp.stage3_carry_z(item["block_h_used_mm"] / 1000.0,
+                                pp.TABLE_PLANE_Z)
+    plan = s3r.layer_plan(chain, q_start, item, analysis["blocks"],
+                          [spot["xy_mm"][0] / 1000.0,
+                           spot["xy_mm"][1] / 1000.0],
+                          pp.TABLE_PLANE_Z, survey_tool0=pair[0],
+                          carry_z=carry_z, scene=scene,
+                          release_dwell_s=0.0,
+                          tower_half_edge=args.tower_half_edge)
+    plan_path = s3r.write_plan(os.path.join(cdir, "plan-%s.json" % tag), plan)
+    rec = {"tag": tag, "kind": "return",
+           "spot_mm": spot["xy_mm"], "spot_gap_mm": spot["gap_mm"],
+           "spot_edge_mm": spot["edge_mm"],
+           "tower_top_mm": merged["top_mm"],
+           "tower_center_mm": merged["center_base_mm"],
+           "yaw_grasp_deg": item["yaw_grasp_deg"],
+           "yaw_source": item["yaw_source"],
+           "predicted_place_mm": [
+               round(v * 1000.0, 2)
+               for v in s3r.predicted_place(
+                   item, [spot["xy_mm"][0] / 1000.0,
+                          spot["xy_mm"][1] / 1000.0])[0]],
+           "plan": os.path.basename(plan_path)}
+    rc = board.exec_plan(plan_path, os.path.join(cdir, "log-%s.jsonl" % tag),
+                         go=True)
+    rec["exec_rc"] = rc
+    _dump(os.path.join(cdir, "return-%s.json" % tag), rec)
+    if rc != 0:
+        raise EntryStop("回位执行判红（rc=%d）—— 停在原地不续跑；"
+                        "块可能还在爪里或半放，先看示教器再决定"
+                        % rc, rc)
+    print("  回位：塔上那块 → 拾取区 %s（离最近块 %s mm，离边 %s mm，yaw %s）"
+          % (spot["xy_mm"], spot["gap_mm"], spot["edge_mm"],
+             item["yaw_source"]))
+    tower_clear_now(board, scene, cdir, tag + "-clear", grid, slot_mm,
+                    cell_idx=args.tower_cell_idx)
+    return rec
+
+
 # ---------------------------------------------------------------- 模式
 def clear_tower_step(args, board, chain, scene, cdir, tag, grid, slot_mm,
-                     placed):
-    """「人把上一块拿走」+ **就地核一次**（不动臂）。
+                     placed, merged=None, zcal=None, rdir=None):
+    """每一轮放置前：把塔上那块清掉，并**就地核一次**塔位空了。
 
-    每次放置前都走一遍（第一次除外）。光靠人回一句「清空了」不算数：
-    ``tower_clear_now`` 在当前位姿抓帧，量到东西就停。
+    默认**机器人自己回位**（``return_to_pick``）——纯测试性的往返不该压给人。
+    ``--no-self-return`` 退回人手动拿：``ask`` 一句 + ``tower_clear_now``。
+    ``merged`` 缺（老调用/数据不全）时也退回人手动，并在日志里写明原因。
     """
     if not placed:
         return None
-    ask("把这块从塔位拿走，放回拾取区；确认塔位清空")
-    return tower_clear_now(board, scene, cdir, tag + "-clear", grid, slot_mm,
-                           cell_idx=args.tower_cell_idx)
+    if getattr(args, "no_self_return", False):
+        ask("把这块从塔位拿走，放回拾取区；确认塔位清空")
+        return tower_clear_now(board, scene, cdir, tag + "-clear", grid,
+                               slot_mm, cell_idx=args.tower_cell_idx)
+    if not merged:
+        raise EntryStop("要机器人自己回位，但上一轮没有塔顶实测（merged 为空）"
+                        " —— 用人手清塔后加 --no-self-return 再跑")
+    return return_to_pick(args, board, chain, scene, cdir, tag, grid, slot_mm,
+                          merged, zcal, rdir=rdir)
 
 
 def mode_zcal(args, ctx):
@@ -441,19 +625,36 @@ def mode_zcal(args, ctx):
     board, chain, scene, grid, slot_mm, pad_mm, zcal = ctx
     cdir = os.path.join(args.run_dir, "entry-zcal")
     os.makedirs(cdir, exist_ok=True)
-    try:
-        tower_precheck(args, board, chain, scene, grid, cdir)
-    except EntryStop as exc:
-        print("!! " + exc.why)
-        return exc.rc
+    if not getattr(args, "resume", False):
+        # 续跑时塔位上**本来就压着**上一次的块（正是要机器人拆回来的那块），
+        # 所以预检只在全新开跑时做。
+        try:
+            tower_precheck(args, board, chain, scene, grid, cdir)
+        except EntryStop as exc:
+            print("!! " + exc.why)
+            return exc.rc
     rows, stop, placed = [], None, False
-    for r in range(1, int(args.reps) + 1):
+    last_merged = None
+    if getattr(args, "resume", False):
+        rows = load_rows(cdir)
+        if rows:
+            placed = True
+            last_merged = rows[-1].get("merged") or rows[-1]
+            print("  续跑：已有 %d 次结果，从第 %d 次接着跑"
+                  % (len(rows), len(rows) + 1))
+            if not getattr(args, "no_self_return", False):
+                # 第一次「机器人自己拆塔」是**新的动作形态**：当次握手，不继承
+                # 之前任何一次授权（AGENTS §1 红线 6）。
+                ask("确认急停就绪、两指整个行程内无手无遮挡："
+                    "接下来由机器人自己把塔上那块抓回拾取区")
+    for r in range(len(rows) + 1, int(args.reps) + 1):
         tag = "zcal-%02d" % r
         rdir = os.path.join(cdir, tag)
         os.makedirs(rdir, exist_ok=True)
         try:
             clear_tower_step(args, board, chain, scene, cdir, tag, grid,
-                             slot_mm, placed)
+                             slot_mm, placed, merged=last_merged, zcal=zcal,
+                             rdir=rdir)
             frame_dir, extras = capture_pick(args, board, scene, rdir, tag)
             analysis = analyse_pick(frame_dir, extras, rdir)
             item = pick_item(args, analysis, scene, zcal)[0]
@@ -469,17 +670,30 @@ def mode_zcal(args, ctx):
             break
         placed = True
         merged = rec["measured"]["merged"]
+        last_merged = merged
         row = {"rep": r, "top_mm": merged["top_mm"],
                "center_base_mm": merged["center_base_mm"],
                "yaw_deg": merged.get("yaw_deg"),
                "pick_bias_mm": pick_bias,
-               "block_idx": item["block_idx"], "class": item.get("class")}
+               "block_idx": item["block_idx"], "class": item.get("class"),
+               # 整份融合观测 —— `--resume` 拿它当「塔上那块」，回位/拆塔要用
+               "merged": merged}
         rows.append(row)
         _dump(os.path.join(rdir, "row.json"), row)
         print("  第 %d/%d 次：顶高 %.2f mm，中心 %s，偏差 %.2f mm"
               % (r, int(args.reps), merged["top_mm"],
                  merged["center_base_mm"],
                  merged["top_mm"] - pad_mm - m3.BLOCK_TRUE_H_MM))
+    if placed and stop is None:
+        # 收尾：最后一块也由机器人拿回拾取区，塔位留给下一项实验是空的
+        # （不然下一项实验的塔位预检会直接判红）。失败不吞：记进 stop。
+        try:
+            clear_tower_step(args, board, chain, scene, cdir,
+                             "zcal-%02d-end" % len(rows), grid, slot_mm, True,
+                             merged=last_merged, zcal=zcal)
+            placed = False
+        except EntryStop as exc:
+            stop = "收尾回位失败：%s" % exc.why
     doc = zcal_doc(rows, pad_mm, meta={
         "kind": "stage3-entry-zcal", "round_dir": cdir,
         "d_mm": float(args.d_mm), "arm": args.arm,
@@ -533,7 +747,7 @@ def mode_release(args, ctx):
     except EntryStop as exc:
         print("!! " + exc.why)
         return exc.rc
-    stop, placed = None, False
+    stop, placed, last_merged = None, False, None
     for name, op, dw in order:
         if stop:
             break
@@ -547,7 +761,8 @@ def mode_release(args, ctx):
             os.makedirs(rdir, exist_ok=True)
             try:
                 clear_tower_step(args, board, chain, scene, cdir, tag, grid,
-                                 slot_mm, placed)
+                                 slot_mm, placed, merged=last_merged,
+                                 zcal=zcal, rdir=rdir)
                 frame_dir, extras = capture_pick(args, board, scene, rdir, tag)
                 analysis = analyse_pick(frame_dir, extras, rdir)
                 item = pick_item(args, analysis, scene, zcal)[0]
@@ -562,6 +777,7 @@ def mode_release(args, ctx):
                 stop = exc.why
                 break
             placed = True
+            last_merged = rec["measured"]["merged"]
             row = _release_row(item, rec, r)
             rows.append(row)
             _dump(os.path.join(rdir, "row.json"), row)
@@ -576,7 +792,7 @@ def mode_release(args, ctx):
     summ = release_summary(groups)
     best = summ.get("best")
     if stop is None and best and args.confirm and int(args.confirm) > 0:
-        print("最优组是 %s；接下来补 %d 次确认，每次仍由人把块放回拾取区"
+        print("最优组是 %s；接下来补 %d 次确认（每次仍由机器人自己回位）"
               % (best, int(args.confirm)))
         op, dw = [(o, d) for n, o, d in order if n == best][0]
         gdir = os.path.join(cdir, best)
@@ -587,7 +803,8 @@ def mode_release(args, ctx):
             os.makedirs(rdir, exist_ok=True)
             try:
                 clear_tower_step(args, board, chain, scene, cdir, tag, grid,
-                                 slot_mm, placed)
+                                 slot_mm, placed, merged=last_merged,
+                                 zcal=zcal, rdir=rdir)
                 frame_dir, extras = capture_pick(args, board, scene, rdir, tag)
                 analysis = analyse_pick(frame_dir, extras, rdir)
                 item = pick_item(args, analysis, scene, zcal)[0]
@@ -602,11 +819,19 @@ def mode_release(args, ctx):
                 stop = exc.why
                 break
             placed = True
+            last_merged = rec["measured"]["merged"]
             row = _release_row(item, rec, int(args.reps) + r)
             rows.append(row)
             _dump(os.path.join(rdir, "row.json"), row)
             print("  确认 %d/%d：Δxy %.2f mm，Δyaw %s°"
                   % (r, int(args.confirm), row["dxy_mm"], row["dyaw_deg"]))
+    if placed and stop is None:
+        # 收尾：最后一块也由机器人拿回拾取区（塔位留给下一项实验）
+        try:
+            clear_tower_step(args, board, chain, scene, cdir, "release-end",
+                             grid, slot_mm, True, merged=last_merged, zcal=zcal)
+        except EntryStop as exc:
+            stop = "收尾回位失败：%s" % exc.why
     summ = release_summary(groups)
     doc = {"kind": "stage3-entry-release", "grid_center_base_mm": slot_mm,
            "opens": opens, "dwells": dwells, "reps": int(args.reps),
@@ -841,9 +1066,10 @@ def protocol(mode):
     return head + {
         "zcal": "① z 标定：塔位单块重复放置 --reps 次（默认 5），"
                 "两个高度跟踪视点各连拍 scene.terminal_frames 帧（默认 3）；"
-                "每次由人把块放回拾取区，驱动就地核一次「塔位真的空了」。",
+                "每次由**机器人自己**把塔上那块抓回拾取区空位"
+                "（--no-self-return 才退回人手动），放回后就地核一次「塔位真的空了」。",
         "release": "② 释放扫参：开口 --opens × 停留 --dwells，每组 --reps 次；"
-                   "最优组再 --confirm 次。每次由人把块放回拾取区，驱动就核一次。",
+                   "最优组再 --confirm 次。每次由**机器人自己**回位（同上）。",
         "occlusion": "③ 持块遮挡：人手搭 1/3/5 层塔，机器人先量基准（塔高不对就停），"
                      "再夹块停在 place_approach 抓帧；抓完把这块放上去，由人重搭。",
         "tolerance": "④ 对中容差：人手把上块偏 --offsets 放上去，"
@@ -872,6 +1098,10 @@ def main(argv=None):
     ap.add_argument("--heights", default="1,3,5")
     ap.add_argument("--offsets", default="0,3,5,8")
     ap.add_argument("--hold-s", type=float, default=10.0)
+    ap.add_argument("--no-self-return", action="store_true",
+                    help="把「塔上那块」交回人手动拿走；默认由机器人自己抓回拾取区")
+    ap.add_argument("--resume", action="store_true",
+                    help="zcal：复用 run-dir 里已有的 row.json，从下一位接着跑")
     ap.add_argument("--go", action="store_true",
                     help="真跑；**每次都当次授权**，闸门在 precision_exec")
     args = ap.parse_args(argv)

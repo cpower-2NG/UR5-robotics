@@ -215,7 +215,7 @@ def test_clear_tower_step_skips_first_placement():
     orig_ask, orig_clear = e.ask, e.tower_clear_now
     e.ask = lambda text: calls.append(("ask", text))
     e.tower_clear_now = lambda *a, **k: calls.append(("clear", k.get("cell_idx")))
-    args = types.SimpleNamespace(tower_cell_idx=4)
+    args = types.SimpleNamespace(tower_cell_idx=4, no_self_return=True)
     try:
         e.clear_tower_step(args, None, None, None, "/tmp", "t", None, None,
                            placed=False)
@@ -226,6 +226,262 @@ def test_clear_tower_step_skips_first_placement():
         assert calls[1][1] == 4, calls
     finally:
         e.ask, e.tower_clear_now = orig_ask, orig_clear
+
+
+@case
+def test_clear_tower_step_robot_returns_by_default():
+    """默认**不叫人**：塔上那块交给机器人自己抓回拾取区。
+
+    反向变异：把 ``return_to_pick`` 换成原来的 ``ask`` —— 本测试必须变红
+    （``ask`` 一次都不该被调到）。
+    """
+    import types
+    calls = []
+    orig = (e.ask, e.tower_clear_now, e.return_to_pick)
+    e.ask = lambda text: calls.append(("ask", text))
+    e.tower_clear_now = lambda *a, **k: calls.append(("clear", k.get("cell_idx")))
+    # 第 10 个位置参数就是 zcal（见 return_to_pick 的签名）
+    e.return_to_pick = lambda *a, **k: calls.append(("return", a[9]))
+    args = types.SimpleNamespace(tower_cell_idx=4)
+    merged = {"top_mm": 32.4, "center_base_mm": [425.5, -117.8]}
+    try:
+        e.clear_tower_step(args, None, None, None, "/tmp", "t", None, None,
+                           placed=True, merged=merged, zcal={"tower": 0.9})
+        assert [c[0] for c in calls] == ["return"], calls
+        assert calls[0][1] == {"tower": 0.9}, calls
+    finally:
+        e.ask, e.tower_clear_now, e.return_to_pick = orig
+
+
+@case
+def test_clear_tower_step_without_merged_stops():
+    """要机器人回位却没有塔顶实测 ⇒ 停（fail-closed），不静默退回人手。"""
+    import types
+    args = types.SimpleNamespace(tower_cell_idx=4)
+    try:
+        e.clear_tower_step(args, None, None, None, "/tmp", "t", None, None,
+                           placed=True, merged=None)
+    except e.EntryStop as exc:
+        assert "没有塔顶实测" in exc.why, exc.why
+    else:
+        raise AssertionError("merged 缺了还往下跑")
+
+
+@case
+def test_free_slot_mm_keeps_gap_and_margin():
+    """回位点必须离**每个**块 ≥60 mm、离区边 ≥25 mm，并尽量靠区心。"""
+    zone = [0.25, 0.575, 0.17, 0.42]          # 米
+    blocks = [blk(0, 300.0, 200.0, 30, 29.5), blk(1, 500.0, 200.0, 30, 29.5)]
+    spot = e.free_slot_mm(blocks, zone)
+    assert spot is not None, "两个块就把区占满了？"
+    x, y = spot["xy_mm"]
+    for b in blocks:
+        d = ((x - b["cx"]) ** 2 + (y - b["cy"]) ** 2) ** 0.5
+        assert d >= e.PICK_RETURN_GAP_MM - 1e-6, (b["idx"], d)
+    assert x - 250.0 >= e.PICK_RETURN_MARGIN_MM - 1e-6
+    assert 575.0 - x >= e.PICK_RETURN_MARGIN_MM - 1e-6
+    assert y - 170.0 >= e.PICK_RETURN_MARGIN_MM - 1e-6
+    assert 420.0 - y >= e.PICK_RETURN_MARGIN_MM - 1e-6
+    # 靠区心：两个块左右对称，最靠心的候选点应当在中线上
+    assert_close(x, (250.0 + 575.0) / 2.0, 5.0, "回位点 x 应贴区心")
+
+
+def _dense_blocks(step=30):
+    """把拾取区铺成 30 mm 点阵（真塞满的样子）。"""
+    pts = [(x, y) for x in range(250, 576, step)
+           for y in range(170, 421, step)]
+    return [blk(i, float(x), float(y), 30, 29.5) for i, (x, y) in enumerate(pts)]
+
+
+@case
+def test_free_slot_mm_returns_none_when_crowded():
+    """塞满就说塞满（调用方 fail-closed），不硬塞到块上。"""
+    zone = [0.25, 0.575, 0.17, 0.42]
+    blocks = _dense_blocks()
+    assert e.free_slot_mm(blocks, zone) is None
+    # 反向变异：把 gap 放宽到 15 mm，同样的块就「放得下」了 —— 说明拒的
+    # 确实是间距判据，不是别的分支（空集/越界）提前返回 None
+    assert e.free_slot_mm(blocks, zone, gap_mm=15.0) is not None
+
+
+@case
+def test_free_slot_mm_empty_zone_takes_center():
+    """区里一块没有 ⇒ 放区心（不留死角、也不贴边）。"""
+    spot = e.free_slot_mm([], [0.25, 0.575, 0.17, 0.42])
+    assert spot["gap_mm"] is None, spot
+    assert_close(spot["xy_mm"][0], 412.5, 5.0, "空区 x")
+    assert_close(spot["xy_mm"][1], 295.0, 5.0, "空区 y")
+
+
+@case
+def test_tower_block_item_uses_corrected_top():
+    """抓塔上那块：h = 顶高 − z 标定 ⇒ 正好是「垫面 + 一块真高」。
+
+    反向变异：漏掉 z 标定（直接用 33.12）⇒ h 大 1.28 mm，抓取变浅、本测试变红。
+    """
+    scene = {"yaw_sign": 1.0, "finger_axis_delta_deg": 0.0,
+             "grasp_at": "block_center"}
+    merged = {"top_mm": 33.12, "center_base_mm": [419.51, -116.55],
+              "yaw_deg": 12.4, "yaw_trusted": True}
+    it = e.tower_block_item(merged, scene, {"tower": 1.28})
+    assert_close(it["block_h_used_mm"], 31.84, 1e-6, "h")
+    assert_close(it["block"]["cx"], 419.51, 1e-6, "cx")
+    assert it["block_idx"] == e.TOWER_BLOCK_IDX
+    assert it["cand"]["dist_mm"] == 0.0, "候选离块心必须是 0（块心抓）"
+    assert_close(it["yaw_grasp_deg"], 12.4, 1e-6, "几何臂 ψ=+θ")
+    assert it["yaw_source"] == "geometric"
+
+
+@case
+def test_tower_block_item_without_yaw():
+    """量不到 yaw ⇒ 抓取角 0 且标 geometric_missing（不假装有角）。"""
+    scene = {"yaw_sign": 1.0, "finger_axis_delta_deg": 0.0}
+    merged = {"top_mm": 33.12, "center_base_mm": [419.51, -116.55],
+              "yaw_deg": None}
+    it = e.tower_block_item(merged, scene, {"tower": 1.28})
+    assert it["yaw_source"] == "geometric_missing", it["yaw_source"]
+    assert_close(it["yaw_grasp_deg"], 0.0, 1e-9, "yaw")
+
+
+@case
+def test_return_to_pick_builds_and_execs_one_plan():
+    """回位 = 一条计划（塔上抓 → 拾取区空位放），收尾回核塔位。"""
+    import types
+    seen = {}
+
+    class _Board:
+        def joints(self, dest):
+            return {"name": [], "position": []}
+
+        def exec_plan(self, path, log, go=True, **kw):
+            seen["plan_path"] = path
+            return 0
+
+    merged = {"top_mm": 32.45, "center_base_mm": [425.52, -117.8],
+              "yaw_deg": 3.0, "yaw_trusted": True}
+    blocks = [blk(0, 300.0, 200.0, 30, 29.5)]
+    orig = (e.capture_pick, e.analyse_pick, e.tower_clear_now, s3r.layer_plan,
+            s3r.write_plan, e.s2.chain_q)
+    e.capture_pick = lambda *a, **k: ("/tmp/fake-pick", [])
+    e.analyse_pick = lambda *a, **k: {"blocks": blocks}
+    e.tower_clear_now = lambda *a, **k: seen.setdefault(
+        "clear_cell", k.get("cell_idx"))
+    e.s2.chain_q = lambda js: [0.0] * 6
+
+    def _layer_plan(chain, q_start, item, bl, slot, surface, **kw):
+        seen.update(item=item, slot=slot, surface=surface, blocks=bl, kw=kw)
+        return {"waypoints": [], "meta": {}}
+
+    s3r.layer_plan = _layer_plan
+    s3r.write_plan = lambda path, plan: path
+    args = types.SimpleNamespace(d_mm=330.0, tower_half_edge=0.020,
+                                 tower_cell_idx=4)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            rec = e.return_to_pick(args, _Board(), None,
+                                   {"pick_zone": [0.25, 0.575, 0.17, 0.42]},
+                                   td, "t", None, [422.65, -114.86], merged,
+                                   {"tower": 1.28}, rdir=td)
+        finally:
+            (e.capture_pick, e.analyse_pick, e.tower_clear_now,
+             s3r.layer_plan, s3r.write_plan, e.s2.chain_q) = orig
+    # 放回点就是 free_slot_mm 选出来的那个，且表面是台面（不是垫面）
+    assert_close(seen["slot"][0], rec["spot_mm"][0] / 1000.0, 1e-9, "slot x")
+    assert_close(seen["surface"], 0.0, 1e-9, "回位铺在台面上")
+    assert seen["item"]["block_idx"] == e.TOWER_BLOCK_IDX
+    assert_close(seen["item"]["block_h_used_mm"], 31.17, 1e-6, "塔上块 h")
+    assert rec["exec_rc"] == 0
+    assert seen["clear_cell"] == 4, "放完要就地核塔位（cell_idx 传对）"
+
+
+@case
+def test_return_to_pick_stops_when_crowded():
+    """拾取区没空位 ⇒ EntryStop，不动臂。"""
+    import types
+
+    class _Board:
+        def joints(self, dest):
+            raise AssertionError("没空位就不该去动臂")
+
+    orig = (e.capture_pick, e.analyse_pick)
+    e.capture_pick = lambda *a, **k: ("/tmp/fake-pick", [])
+    e.analyse_pick = lambda *a, **k: {"blocks": _dense_blocks()}
+    args = types.SimpleNamespace(d_mm=330.0, tower_half_edge=0.020,
+                                 tower_cell_idx=4)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            e.return_to_pick(args, _Board(), None,
+                             {"pick_zone": [0.25, 0.575, 0.17, 0.42]},
+                             td, "t", None, [422.65, -114.86],
+                             {"top_mm": 32.0, "center_base_mm": [422.0, -115.0]},
+                             {"tower": 1.0}, rdir=td)
+        except e.EntryStop as exc:
+            assert "放不下" in exc.why, exc.why
+        else:
+            raise AssertionError("没空位还往下跑")
+        finally:
+            e.capture_pick, e.analyse_pick = orig
+
+
+@case
+def test_return_to_pick_red_exec_stops():
+    """回位执行判红 ⇒ 停在原地（块可能还在爪里），不续跑。"""
+    import types
+
+    class _Board:
+        def joints(self, dest):
+            return {"name": [], "position": []}
+
+        def exec_plan(self, path, log, go=True, **kw):
+            return 3
+
+    orig = (e.capture_pick, e.analyse_pick, e.tower_clear_now,
+            s3r.layer_plan, s3r.write_plan, e.s2.chain_q)
+    e.capture_pick = lambda *a, **k: ("/tmp/fake-pick", [])
+    e.analyse_pick = lambda *a, **k: {"blocks": [blk(0, 300.0, 200.0, 30, 29.5)]}
+    e.s2.chain_q = lambda js: [0.0] * 6
+    s3r.layer_plan = lambda *a, **k: {"waypoints": [], "meta": {}}
+    s3r.write_plan = lambda path, plan: path
+    called = []
+    e.tower_clear_now = lambda *a, **k: called.append("clear")
+    args = types.SimpleNamespace(d_mm=330.0, tower_half_edge=0.020,
+                                 tower_cell_idx=4)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            e.return_to_pick(args, _Board(), None,
+                             {"pick_zone": [0.25, 0.575, 0.17, 0.42]},
+                             td, "t", None, [422.65, -114.86],
+                             {"top_mm": 32.0, "center_base_mm": [422.0, -115.0],
+                              "yaw_deg": 1.0}, {"tower": 1.0}, rdir=td)
+        except e.EntryStop as exc:
+            assert exc.rc == 3, exc.rc
+            assert "停在原地" in exc.why, exc.why
+        else:
+            raise AssertionError("判红了还往下跑")
+        finally:
+            (e.capture_pick, e.analyse_pick, e.tower_clear_now,
+             s3r.layer_plan, s3r.write_plan, e.s2.chain_q) = orig
+    assert called == [], "判红后不该去核塔位"
+
+
+@case
+def test_load_rows_reads_and_sorts():
+    """续跑：只认 rep 是整数的 row.json，按 rep 排序。"""
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for rep, top in ((2, 32.0), (1, 33.0)):
+            d = os.path.join(td, "zcal-%02d" % rep)
+            os.makedirs(d)
+            json.dump({"rep": rep, "top_mm": top}, open(os.path.join(d, "row.json"), "w"))
+        os.makedirs(os.path.join(td, "zcal-09"))        # 空目录
+        os.makedirs(os.path.join(td, "zcal-10"))
+        open(os.path.join(td, "zcal-10", "row.json"), "w").write("{坏")
+        rows = e.load_rows(td)
+        assert [r["rep"] for r in rows] == [1, 2], rows
 
 
 @case

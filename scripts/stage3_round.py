@@ -87,7 +87,8 @@ def _finish_plan(wps, checks, meta, q_start, chain):
 def layer_plan(chain, q_start, item, blocks, slot_m, surface_m,
                tower_xy_mm=None, tower_top_mm=None, survey_tool0=None,
                carry_z=None, scene=None, place_open_mm=None,
-               release_dwell_s=None, tower_half_edge=0.020):
+               release_dwell_s=None, tower_half_edge=0.020,
+               pick_open_mm=None):
     """一层 = 抓 ``item["block"]`` 放到 ``slot_m`` 的 ``surface_m`` 上。"""
     scene = scene or {}
     block = dict(item["block"])
@@ -101,7 +102,8 @@ def layer_plan(chain, q_start, item, blocks, slot_m, surface_m,
         yaw_grasp_deg=item["yaw_grasp_deg"],
         yaw_place_deg=item["yaw_place_deg"],
         yaw_source=item["yaw_source"],
-        pick_open_mm=scene.get("pick_open_mm"),
+        pick_open_mm=(pick_open_mm if pick_open_mm is not None
+                      else scene.get("pick_open_mm")),
         place_open_mm=(place_open_mm if place_open_mm is not None
                        else scene.get("place_open_mm")),
         grasp_at=scene.get("grasp_at", "block_center"),

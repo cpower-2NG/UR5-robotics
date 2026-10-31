@@ -209,14 +209,26 @@ def main():
     raw = node.create_client(RawRequest, "/dashboard_client/raw_request")
 
     def controller_state(name):
-        if not ctl.wait_for_service(timeout_sec=5.0):
-            return None
-        f = ctl.call_async(ListControllers.Request())
-        rclpy.spin_until_future_complete(node, f, timeout_sec=8.0)
-        r = f.result()
-        if r is None:
-            return None
-        return next((c.state for c in r.controller if c.name == name), None)
+        """查控制器状态。**一次不应答不等于控制器没激活** —— 重试几次再判。
+
+        2026-10-31 实测：示教器刚按 PLAY 的那几秒，`controller_stopper` 正在做
+        STRICT 切换，`/controller_manager/list_controllers` 有 8 s 不应答，
+        闸门拿到 None 就把整轮拒了（再查 JTC 是 active）。重试**不放宽**判据：
+        三次都拿不到，仍然返回 None、仍然判红（fail-closed）。
+        """
+        for _ in range(3):
+            if not ctl.wait_for_service(timeout_sec=3.0):
+                time.sleep(1.0)
+                continue
+            f = ctl.call_async(ListControllers.Request())
+            rclpy.spin_until_future_complete(node, f, timeout_sec=5.0)
+            r = f.result()
+            if r is not None:
+                state = next((c.state for c in r.controller if c.name == name), None)
+                if state is not None:
+                    return state
+            time.sleep(1.0)
+        return None
 
     def program_state():
         """查示教器程序状态。**一次不应答不等于没在跑** —— 重试几次再判。
