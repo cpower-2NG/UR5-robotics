@@ -375,6 +375,135 @@ def test_place_clearance_knob(chain):
                  why="间隙少 2 mm，place_z 正好低 2 mm")
 
 
+# ---------------------------------------------------------------- 后矫正 nudge
+NUDGE_NAMES = ["nudge_approach", "nudge_grip", "nudge_shift", "nudge_twist",
+               "nudge_release", "nudge_retreat", "nudge_survey"]
+
+
+def nudge_block():
+    """台面上孤零零一块 29.5 mm，中心 422.65 / −114.86 mm。"""
+    return {"idx": 0, "class": "purple", "cx": 422.65, "cy": -114.86,
+            "top": 29.5, "h": 29.5}
+
+
+@case
+def test_nudge_plan_geometry(chain):
+    """矫正计划：先对齐块心、不抬升、平移到 δ、原地转到 δyaw。"""
+    blocks, cand, q0 = scene(chain)
+    bx = nudge_block()
+    dx, dy, dyaw = 3.0, -2.0, 4.0
+    wps, checks, meta = pp.build_nudge(
+        chain, q0, bx, shift_xy_mm=(dx, dy), dyaw_deg=dyaw,
+        surface_z=PAD_Z, yaw_block_deg=1.5)
+    assert [w["name"] for w in wps] == NUDGE_NAMES, [w["name"] for w in wps]
+    assert len(checks) == len(wps)
+    assert meta["kind"] == "nudge"
+
+    by = {w["name"]: w for w in wps}
+    x0, y0 = bx["cx"] / 1000.0, bx["cy"] / 1000.0
+    # 1) 进/抓都在**实测块心**上；平移后落在 δ 的终点
+    za, zg = meta["approach_z"], meta["grip_z"]
+    for n, z in (("nudge_approach", za), ("nudge_grip", zg)):
+        pe, _ = pp.pose_residual(chain, by[n]["q"], (x0, y0, z), 1.5)
+        assert pe < 0.1, "%s 没对准块心：%.3f mm" % (n, pe)
+    for n, z in (("nudge_shift", zg), ("nudge_twist", zg),
+                 ("nudge_release", zg), ("nudge_retreat", za)):
+        pe, _ = pp.pose_residual(chain, by[n]["q"],
+                                 (x0 + dx / 1000.0, y0 + dy / 1000.0, z), 1.5)
+        assert pe < 0.1, "%s 没落在 δ 终点：%.3f mm" % (n, pe)
+    # 2) **不抬**：抓住到松开这一段所有航点同高（这是「只夹不抬」的定义）
+    def z_of(n):
+        return float(chain.fk(by[n]["q"])[2, 3])
+
+    zs = [z_of(n) for n in ("nudge_grip", "nudge_shift",
+                            "nudge_twist", "nudge_release")]
+    assert max(zs) - min(zs) < 1e-6, \
+        "抓/移/转/松不在同一高度：%s（会变成抬起来）" % zs
+    assert z_of("nudge_approach") > z_of("nudge_grip") + 0.03, \
+        "进给点必须高过夹持点至少 30 mm"
+    # 3) 转角只发生在 twist 这一步：shift 前仍是原 yaw，之后是 yaw + δ
+    _, re_twist = pp.pose_residual(chain, by["nudge_twist"]["q"],
+                                   chain.fk(by["nudge_twist"]["q"])[:3, 3],
+                                   5.5)
+    assert re_twist < 0.05, "twist 没转到 yaw+δ：%.4f°" % re_twist
+    assert_close(meta["yaw_from_deg"], 1.5, 1e-9)
+    assert_close(meta["yaw_to_deg"], 5.5, 1e-9)
+    assert_close(meta["shift_norm_mm"], np.hypot(dx, dy), 1e-3,
+                 "meta 里是四舍五入到 0.001 mm")
+    # 4) 夹持高度按「块顶 + 裸指尖 + 夹持余量」算，不是拍脑袋的常数
+    assert_close(meta["grip_z"],
+                 PAD_Z + np.clip(H_BLK + pp.TOOL0_TO_FINGERTIP
+                                 + pp.GRASP_CLEARANCE,
+                                 pp.GRASP_Z_MIN, pp.GRASP_Z_MAX),
+                 1e-9, "夹持高度")
+
+
+@case
+def test_nudge_rejects_out_of_range(chain):
+    """超上限不是「放歪」而是「没放对」：必须拒，不许硬拽。"""
+    _, _, q0 = scene(chain)
+    bx = nudge_block()
+    for kw in ({"shift_xy_mm": (pp.NUDGE_MAX_SHIFT_MM + 1.0, 0.0)},
+               {"shift_xy_mm": (0.0, -(pp.NUDGE_MAX_SHIFT_MM + 1.0))},
+               {"dyaw_deg": pp.NUDGE_MAX_YAW_DEG + 1.0},
+               {"dyaw_deg": -(pp.NUDGE_MAX_YAW_DEG + 1.0)}):
+        try:
+            pp.build_nudge(chain, q0, bx, surface_z=PAD_Z, **kw)
+        except pp.PlanError:
+            pass
+        else:
+            raise AssertionError("超上限没有拒绝：%r" % (kw,))
+    # 正好到上限要放行（边界不是「大于等于」）
+    wps, _, _ = pp.build_nudge(chain, q0, bx,
+                               shift_xy_mm=(pp.NUDGE_MAX_SHIFT_MM, 0.0),
+                               surface_z=PAD_Z)
+    assert [w["name"] for w in wps] == NUDGE_NAMES
+
+
+@case
+def test_nudge_refuses_crowded_neighbour(chain):
+    """邻块 40 mm < MIN_BLOCK_GAP：张开的两指会碰到它，计划期就拒。"""
+    _, _, q0 = scene(chain)
+    bx = nudge_block()
+    near = dict(bx, idx=1, cx=bx["cx"] + 40.0)
+    try:
+        pp.build_nudge(chain, q0, bx, surface_z=PAD_Z, blocks=[bx, near])
+    except pp.PlanError:
+        pass
+    else:
+        raise AssertionError("邻块太近仍然写出了计划")
+
+
+@case
+def test_nudge_plan_json_is_executable_shape(chain):
+    """走**真入口那条路**（stage3_entry._nudge_once → nudge_plan → build_nudge）。
+
+    执行器只认 ``version`` / ``meta`` / ``q_start`` / ``waypoints`` 这一种形状；
+    这里把它钉死，免得中间层漏透传（2026-10-31 place_clearance 就踩过）。
+    """
+    _, _, q0 = scene(chain)
+    bx = nudge_block()
+    slot = (SLOT_MM[0] / 1000.0, SLOT_MM[1] / 1000.0)
+    pair = pp.stage3_survey_tool0(PAD_Z + H_BLK, slot)
+    plan = s3r.nudge_plan(chain, q0, bx, [bx],
+                          shift_xy_mm=(3.0, -2.0), dyaw_deg=4.0,
+                          surface_m=PAD_Z, yaw_block_deg=1.5, open_mm=50.0,
+                          survey_tool0=pair[0])
+    assert plan["version"] == 2, plan["version"]
+    assert plan["meta"]["kind"] == "nudge", plan["meta"]["kind"]
+    assert len(plan["q_start"]) == 6
+    assert [w["name"].split("_split")[0] for w in plan["waypoints"]] \
+        == NUDGE_NAMES, [w["name"] for w in plan["waypoints"]]
+    # 夹爪动作要在计划里看得见（执行器靠 before/after 认出「这一次要开合」）
+    acts = {w.get("after", {}).get("gripper") for w in plan["waypoints"]
+            if w.get("after")}
+    assert "close" in acts and "open_to" in acts, acts
+    # 收尾巡检位 = 测量用的那一对里的第一个（复测不用再走一趟）
+    assert_close(plan["meta"]["survey_tool0"][0], pair[0][0], 1e-4,
+                 "survey 收尾位（meta 保留 4 位）")
+    assert_close(plan["meta"]["shift_norm_mm"], np.hypot(3.0, -2.0), 1e-3)
+
+
 def main():
     urdf = find_urdf()
     failed = skipped = 0

@@ -898,6 +898,146 @@ def build_stack(chain, q_start, cand, block, blocks, slot, surface_z,
     return wps, checks, meta
 
 
+# ---------------------------------------------------------------- 放置后矫正
+#: 单次矫正允许的最大平移（mm）与最大转角（°）。超出的错误**不是**「放歪了」，
+#: 是「根本没放对」，该走完整抓放；拿 nudge 硬拽只会把块拖到邻块上去。
+NUDGE_MAX_SHIFT_MM = 15.0
+NUDGE_MAX_YAW_DEG = 15.0
+
+
+def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
+                surface_z=TABLE_PLANE_Z, yaw_block_deg=0.0, blocks=None,
+                open_mm=None, survey_tool0=None, tower_box=None,
+                held_half_edge=0.020):
+    """放置后矫正：**只夹不抬**，把已经放下的块平移 δxy / 原地转 δyaw。
+
+    为什么有这个原语（2026-11-01 用户提出，第一百八十五轮记账）
+    ────────────────────────────────────────────────────────────
+    入口② 15 次实测：Δxy σ 1.14 mm，Δyaw（彩色）σ 5.14°、6/15 超契约的 5° 门。
+    yaw 那部分经两套**数据来源不同**的估计器对撞确认（r=0.897、11/15 同号）
+    是**真实的释放转动**，不是测量噪声；调参调不掉，只能加动作去改。
+
+    这招的天然优势：δ = 目标 − 本次实测，测量与校正在**同一趟、同一套腕部
+    相机**里完成，静态外参偏差在相减时抵消。它不要求外参绝对准，只要求同趟
+    一致 —— 比开环放置依赖 `grid.json` 绝对坐标强一档。
+
+    动作序列
+    ────────
+    ``nudge_approach → nudge_grip → nudge_shift → nudge_twist → nudge_release
+    → nudge_retreat → nudge_survey``
+
+    · tool0 的 xy 先对齐**实测块心**：绕 tool0 的 z 转就是绕块心那条竖线转，
+      块心不跟着跑（真滑移由松手后的复测发现，这里不假装能保证）。
+    · `grip`/`shift`/`twist`/`release` **同高**：块始终贴着自己那一层，不抬。
+    · 夹持深度沿用抓取那套算式（`GRASP_CLEARANCE`），够传力矩又不压块。
+
+    会拒的情况（fail-closed，不写计划）
+    ──────────────────────────────────
+    · |δxy| > `NUDGE_MAX_SHIFT_MM` 或 |δyaw| > `NUDGE_MAX_YAW_DEG`；
+    · 给了 ``blocks`` 时，离最近邻块 < `MIN_BLOCK_GAP`（张开的两指会碰邻块）；
+    · 任一航点过不了 `check_guard`（裸指尖离台面）；
+    · 给了 ``tower_box`` 还要过 `check_held_block`。**注意 box 必须把被矫正的
+      这一块排除在外**（box 顶取被矫正块的底面），否则必然误报 —— 块本来就在箱里。
+
+    参数里的 ``block`` 与 `build_pick` 同形：``cx``/``cy``（mm）、``h``（mm，
+    相对它脚下那层表面）；``surface_z`` 是块脚下那层的 z（m，base 系）。
+    """
+    dx_mm, dy_mm = float(shift_xy_mm[0]), float(shift_xy_mm[1])
+    shift_mm = float(np.hypot(dx_mm, dy_mm))
+    dyaw_deg = float(dyaw_deg)
+    if shift_mm > NUDGE_MAX_SHIFT_MM + 1e-9:
+        raise PlanError("矫正平移 %.1f mm 超过 %.0f mm 上限 —— 这不是「放歪」"
+                        "而是「没放对」，该走完整抓放"
+                        % (shift_mm, NUDGE_MAX_SHIFT_MM))
+    if abs(dyaw_deg) > NUDGE_MAX_YAW_DEG + 1e-9:
+        raise PlanError("矫正转角 %.1f° 超过 %.0f° 上限（同上，别硬拽）"
+                        % (dyaw_deg, NUDGE_MAX_YAW_DEG))
+
+    wz = (block["h"] if block.get("h") is not None else block["top"]) / 1000.0
+    surf = float(surface_z)
+    top_abs = surf + wz
+    bx, by = block["cx"] / 1000.0, block["cy"] / 1000.0
+    yaw0 = fold_yaw_180(yaw_block_deg)
+    yaw1 = fold_yaw_180(yaw_block_deg + dyaw_deg)
+
+    # 高度算式与 `build_pick` 完全同源：先在「相对台面」的坐标里解出本地
+    # tool0 z（软限位那对常量也是按台面平面标定的），再整体抬到 surf。
+    approach_z = surf + wz + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE
+    grip_z_local = float(np.clip(wz + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE,
+                                 GRASP_Z_MIN, GRASP_Z_MAX))
+    grip_z = surf + grip_z_local
+    # 张开宽度：默认块宽 + 10 mm（够跨进两侧，又不至于把行程撑到邻块）。
+    open_used = float(open_mm) if open_mm is not None else 40.0
+
+    if blocks:
+        gap = check_block_gap(block, blocks)
+        if gap is not None and gap < MIN_BLOCK_GAP:
+            raise PlanError("块 #%d 离最近邻块只有 %.1f mm（下限 %.0f mm）—— "
+                            "矫正时张开的两指会碰邻块"
+                            % (block["idx"], gap * 1000, MIN_BLOCK_GAP * 1000))
+
+    guard = None
+    if tower_box is not None:
+        grasp_depth_m = wz - (grip_z_local - TOOL0_TO_BARE_FINGERTIP)
+        below_tip = wz - grasp_depth_m + TOOL0_TO_BARE_FINGERTIP
+
+        def guard(qa, qb, _below=below_tip):
+            ok, worst = check_guard(chain, qa, qb, TABLE_PLANE_Z)
+            if not ok:
+                return False, worst
+            ok2, w2 = check_held_block(chain, qa, qb, held_half_edge, wz,
+                                       _below, tower_box, None)
+            if not ok2:
+                return False, w2
+            return True, worst
+
+    survey_xyz = (SURVEY_TOOL0["place"] if survey_tool0 is None
+                  else tuple(survey_tool0))
+
+    def _open(mm):
+        return {"gripper": "open"} if mm is None else {"gripper": "open_to",
+                                                       "mm": float(mm)}
+
+    tx, ty = bx + dx_mm / 1000.0, by + dy_mm / 1000.0
+    specs = [
+        ("nudge_approach", (bx, by, approach_z), yaw0, None, _open(open_used)),
+        ("nudge_grip", (bx, by, grip_z), yaw0,
+         {"gripper": "close", "readback": True}, None),
+        ("nudge_shift", (tx, ty, grip_z), yaw0,
+         {"gripper": "readback"}, None),
+        ("nudge_twist", (tx, ty, grip_z), yaw1,
+         {"gripper": "readback"}, None),
+        ("nudge_release", (tx, ty, grip_z), yaw1, _open(open_used), None),
+        ("nudge_retreat", (tx, ty, approach_z), yaw1, None, None),
+        ("nudge_survey", survey_xyz, 0.0, None, None),
+    ]
+    qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
+                       yaws=[y for _, _, y, _, _ in specs], guard=guard)
+    wps, checks = [], []
+    q = q_start
+    for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
+        q, c = add_move(wps, chain, name, xyz, q, yaw, TABLE_PLANE_Z,
+                        after=after, before=before, q=q_solved, guard=guard)
+        checks.append(c)
+
+    meta = {"kind": "nudge", "block_idx": block.get("idx"),
+            "surface_z_mm": round(surf * 1000.0, 2),
+            "block_top_abs_mm": round(top_abs * 1000.0, 2),
+            "block_h_mm": round(wz * 1000.0, 2),
+            "block_xy_mm": [round(block["cx"], 2), round(block["cy"], 2)],
+            "shift_xy_mm": [round(dx_mm, 3), round(dy_mm, 3)],
+            "shift_norm_mm": round(shift_mm, 3),
+            "dyaw_deg": round(dyaw_deg, 3),
+            "yaw_from_deg": round(yaw0, 3), "yaw_to_deg": round(yaw1, 3),
+            "target_xy_mm": [round(tx * 1000.0, 2), round(ty * 1000.0, 2)],
+            "grip_z": round(grip_z, 4), "approach_z": round(approach_z, 4),
+            "open_mm": round(open_used, 1),
+            "tower_box": ([round(float(v), 4) for v in tower_box]
+                          if tower_box is not None else None),
+            "survey_tool0": [round(float(v), 4) for v in survey_xyz]}
+    return wps, checks, meta
+
+
 # ---------------------------------------------------------------- CLI
 def main():
     ap = argparse.ArgumentParser()

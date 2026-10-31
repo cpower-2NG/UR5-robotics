@@ -121,6 +121,24 @@ def move_plan(chain, q_start, xyz, name="move"):
     return _finish_plan(wps, checks, meta, q_start, chain)
 
 
+def nudge_plan(chain, q_start, block, blocks, shift_xy_mm=(0.0, 0.0),
+               dyaw_deg=0.0, surface_m=pp.TABLE_PLANE_Z, yaw_block_deg=0.0,
+               open_mm=None, survey_tool0=None, tower_box=None,
+               held_half_edge=0.020):
+    """塔顶「只夹不抬」的放置后矫正计划（契约 §3 第 5 项）。
+
+    与 `layer_plan` 同一个收尾（`_finish_plan`），执行器只认这一种 JSON。
+    ``block`` 与 `build_nudge` 同形（``cx``/``cy`` mm、``h`` mm 相对脚下那层）；
+    ``yaw_block_deg`` 是**当前 tool0 yaw**（不是实测块 yaw，换算在调用方）。
+    """
+    wps, checks, meta = pp.build_nudge(
+        chain, q_start, block, shift_xy_mm=shift_xy_mm, dyaw_deg=dyaw_deg,
+        surface_z=surface_m, yaw_block_deg=yaw_block_deg, blocks=blocks,
+        open_mm=open_mm, survey_tool0=survey_tool0, tower_box=tower_box,
+        held_half_edge=held_half_edge)
+    return _finish_plan(wps, checks, meta, q_start, chain)
+
+
 def predicted_place(item, slot_m):
     """放置瞬间块心的预测（base，m）：``slot + R(Δyaw)·抓取偏心``。
 

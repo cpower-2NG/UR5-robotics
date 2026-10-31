@@ -717,6 +717,111 @@ def test_resolve_zcal_path_fail_closed():
         assert e.resolve_zcal_path(td, None, "release") == p
 
 
+# ---------------------------------------------------------------- 后矫正（⑤）
+@case
+def test_nudge_delta_sign_and_mod90():
+    """δxy = 目标 − 实测；yaw 折 mod 90 取最短角，块应转的方向与臂符号无关。"""
+    tgt = [425.0, -114.86]
+    d = e.nudge_delta([422.0, -114.86], 0.0, tgt)
+    assert_close(d["dx_mm"], 3.0, 1e-9)
+    assert_close(d["dy_mm"], 0.0, 1e-9)
+    assert_close(d["d_mm"], 3.0, 1e-9)
+    assert_close(d["dyaw_deg"], 0.0, 1e-9, "yaw 已经正了")
+    # 块在 +7°：tool0 要转 −7°，块跟着转 −7°
+    d = e.nudge_delta([425.0, -114.86], 7.0, tgt, yaw_sign=1.0)
+    assert_close(d["dyaw_deg"], -7.0, 1e-9)
+    assert_close(d["dyaw_block_deg"], -7.0, 1e-9)
+    # 方块按 90° 周期：87° 该转 +3°，不是 −87°
+    d = e.nudge_delta([425.0, -114.86], 87.0, tgt, yaw_sign=1.0)
+    assert_close(d["dyaw_deg"], 3.0, 1e-9)
+    # 臂的符号约定反过来时，tool0 的角反号，但**块该转的角度不变**
+    d = e.nudge_delta([425.0, -114.86], 7.0, tgt, yaw_sign=-1.0)
+    assert_close(d["dyaw_deg"], 7.0, 1e-9)
+    assert_close(d["dyaw_block_deg"], -7.0, 1e-9)
+    # 场景里 finger_axis_delta_deg 非零时，目标 tool0 角就是它
+    d = e.nudge_delta([425.0, -114.86], 0.0, tgt, yaw_sign=1.0, delta_deg=2.5)
+    assert_close(d["yaw_to_deg"], 2.5, 1e-9)
+
+
+@case
+def test_nearby_blocks_keeps_only_ring():
+    """离格心 [25, 90] mm 的其它块才算邻块；目标自己、过远的、low 的都不算。"""
+    blocks = [blk(0, 0.0, 0.0, 31.0, 29.5),          # 目标自己（距离 0）
+              blk(1, 60.0, 0.0, 31.0, 29.5),         # 邻块
+              blk(2, 200.0, 0.0, 31.0, 29.5),        # 太远
+              blk(3, 0.0, 70.0, 5.0, 4.0, low=True)]  # 台面噪声
+    out = e.nearby_blocks(blocks, [0.0, 0.0])
+    assert [r["idx"] for r in out] == [1], out
+    assert_close(out[0]["dist_mm"], 60.0, 1e-9)
+
+
+@case
+def test_neighbour_shift_pairs_or_refuses():
+    """配得上就报移动量；数量/位置变了就记 None，不猜。"""
+    b = [{"idx": 1, "center_mm": [60.0, 0.0]},
+         {"idx": 2, "center_mm": [0.0, 70.0]}]
+    a = [{"idx": 7, "center_mm": [61.5, 0.0]},
+         {"idx": 8, "center_mm": [0.0, 110.0]}]        # 第二块跑了 40 mm
+    out = e.neighbour_shift(b, a, match_mm=30.0)
+    assert out[0] == {"before_idx": 1, "after_idx": 7, "move_mm": 1.5}, out[0]
+    assert out[1]["after_idx"] is None and out[1]["move_mm"] is None, out[1]
+
+
+def _merged(cx, cy, yaw_color, yaw_depth=None, top=31.5):
+    return {"found": True, "center_base_mm": [cx, cy], "top_mm": top,
+            "yaw_deg": yaw_depth, "yaw_color_deg": yaw_color}
+
+
+@case
+def test_nudge_row_gain_and_gate():
+    """push gain = 实走/指令的投影比；终态按**彩色** yaw 判 §4.1 的 5 mm / 5°。"""
+    cmd = dict(e.nudge_delta([421.0, 0.0], 6.0, [425.0, 0.0]), )
+    before = _merged(421.0, 0.0, 6.0, yaw_depth=20.0)
+    after = _merged(424.0, 0.0, 1.0, yaw_depth=3.0)
+    row = e.nudge_row(1, cmd, before, after, [425.0, 0.0])
+    assert_close(row["push"]["d_actual_mm"], 3.0, 1e-9)
+    assert_close(row["push"]["gain_xy"], 0.75, 1e-9, "3 mm 实走 / 4 mm 指令")
+    assert_close(row["push"]["perp_mm"], 0.0, 1e-9)
+    assert_close(row["yaw"]["dyaw_actual_deg"], -5.0, 1e-9)
+    assert_close(row["yaw"]["gain_yaw"], round(5.0 / 6.0, 2), 1e-9,
+                 "行里的数一律保留 2 位")
+    assert row["before"]["yaw_err_deg"] == 6.0, row["before"]
+    assert row["after"]["xy_err_mm"] == 1.0
+    assert row["final_ok"] is True, row
+    # 深度 yaw 差 20° 也不影响判决（契约 §4.2.5：深度只报告）
+    assert row["before"]["yaw_depth_deg"] == 20.0
+
+    # 终态 yaw 仍差 8° ⇒ 不过门
+    row = e.nudge_row(2, cmd, before, _merged(425.0, 0.0, 8.0), [425.0, 0.0])
+    assert row["final_ok"] is False and row["reason"] == "still_off", row
+
+    # 没有彩色 yaw ⇒ 证明不了，ok=None（不拿深度顶替）
+    row = e.nudge_row(3, cmd, before, _merged(425.0, 0.0, None, yaw_depth=0.0),
+                      [425.0, 0.0])
+    assert row["final_ok"] is None and row["reason"] == "no_colour_yaw", row
+
+
+@case
+def test_nudge_summary_splits_skipped_from_failed():
+    """「没敢矫正」与「矫正了没修回来」分开计数。"""
+    ok = {"status": "ok", "final_ok": True,
+          "before": {"xy_err_mm": 6.0, "yaw_err_deg": 8.0},
+          "after": {"xy_err_mm": 1.0, "yaw_err_deg": 1.0},
+          "push": {"gain_xy": 0.9, "perp_mm": 0.2},
+          "yaw": {"gain_yaw": 0.8}}
+    bad = {"status": "ok", "final_ok": False,
+           "before": {"xy_err_mm": 4.0, "yaw_err_deg": 2.0},
+           "after": {"xy_err_mm": 4.5, "yaw_err_deg": 6.0},
+           "push": {"gain_xy": 0.1, "perp_mm": 3.0},
+           "yaw": {"gain_yaw": 1.5}}
+    skipped = {"status": "out_of_range", "final_ok": None}
+    s = e.nudge_summary([ok, bad, skipped])
+    assert s["n"] == 3 and s["n_nudged"] == 2, s
+    assert s["n_final_ok"] == 1 and s["n_skipped"] == 1, s
+    assert s["gain_xy"]["n"] == 2 and s["gain_xy"]["median"] == 0.5, s
+    assert s["xy_err_before"]["n"] == 2, s
+
+
 # ---------------------------------------------------------------- 协议
 @case
 def test_protocol_non_empty_for_all_modes():

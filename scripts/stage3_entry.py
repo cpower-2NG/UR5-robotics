@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""阶段 3 入口四实验的驱动（真机；每次 ``--go`` 都要**当次授权**）。
+"""阶段 3 入口五实验的驱动（真机；每次 ``--go`` 都要**当次授权**）。
 
-四项实验（契约 §2.2）
-────────────────────
+五项实验（契约 §3）
+──────────────────
 1. ``--mode zcal`` —— 塔位单块重复放置 ≥5 次，两个高度跟踪视点各 ≥3 帧；
    偏差 ``z_bias = 顶高 − 垫面 − 29.5``，取中位落盘 ``zcal.json``（``by_site``），
    每次残差 |≤2 mm| 才算过。顺带用拾取帧记一份拾取侧偏差。
-2. ``--mode release`` —— 开口 {50,70,95} mm × 停留 {0,0.5} s 共 6 组 ×5 次，
+2. ``--mode release`` —— 开口 30/50/40 mm × 停留 {0,0.5} s 各 5 次，
    每组量终态中心/yaw/顶高，算「实测 − 预测」的重复性（极差、σ）；
    最优组再补 ``--confirm`` 次。**数值闸门不在这里编**，数据出表由用户拍板。
 3. ``--mode occlusion`` —— 人手先搭好 1/3/5 层塔，机器人夹着块停在
@@ -14,6 +14,9 @@
    对照组做不做。**抓完这一帧就把这块放上去**（塔变成 h+1 层，由人重搭）。
 4. ``--mode tolerance`` —— 人手把上块相对下块偏 0/3/5/8 mm 放上去，机器人
    **只动臂不碰夹爪**：量下层基准 → 量上层 → 静置 10 s 再量。
+5. ``--mode nudge`` —— 开环放一块（入口② 最优组）→ 量 → 夹爪降到块两侧
+   **只夹不抬** → 平移 δ / 原地转 δyaw → 松开 → 退开复测。δ = 目标 − 实测。
+   记 push gain、有没有带转、有没有顶动邻块；判据 = 契约 §4.1 的 ≤5 mm / ≤5°。
 
 真机纪律（每次会话重来）
 ────────────────────────
@@ -48,7 +51,7 @@ import stage3_measure as m3                                        # noqa: E402
 import stage3_round as s3r                                         # noqa: E402
 import urkin                                                      # noqa: E402
 
-MODES = ("zcal", "release", "occlusion", "tolerance")
+MODES = ("zcal", "release", "occlusion", "tolerance", "nudge")
 
 #: 入口线：校正后每次高度对 29.5 mm 的偏差绝对值上限。
 ZCAL_TOL_MM = 2.0
@@ -211,6 +214,202 @@ def tol_offset_mm(lower_center_mm, upper_center_mm):
     dy = float(upper_center_mm[1]) - float(lower_center_mm[1])
     return {"dx_mm": round(dx, 2), "dy_mm": round(dy, 2),
             "d_mm": round(math.hypot(dx, dy), 2)}
+
+
+# ---------------------------------------------------------------- 后矫正（⑤）
+#: 矫正后判据 = 契约 §4.1 的门（≤5 mm / ≤5°），**不新编数**。第 1 层没有下层，
+#: 就按「目标 = 格心 + 0°」算；主轮里同样是这两个数，换成「相对下层实测」。
+NUDGE_XY_TOL_MM = 5.0
+NUDGE_YAW_TOL_DEG = 5.0
+#: 排查「有没有顶动邻块」的半径（mm，离目标格心）。手指半开 50 mm ⇒
+#: 半径 90 mm 已把两指行程全包住。
+NUDGE_NEAR_MM = 90.0
+#: 该半径内、离目标格心比这更近的簇，当成被矫正的那块自己
+#: （块半对角线 17.7 mm；矫正量上限 15 mm，两者加起来仍 <25）。
+NUDGE_SELF_MM = 25.0
+
+
+def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
+                yaw_sign=1.0, delta_deg=0.0):
+    """「目标 − 实测」→ 要下的平移 δ(mm) 与 tool0 转角 δ(°)。纯函数。
+
+    ``yaw_sign`` / ``delta_deg`` 与 `stage2_round.yaw_for_arm` **同一套映射**
+    （``tool0_yaw = sign·θ + δ``）；目标块朝向是 0（格线方向），对应的 tool0
+    角正好是 ``δ``。
+
+    方块按 **90° 周期**折最短角（`stage2_round.signed_err_mod90` 同口径）：
+    方块的正面/侧面互换，转 87° 与转 −3° 是同一件事。`fold_yaw_180` 那一次
+    折是给夹爪挑一支更短的等价解，不是近似。
+
+    返回里两个角分开写：
+    · ``dyaw_deg`` —— **tool0** 要转多少（喂给 `build_nudge`）；
+    · ``dyaw_block_deg`` —— 块**应跟着转**多少（= sign·dyaw_deg，用于对账）。
+    """
+    sign = float(yaw_sign)
+    dx = float(target_xy_mm[0]) - float(measured_xy_mm[0])
+    dy = float(target_xy_mm[1]) - float(measured_xy_mm[1])
+    yaw_from = pp.fold_yaw_180(sign * float(measured_yaw_deg) + float(delta_deg))
+    yaw_to = pp.fold_yaw_180(float(delta_deg))
+    dyaw = float(s2.signed_err_mod90(yaw_to, yaw_from))
+    return {"dx_mm": dx, "dy_mm": dy, "d_mm": math.hypot(dx, dy),
+            "dyaw_deg": dyaw, "dyaw_block_deg": sign * dyaw,
+            "yaw_from_deg": float(yaw_from), "yaw_to_deg": float(yaw_to)}
+
+
+def nearby_blocks(blocks, target_xy_mm, radius_mm=NUDGE_NEAR_MM,
+                  exclude_mm=NUDGE_SELF_MM):
+    """离目标格心 ``[exclude_mm, radius_mm]`` 内的**其它**块（诊断顶没顶邻块）。
+
+    ``low`` 的簇（连接件 / 台面噪声）不算。
+    """
+    out = []
+    for b in blocks or []:
+        if b.get("low"):
+            continue
+        d = math.hypot(float(b["cx"]) - float(target_xy_mm[0]),
+                       float(b["cy"]) - float(target_xy_mm[1]))
+        if float(exclude_mm) <= d <= float(radius_mm):
+            out.append({"idx": b.get("idx"),
+                        "center_mm": [round(float(b["cx"]), 2),
+                                      round(float(b["cy"]), 2)],
+                        "top_mm": round(float(b.get("top", 0.0)), 2),
+                        "dist_mm": round(d, 2)})
+    return sorted(out, key=lambda r: r["dist_mm"])
+
+
+def neighbour_shift(before_list, after_list, match_mm=30.0):
+    """前后两批邻块按**最近匹配**配对，给出各自移动了多少。
+
+    配不上（数量变了 / 最近的一个也超过 ``match_mm``）就记 ``None`` ——
+    不猜「它大概就是那一块」。
+    """
+    out, used = [], set()
+    for b in before_list or []:
+        best, bd = None, None
+        for i, a in enumerate(after_list or []):
+            if i in used:
+                continue
+            d = math.hypot(a["center_mm"][0] - b["center_mm"][0],
+                           a["center_mm"][1] - b["center_mm"][1])
+            if bd is None or d < bd:
+                best, bd = i, d
+        if best is not None and bd <= float(match_mm):
+            used.add(best)
+            out.append({"before_idx": b["idx"],
+                        "after_idx": after_list[best]["idx"],
+                        "move_mm": round(bd, 2)})
+        else:
+            out.append({"before_idx": b["idx"], "after_idx": None,
+                        "move_mm": None})
+    return out
+
+
+def nudge_row(rep, cmd, before, after, target_xy_mm,
+              xy_tol_mm=NUDGE_XY_TOL_MM, yaw_tol_deg=NUDGE_YAW_TOL_DEG):
+    """一次矫正的前后对账：实走 δ、push gain、带转角、终态过不过门。
+
+    ``before`` / ``after`` 是矫正前后的 ``merged``（`stage3_measure` 融合值）。
+    **yaw 判据一律走彩色掩码**（契约 §4.2.5），深度 ``yaw_deg`` 只报告：
+    两个估计器逐次差 1.43 倍，拿深度当 ``ok`` 会把合格的矫正判红。
+
+    ``ok=None``（``reason="no_colour_yaw"``）= 证明不了，转人评 —— 与
+    `stage3_measure.pose_consistency` 同一口径。
+    """
+    def centre(m):
+        return [float(m["center_base_mm"][0]), float(m["center_base_mm"][1])]
+
+    def yaw_color(m):
+        y = m.get("yaw_color_deg")
+        return None if y is None else float(y)
+
+    def err_vs_target(c):
+        return math.hypot(float(target_xy_mm[0]) - c[0],
+                          float(target_xy_mm[1]) - c[1])
+
+    bc, ac = centre(before), centre(after)
+    by, ay = yaw_color(before), yaw_color(after)
+    yaw_err0 = None if by is None else float(s2.signed_err_mod90(by, 0.0))
+    yaw_err1 = None if ay is None else float(s2.signed_err_mod90(ay, 0.0))
+    dyaw_act = (None if (by is None or ay is None)
+                else float(s2.signed_err_mod90(ay, by)))
+    dyaw_cmd = float(cmd["dyaw_block_deg"])
+    yaw_gain = (None if (dyaw_act is None or abs(dyaw_cmd) < 1e-9)
+                else dyaw_act / dyaw_cmd)
+
+    # 实走 δ：沿指令方向的有符号投影比（push gain）+ 侧向走偏（粘滑/推力偏）。
+    dx, dy = ac[0] - bc[0], ac[1] - bc[1]
+    d_act = math.hypot(dx, dy)
+    cx, cy = float(cmd["dx_mm"]), float(cmd["dy_mm"])
+    d_cmd = math.hypot(cx, cy)
+    if d_cmd > 1e-9:
+        gain = (dx * cx + dy * cy) / (d_cmd * d_cmd)
+        perp = abs(-dx * cy + dy * cx) / d_cmd
+    else:
+        gain, perp = None, d_act
+
+    e0, e1 = err_vs_target(bc), err_vs_target(ac)
+    if yaw_err1 is None:
+        ok, reason = None, "no_colour_yaw"
+    else:
+        ok = bool(e1 <= float(xy_tol_mm) and abs(yaw_err1) <= float(yaw_tol_deg))
+        reason = "ok" if ok else "still_off"
+
+    def state(c, e, y, ye):
+        return {"center_mm": [round(c[0], 2), round(c[1], 2)],
+                "xy_err_mm": round(e, 2), "yaw_color_deg": y,
+                "yaw_err_deg": None if ye is None else round(ye, 2)}
+
+    return {"rep": int(rep),
+            "commanded": {k: round(float(v), 3) for k, v in cmd.items()},
+            "before": dict(state(bc, e0, by, yaw_err0),
+                           yaw_depth_deg=before.get("yaw_deg"),
+                           top_mm=before.get("top_mm")),
+            "after": dict(state(ac, e1, ay, yaw_err1),
+                          yaw_depth_deg=after.get("yaw_deg"),
+                          top_mm=after.get("top_mm")),
+            "push": {"d_actual_mm": round(d_act, 2),
+                     "gain_xy": None if gain is None else round(gain, 2),
+                     "perp_mm": round(perp, 2),
+                     "d_cmd_mm": round(d_cmd, 2)},
+            "yaw": {"dyaw_actual_deg": (None if dyaw_act is None
+                                        else round(dyaw_act, 2)),
+                    "dyaw_expected_deg": round(dyaw_cmd, 2),
+                    "gain_yaw": (None if yaw_gain is None
+                                 else round(yaw_gain, 2))},
+            "delta_xy_mm": round(e0 - e1, 2),
+            "final_ok": ok, "reason": reason,
+            "tol": {"xy_mm": float(xy_tol_mm),
+                    "yaw_deg": float(yaw_tol_deg)}}
+
+
+def nudge_summary(rows):
+    """矫正实验汇总：终态过门比例 + push / 转角增益的重复性。
+
+    两个比例分开报 —— 「放得太歪（超 15 mm/15°）压根没敢矫正」与「矫正了但
+    没修回来」是两件事，混成一个数就看不出该改哪一头。
+    """
+    done = [r for r in rows or [] if r.get("status") == "ok"]
+    ok = [r for r in done if r.get("final_ok") is True]
+
+    def col(key, sub=None):
+        vals = []
+        for r in done:
+            v = r.get(sub, {}).get(key) if sub else r.get(key)
+            vals.append(v)
+        return group_stats(vals)
+
+    return {"n": len(rows or []), "n_nudged": len(done),
+            "n_final_ok": len(ok),
+            "n_skipped": len([r for r in rows or []
+                              if r.get("status") != "ok"]),
+            "xy_err_before": col("xy_err_mm", "before"),
+            "xy_err_after": col("xy_err_mm", "after"),
+            "yaw_err_before": col("yaw_err_deg", "before"),
+            "yaw_err_after": col("yaw_err_deg", "after"),
+            "gain_xy": col("gain_xy", "push"),
+            "push_perp": col("perp_mm", "push"),
+            "gain_yaw": col("gain_yaw", "yaw"),
+            "tol": {"xy_mm": NUDGE_XY_TOL_MM, "yaw_deg": NUDGE_YAW_TOL_DEG}}
 
 
 # ---------------------------------------------------------------- 板侧动作
@@ -1140,6 +1339,240 @@ def mode_tolerance(args, ctx):
     return 2 if stop else 0
 
 
+def window_candidates(meas):
+    """塔位测量里 pose1 第一帧的候选簇（**含目标块自己**）。"""
+    try:
+        return list(meas["poses"][0]["frames"][0]["diag"]["candidates"])
+    except (KeyError, IndexError, TypeError):
+        return []
+
+
+def scan_near(frame_dir, target_xy_mm, radius_mm=NUDGE_NEAR_MM,
+              exclude_mm=NUDGE_SELF_MM):
+    """一帧 → 离目标格心 ``[exclude, radius]`` 内的其它块（邻块诊断）。"""
+    blocks, _tz = gc.find_blocks(gc.load_frame(frame_dir),
+                                 max_h_mm=m3.MAX_H_MM,
+                                 min_h_mm=m3.MIN_H_MM)
+    return nearby_blocks(blocks, target_xy_mm, radius_mm=radius_mm,
+                         exclude_mm=exclude_mm)
+
+
+def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
+                pad_mm, zcal, before, rec, sign, delta, rep):
+    """放好一块之后：量过的那份 ``before`` → 只夹不抬地推到目标 → 复测。
+
+    返回一行对账（``status`` 可能是 ``ok`` / ``no_colour_yaw`` /
+    ``out_of_range`` / ``plan_rejected``）。执行判红才抛 ``EntryStop``
+    —— 那是「块可能还在指间」，必须停。
+    """
+    merged = before["merged"]
+    base = {"rep": int(rep), "tag": tag, "before_merged": merged,
+            "placement": {"predicted_place_mm": rec.get("predicted_place_mm"),
+                          "predicted_top_mm": rec.get("predicted_top_mm")}}
+    if not merged.get("found"):
+        raise EntryStop("%s 矫正前量不到块 —— 不瞎夹" % tag)
+    yaw_c = merged.get("yaw_color_deg")
+    if yaw_c is None or not merged.get("yaw_color_trusted"):
+        # 契约 §4.2.5：彩色 yaw 缺失 ⇒ 人评，**不拿深度顶替**。
+        return dict(base, status="no_colour_yaw",
+                    reason="彩色 yaw 缺失/不可信（深度只报告，不顶替）")
+
+    cmd = nudge_delta(merged["center_base_mm"], yaw_c, slot_mm,
+                      yaw_sign=sign, delta_deg=delta)
+    base["commanded"] = {k: round(float(v), 3) for k, v in cmd.items()}
+    if (abs(cmd["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
+            or abs(cmd["dyaw_deg"]) > pp.NUDGE_MAX_YAW_DEG):
+        return dict(base, status="out_of_range",
+                    reason="δ 超单次上限（%.0f mm / %.0f°）—— 该走完整抓放，"
+                           "硬拽会把块拖到邻块上"
+                           % (pp.NUDGE_MAX_SHIFT_MM, pp.NUDGE_MAX_YAW_DEG))
+
+    # 目标块在塔窗候选里的编号：`check_block_gap` 靠 idx 把它自己排除掉。
+    bcx, bcy = [float(v) for v in merged["center_base_mm"]]
+    cands = window_candidates(before)
+    idx = TOWER_BLOCK_IDX
+    if cands:
+        near = min(cands, key=lambda c: math.hypot(c["cx"] - bcx,
+                                                   c["cy"] - bcy))
+        d_near = math.hypot(near["cx"] - bcx, near["cy"] - bcy)
+        if d_near > 10.0:
+            raise EntryStop("%s 测量中心与帧内候选差 %.1f mm —— 对不上，"
+                            "不夹" % (tag, d_near))
+        idx = int(near["idx"])
+    blocks = [{"idx": int(c["idx"]), "cx": float(c["cx"]),
+               "cy": float(c["cy"])} for c in cands]
+    if not blocks:
+        blocks = [{"idx": idx, "cx": bcx, "cy": bcy}]
+
+    # 复测用同一个位姿对：高度跟踪取**校正后**的塔顶（块不抬，前后同高）。
+    top_mm = before.get("next_surface_est_mm")
+    if top_mm is None:
+        top_mm = merged["top_mm"]
+    pair = _survey_pair(top_mm, slot_mm, args.d_mm)
+    js = board.joints(os.path.join(cdir, "joints-%s" % tag))
+    q_start = s2.chain_q(js)
+    # 块高用**真高**：nudge 的夹持深度 = 块高 − 18.5 mm，z 偏差进不来；
+    # 脚下那层表面 = 垫面（入口⑤ 只做第 1 层；k≥2 层要换 surface + tower_box）。
+    block = {"idx": idx, "cx": bcx, "cy": bcy,
+             "top": m3.BLOCK_TRUE_H_MM, "h": m3.BLOCK_TRUE_H_MM}
+    try:
+        plan = s3r.nudge_plan(chain, q_start, block, blocks,
+                              shift_xy_mm=(cmd["dx_mm"], cmd["dy_mm"]),
+                              dyaw_deg=cmd["dyaw_deg"],
+                              surface_m=float(pad_mm) / 1000.0,
+                              yaw_block_deg=cmd["yaw_from_deg"],
+                              open_mm=float(args.nudge_open),
+                              survey_tool0=pair[0])
+    except pp.PlanError as exc:
+        return dict(base, status="plan_rejected", reason=str(exc))
+    plan_path = s3r.write_plan(os.path.join(rdir, "plan-nudge.json"), plan)
+    rc = board.exec_plan(plan_path, os.path.join(rdir, "log-nudge.jsonl"),
+                         go=True)
+    if rc != 0:
+        raise EntryStop("%s 矫正执行判红（rc=%d）—— 停在原地不续跑；"
+                        "块可能还在指间，先看示教器再决定" % (tag, rc), rc)
+    # nudge 计划最后一条航点就是 pair[0]（survey_tool0），不用再走一趟。
+    after = measure_pair(board, chain, scene, rdir, tag + "-after", pair,
+                         grid, slot_mm, layer=1, z_bias_mm=zcal["tower"],
+                         move=False)
+    nb0 = scan_near(os.path.join(rdir, "frame-%s-pose1" % tag), slot_mm)
+    nb1 = scan_near(os.path.join(rdir, "frame-%s-after-pose1" % tag), slot_mm)
+    row = nudge_row(rep, cmd, merged, after["merged"], slot_mm)
+    row.update(base)
+    row.update({"status": "ok", "after_merged": after["merged"],
+                "survey_tool0": pair[0],
+                "plan": os.path.basename(plan_path),
+                "plan_meta": plan["meta"],
+                "neighbours_before": nb0, "neighbours_after": nb1,
+                "neighbours_shift": neighbour_shift(nb0, nb1)})
+    return row
+
+
+def mode_nudge(args, ctx):
+    """⑤ 放置后矫正：开环放一块 → 量 → **只夹不抬**推到目标 → 退开再量。
+
+    契约 §3 第 5 项。δ = 目标 − 实测；≥10 次；每次记**指令 δ 与实走 δ**、
+    push gain、有没有带转、有没有顶动邻块；判据就是 §4.1 的 ≤5 mm / ≤5°。
+
+    「放」用入口② 选出的最优释放组（默认开口 50 / 停留 0 / 间隙 3 mm）——
+    矫正要修的是**真实产线**会出现的偏差，不是人为制造的偏差。
+    每次仍由机器人自己把块拆回拾取区（纯测试的往返不压给人）。
+    """
+    board, chain, scene, grid, slot_mm, pad_mm, zcal = ctx
+    cdir = os.path.join(args.run_dir, "entry-nudge")
+    os.makedirs(cdir, exist_ok=True)
+    sign = float(scene.get("yaw_sign", 1.0))
+    delta = float(scene.get("finger_axis_delta_deg", 0.0))
+    reps = int(args.reps)
+    if reps < 10:
+        print("!! 契约 §3 第 5 项要求 ≥10 次；本次只排了 %d 次 —— 这一轮不能算过"
+              % reps)
+    ask("确认急停就绪、两指整个行程内无手无遮挡：接下来连续 %d 次"
+        "「开环放一块 → 只夹不抬地矫正 → 退开再量」，每次都由机器人自己"
+        "把块拆回拾取区" % reps)
+    try:
+        meas, msg = measure_tower(args, board, chain, scene, grid, cdir,
+                                  tag="precheck")
+        if msg:
+            raise EntryStop(msg + " —— 先清空再跑")
+    except EntryStop as exc:
+        print("!! " + exc.why)
+        return exc.rc
+    rows, stop = [], None
+    placed, last_merged = False, None
+    for r in range(1, reps + 1):
+        tag = "nudge-%02d" % r
+        rdir = os.path.join(cdir, tag)
+        os.makedirs(rdir, exist_ok=True)
+        try:
+            clear_tower_step(args, board, chain, scene, cdir, tag, grid,
+                             slot_mm, placed, merged=last_merged, zcal=zcal,
+                             rdir=rdir)
+            frame_dir, extras = capture_pick(args, board, scene, rdir, tag)
+            analysis = analyse_pick(frame_dir, extras, rdir)
+            item = pick_item(args, analysis, scene, zcal)[0]
+            rec = place_one(args, board, chain, scene, grid, analysis, item,
+                            slot_mm, pad_mm, rdir, tag, z_bias_mm=zcal["tower"],
+                            plan_kwargs={
+                                "place_open_mm": float(args.nudge_open),
+                                "release_dwell_s": float(args.nudge_dwell),
+                                "place_clearance": float(args.nudge_clearance)
+                                / 1000.0,
+                                "tower_half_edge": args.tower_half_edge})
+        except EntryStop as exc:
+            stop = exc.why
+            break
+        placed = True
+        last_merged = rec["measured"]["merged"]
+        try:
+            row = _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag,
+                              slot_mm, pad_mm, zcal, rec["measured"], rec,
+                              sign, delta, r)
+        except EntryStop as exc:
+            stop = exc.why
+            break
+        rows.append(row)
+        _dump(os.path.join(rdir, "row.json"), row)
+        if row.get("after_merged"):
+            last_merged = row["after_merged"]
+        if row["status"] == "ok":
+            print("  %s 前 %.2f mm / %.2f° → 后 %.2f mm / %.2f°；"
+                  "push gain %s，带转 %s°（指令 %s°）%s"
+                  % (tag, row["before"]["xy_err_mm"],
+                     _fmt(row["before"]["yaw_err_deg"]),
+                     row["after"]["xy_err_mm"],
+                     _fmt(row["after"]["yaw_err_deg"]),
+                     row["push"]["gain_xy"], _fmt(row["yaw"]["dyaw_actual_deg"]),
+                     row["yaw"]["dyaw_expected_deg"],
+                     "；**过了**" if row["final_ok"] else "；仍超门"))
+        else:
+            print("  %s 没矫正（%s）：%s"
+                  % (tag, row["status"], row.get("reason")))
+    if placed and stop is None:
+        # 收尾：最后一块也由机器人拿回拾取区（塔位留给下一项实验）
+        try:
+            clear_tower_step(args, board, chain, scene, cdir, "nudge-end",
+                             grid, slot_mm, True, merged=last_merged,
+                             zcal=zcal)
+        except EntryStop as exc:
+            stop = "收尾回位失败：%s" % exc.why
+    summ = nudge_summary(rows)
+    doc = {"kind": "stage3-entry-nudge", "grid_center_base_mm": slot_mm,
+           "pad_z_mm": pad_mm, "reps": reps,
+           "release": {"open_mm": float(args.nudge_open),
+                       "dwell_s": float(args.nudge_dwell),
+                       "clearance_mm": float(args.nudge_clearance)},
+           "max_shift_mm": pp.NUDGE_MAX_SHIFT_MM,
+           "max_yaw_deg": pp.NUDGE_MAX_YAW_DEG,
+           "rows": rows, "summary": summ, "stop_reason": stop}
+    path = _dump(os.path.join(cdir, "summary.json"), doc)
+    print("\n后矫正（判据 = 契约 §4.1：≤%.0f mm / ≤%.0f°）："
+          % (NUDGE_XY_TOL_MM, NUDGE_YAW_TOL_DEG))
+    print("  矫正 %d/%d 次，终态过门 %d 次；没矫正 %d 次"
+          % (summ["n_nudged"], summ["n"], summ["n_final_ok"],
+             summ["n_skipped"]))
+    for key, label in (("xy_err_before", "Δxy 前"), ("xy_err_after", "Δxy 后"),
+                       ("yaw_err_before", "Δyaw 前"),
+                       ("yaw_err_after", "Δyaw 后")):
+        s = summ[key]
+        if s.get("n"):
+            print("  %-8s 中位 %.2f 极差 %.2f（n=%d）"
+                  % (label, s["median"], s["range"], s["n"]))
+    for key, label in (("gain_xy", "push gain"), ("push_perp", "侧向走偏 mm"),
+                       ("gain_yaw", "转角 gain")):
+        s = summ[key]
+        if s.get("n"):
+            print("  %-12s 中位 %.2f 极差 %.2f（n=%d）"
+                  % (label, s["median"], s["range"], s["n"]))
+    print("  数据 → %s" % path)
+    print("  通过与否带这张表给用户拍板；修不动就如实记失败，不改主命题阈值")
+    return 2 if stop else 0
+
+
+def _fmt(v):
+    return "—" if v is None else "%.2f" % float(v)
+
+
 # ---------------------------------------------------------------- 上下文/CLI
 def resolve_zcal_path(run_dir, explicit, mode):
     """z 标定文件从哪来：显式 > ``<run-dir>/entry-zcal/zcal.json`` > **停**。
@@ -1198,11 +1631,14 @@ def protocol(mode):
                      "再夹块停在 place_approach 抓帧；抓完把这块放上去，由人重搭。",
         "tolerance": "④ 对中容差：人手把上块偏 --offsets 放上去，"
                      "机器人只动臂测量 + 静置复测（下块/两层高度对不上就停）。",
+        "nudge": "⑤ 后矫正：开环放一块（用入口② 最优组）→ 量 → **只夹不抬**"
+                 "推到格心/格线 → 退开再量，--reps 次（契约要求 ≥10）；"
+                 "每次由**机器人自己**把块拆回拾取区。判据 = §4.1 的 ≤5 mm / ≤5°。",
     }[mode]
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="阶段 3 入口四实验驱动")
+    ap = argparse.ArgumentParser(description="阶段 3 入口五实验驱动")
     ap.add_argument("--mode", required=True, choices=MODES)
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--urdf", required=True)
@@ -1224,6 +1660,12 @@ def main(argv=None):
     ap.add_argument("--heights", default="1,3,5")
     ap.add_argument("--offsets", default="0,3,5,8")
     ap.add_argument("--hold-s", type=float, default=10.0)
+    ap.add_argument("--nudge-open", type=float, default=50.0,
+                    help="⑤ 矫正前开环放置用的开口（mm）；默认入口② 最优组")
+    ap.add_argument("--nudge-dwell", type=float, default=0.0,
+                    help="⑤ 矫正前开环放置用的停留（s）")
+    ap.add_argument("--nudge-clearance", type=float, default=3.0,
+                    help="⑤ 矫正前开环放置用的间隙（mm）；默认入口② 最优组")
     ap.add_argument("--no-self-return", action="store_true",
                     help="把「塔上那块」交回人手动拿走；默认由机器人自己抓回拾取区")
     ap.add_argument("--resume", action="store_true",
@@ -1251,7 +1693,8 @@ def main(argv=None):
     board.push()
     ctx = (board, chain, scene, grid, slot_mm, pad_mm, zcal)
     fn = {"zcal": mode_zcal, "release": mode_release,
-          "occlusion": mode_occlusion, "tolerance": mode_tolerance}[args.mode]
+          "occlusion": mode_occlusion, "tolerance": mode_tolerance,
+          "nudge": mode_nudge}[args.mode]
     return fn(args, ctx)
 
 
