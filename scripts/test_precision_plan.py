@@ -665,6 +665,30 @@ def test_split_jumps(chain):
 
 
 @case
+def test_fold_yaw_90():
+    """正方体四面对称：抓取角折到 (−45°, +45°]（90° 换面，矩形块不成立）。
+
+    2026-11-01 入口⑤ 回位的真数：塔上那块实测 yaw 89.75°，只按 180° 折就留在
+    89.75° ⇒ 腕 3 要么 229.6°、要么 −210.045°（超缠绕帽 0.045°），两边都是死。
+    按 90° 折成 −0.25° 后，同一趟回位最大单跳 42.4°、腕 3 峰值 135.6°。
+    """
+    assert abs(pp.fold_yaw_90(89.75) - (-0.25)) < 1e-9
+    assert abs(pp.fold_yaw_90(-0.25) - (-0.25)) < 1e-9
+    assert abs(pp.fold_yaw_90(45.0) - 45.0) < 1e-9
+    assert abs(pp.fold_yaw_90(45.01) - (45.01 - 90.0)) < 1e-9
+    assert abs(pp.fold_yaw_90(100.0) - 10.0) < 1e-9
+    assert abs(pp.fold_yaw_90(-100.0) - (-10.0)) < 1e-9
+    assert pp.fold_yaw_90(0.0) == 0.0
+    assert pp.fold_yaw_90(180.0) == 0.0
+    # 折完必须落在半个象限内：整圈任意角都不许超 ±45°
+    for deg in range(-360, 361, 7):
+        v = pp.fold_yaw_90(deg)
+        assert -45.0 < v <= 45.0, (deg, v)
+    # 与 180° 折不是一回事：89.75° 在 180° 折下不动，90° 折才动
+    assert abs(pp.fold_yaw_180(89.75) - 89.75) < 1e-9
+
+
+@case
 def test_split_jumps_checks_first_hop(chain):
     """起点 → 第 1 个航点这一跳也必须判 `MAX_JOINT_SWING`。
 

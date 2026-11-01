@@ -193,6 +193,9 @@ def build_items(analysis, scene, n, arm="geometric", zcal=None):
                 raise RuntimeError("块 #%d 没有贴块边的 candidate：%s"
                                    % (block["idx"], note))
         yg, yp, src, why = s2.yaw_for_arm(arm, block, cand, scene)
+        # 阶段 3 的块是 29.5 mm 正方体（四面对称）⇒ 抓/放角按 90° 折，
+        # 每个角落在 (−45°, 45°] 内，腕的总行程随之最小。见 pp.fold_yaw_90。
+        yg, yp = pp.fold_yaw_90(yg), pp.fold_yaw_90(yp)
         h_raw = block.get("h")
         if h_raw is None:
             h_raw = block.get("top")

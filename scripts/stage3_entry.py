@@ -723,6 +723,9 @@ def tower_block_item(merged, scene, zcal, arm="geometric"):
             # 塔上那块没有 GraspNet 候选宽度可读，给标称值。
             "width_mm": 30.0}
     yg, yp, src, why = s2.yaw_for_arm(arm, block, cand, scene)
+    # 正方体四面对称：抓/放角按 90° 折（理由与 `build_items` 同一处）。
+    # 折不动就是回位被拒 —— 2026-11-01 入口⑤ 第 6 次/诊断档第 2 次都是这么停的。
+    yg, yp = pp.fold_yaw_90(yg), pp.fold_yaw_90(yp)
     return {"order": 1, "block_idx": TOWER_BLOCK_IDX,
             "class": merged.get("class"), "arm": arm,
             "block": block, "cand": cand,

@@ -335,6 +335,28 @@ def test_tower_block_item_uses_corrected_top():
 
 
 @case
+def test_tower_block_item_folds_yaw_90():
+    """塔上那块的正方体对称：抓/放角都折到 (−45°, 45°]。
+
+    反向变异：去掉 `fold_yaw_90` 那一行 ⇒ 89.75° 原样留下，本测试变红，
+    而那正是 2026-11-01 入口⑤ 回位被拒（229.6° / −210.045° 两边都是死）的输入。
+    """
+    scene = {"yaw_sign": 1.0, "finger_axis_delta_deg": 0.0,
+             "grasp_at": "block_center"}
+    merged = {"top_mm": 32.99, "center_base_mm": [421.07, -119.06],
+              "yaw_deg": 89.75, "yaw_trusted": True}
+    it = e.tower_block_item(merged, scene, {"tower": 0.0})
+    assert_close(it["yaw_grasp_deg"], -0.25, 1e-6, "89.75° 折 90°")
+    assert_close(it["yaw_place_deg"], 0.0, 1e-6, "放置角")
+    # 折完的抓/放角差（= 腕要转的角度）不许超过半个象限
+    for merged_yaw in (12.4, 46.0, 89.75, -100.0, 137.0):
+        merged2 = dict(merged, yaw_deg=merged_yaw)
+        it2 = e.tower_block_item(merged2, scene, {"tower": 0.0})
+        for key in ("yaw_grasp_deg", "yaw_place_deg"):
+            assert -45.0 < it2[key] <= 45.0, (merged_yaw, key, it2[key])
+
+
+@case
 def test_tower_block_item_without_yaw():
     """量不到 yaw ⇒ 抓取角 0 且标 geometric_missing（不假装有角）。"""
     scene = {"yaw_sign": 1.0, "finger_axis_delta_deg": 0.0}
