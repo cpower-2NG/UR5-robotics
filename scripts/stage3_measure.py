@@ -203,6 +203,8 @@ def _rescue_by_side(frame, mask, block, yaw_deg, side_mm, z_top_m):
     『重拟合出的真边长正方形』的比例」—— 块被遮掉一半、或颜色只长了一半，
     这个值都会掉下来。
     """
+    if block.get("cx") is None or block.get("cy") is None:
+        return None                     # 没有深度质心就没法搜框，交给原判据
     pts = _plane_xy_of_mask(frame, mask, z_top_m)
     n_all = int(cv2.countNonZero(mask))
     if pts is None or n_all < COLOR_MIN_PIXELS:
