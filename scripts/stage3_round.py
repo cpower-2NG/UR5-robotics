@@ -74,7 +74,7 @@ def load_zcal(path):
 def _finish_plan(wps, checks, meta, q_start, chain):
     """与 `precision_plan.main` 完全相同的计划 JSON（执行器只认这一种）。"""
     n_before = len(wps)
-    wps, added = pp.split_jumps(wps, chain)
+    wps, added = pp.split_jumps(wps, chain, q_start=q_start)
     if len(checks) != n_before:
         raise RuntimeError("预检记录不完整：%d 条航点只有 %d 条记录"
                            % (n_before, len(checks)))

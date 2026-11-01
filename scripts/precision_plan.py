@@ -557,26 +557,34 @@ def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
                "elbow_min_z_mm": round(worst[2] * 1000, 1) if worst else None}
 
 
-def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP):
+def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP, q_start=None):
     """相邻航点间关节跳变超过 max_jump 时，在关节空间插中间点。
 
     注意：JTC 本来就是在关节空间做直线插值，所以插点**不改变轨迹形状** ——
     它改变的是「这一条指令有多大」，便于日志与失败定位，也让 max_joint_jump
     这条约定在执行器的逐航点闸门里仍然有意义。
+
+    ``q_start``：计划的起点关节角。给上它才对**第一跳**也判 ``MAX_JOINT_SWING``。
+    此前这条链只比相邻航点，起点→第 1 个航点整个漏检 —— 2026-11-01 入口⑤ 第 6 次
+    的回位计划里，wrist_3 就是从这里 +229.6° 起步却没被拦下（台账第一百八十七轮 §7）。
+    **第一跳只判不插点**：插点只影响指令大小、不改轨迹，而这一跳的几何要跟既有
+    计划的 JSON 保持一致（阶段 2 的产物不动）。
     """
     out = []
     added = 0
-    prev_q = None
+    prev_q = None if q_start is None else np.asarray(q_start, float)
+    first = True
     for w in waypoints:
         q = np.asarray(w["q"], float)
         if prev_q is not None:
             jump = float(np.max(np.abs(q - prev_q)))
             if jump > MAX_JOINT_SWING:
+                where = "起点 → 航点 %s" % w["name"] if first else "航点 %s" % w["name"]
                 raise PlanError(
-                    "航点 %s 有单个关节要转 %.1f°（上限 %.0f°）—— 整圈翻转不是解法，"
+                    "%s 有单个关节要转 %.1f°（上限 %.0f°）—— 整圈翻转不是解法，"
                     "应换一支 IK 的等价角（见 unwrap_near）"
-                    % (w["name"], np.degrees(jump), np.degrees(MAX_JOINT_SWING)))
-            if jump > max_jump:
+                    % (where, np.degrees(jump), np.degrees(MAX_JOINT_SWING)))
+            if jump > max_jump and not first:
                 n = int(np.ceil(jump / max_jump))
                 for i in range(1, n):
                     qi = prev_q + (q - prev_q) * (i / n)
@@ -592,6 +600,7 @@ def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP):
                     added += 1
         out.append(w)
         prev_q = q
+        first = False
     return out, added
 
 
@@ -1111,7 +1120,7 @@ def main():
                 release_speed_pct=args.release_speed_pct,
                 release_dwell_s=args.release_dwell_s)
         n_before_split = len(wps)
-        wps, added = split_jumps(wps, chain)
+        wps, added = split_jumps(wps, chain, q_start=q_start)
         # 每个**原始**航点都必须有一条预检记录（插出来的点继承相邻两点的检查）。
         if len(checks) != n_before_split:
             raise PlanError("预检记录不完整：%d 条航点只有 %d 条记录"

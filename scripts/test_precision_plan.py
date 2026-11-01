@@ -665,6 +665,61 @@ def test_split_jumps(chain):
 
 
 @case
+def test_split_jumps_checks_first_hop(chain):
+    """起点 → 第 1 个航点这一跳也必须判 `MAX_JOINT_SWING`。
+
+    2026-11-01 入口⑤ 第 6 次回位（台账第一百八十七轮 §7）：wrist_3 从 −79.6°
+    直接要 +150.0°（229.6°），而相邻航点的检查要从第 2 个点才开始 —— 那一跳
+    整条链上没人看。侥幸的是后面 to_slot 也超限，计划才被拦下。
+    """
+    i = chain.move_joints.index("wrist_3_joint")
+    base = [0.5] * 6
+    q0 = list(base)
+    far = list(base)
+    far[i] = base[i] + 4.0                       # 4.0 rad > π，字面整圈翻
+    wps = [{"name": "approach", "q": far, "duration": 2.0}]
+    # 不给 q_start ⇒ 旧行为：第一跳没人看（这就是那个洞本身）
+    out, added = pp.split_jumps(wps, chain, max_jump=1.0)
+    assert out == wps and added == 0
+    # 给上 q_start ⇒ 必须拦，且要说清是「起点 → 第 1 个点」
+    try:
+        pp.split_jumps(wps, chain, max_jump=1.0, q_start=q0)
+    except pp.PlanError as e:
+        assert "起点 → 航点 approach" in str(e), e
+    else:
+        raise AssertionError("起点→首个航点转 %.0f°，护栏没拦"
+                             % np.degrees(4.0))
+    # 第一跳只判不插点：1.5 rad 超 max_jump 但没超 π ⇒ 一条都不插，
+    # 既有计划（阶段 2 的产物）的 JSON 不因此改变
+    near = list(base)
+    near[i] = base[i] + 1.5
+    wps2 = [{"name": "approach", "q": near, "duration": 2.0}]
+    out2, added2 = pp.split_jumps(wps2, chain, max_jump=1.0, q_start=q0)
+    assert added2 == 0 and out2 == wps2, (added2, out2)
+
+
+@case
+def test_finish_plan_passes_q_start_to_split_jumps(chain):
+    """接线：`stage3_round._finish_plan` 必须把 q_start 交下去。
+
+    否则 `split_jumps` 的第一跳检查形同虚设（默认 q_start=None）。
+    """
+    import stage3_round as s3r
+    i = chain.move_joints.index("wrist_3_joint")
+    q0 = [0.5] * 6
+    far = [0.5] * 6
+    far[i] = 0.5 + 4.0
+    wps = [{"name": "approach", "q": far, "duration": 2.0}]
+    checks = [{"name": "approach"}]
+    try:
+        s3r._finish_plan(wps, checks, {}, q0, chain)
+    except pp.PlanError as e:
+        assert "起点 → 航点 approach" in str(e), e
+    else:
+        raise AssertionError("_finish_plan 没把 q_start 交给 split_jumps")
+
+
+@case
 def test_wrist_guard(chain):
     """腕 2 过 0（奇异位形）必须判红 —— 包括**插点插出来**的过 0。"""
     i = chain.move_joints.index("wrist_2_joint")
