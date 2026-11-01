@@ -12,6 +12,8 @@ import os
 import sys
 import types
 
+import numpy as np
+
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -148,6 +150,128 @@ def test_occlusion_separates_tower_from_held_block():
                               [422.65, -114.86], held_top_mm=held)
     assert rep2["tower_top_visible"] is False, rep2
     assert rep2["n_window"] == 1
+
+
+# ------------------------------------------------------- 遮挡：顶面被切掉的闸门
+def synth_frame(patch_uv=None, patch_px=40, back_depth=1.0, patch_depth=0.90,
+                w=1280, h=720, f=600.0):
+    """造一帧：整幅深度 ``back_depth``，``patch_uv`` 处一块 ``patch_px`` 见方
+    的 ``patch_depth``。R=I、t=0 ⇒ 相机系 = base 系，1 px = d/f 米。"""
+    depth = np.full((h, w), float(back_depth), np.float32)
+    if patch_uv is not None:
+        u0, v0 = patch_uv
+        hh = patch_px // 2
+        depth[v0 - hh:v0 + hh, u0 - hh:u0 + hh] = float(patch_depth)
+    K = np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]])
+    return {"depth": depth, "K": K, "R_bc": np.eye(3),
+            "t_bc": np.zeros(3)}
+
+
+#: 合成帧里「块顶」在 base 系的 z（mm）
+SYNTH_ZTOP = 900.0
+
+
+@case
+def test_top_face_framing_sees_all_four_borders():
+    """顶面点的**四边**都得查 —— 只查一边会让贴底边的帧蒙混过关。
+
+    反向变异：`clear` 里去掉 `(h-1)-v_max` 那一项 ⇒ 贴底边的那条断言必红。
+    """
+    # 画幅中央：四边都远
+    mid = synth_frame((640, 360))
+    fr = e.top_face_framing(mid, 0.0, 0.0, SYNTH_ZTOP)
+    assert fr["clipped"] is False, fr
+    assert 300.0 < fr["clear_px"] < 400.0, fr
+    assert fr["n"] > 500, fr
+
+    # 贴底边：只有「到下边」这一项小
+    low = synth_frame((640, 700))
+    fr = e.top_face_framing(low, 0.0, 510.0, SYNTH_ZTOP)
+    assert fr["clipped"] is True, fr
+    assert fr["clear_px"] < 5.0, fr
+    assert fr["n"] > 500, fr
+
+    # 贴右边：换成「到左右」这一项小
+    right = synth_frame((1270, 360))
+    fr = e.top_face_framing(right, (1270 - 640) * 1.5, 0.0, SYNTH_ZTOP)
+    assert fr["clipped"] is True, fr
+    assert fr["clear_px"] < 5.0, fr
+
+
+@case
+def test_top_face_framing_fails_closed_when_face_missing():
+    """顶面点太少（没测到 / 高度对不上）⇒ 判 clipped，不许静默放行。
+
+    反向变异：把 `if n < 50` 改成 `return ... clipped False` ⇒ 本用例必红。
+    """
+    empty = synth_frame(None)                       # 只有台面，没有块顶
+    fr = e.top_face_framing(empty, 0.0, 0.0, SYNTH_ZTOP)
+    assert fr["clipped"] is True, fr
+    assert fr["n"] < 50, fr
+    assert "点太少" in fr["reason"], fr
+
+
+@case
+def test_top_face_clear_threshold_is_load_bearing():
+    """20 px 这道闸必须真在起作用 —— 把阈值调到 0 就等于没闸。
+
+    反向变异：`TOP_FACE_CLEAR_PX` 改 0.0 ⇒ 下面第二段必红。
+    """
+    assert 15.0 < e.TOP_FACE_CLEAR_PX < 40.0, e.TOP_FACE_CLEAR_PX
+    low = synth_frame((640, 700))
+    assert e.top_face_framing(low, 0.0, 510.0, SYNTH_ZTOP)["clipped"] is True
+    assert e.top_face_framing(low, 0.0, 510.0, SYNTH_ZTOP,
+                              clear_px=0.0)["clipped"] is False
+
+
+@case
+def test_occlusion_report_marks_clipped_tower_unusable():
+    """「看得见」≠「可用」：顶面贴到图像边界的帧，中心必须判不可用。
+
+    2026-11-01 三层实测：place_approach 处裕度 −1~1 px，质心偏 +6.4~+7.2 mm。
+    反向变异：`tower_top_usable` 写成 `bool(tower)`（不看 framing）⇒ 本用例必红。
+    """
+    held = SYNTH_ZTOP + 45.0 + 29.5
+    mid = synth_frame((640, 360))
+    rep = e.occlusion_report([blk(1, 0.0, 0.0, SYNTH_ZTOP, SYNTH_ZTOP)], SYNTH_ZTOP,
+                             [0.0, 0.0], held_top_mm=held, radius_mm=50.0,
+                             frame=mid)
+    assert rep["tower_top_visible"] is True and rep["tower_top_usable"] is True, \
+        rep
+
+    low = synth_frame((640, 700))
+    rep = e.occlusion_report([blk(1, 0.0, 510.0, SYNTH_ZTOP, SYNTH_ZTOP)],
+                             SYNTH_ZTOP, [0.0, 510.0], held_top_mm=held,
+                             radius_mm=50.0, frame=low)
+    assert rep["tower_top_visible"] is True, rep      # 确实看得见
+    assert rep["tower_top_usable"] is False, rep      # 但中心不可用
+    assert rep["framing"][0]["clipped"] is True, rep
+
+    # 不传 frame ⇒ 退回旧语义，不凭空判不可用（向后兼容）
+    rep = e.occlusion_report([blk(1, 0.0, 0.0, SYNTH_ZTOP, SYNTH_ZTOP)],
+                             SYNTH_ZTOP, [0.0, 0.0], held_top_mm=held)
+    assert rep["framing"] is None, rep
+    assert rep["tower_top_usable"] is True, rep
+
+
+@case
+def test_held_top_from_plan_follows_carry_height():
+    """持块顶高必须跟着这份计划的 ``carry_z`` 走，不能套死 place_approach。
+
+    用 2026-11-01 第 1 层档**真实**的 plan meta：carry_z 355.43 mm、
+    block_below_tip 11.23、block_h 29.73 ⇒ 顶 169.73 mm；
+    而 place_approach 的算法给 106.34 mm —— 差 63.39 mm ≈ carry−approach。
+    反向变异：把 `carry_z` 换成 `place_approach_z` ⇒ 两者相等，断言必红。
+    """
+    meta = {"carry_z": 0.35543, "block_below_tip_mm": 11.23,
+            "block_h_mm": 29.73, "place_approach_z": 0.29227,
+            "surface_z_mm": 31.84}
+    top = e.held_top_from_plan(meta)
+    assert_close(top, 169.73, tol=0.02)
+    approach_top = 31.84 + 40.0 + 5.0 + 29.5
+    assert_close(top - approach_top, 63.42, tol=0.05)
+    stub = dict(meta, carry_z=meta["place_approach_z"])
+    assert e.held_top_from_plan(stub) < top - 50.0
 
 
 @case

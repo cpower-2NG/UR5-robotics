@@ -60,6 +60,17 @@ MODES = ("zcal", "release", "occlusion", "tolerance", "nudge")
 ZCAL_TOL_MM = 2.0
 #: 遮挡实验里「塔顶簇」的判据：top 落在期望顶高 ±这个值内。
 OCCL_TOL_MM = 6.0
+#: 塔顶面点集离**图像边缘**的最小像素裕度闸门。低于它就判「顶面被画幅/
+#: 持块切掉」，中心不可用（fail-closed）。
+#:
+#: 2026-11-01 三层实测（离线重建，见台账）：裕度与质心偏差是**一一对应**的——
+#:   place_approach 处（裕度 −1~1 px）顶面只露出 62~67%，质心沿「相机→塔」
+#:   方向偏 +5.4~+5.6 mm（实测簇 +6.4~+7.2 mm）；
+#:   裕度 7~15 px（抬 20 mm）偏 +1.6~+1.9；裕度 20~27 px（抬 30 mm）偏 +0.2~+0.6；
+#:   **裕度 ≥32 px（抬 40 mm 起）偏 0.00**。
+#: 取 20 px：拦下偏差 ≥1.6 mm 的帧，放过 ≤0.6 mm 的。正常基准帧（近垂直）
+#: 裕度 239~325 px、carry 高度抓帧 44~61 px，都远在线上。
+TOP_FACE_CLEAR_PX = 20.0
 #: 塔位「空」的判据窗：比测量窗（50 mm）更紧。相邻格心最近 60 mm，
 #: 阶段 2 的放置容差 10 mm ⇒ 邻块中心最远能到 ~50 mm，收紧到 40 mm 不误伤。
 TOWER_CLEAR_RADIUS_MM = 40.0
@@ -172,13 +183,63 @@ def release_summary(groups):
             "order": sorted(usable, key=key)}
 
 
+def held_top_from_plan(plan_meta):
+    """持块顶高（mm）= carry 高度 − tool0→指尖 − 块底到指尖 + 块高。
+
+    从**计划自己的** meta 反算，不套 ``place_approach + 40 + 5 + 29.5`` 那个
+    式子：换了抓帧高度（遮挡实验改到 carry）之后，那个式子会固定差
+    ``carry_z − place_approach_z``（实测 50~63 mm），持块簇就再也对不上。
+    """
+    return (float(plan_meta["carry_z"]) * 1000.0
+            - pp.TOOL0_TO_BARE_FINGERTIP * 1000.0
+            - float(plan_meta["block_below_tip_mm"])
+            + float(plan_meta["block_h_mm"]))
+
+
+def top_face_framing(frame, cx_mm, cy_mm, ztop_mm, radius_mm=25.0,
+                     band_mm=3.0, clear_px=TOP_FACE_CLEAR_PX):
+    """量一簇的顶面离图像边缘还剩多少像素 —— 判断顶面有没有被切掉。
+
+    只回一个**结构性**判据，不含任何遮挡模型：把 ``ztop_mm`` 往下
+    ``band_mm`` 以内的点取出来，看它们最近离图像四边几像素。顶面被画幅
+    切掉、或又被手里那块压掉一角，都会让点集贴到边上（见 ``TOP_FACE_CLEAR_PX``
+    的实测表）。``radius_mm`` 取 25：块半对角线 20.9 mm，即使中心已偏 7 mm，
+    真实顶面仍落在这个圈里；而邻格中心 ≥60 mm，不会误抓邻块。
+    """
+    depth = frame["depth"]
+    R, t, K = frame["R_bc"], frame["t_bc"], frame["K"]
+    P, pix = gc.backproject(depth, K)
+    Q = (P @ R.T + t) * 1000.0
+    d = np.hypot(Q[:, 0] - float(cx_mm), Q[:, 1] - float(cy_mm))
+    sel = (d < float(radius_mm)) & (np.abs(Q[:, 2] - float(ztop_mm))
+                                    <= float(band_mm))
+    n = int(sel.sum())
+    if n < 50:
+        return {"n": n, "clear_px": 0.0, "span_px": [0.0, 0.0],
+                "clipped": True, "reason": "顶面点太少（%d < 50）" % n}
+    vv, uu = pix[sel, 1], pix[sel, 0]
+    h, w = depth.shape
+    clear = min(float(uu.min()), float((w - 1) - uu.max()),
+                float(vv.min()), float((h - 1) - vv.max()))
+    return {"n": n, "clear_px": round(clear, 1),
+            "span_px": [round(float(uu.max() - uu.min()), 1),
+                        round(float(vv.max() - vv.min()), 1)],
+            "clipped": bool(clear < float(clear_px)),
+            "reason": "" if clear >= float(clear_px) else
+            "顶面贴到图像边缘（裕度 %.0f px < %.0f px）——中心会沿"
+            "「相机→塔」方向偏，不可用" % (clear, clear_px)}
+
+
 def occlusion_report(blocks, expected_top_mm, window_xy_mm,
                      radius_mm=m3.TOWER_RADIUS_MM, held_top_mm=None,
-                     tol_mm=OCCL_TOL_MM, min_h_mm=m3.MIN_H_MM):
-    """夹着块那一帧 → 「塔顶还在不在视野里」。
+                     tol_mm=OCCL_TOL_MM, min_h_mm=m3.MIN_H_MM, frame=None):
+    """夹着块那一帧 → 「塔顶还在不在视野里、量出来的中心能不能用」。
 
     只看塔窗内、非 low、高度 ≥``min_h_mm`` 的簇。**手里那块会挡在塔顶上方**
     （其顶面约比塔顶高 74.5 mm），所以按期望顶高分类，不拿「最高簇」当塔顶。
+
+    ``frame`` 非空时，再对每个塔顶簇跑 `top_face_framing`：顶面贴到图像边缘
+    的帧中心和 yaw 都不可用（偏差可达 +5~+7 mm，见 ``TOP_FACE_CLEAR_PX``）。
     """
     wx, wy = float(window_xy_mm[0]), float(window_xy_mm[1])
     inside = []
@@ -200,6 +261,13 @@ def occlusion_report(blocks, expected_top_mm, window_xy_mm,
     if held_top_mm is not None:
         held = [b for b in inside if abs(b["top"] - float(held_top_mm))
                 <= float(tol_mm)]
+    framing = None
+    if frame is not None and tower:
+        framing = []
+        for b in tower:
+            fr = top_face_framing(frame, b["cx"], b["cy"], b["top"])
+            b["framing"] = fr
+            framing.append(fr)
     return {"window_xy_mm": [wx, wy], "radius_mm": float(radius_mm),
             "expected_top_mm": round(float(expected_top_mm), 2),
             "held_top_mm": (None if held_top_mm is None
@@ -207,8 +275,11 @@ def occlusion_report(blocks, expected_top_mm, window_xy_mm,
             "n_window": len(inside), "clusters": inside,
             "tower_clusters": tower, "held_clusters": held,
             # 「量得到」只表示视野里有一簇落在塔顶高度上；中心/yaw 能不能用
-            # 还要人看 —— 这就是本实验要回答的。
-            "tower_top_visible": bool(tower)}
+            # 还要看 framing —— 这就是本实验要回答的。
+            "tower_top_visible": bool(tower),
+            "framing": framing,
+            "tower_top_usable": bool(tower) and (
+                framing is None or not any(f["clipped"] for f in framing))}
 
 
 def tol_offset_mm(lower_center_mm, upper_center_mm):
@@ -1369,7 +1440,15 @@ def mode_occlusion(args, ctx):
             # 29.5 mm 见方只搭接 ~4 mm，5 mm 自由下落一冲就从塔边滑掉
             # （2026-11-01 第 1 层档实测事故，块落到格 1 附近）。
             tower_xy = occlusion_place_xy(base["merged"], slot_mm)
-            # ---- 夹着块停在 place_approach
+            # ---- 夹着块停在 **carry 高度**（`to_slot`），不是 place_approach
+            #
+            # 2026-11-01 离线定量（三层一致）：place_approach 处相机在塔顶侧上方
+            # 90 mm / 236 mm，手里那块与塔顶同尺寸、只高 45 mm ⇒ 它把**远侧**
+            # 顶面挡掉 31~35%，剩下那点又跑出图像下边界 12~20%，只露出 62~67%，
+            # 质心沿「相机→塔」方向偏 +5.4~+5.6 mm（实测簇 +6.4~+7.2）。
+            # 抬高 40 mm 起顶面 100% 可见、偏差 0.00；`to_slot` 正在
+            # place_approach 正上方 50~63 mm（Δxy=0.00），本来就在路径上，
+            # 在这里抓帧不额外走路，顶面 100% 可见（离下边界 44~61 px）。
             frame_dir, extras = capture_pick(args, board, scene, hdir, "pick")
             analysis = analyse_pick(frame_dir, extras, hdir)
             item = pick_item(args, analysis, scene, zcal)[0]
@@ -1380,19 +1459,37 @@ def mode_occlusion(args, ctx):
                             plan_kwargs={"tower_xy_mm": tower_xy,
                                          "tower_top_mm": tower_top_mm,
                                          "tower_half_edge": args.tower_half_edge},
-                            exec_kwargs={"upto": "place_approach"})
+                            exec_kwargs={"upto": "to_slot"})
             n = int(scene.get("terminal_frames", 3))
             dirs = s3r.capture_frames(
                 board, os.path.join(hdir, "frame-hold"),
                 "entry-occl-l%02d-hold" % h, n)
-            blocks, _tz = gc.find_blocks(gc.load_frame(dirs[0]),
-                                         max_h_mm=m3.MAX_H_MM,
-                                         min_h_mm=m3.MIN_H_MM)
-            held_top_mm = (tower_top_mm + pp.PLACE_APPROACH_GAP * 1000.0
-                           + pp.PLACE_CLEARANCE * 1000.0
-                           + m3.BLOCK_TRUE_H_MM)
-            rep = occlusion_report(blocks, tower_top_mm, slot_mm,
-                                   held_top_mm=held_top_mm)
+            # 持块顶高从**这份计划实际用的** carry_z 反算，不套 place_approach
+            # 的公式：换了抓帧高度之后那个式子就错 50~63 mm。
+            plan_meta = json.load(
+                open(os.path.join(hdir, "plan-hold.json")))["meta"]
+            held_top_mm = held_top_from_plan(plan_meta)
+            reps = []
+            for d in dirs:
+                fr = gc.load_frame(d)
+                blocks, _tz = gc.find_blocks(fr, max_h_mm=m3.MAX_H_MM,
+                                             min_h_mm=m3.MIN_H_MM)
+                r = occlusion_report(blocks, tower_top_mm, slot_mm,
+                                     held_top_mm=held_top_mm, frame=fr)
+                r["frame"] = os.path.basename(d)
+                reps.append(r)
+            # 逐帧全过才算数（fail-closed）：一帧被切就说明这个位姿不稳。
+            rep = {k: reps[0][k] for k in
+                   ("window_xy_mm", "radius_mm", "expected_top_mm",
+                    "held_top_mm", "n_window", "clusters", "tower_clusters",
+                    "held_clusters")}
+            rep["tower_top_visible"] = all(r["tower_top_visible"] for r in reps)
+            rep["tower_top_usable"] = all(r["tower_top_usable"] for r in reps)
+            rep["per_frame"] = [{k: r[k] for k in
+                                 ("frame", "n_window", "tower_clusters",
+                                  "held_clusters", "framing",
+                                  "tower_top_visible", "tower_top_usable")}
+                                for r in reps]
             rep.update({"layer": h, "frames": [os.path.basename(d)
                                                for d in dirs],
                         "baseline_merged": base["merged"],
@@ -1402,10 +1499,17 @@ def mode_occlusion(args, ctx):
             print("  %d 层：塔窗内 %d 簇；塔顶高度上 %d 簇 ⇒ %s"
                   % (h, rep["n_window"], len(rep["tower_clusters"]),
                      "看得见" if rep["tower_top_visible"] else "**看不见**"))
+            if rep["tower_top_visible"]:
+                clears = [f["framing"][0]["clear_px"]
+                          for f in rep["per_frame"] if f["framing"]]
+                print("     顶面离图像边缘 %s px ⇒ 中心%s"
+                      % ("/".join("%.0f" % c for c in clears),
+                         "可用" if rep["tower_top_usable"]
+                         else "**不可用（被切掉）**"))
             # ---- 把这一块放上去（塔变 h+1 层，由人重搭）
             rc, nxt = finish_plan(board, hdir, "hold",
                                   os.path.join(hdir, "plan-hold.json"),
-                                  "place_approach")
+                                  "to_slot")
             if rc != 0:
                 raise EntryStop("补完放置失败（rc=%d，从 %s）" % (rc, nxt), rc)
             # 放完必须**量一次**再宣布成功：执行器 rc=0 只说明轨迹走完了，
@@ -1433,9 +1537,12 @@ def mode_occlusion(args, ctx):
            "d_mm": float(args.d_mm), "results": out, "stop_reason": stop}
     path = _dump(os.path.join(cdir, "summary.json"), doc)
     visible = [r["layer"] for r in out if r["tower_top_visible"]]
+    usable = [r["layer"] for r in out if r.get("tower_top_usable")]
     print("\n遮挡实验结果：%s"
           % ("、".join("%d 层可见" % v for v in visible) if visible
              else "所有测过的塔层都看不见塔顶"))
+    print("  其中中心可用（顶面没被切掉）：%s"
+          % ("、".join("%d 层" % v for v in usable) if usable else "**无**"))
     print("  数据 → %s" % path)
     print("  eye-in-hand 对照组做不做由用户看这张表拍板")
     return 2 if stop else 0
