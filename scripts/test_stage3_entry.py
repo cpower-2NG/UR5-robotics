@@ -857,6 +857,49 @@ def test_nudge_row_gain_and_gate():
 
 
 @case
+def test_nudge_pose_gate_enforces_contract_4_2_5():
+    """契约 §4.2.5：两视点差 ≤10 mm / ≤6°，超了或证明不了 ⇒ 转人评，不许记成 ok。
+
+    现实原型（2026-11-01 实测）：零位移诊断档第 1 次两视点差 **11.17 mm**，原来
+    照样记成 ``status: ok`` 混进 ``n_final_ok``。这条测试把那个缺口钉住。
+    """
+    ok_b = dict(_merged(421.0, 0.0, 6.0), center_span_mm=2.5,
+                yaw_color_span_deg=0.5)
+    ok_a = dict(_merged(422.0, 0.0, 1.0), center_span_mm=1.8,
+                yaw_color_span_deg=0.4)
+    assert e.nudge_pose_gate(ok_b, ok_a) is None, "过门时不许报理由"
+
+    # 中心两视点差 11.17 mm > 10 mm（真实那一行的数）
+    bad_x = dict(ok_b, center_span_mm=11.17)
+    why = e.nudge_pose_gate(bad_x, ok_a)
+    assert why and "11.2 mm" in why and "矫正前" in why, why
+    # 后半程坏一样拦，且理由点名「矫正后」
+    why = e.nudge_pose_gate(ok_b, dict(ok_a, center_span_mm=12.0))
+    assert why and "矫正后" in why, why
+    # 彩色 yaw 两视点差 7° > 6°
+    why = e.nudge_pose_gate(dict(ok_b, yaw_color_span_deg=7.0), ok_a)
+    assert why and "yaw" in why, why
+    # 只有一个视点能测到 ⇒ 证明不了一致 ⇒ 同样转人评
+    lone = {k: v for k, v in ok_b.items() if k != "center_span_mm"}
+    why = e.nudge_pose_gate(lone, ok_a)
+    assert why and "只有一个视点" in why, why
+
+    # 只查矫正前（``after`` 省略）时不许凭空判「矫正后」缺测
+    assert e.nudge_pose_gate(ok_b) is None
+    assert e.nudge_pose_gate(bad_x) is not None
+
+    # 反向变异：把门拆掉（阈值放到无穷远）必须让上面那几条都放行，
+    # 否则说明是别的分支在拦，测试根本没测到门。
+    old = (e.m3.POSE_XY_TOL_MM, e.m3.POSE_YAW_TOL_DEG)
+    try:
+        e.m3.POSE_XY_TOL_MM = e.m3.POSE_YAW_TOL_DEG = float("inf")
+        assert e.nudge_pose_gate(bad_x, ok_a) is None, "阈值拆除后仍报红 ⇒ 测试没测到门"
+        assert e.nudge_pose_gate(dict(ok_b, yaw_color_span_deg=7.0)) is None
+    finally:
+        e.m3.POSE_XY_TOL_MM, e.m3.POSE_YAW_TOL_DEG = old
+
+
+@case
 def test_nudge_summary_splits_skipped_from_failed():
     """「没敢矫正」与「矫正了没修回来」分开计数。"""
     ok = {"status": "ok", "final_ok": True,

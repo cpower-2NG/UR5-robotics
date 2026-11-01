@@ -400,6 +400,42 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
                     "yaw_deg": float(yaw_tol_deg)}}
 
 
+def nudge_pose_gate(before, after=None):
+    """契约 §4.2.5 的多姿态一致性门 —— 过门返回 ``None``，否则返回人评理由。
+
+    ``after`` 省略（``None``）= 只查矫正前那一次（还没动臂，用来决定夹不夹）。
+
+    ``before`` / ``after`` 是 ``stage3_measure`` 的融合值；这里只读它自己记下的
+    两视点差（``center_span_mm`` / ``yaw_color_span_deg``），不重算。
+
+    为什么要单独补这一道（2026-11-01 实测）：nudge 这条路径原来只取融合后的
+    ``center_base_mm``，把离散度记进 row.json 就没人看了。零位移诊断档第 1 次
+    的两个视点相差 **11.17 mm**（超过契约的 10 mm 门），却仍被记成一条普通的
+    ``status: ok``，混进了 ``n_final_ok``。几十次跑下来这种东西会把结论带偏，
+    而且从汇总里根本看不出来。
+
+    ``span`` 缺失 = 只有一个视点能测到 ⇒ **证明不了一致**，同样转人评
+    （与 ``stage3_measure.pose_consistency`` 的 ``ok=None`` 同一口径）。
+    """
+    pairs = [("矫正前", before or {})]
+    if after is not None:
+        pairs.append(("矫正后", after or {}))
+    bad = []
+    for name, m in pairs:
+        sp = m.get("center_span_mm")
+        ys = m.get("yaw_color_span_deg")
+        if sp is None or ys is None:
+            bad.append("%s只有一个视点能测到（证明不了一致）" % name)
+            continue
+        if sp > m3.POSE_XY_TOL_MM:
+            bad.append("%s两视点差 %.1f mm > %.0f mm"
+                       % (name, sp, m3.POSE_XY_TOL_MM))
+        if ys > m3.POSE_YAW_TOL_DEG:
+            bad.append("%s两视点 yaw 差 %.1f° > %.0f°"
+                       % (name, ys, m3.POSE_YAW_TOL_DEG))
+    return "；".join(bad) or None
+
+
 def nudge_summary(rows):
     """矫正实验汇总：终态过门比例 + push / 转角增益的重复性。
 
@@ -1397,6 +1433,10 @@ def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
         # 契约 §4.2.5：彩色 yaw 缺失 ⇒ 人评，**不拿深度顶替**。
         return dict(base, status="no_colour_yaw",
                     reason="彩色 yaw 缺失/不可信（深度只报告，不顶替）")
+    why = nudge_pose_gate(merged, None)
+    if why:
+        # 两个视点对「块在哪」都对不上，就别拿它当抓取目标 —— 不瞎夹。
+        return dict(base, status="person_review", reason=why)
 
     cmd = nudge_delta(merged["center_base_mm"], yaw_c, slot_mm,
                       yaw_sign=sign, delta_deg=delta)
@@ -1465,8 +1505,13 @@ def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
     nb0 = scan_near(os.path.join(rdir, "frame-%s-pose1" % tag), slot_mm)
     nb1 = scan_near(os.path.join(rdir, "frame-%s-after-pose1" % tag), slot_mm)
     row = nudge_row(rep, applied, merged, after["merged"], slot_mm)
+    why = nudge_pose_gate(merged, after["merged"])
+    if why:
+        # 进不了机判：先判过门，再看它原本的 status（契约 §4.2.5）。
+        row.update({"status": "person_review", "reason": why})
     row.update(base)
-    row.update({"status": "ok", "after_merged": after["merged"],
+    row.update({"status": row.get("status") or "ok",
+                "after_merged": after["merged"],
                 "survey_tool0": pair[0],
                 "plan": os.path.basename(plan_path),
                 "plan_meta": plan["meta"],
