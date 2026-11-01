@@ -1534,19 +1534,7 @@ def mode_nudge(args, ctx):
         _dump(os.path.join(rdir, "row.json"), row)
         if row.get("after_merged"):
             last_merged = row["after_merged"]
-        if row["status"] == "ok":
-            print("  %s 前 %.2f mm / %.2f° → 后 %.2f mm / %.2f°；"
-                  "push gain %s，带转 %s°（指令 %s°）%s"
-                  % (tag, row["before"]["xy_err_mm"],
-                     _fmt(row["before"]["yaw_err_deg"]),
-                     row["after"]["xy_err_mm"],
-                     _fmt(row["after"]["yaw_err_deg"]),
-                     row["push"]["gain_xy"], _fmt(row["yaw"]["dyaw_actual_deg"]),
-                     row["yaw"]["dyaw_expected_deg"],
-                     "；**过了**" if row["final_ok"] else "；仍超门"))
-        else:
-            print("  %s 没矫正（%s）：%s"
-                  % (tag, row["status"], row.get("reason")))
+        print(format_nudge_line(tag, row))
     if placed and stop is None:
         # 收尾：最后一块也由机器人拿回拾取区（塔位留给下一项实验）
         try:
@@ -1590,6 +1578,31 @@ def mode_nudge(args, ctx):
 
 def _fmt(v):
     return "—" if v is None else "%.2f" % float(v)
+
+
+def format_nudge_line(tag, row):
+    """一次矫正的一行摘要。
+
+    2026-11-01 真机事故：原版把 ``_fmt(...)``（**字符串**）塞进 ``%.2f``，
+    第 2 次一走到成功分支就 ``TypeError`` 把整个 10 次跑打断（前两次的数据
+    已经在盘上，但臂停在半路）。所以这里一律 ``%s`` —— 数值格式由 ``_fmt``
+    负责，缺值显示「—」，不再让格式化本身成为崩溃点。
+    """
+    if row.get("status") != "ok":
+        return ("  %s 没矫正（%s）：%s"
+                % (tag, row.get("status"), row.get("reason")))
+    before = row.get("before") or {}
+    after = row.get("after") or {}
+    push = row.get("push") or {}
+    yaw = row.get("yaw") or {}
+    return ("  %s 前 %s mm / %s° → 后 %s mm / %s°；"
+            "push gain %s，带转 %s°（指令 %s°）%s"
+            % (tag, _fmt(before.get("xy_err_mm")),
+               _fmt(before.get("yaw_err_deg")),
+               _fmt(after.get("xy_err_mm")), _fmt(after.get("yaw_err_deg")),
+               push.get("gain_xy"), _fmt(yaw.get("dyaw_actual_deg")),
+               _fmt(yaw.get("dyaw_expected_deg")),
+               "；**过了**" if row.get("final_ok") else "；仍超门"))
 
 
 # ---------------------------------------------------------------- 上下文/CLI

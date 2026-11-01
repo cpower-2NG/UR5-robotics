@@ -822,6 +822,37 @@ def test_nudge_summary_splits_skipped_from_failed():
     assert s["xy_err_before"]["n"] == 2, s
 
 
+@case
+def test_format_nudge_line_never_raises_on_missing_values():
+    """2026-11-01 真机事故回归：成功分支的打印曾是崩溃点。
+
+    原版把 ``_fmt(...)`` 的**字符串**塞进 ``%.2f``，第 2 次一走到成功分支就
+    ``TypeError``，把整轮 10 次打断。这条测试要求：正常行打得出、缺值（None）
+    的 yaw 也能打、没矫正的行带原因。
+    """
+    ok = {"status": "ok", "final_ok": True,
+          "before": {"xy_err_mm": 2.98, "yaw_err_deg": -5.22},
+          "after": {"xy_err_mm": 4.77, "yaw_err_deg": -0.37},
+          "push": {"gain_xy": 0.72},
+          "yaw": {"dyaw_actual_deg": 4.85, "dyaw_expected_deg": 5.22}}
+    line = e.format_nudge_line("nudge-02", ok)
+    assert "2.98" in line and "4.77" in line and "过了" in line, line
+
+    # 终态没有彩色 yaw（no_colour_yaw）⇒ 显示「—」，不抛异常
+    blank = dict(ok, after={"xy_err_mm": 1.0, "yaw_err_deg": None},
+                 yaw={"dyaw_actual_deg": None, "dyaw_expected_deg": 5.0})
+    line = e.format_nudge_line("nudge-03", blank)
+    assert "—" in line, line
+
+    over = dict(ok, final_ok=False,
+                after={"xy_err_mm": 9.0, "yaw_err_deg": 8.0})
+    assert "仍超门" in e.format_nudge_line("nudge-04", over)
+
+    skipped = {"status": "out_of_range", "reason": "δ 超上限"}
+    line = e.format_nudge_line("nudge-05", skipped)
+    assert "没矫正" in line and "δ 超上限" in line, line
+
+
 # ---------------------------------------------------------------- 协议
 @case
 def test_protocol_non_empty_for_all_modes():
