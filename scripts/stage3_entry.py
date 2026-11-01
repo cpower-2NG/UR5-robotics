@@ -1467,20 +1467,39 @@ def mode_nudge(args, ctx):
     if reps < 10:
         print("!! 契约 §3 第 5 项要求 ≥10 次；本次只排了 %d 次 —— 这一轮不能算过"
               % reps)
+    resume = bool(getattr(args, "resume", False))
+    done = ({row["rep"]: row for row in load_rows(cdir)} if resume else {})
+    rows = [done[k] for k in sorted(done)]
+    placed = bool(rows)
+    last_merged = ((rows[-1].get("after_merged") or rows[-1].get("merged"))
+                   if rows else None)
+    if rows:
+        print("  续跑：已有 %d 次结果，从第 %d 次接着跑"
+              % (len(rows), rows[-1]["rep"] + 1))
     ask("确认急停就绪、两指整个行程内无手无遮挡：接下来连续 %d 次"
         "「开环放一块 → 只夹不抬地矫正 → 退开再量」，每次都由机器人自己"
-        "把块拆回拾取区" % reps)
+        "把块拆回拾取区" % (reps - len(rows)))
     try:
         meas, msg = measure_tower(args, board, chain, scene, grid, cdir,
-                                  tag="precheck")
-        if msg:
+                                  tag=("resume-precheck" if resume
+                                       else "precheck"))
+        act = resume_tower_action(msg, meas, last_merged, resume)
+        if act == "stop":
             raise EntryStop(msg + " —— 先清空再跑")
+        if act == "return":
+            print("  续跑：塔位非空 → 机器人自己把上次那块拆回拾取区")
+            return_to_pick(args, board, chain, scene, cdir, "resume-clear",
+                           grid, slot_mm, meas.get("merged") or last_merged,
+                           zcal)
+        # 走到这里塔位一定是空的（刚拆回或本来就空）
+        placed, last_merged = False, None
     except EntryStop as exc:
         print("!! " + exc.why)
         return exc.rc
-    rows, stop = [], None
-    placed, last_merged = False, None
+    stop = None
     for r in range(1, reps + 1):
+        if r in done:
+            continue
         tag = "nudge-%02d" % r
         rdir = os.path.join(cdir, tag)
         os.makedirs(rdir, exist_ok=True)
@@ -1669,8 +1688,9 @@ def main(argv=None):
     ap.add_argument("--no-self-return", action="store_true",
                     help="把「塔上那块」交回人手动拿走；默认由机器人自己抓回拾取区")
     ap.add_argument("--resume", action="store_true",
-                    help="zcal/release：复用 run-dir 里已有的 row.json，从没做的那一位接着跑；"
-                         "塔上若还压着上次那块，先由机器人自己拆回")
+                    help="zcal/release/nudge：复用 run-dir 里已有的 row.json，"
+                         "从没做的那一位接着跑；塔上若还压着上次那块，"
+                         "先由机器人自己拆回")
     ap.add_argument("--go", action="store_true",
                     help="真跑；**每次都当次授权**，闸门在 precision_exec")
     args = ap.parse_args(argv)
