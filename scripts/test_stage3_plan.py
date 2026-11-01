@@ -109,6 +109,35 @@ def test_layer_surface_uses_corrected_top_not_below_surface():
 
 
 @case
+def test_closed_loop_yaw_uses_colour_not_depth():
+    """闭环目标必须和判分同源（彩色掩码，契约 §4.2.5）。
+
+    这一对数是入口③ 5 层的真值：同一座**静止**的塔，基准帧深度 89.334 /
+    彩色 1.652，持块帧深度 14.5 / 彩色 1.6。闭环若拿深度，第二层就要把块
+    拧 15° 去「对齐」一个并不存在的朝向。
+    """
+    m = {"found": True, "yaw_deg": 14.5, "yaw_trusted": True,
+         "yaw_color_deg": 1.652, "yaw_color_trusted": True}
+    yaw, src = s3r.closed_loop_yaw(m)
+    assert_close(yaw, 1.652, 1e-9, "闭环 yaw 必须是彩色那一路")
+    assert src == "color", src
+
+
+@case
+def test_closed_loop_yaw_refuses_without_colour():
+    """彩色判不了就返回 None（调用方停轮），**不拿深度顶替**。"""
+    for m, want in (({"found": True, "yaw_deg": 14.5, "yaw_trusted": True,
+                      "yaw_color_deg": None, "yaw_color_trusted": None},
+                     "no_color_yaw"),
+                    ({"found": True, "yaw_deg": 14.5, "yaw_trusted": True,
+                      "yaw_color_deg": 1.6, "yaw_color_trusted": False},
+                     "color_yaw_untrusted")):
+        yaw, src = s3r.closed_loop_yaw(m)
+        assert yaw is None, "深度值 %r 不许顶替" % m["yaw_deg"]
+        assert src == want, (src, want)
+
+
+@case
 def test_survey_pose_tracks_tower_top():
     """相机—塔顶距离恒定；塔越高 tool0 越高。"""
     d = pp.STAGE3_SURVEY_DEFAULT_D

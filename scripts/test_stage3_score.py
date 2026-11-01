@@ -31,11 +31,26 @@ def case(fn):
     return fn
 
 
+_UNSET = object()
+
+
 def layer_rec(k, top, cx=422.65, cy=-114.86, yaw=0.0, exec_rc=0,
               cons_ok=True, trusted=True, found=True, pred=None,
-              pred_yaw=None, pred_top=None):
+              pred_yaw=None, pred_top=None, yaw_color=_UNSET,
+              color_trusted=_UNSET):
+    """一条层记录。``yaw`` 是**深度**值（只报告），``yaw_color`` 是判据用的那一路。
+
+    默认 ``yaw_color = yaw``、``color_trusted = trusted`` —— 老用例只要不显式
+    区分两路，语义就不变；要验「判据走哪一路」时单独覆盖。
+    """
+    if yaw_color is _UNSET:
+        yaw_color = yaw
+    if color_trusted is _UNSET:
+        color_trusted = trusted
     merged = {"found": found, "center_base_mm": [cx, cy], "top_mm": top,
-              "yaw_deg": yaw, "yaw_trusted": trusted}
+              "yaw_deg": yaw, "yaw_trusted": trusted,
+              "yaw_color_deg": yaw_color,
+              "yaw_color_trusted": color_trusted}
     cons = {"ok": cons_ok,
             "reason": ("ok" if cons_ok is True else
                        "single_pose" if cons_ok is None else "pose_mismatch")}
@@ -48,16 +63,18 @@ def layer_rec(k, top, cx=422.65, cy=-114.86, yaw=0.0, exec_rc=0,
     return rec
 
 
-def terminal(cx=422.65, cy=-114.86, top=90.5, yaw=0.0, wait_s=10.0):
+def terminal(cx=422.65, cy=-114.86, top=90.5, yaw=0.0, wait_s=10.0,
+             yaw_color=_UNSET):
+    if yaw_color is _UNSET:
+        yaw_color = yaw
     return {"wait_s": wait_s,
             "measured": {"merged": {"found": True,
                                     "center_base_mm": [cx, cy],
                                     "top_mm": top, "yaw_deg": yaw,
-                                    "yaw_trusted": True},
+                                    "yaw_trusted": True,
+                                    "yaw_color_deg": yaw_color,
+                                    "yaw_color_trusted": True},
                          "consistency": {"ok": True}}}
-
-
-_UNSET = object()
 
 
 def obs3(layers=None, term=_UNSET, **kw):
@@ -138,6 +155,69 @@ def test_relative_yaw_threshold():
     lay2 = [layer_rec(1, 31.5, yaw=89.5), layer_rec(2, 61.0, yaw=0.5)]
     res2 = s3.score_round(obs3(layers=lay2, n_layers=2, term=terminal(top=61.0)))
     assert res2["layers"][1]["yaw_rel_deg"] == 1.0, res2["layers"][1]
+
+
+# ---------------------------------------------------------------- yaw 来源
+@case
+def test_yaw_gate_uses_colour_not_depth():
+    """判据走彩色：深度两路各说各话（89.3 vs 14.5）时，不该判红。
+
+    这一对数是 2026-11-01 入口③ 5 层的真值：基准帧深度 89.334 / 彩色 1.652，
+    持块帧深度 14.5 / 彩色 1.6。拿深度当判据会把 0.05° 的真实差算成 15.2°。
+    """
+    lay = [layer_rec(1, 31.5, yaw=89.334, yaw_color=1.652),
+           layer_rec(2, 61.0, yaw=14.5, yaw_color=1.600)]
+    res = s3.score_round(obs3(layers=lay, n_layers=2, term=terminal(top=61.0)))
+    r2 = res["layers"][1]
+    assert abs(r2["yaw_rel_deg"] - 0.052) < 0.01, r2["yaw_rel_deg"]
+    assert r2["status"] == "ok", r2
+    assert r2["measured"]["yaw_source"] == "color"
+    # 深度值仍然留档（只报告）
+    assert r2["measured"]["yaw_deg"] == 14.5
+
+
+@case
+def test_missing_colour_yaw_is_review_not_depth_fallback():
+    """彩色缺失 ⇒ 人评；深度明明有值也不许顶替（契约 §4.2.5）。"""
+    lay = [layer_rec(1, 31.5, yaw_color=None),
+           layer_rec(2, 61.0)]
+    res = s3.score_round(obs3(layers=lay, n_layers=2, term=terminal(top=61.0)))
+    r1 = res["layers"][0]
+    assert r1["status"] == "person_review", r1
+    assert "no_color_yaw" in r1["reasons"], r1["reasons"]
+    assert r1["measured"]["yaw_deg"] == 0.0, "深度值不能因为不判分就被抹掉"
+
+
+@case
+def test_colour_yaw_untrusted_is_review():
+    lay = [layer_rec(1, 31.5), layer_rec(2, 61.0, color_trusted=False)]
+    res = s3.score_round(obs3(layers=lay, n_layers=2, term=terminal(top=61.0)))
+    r2 = res["layers"][1]
+    assert r2["status"] == "person_review", r2
+    assert "color_yaw_untrusted" in r2["reasons"], r2["reasons"]
+
+
+@case
+def test_previous_layer_colour_yaw_missing_is_review():
+    """下层彩色 yaw 判不了 ⇒ 相对 yaw 无从算起，不放行。"""
+    lay = [layer_rec(1, 31.5, yaw_color=None), layer_rec(2, 61.0)]
+    res = s3.score_round(obs3(layers=lay, n_layers=2, term=terminal(top=61.0)))
+    r2 = res["layers"][1]
+    assert r2["status"] == "person_review", r2
+    assert any("previous_no_color_yaw" in r for r in r2["reasons"]), r2["reasons"]
+
+
+@case
+def test_stability_uses_colour_yaw():
+    """Δyaw 也走彩色：深度两路差 74.8° 时稳定性仍应判过。"""
+    lay = [layer_rec(1, 31.5), layer_rec(2, 61.0),
+           layer_rec(3, 90.5, yaw=89.334, yaw_color=1.65)]
+    t = terminal(top=90.5, yaw=14.5, yaw_color=1.60)
+    res = s3.score_round(obs3(layers=lay, term=t))
+    assert abs(res["stability"]["dyaw_deg"] - 0.05) < 0.01, res["stability"]
+    assert res["stability"]["status"] == "ok", res["stability"]
+    assert res["stability"]["yaw_source"] == {"terminal": "color",
+                                              "layer": "color"}
 
 
 # ---------------------------------------------------------------- 人评
@@ -243,12 +323,19 @@ def test_stability_collapse_is_fail():
 
 
 @case
-def test_stability_missing_when_terminal_yaw_absent():
+def test_stability_reviews_when_terminal_colour_yaw_absent():
+    """彩色 yaw 缺失 ⇒ 人评（契约 §4.2.5），**不拿深度顶替**，也不是 missing。
+
+    深度 ``yaw_deg`` 仍在 —— 只是不进判据；这条同时证明它没被拿来顶替。
+    """
     t = terminal()
-    t["measured"]["merged"]["yaw_deg"] = None
+    t["measured"]["merged"]["yaw_color_deg"] = None
     res = s3.score_round(obs3(term=t))
-    assert res["stability"]["status"] == "missing"
-    assert res["verdict"] == "missing_data"
+    assert res["stability"]["status"] == "person_review", res["stability"]
+    assert res["stability"]["dyaw_deg"] is None
+    assert any("no_color_yaw" in r for r in res["stability"]["reasons"]), \
+        res["stability"]
+    assert res["verdict"] == "person_review"
 
 
 # ---------------------------------------------------------------- 其他

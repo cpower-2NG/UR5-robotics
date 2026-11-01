@@ -174,6 +174,17 @@ def layer_surface_mm(layer, prev, pad_mm):
     return float(nxt)
 
 
+def closed_loop_yaw(prev_merged):
+    """闭环组：上一层实测塔顶 yaw → ``(yaw_deg, 来源)``；判不了给 ``(None, 原因)``。
+
+    **必须和判分同源**（契约 §4.2.5，走 `m3.metric_yaw`，即彩色掩码那一路）。
+    拿深度 ``yaw_deg`` 来闭环 = 把 2–5° 的估计器噪声主动拧进塔里：判分那边已经
+    改成彩色，控制这边再用深度，两层之间就隔着一个看不出来的朝向偏差。
+    彩色判不了 ⇒ 返回 ``None``，调用方**停轮**，不偷偷顶替。
+    """
+    return m3.metric_yaw(prev_merged or {})
+
+
 # ---------------------------------------------------------------- 选块
 def build_items(analysis, scene, n, arm="geometric", zcal=None):
     """候选池 → 逐层要抓的块（按候选离块心最近排序，不按颜色）。"""
@@ -399,11 +410,19 @@ def run_round(args):
         # 放置目标：主组固定格心；闭环组用上一层实测中心 / yaw。
         slot_target = [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0]
         yaw_place = float(item["yaw_place_deg"])
+        yaw_place_src = "plan"          # 主组：目标就是计划里的块朝向
         if args.group == "closed" and prev and prev["merged"].get("found"):
             lm = prev["merged"]
             slot_target = [lm["center_base_mm"][0] / 1000.0,
                            lm["center_base_mm"][1] / 1000.0]
-            yaw_place = float(lm["yaw_deg"])
+            pyaw, pyaw_src = closed_loop_yaw(lm)
+            if pyaw is None:
+                stop = "closed_yaw_%s（第 %d 层，缺可用的彩色 yaw）" % (
+                    pyaw_src, k)
+                print("!! " + stop)
+                break
+            yaw_place = pyaw
+            yaw_place_src = pyaw_src
         item = dict(item, yaw_place_deg=yaw_place)
         surface_m = surface_mm / 1000.0
         survey_top_m = surface_m + m3.BLOCK_TRUE_H_MM / 1000.0
@@ -449,6 +468,8 @@ def run_round(args):
                 "survey_tool0": meta["survey_tool0"],
                 "tower_box": meta.get("tower_box"),
                 "yaw_place_deg": round(yaw_place, 3),
+                # 闭环目标来自哪一路 yaw —— 事后能解释每一层的朝向是怎么来的。
+                "yaw_place_source": yaw_place_src,
                 "predicted_center_base_mm": [round(v * 1000.0, 2)
                                              for v in pred_xy],
                 # 松手瞬间的块顶 = 表面 + 5 mm 放置间隙 + 真高。

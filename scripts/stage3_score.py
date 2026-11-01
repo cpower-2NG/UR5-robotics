@@ -26,6 +26,9 @@
   Δyaw ≤ 2°、Δz ≤ 2 mm；
 · **绝对格心偏差**一并报告，**不**单独判红（塔成立与否看相对下层）；
 · 多视点一致性不过 / yaw 不可信 ⇒ ``person_review``，不进机判；
+· **所有 yaw 判据走彩色掩码**（契约 §4.2.5，见 `yaw_metric`）：
+  深度 ``yaw_rect`` 只作报告，彩色 yaw 缺失/不可信 ⇒ ``person_review``，
+  **不拿深度顶替**；
 · 人眼复核没填（``human_review`` 缺失或未批准）⇒ 不得判 ``ok``。
 
 退出码：0 = 逐层全过；1 = 有不过 / 待人评；2 = 数据缺失或坏。
@@ -43,6 +46,7 @@ sys.dont_write_bytecode = True
 import numpy as np                                                # noqa: E402
 
 import stage2_score as s2s                                         # noqa: E402
+import stage3_measure as m3                                        # noqa: E402
 
 
 def diff_mod90(a, b):
@@ -89,6 +93,11 @@ def _planned(layer):
     return layer.get("planned") or {}
 
 
+#: 判据用的 yaw 来源规则**只有一份**，在 ``stage3_measure.metric_yaw`` ——
+#: 闭环控制（``stage3_round``）调的是同一个函数，两处各写一份会漂。
+yaw_metric = m3.metric_yaw
+
+
 def _xy(rec):
     xy = rec.get("center_base_mm")
     if not xy or len(xy) < 2:
@@ -117,9 +126,16 @@ def score_layer(rec, prev, thresholds, grid_center=None,
            "class": rec.get("class"),
            "measured": {"center_base_mm": _xy(m) if m.get("found") else None,
                         "top_mm": m.get("top_mm") if m.get("found") else None,
+                        # 深度 yaw —— 只报告，不进任何判据（契约 §4.2.5）。
                         "yaw_deg": m.get("yaw_deg") if m.get("found") else None,
                         "yaw_trusted": m.get("yaw_trusted") if m.get("found")
-                        else None},
+                        else None,
+                        # 彩色 yaw —— 判据用的就是这一路。
+                        "yaw_color_deg": (m.get("yaw_color_deg")
+                                          if m.get("found") else None),
+                        "yaw_color_trusted": (m.get("yaw_color_trusted")
+                                              if m.get("found") else None),
+                        "yaw_source": None},
            "consistency": cons,
            "z_increment_mm": None, "z_err_mm": None,
            "xy_rel_mm": None, "yaw_rel_deg": None,
@@ -140,17 +156,17 @@ def score_layer(rec, prev, thresholds, grid_center=None,
 
     center = _xy(m)
     top = m.get("top_mm")
-    yaw = m.get("yaw_deg")
+    yaw, yaw_src = yaw_metric(m)
+    row["measured"]["yaw_source"] = yaw_src
     # 多视点一致性 / yaw 可信度：数据在、但不可信 ⇒ 人评。
     if cons.get("ok") is not True:
         why = "pose_consistency=%s" % (cons.get("reason") or cons.get("ok"))
         if cons.get("ok") is None:
             why = "single_pose_only"
         return bad(STATUS_REVIEW, why)
+    # 彩色 yaw 判不了就转人评：既不用深度顶替，也不把缺数据当合格。
     if yaw is None:
-        return bad(STATUS_REVIEW, "yaw_missing")
-    if not m.get("yaw_trusted"):
-        return bad(STATUS_REVIEW, "yaw_untrusted")
+        return bad(STATUS_REVIEW, yaw_src)
 
     # 绝对格心偏差：只报告。yaw 的绝对目标 = 格线方向（grid_yaw_base_deg）。
     if grid_center is not None:
@@ -177,7 +193,11 @@ def score_layer(rec, prev, thresholds, grid_center=None,
     pm = _merged(prev)
     if not pm.get("found"):
         return bad(STATUS_MISSING, "previous_layer_missing")
-    pc, ptop, pyaw = _xy(pm), pm.get("top_mm"), pm.get("yaw_deg")
+    pc, ptop = _xy(pm), pm.get("top_mm")
+    # 相对 yaw 也走彩色；下层判不了同样不放行（两次噪声相加，更不能混源）。
+    pyaw, pyaw_src = yaw_metric(pm)
+    if pyaw is None:
+        return bad(STATUS_REVIEW, "previous_%s" % pyaw_src)
 
     z_inc = round(float(top) - float(ptop), 2)
     row["z_increment_mm"] = z_inc
@@ -222,8 +242,12 @@ def score_stability(obs, layers, thresholds):
     if not lm.get("found"):
         out["reasons"].append("top_layer_missing")
         return out
-    center, top, yaw = _xy(tm), tm.get("top_mm"), tm.get("yaw_deg")
-    lc, lt, ly = _xy(lm), lm.get("top_mm"), lm.get("yaw_deg")
+    center, top = _xy(tm), tm.get("top_mm")
+    lc, lt = _xy(lm), lm.get("top_mm")
+    # Δyaw 也走彩色（契约 §4.2.5）：2° 的稳定性门比深度法的自带散差还小。
+    yaw, yaw_src = yaw_metric(tm)
+    ly, ly_src = yaw_metric(lm)
+    out["yaw_source"] = {"terminal": yaw_src, "layer": ly_src}
     out["dxy_mm"] = _dist(center, lc)
     out["dz_mm"] = round(float(top) - float(lt), 2)
     out["dyaw_deg"] = (round(abs(diff_mod90(yaw, ly)), 2)
@@ -231,6 +255,12 @@ def score_stability(obs, layers, thresholds):
     if out["dz_mm"] <= -COLLAPSE_DROP_MM:
         out["status"] = STATUS_FAIL
         out["reasons"].append("collapse_drop=%.1fmm" % out["dz_mm"])
+        return out
+    if out["dyaw_deg"] is None:
+        # 彩色 yaw 判不了 ⇒ 人评（契约 §4.2.5），不拿深度顶替。
+        out["status"] = STATUS_REVIEW
+        out["reasons"].append("dyaw_unavailable:%s"
+                              % (yaw_src if yaw is None else ly_src))
         return out
     checks = [("dxy", out["dxy_mm"], thresholds["stability_xy_mm"]),
               ("dyaw", out["dyaw_deg"], thresholds["stability_yaw_deg"]),
@@ -472,8 +502,13 @@ def _md(res):
              "- 稳定性阈值：Δxy ≤%.1f mm、Δyaw ≤%.1f°、Δz ≤%.1f mm"
              % (th["stability_xy_mm"], th["stability_yaw_deg"],
                 th["stability_z_mm"]), "",
+             "- yaw 判据一律走**彩色掩码**（契约 §4.2.5）；深度 `yaw_deg` 只落盘报告，"
+             "不进任何阈值。每层来源：%s"
+             % "、".join("%s=%s" % (r["layer"],
+                                   r["measured"].get("yaw_source") or "-")
+                        for r in res["layers"]), "",
              "| 层 | 状态 | 顶高 mm | z 增量 mm | z 误差 mm | xy 相对 mm | "
-             "yaw 相对 ° | xy 绝对 mm | yaw 绝对 ° | 释放 dxy/dyaw/dz |",
+             "yaw 相对 °（彩色） | xy 绝对 mm | yaw 绝对 °（彩色） | 释放 dxy/dyaw/dz |",
              "|---|---|---|---|---|---|---|---|---|---|"]
     for r in res["layers"]:
         rel = r.get("release") or {}
@@ -485,9 +520,11 @@ def _md(res):
                         "%s/%s/%s" % (rel.get("dxy_mm"), rel.get("dyaw_deg"),
                                       rel.get("dz_mm"))))
     st = res["stability"]
+    ysrc = st.get("yaw_source") or {}
     lines += ["", "稳定性（终态 vs 最上层放好瞬间，静置 %s s）："
-              "Δxy=%s mm、Δyaw=%s°、Δz=%s mm → **%s**"
+              "Δxy=%s mm、Δyaw=%s°（彩色：终态 %s / 层 %s）、Δz=%s mm → **%s**"
               % (st.get("wait_s"), st.get("dxy_mm"), st.get("dyaw_deg"),
+                 ysrc.get("terminal"), ysrc.get("layer"),
                  st.get("dz_mm"), st["status"])]
     if st.get("reasons"):
         lines.append("- " + "；".join(st["reasons"]))

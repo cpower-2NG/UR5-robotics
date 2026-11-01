@@ -14,10 +14,11 @@
 · 塔窗：第 1 层 = 中心格心 ±``radius_mm``（默认 50 mm），第 k≥2 层 = 上一层
   实测中心 ±``radius_mm``；窗内取**最高**的合格簇（``top`` 是 base 系绝对 z，
   97 分位，与 ``find_blocks`` 同一口径）；
-· yaw **两套并行记录**：深度 ``yaw_rect``（``yaw_deg``）与彩色掩码最小外接矩形
-  （``yaw_color_deg``）。2026-11-01 实测深度那套会被侧面污染（同一次放置两视点
-  差到 26°），所以在换判据之前先两套都记、事后对比。``yaw_trusted`` /
-  ``yaw_color_trusted`` 为假 ⇒ 该层转人评；
+· yaw **两套并行记录，判据只用彩色那套**：深度 ``yaw_rect``（``yaw_deg``）与
+  彩色掩码最小外接矩形（``yaw_color_deg``）。深度那套会被侧面污染（同一次放置
+  两视点差到 26°），连完整正方形也自带 ~2° 散差 ⇒ 契约 §4.2.5 定为
+  「彩色是判据，深度只报告」。取用一律走 `metric_yaw`；彩色判不了 ⇒ 该层转人评，
+  不拿深度顶替；
 · z 标定：``surface = top − block_h − z_bias``。``z_bias`` 的定义是
   「同一位置单块实测顶高 − 真高」，塔位侧由入口实验 1 标定（扣掉垫厚）。
 
@@ -62,6 +63,29 @@ POSE_Z_TOL_MM = 10.0
 
 #: 中心格 —— 塔基（用户拍板）。
 TOWER_CELL_IDX = 4
+
+
+def metric_yaw(merged):
+    """测量融合值 → ``(yaw_deg, 来源)``；判不了给 ``(None, 原因)``。
+
+    **契约 §4.2.5：yaw 这一维一律走彩色掩码估计器**，深度 ``yaw_rect`` 只作
+    报告。判不了就转 ``person_review``，**不拿深度顶替**。
+
+    判分（``stage3_score``）与闭环控制（``stage3_round`` 的 closed 组）都走这一个
+    函数——两处各写一份就会漂：控制拿深度 yaw 去摆位，等于把 2–5° 的估计器噪声
+    直接拧进塔里。
+
+    两套估计器量的不是同一件事：彩色走像素 ``cv2.minAreaRect``；深度走点云
+    ``graspnet_candidates.min_area_rect_2d``。后者对**完整的、无噪声的
+    29.5 mm 正方形**本身就带散差：2–98 分位裁剪 + 采样密度给一个固定偏置，
+    再加 0.3 mm 的边缘抖动就是 σ≈2.1°、极差 6.5°（台账第一百九十八轮）。
+    """
+    y = merged.get("yaw_color_deg")
+    if y is None:
+        return None, "no_color_yaw"
+    if not merged.get("yaw_color_trusted"):
+        return None, "color_yaw_untrusted"
+    return float(y), "color"
 
 
 def grid_center(grid, cell_idx=TOWER_CELL_IDX):
