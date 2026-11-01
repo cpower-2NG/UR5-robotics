@@ -117,6 +117,32 @@ def test_fuse_frames_median_and_yaw():
 
 
 @case
+def test_fuse_frames_ignores_untrusted_color_yaw():
+    """不可信帧的彩色 yaw **不进圆均值** —— 否则一致性会拿污染值报「一致」。
+
+    可信判据（``all()``）与数值聚合是两件事：只让标志挡门、却让值参与平均，
+    就会出现「``metric_yaw`` 说不可信、``pose_consistency`` 说两视点一致」的
+    自相矛盾报告。
+    """
+    good = lambda y: {"found": True, "frame": "g%d" % y,   # noqa: E731
+                      "center_base_mm": [422.0, -115.0], "top_mm": 32.0,
+                      "yaw_color_deg": y, "yaw_color_trusted": True}
+    bad = {"found": True, "frame": "bad", "center_base_mm": [422.0, -115.0],
+           "top_mm": 32.0, "yaw_color_deg": 40.0, "yaw_color_trusted": False}
+
+    f = m3.fuse_frames([good(1.0), good(1.2), bad])
+    assert f["yaw_color_trusted"] is False, f          # 有不可信帧 ⇒ 整层不可信
+    assert abs(f["yaw_color_deg"] - 1.1) < 0.2, \
+        ("不可信帧污染了均值", f["yaw_color_deg"])
+    assert f["yaw_color_votes"] == [2, 3], f["yaw_color_votes"]
+
+    # 全不可信 ⇒ 不给均值（否则 `pose_consistency` 会拿它算出「一致」）
+    g = m3.fuse_frames([bad, dict(bad, frame="bad2")])
+    assert g["yaw_color_deg"] is None, g
+    assert g["yaw_color_votes"] == [0, 2], g["yaw_color_votes"]
+
+
+@case
 def test_pose_consistency_states():
     a = {"found": True, "center_base_mm": [422.0, -115.0], "top_mm": 31.0,
          "yaw_deg": 1.0, "yaw_color_deg": 0.5}
@@ -161,10 +187,10 @@ def test_pose_consistency_yaw_uses_color():
 FAKE = {
     "p1": {"found": True, "frame": "p1", "center_base_mm": [422.0, -115.0],
            "top_mm": 32.0, "yaw_deg": 0.5, "yaw_color_deg": 0.6,
-           "yaw_trusted": True},
+           "yaw_trusted": True, "yaw_color_trusted": True},
     "p2": {"found": True, "frame": "p2", "center_base_mm": [423.0, -115.0],
            "top_mm": 32.4, "yaw_deg": 1.0, "yaw_color_deg": 1.0,
-           "yaw_trusted": True},
+           "yaw_trusted": True, "yaw_color_trusted": True},
 }
 
 

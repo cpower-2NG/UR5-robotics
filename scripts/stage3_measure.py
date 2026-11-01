@@ -532,8 +532,12 @@ def fuse_frames(records):
     yaws = [r["yaw_deg"] for r in found if r.get("yaw_deg") is not None]
     yaw = s2.mean_yaw_mod90(yaws) if yaws else None
     yaw_span = s2.yaw_span_mod90(yaws) if len(yaws) > 1 else None
+    # 彩色 yaw 的圆均值**只收可信帧**：可信与否是另一路判据（``all()``），
+    # 不能一边让不可信帧的值污染均值、一边又用标志把它挡在门外 ——
+    # 那样 `pose_consistency` 会拿污染值算出一个「一致」的假报告。
     cyaws = [r["yaw_color_deg"] for r in found
-             if r.get("yaw_color_deg") is not None]
+             if r.get("yaw_color_deg") is not None
+             and r.get("yaw_color_trusted")]
     cyaw = s2.mean_yaw_mod90(cyaws) if cyaws else None
     cyaw_span = s2.yaw_span_mod90(cyaws) if len(cyaws) > 1 else None
     tops = [r["top_mm"] for r in found]
@@ -554,6 +558,9 @@ def fuse_frames(records):
             "yaw_color_span_deg": cyaw_span,
             "yaw_color_trusted": bool(found) and all(
                 r.get("yaw_color_trusted") for r in found),
+            # 有几个可信帧真的投了票 / 一共有几帧出了彩色读数（审计用）。
+            "yaw_color_votes": [len(cyaws), sum(
+                1 for r in found if r.get("yaw_color_deg") is not None)],
             "frames_used": [r.get("frame") for r in found]}
 
 
