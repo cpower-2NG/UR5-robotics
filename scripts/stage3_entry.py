@@ -1847,7 +1847,9 @@ def main(argv=None):
     ap.add_argument("--nudge-bias-comp", type=str, default=None, metavar="EX,EY",
                     help="⑤ 预补偿：闭合那一下会把块沿指轴推走 (E·â)·â，E 给在 base 系"
                          "（mm）。横移目标里减掉预测的 Δ。现值 \"-2.05,-4.78\""
-                         "（台账第一百八十九轮），但只在 4 号格附近估过")
+                         "（台账第一百八十九轮），但只在 4 号格附近估过。"
+                         "**必须用等号式**（--nudge-bias-comp=-2.05,-4.78）："
+                         "负号开头、空格分开会被 argparse 当成另一个选项")
     ap.add_argument("--nudge-yaw-quadrant", type=int, default=0, choices=(0, 1, 2, 3),
                     help="⑤ 接近朝向再加 k·90°（方块 90° 自对称，仍是合法抓取）。"
                          "用来做方向帧判别：夹爪系里的侧推会跟着转，世界系里的不转")
