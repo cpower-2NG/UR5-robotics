@@ -25,6 +25,9 @@
   两指整个行程内无手无遮挡；
 · 任何一次执行判红 / 测量缺失 ⇒ 停在这一步，**不自动续跑**，交给人判读；
 · 人搬块/搭塔的每一步都压成一行 ``>>> 需要人动手``，由 AI 原样转达；
+  放行方式由 ``--ask-mode`` 定：``enter``（默认，等回车）/ ``file``（等哨兵
+  文件 ``ack-NNN``，AI 驱动用）/ ``auto``（不停，只给离线演习）；
+  **``--ask-mode auto`` 一律不许配 ``--go``**；
 · 不 push。
 
 不带 ``--go`` 只打印协议（不抓帧、不动臂）—— 离线计划预演用
@@ -533,10 +536,51 @@ def _dump(path, obj):
     return path
 
 
+#: 「要人动手」怎么放行。``enter`` 是原来的行为；``file`` 给 AI 驱动用；
+#: ``auto`` 只给离线演习（``--go`` 时禁用，见 ``main``）。
+_ASK = {"mode": "enter", "dir": None, "timeout_s": 0.0, "seq": 0}
+
+
 def ask(text):
-    """把「要人动手」压成一行；有终端就等回车，没有就只提示不阻塞。"""
-    line = ">>> 需要人动手：" + text
-    print(line, flush=True)
+    """把「要人动手」压成一行，然后按 ``--ask-mode`` 决定什么时候往下走。
+
+    ``enter``（默认）：有终端就等回车；没有终端（管道/后台）只提示不阻塞
+    —— 老行为，**后台跑一步都不会停**，所以 AI 驱动只能走 ``file``。
+    ``file``：先写 ``ask-NNN.txt``（提示原文），再等 ``ack-NNN`` 出现才继续。
+    编号每次自增，所以放行不会串到上一条/下一条 —— 上一轮残留的 ack 先删掉。
+    ``auto``：不停，直接继续（离线演习用；配 ``--go`` 会被 ``main`` 拒掉）。
+    """
+    print(">>> 需要人动手：" + text, flush=True)
+    mode = _ASK["mode"]
+    if mode == "auto":
+        print("    （--ask-mode auto：不停，直接继续）", flush=True)
+        return
+    if mode == "file":
+        d = _ASK["dir"]
+        if not d:
+            raise SystemExit("--ask-mode file 需要 --ask-dir 或 --run-dir")
+        os.makedirs(d, exist_ok=True)
+        n = int(_ASK["seq"]) + 1
+        _ASK["seq"] = n
+        need = os.path.join(d, "ask-%03d.txt" % n)
+        ack = os.path.join(d, "ack-%03d" % n)
+        if os.path.exists(ack):
+            os.remove(ack)
+        with open(need, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        print("    做完后创建这个文件放行：%s" % ack, flush=True)
+        t0 = time.time()
+        while not os.path.exists(ack):
+            if _ASK["timeout_s"] > 0 and time.time() - t0 > _ASK["timeout_s"]:
+                print("!! 等人超时（%.1f s）：%s"
+                      % (_ASK["timeout_s"], text), flush=True)
+                raise SystemExit(3)
+            time.sleep(0.5)
+        try:
+            os.remove(ack)
+        except OSError:
+            pass
+        return
     try:
         input("    完成后按回车继续 …")
     except EOFError:
@@ -1859,9 +1903,23 @@ def main(argv=None):
                     help="zcal/release/nudge：复用 run-dir 里已有的 row.json，"
                          "从没做的那一位接着跑；塔上若还压着上次那块，"
                          "先由机器人自己拆回")
+    ap.add_argument("--ask-mode", default="enter",
+                    choices=("enter", "file", "auto"),
+                    help="「需要人动手」怎么放行：enter=等回车（默认；没终端就不停）；"
+                         "file=等哨兵文件 ack-NNN（AI 驱动用）；auto=不停（不许配 --go）")
+    ap.add_argument("--ask-dir", default=None,
+                    help="--ask-mode file 的哨兵目录；默认 <run-dir>/_ask")
+    ap.add_argument("--ask-timeout-s", type=float, default=0.0,
+                    help="--ask-mode file 等多久算超时；0=一直等（默认）")
     ap.add_argument("--go", action="store_true",
                     help="真跑；**每次都当次授权**，闸门在 precision_exec")
     args = ap.parse_args(argv)
+    if args.go and args.ask_mode == "auto":
+        raise SystemExit("--ask-mode auto 不许配 --go：那等于把「需要人动手」"
+                         "全跳过还动臂")
+    _ASK["mode"] = args.ask_mode
+    _ASK["dir"] = args.ask_dir or os.path.join(args.run_dir, "_ask")
+    _ASK["timeout_s"] = float(args.ask_timeout_s)
 
     if not args.go:
         print(protocol(args.mode))
@@ -1876,8 +1934,10 @@ def main(argv=None):
     os.makedirs(args.run_dir, exist_ok=True)
     board = pr.Board(s2.BOARD_ALIAS, args.run_dir)
     print(protocol(args.mode))
-    print(">>> 需要人动手：确认急停就绪、两指行程内无手无遮挡；"
-          "执行器在板上还会核对 PLAYING / JTC / robot_mode")
+    # 动臂前的第一道确认也走 ask：file 模式下它就是一个必须被放行的哨兵，
+    # 而不是一行没人看的提示。
+    ask("确认急停就绪、两指行程内无手无遮挡；执行器在板上还会核对 "
+        "PLAYING / JTC / robot_mode")
     board.push()
     ctx = (board, chain, scene, grid, slot_mm, pad_mm, zcal)
     fn = {"zcal": mode_zcal, "release": mode_release,
