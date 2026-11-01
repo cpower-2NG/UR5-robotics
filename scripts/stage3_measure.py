@@ -64,6 +64,22 @@ POSE_Z_TOL_MM = 10.0
 #: 中心格 —— 塔基（用户拍板）。
 TOWER_CELL_IDX = 4
 
+#: 塔顶面点集离**图像边缘**的最小像素裕度闸门。低于它就判「顶面被画幅/
+#: 持块切掉」，中心不可用（fail-closed）。
+#:
+#: 2026-11-01 三层实测（离线重建，见台账）：裕度与质心偏差是**一一对应**的——
+#:   place_approach 处（裕度 −1~1 px）顶面只露出 62~67%，质心沿「相机→塔」
+#:   方向偏 +5.4~+5.6 mm（实测簇 +6.4~+7.2 mm）；
+#:   裕度 7~15 px（抬 20 mm）偏 +1.6~+1.9；裕度 20~27 px（抬 30 mm）偏 +0.2~+0.6；
+#:   **裕度 ≥32 px（抬 40 mm 起）偏 0.00**。
+#: 取 20 px：拦下偏差 ≥1.6 mm 的帧，放过 ≤0.6 mm 的。正常基准帧（近垂直）
+#: 裕度 239~325 px、carry 高度抓帧 44~61 px，都远在线上。
+#:
+#: **2026-11-01 从 `stage3_entry` 搬到这里**：原来只有入口实验用它，生产测量
+#: 链（`measure_frame`）没有 —— 同一套测量位姿一旦被改低，就会静默地量出偏
+#: +5~+7 mm 的中心。搬家而不是复制（全仓一个投影口径）。
+TOP_FACE_CLEAR_PX = 20.0
+
 
 def metric_yaw(merged):
     """测量融合值 → ``(yaw_deg, 来源)``；判不了给 ``(None, 原因)``。
@@ -373,6 +389,40 @@ def color_rect_yaw(frame, block, half_px=COLOR_HALF_PX, tol=COLOR_TOL,
     return fix
 
 
+def top_face_framing(frame, cx_mm, cy_mm, ztop_mm, radius_mm=25.0,
+                     band_mm=3.0, clear_px=TOP_FACE_CLEAR_PX):
+    """量一簇的顶面离图像边缘还剩多少像素 —— 判断顶面有没有被切掉。
+
+    只回一个**结构性**判据，不含任何遮挡模型：把 ``ztop_mm`` 往下
+    ``band_mm`` 以内的点取出来，看它们最近离图像四边几像素。顶面被画幅
+    切掉、或又被手里那块压掉一角，都会让点集贴到边上（见 ``TOP_FACE_CLEAR_PX``
+    的实测表）。``radius_mm`` 取 25：块半对角线 20.9 mm，即使中心已偏 7 mm，
+    真实顶面仍落在这个圈里；而邻格中心 ≥60 mm，不会误抓邻块。
+    """
+    depth = frame["depth"]
+    R, t, K = frame["R_bc"], frame["t_bc"], frame["K"]
+    P, pix = gc.backproject(depth, K)
+    Q = (P @ R.T + t) * 1000.0
+    d = np.hypot(Q[:, 0] - float(cx_mm), Q[:, 1] - float(cy_mm))
+    sel = (d < float(radius_mm)) & (np.abs(Q[:, 2] - float(ztop_mm))
+                                    <= float(band_mm))
+    n = int(sel.sum())
+    if n < 50:
+        return {"n": n, "clear_px": 0.0, "span_px": [0.0, 0.0],
+                "clipped": True, "reason": "顶面点太少（%d < 50）" % n}
+    vv, uu = pix[sel, 1], pix[sel, 0]
+    h, w = depth.shape
+    clear = min(float(uu.min()), float((w - 1) - uu.max()),
+                float(vv.min()), float((h - 1) - vv.max()))
+    return {"n": n, "clear_px": round(clear, 1),
+            "span_px": [round(float(uu.max() - uu.min()), 1),
+                        round(float(vv.max() - vv.min()), 1)],
+            "clipped": bool(clear < float(clear_px)),
+            "reason": "" if clear >= float(clear_px) else
+            "顶面贴到图像边缘（裕度 %.0f px < %.0f px）——中心会沿"
+            "「相机→塔」方向偏，不可用" % (clear, clear_px)}
+
+
 def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
                    min_h_mm=MIN_H_MM):
     """塔窗内取**最高**的合格簇；返回 ``(block|None, diag)``。
@@ -431,7 +481,14 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
         return out
     yaw = top.get("yaw_rect")
     cyaw = color_rect_yaw(frame, top, side_mm=block_h_mm)
+    # 顶面贴到画幅边 ⇒ 中心的偏差可达 +5~+7 mm（`TOP_FACE_CLEAR_PX` 实测表），
+    # 这一帧的中心/yaw 一律不进融合。**fail-closed**：宁可少一帧、转人评，
+    # 也不让带偏的读数混进中位数。
+    framing = top_face_framing(frame, top["cx"], top["cy"], top["top"],
+                               clear_px=TOP_FACE_CLEAR_PX)
     out.update({
+        "framing": framing,
+        "usable": not framing["clipped"],
         "center_base_mm": [round(float(top["cx"]), 2),
                            round(float(top["cy"]), 2)],
         # 绝对顶高（base 系）—— 层间增量与稳定性都用它，标定偏差在差分里抵消。
@@ -566,13 +623,21 @@ def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,
     拿前者当下一层表面会整整差一块高（29.5 mm）。
     """
     poses = []
+    dropped = []
     for name, dirs in pose_frames:
         frames = [measure_frame(d, grid=grid, window_xy_mm=window_xy_mm,
                                 z_bias_mm=z_bias_mm, block_h_mm=block_h_mm,
                                 radius_mm=radius_mm, max_h_mm=max_h_mm,
                                 min_h_mm=min_h_mm) for d in dirs]
+        # ``usable=False`` = 顶面贴到画幅边（`TOP_FACE_CLEAR_PX`）：中心会偏
+        # +5~+7 mm，**不进融合**。全被剔掉就按「这一视点没测到」处理。
+        kept = [f for f in frames if f.get("usable", True)]
+        dropped += [{"pose": name, "frame": f.get("frame"),
+                     "clear_px": (f.get("framing") or {}).get("clear_px")}
+                    for f in frames if not f.get("usable", True)]
         poses.append({"name": name, "frames": frames,
-                      "fused": fuse_frames(frames)})
+                      "n_dropped": len(frames) - len(kept),
+                      "fused": fuse_frames(kept)})
     fused_all = [p["fused"] for p in poses]
     cons = pose_consistency(fused_all)
     # 融合时带上视点名，``merged["frames_used"]`` 才不会是一串 None。
@@ -584,7 +649,8 @@ def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,
                              round(float(window_xy_mm[1]), 2)]
                             if window_xy_mm is not None else
                             (grid_center(grid) if grid else None)),
-           "poses": poses, "consistency": cons, "merged": merged}
+           "poses": poses, "consistency": cons, "merged": merged,
+           "frames_dropped": dropped}
     if merged.get("found"):
         out["surface_est_mm"] = round(merged["top_mm"] - float(block_h_mm)
                                       - float(z_bias_mm), 2)

@@ -63,14 +63,10 @@ OCCL_TOL_MM = 6.0
 #: 塔顶面点集离**图像边缘**的最小像素裕度闸门。低于它就判「顶面被画幅/
 #: 持块切掉」，中心不可用（fail-closed）。
 #:
-#: 2026-11-01 三层实测（离线重建，见台账）：裕度与质心偏差是**一一对应**的——
-#:   place_approach 处（裕度 −1~1 px）顶面只露出 62~67%，质心沿「相机→塔」
-#:   方向偏 +5.4~+5.6 mm（实测簇 +6.4~+7.2 mm）；
-#:   裕度 7~15 px（抬 20 mm）偏 +1.6~+1.9；裕度 20~27 px（抬 30 mm）偏 +0.2~+0.6；
-#:   **裕度 ≥32 px（抬 40 mm 起）偏 0.00**。
-#: 取 20 px：拦下偏差 ≥1.6 mm 的帧，放过 ≤0.6 mm 的。正常基准帧（近垂直）
-#: 裕度 239~325 px、carry 高度抓帧 44~61 px，都远在线上。
-TOP_FACE_CLEAR_PX = 20.0
+#: **已搬到 `stage3_measure.TOP_FACE_CLEAR_PX`**（2026-11-01）：生产测量链
+#: `measure_frame` 也要用同一条闸门，而它不能反向依赖本模块（会成环）。
+#: 这里只留别名，取值与实测表都在那边；本模块内的用法一个字都不改。
+TOP_FACE_CLEAR_PX = m3.TOP_FACE_CLEAR_PX
 #: 塔位「空」的判据窗：比测量窗（50 mm）更紧。相邻格心最近 60 mm，
 #: 阶段 2 的放置容差 10 mm ⇒ 邻块中心最远能到 ~50 mm，收紧到 40 mm 不误伤。
 TOWER_CLEAR_RADIUS_MM = 40.0
@@ -197,37 +193,18 @@ def held_top_from_plan(plan_meta):
 
 
 def top_face_framing(frame, cx_mm, cy_mm, ztop_mm, radius_mm=25.0,
-                     band_mm=3.0, clear_px=TOP_FACE_CLEAR_PX):
-    """量一簇的顶面离图像边缘还剩多少像素 —— 判断顶面有没有被切掉。
+                     band_mm=3.0, clear_px=None):
+    """**桩**：实现在 `stage3_measure.top_face_framing`（2026-11-01 搬家）。
 
-    只回一个**结构性**判据，不含任何遮挡模型：把 ``ztop_mm`` 往下
-    ``band_mm`` 以内的点取出来，看它们最近离图像四边几像素。顶面被画幅
-    切掉、或又被手里那块压掉一角，都会让点集贴到边上（见 ``TOP_FACE_CLEAR_PX``
-    的实测表）。``radius_mm`` 取 25：块半对角线 20.9 mm，即使中心已偏 7 mm，
-    真实顶面仍落在这个圈里；而邻格中心 ≥60 mm，不会误抓邻块。
+    为什么搬：生产测量链 `measure_frame` 也要用同一条闸门，而 `stage3_measure`
+    不能反向 import 本模块（成环）。这里保留同名入口，调用方与测试一个字都不用改；
+    默认 `clear_px` 也实时取 `m3.TOP_FACE_CLEAR_PX`，改常数不会再被默认值缓存住。
     """
-    depth = frame["depth"]
-    R, t, K = frame["R_bc"], frame["t_bc"], frame["K"]
-    P, pix = gc.backproject(depth, K)
-    Q = (P @ R.T + t) * 1000.0
-    d = np.hypot(Q[:, 0] - float(cx_mm), Q[:, 1] - float(cy_mm))
-    sel = (d < float(radius_mm)) & (np.abs(Q[:, 2] - float(ztop_mm))
-                                    <= float(band_mm))
-    n = int(sel.sum())
-    if n < 50:
-        return {"n": n, "clear_px": 0.0, "span_px": [0.0, 0.0],
-                "clipped": True, "reason": "顶面点太少（%d < 50）" % n}
-    vv, uu = pix[sel, 1], pix[sel, 0]
-    h, w = depth.shape
-    clear = min(float(uu.min()), float((w - 1) - uu.max()),
-                float(vv.min()), float((h - 1) - vv.max()))
-    return {"n": n, "clear_px": round(clear, 1),
-            "span_px": [round(float(uu.max() - uu.min()), 1),
-                        round(float(vv.max() - vv.min()), 1)],
-            "clipped": bool(clear < float(clear_px)),
-            "reason": "" if clear >= float(clear_px) else
-            "顶面贴到图像边缘（裕度 %.0f px < %.0f px）——中心会沿"
-            "「相机→塔」方向偏，不可用" % (clear, clear_px)}
+    if clear_px is None:
+        clear_px = m3.TOP_FACE_CLEAR_PX
+    return m3.top_face_framing(frame, cx_mm, cy_mm, ztop_mm,
+                               radius_mm=radius_mm, band_mm=band_mm,
+                               clear_px=clear_px)
 
 
 def occlusion_report(blocks, expected_top_mm, window_xy_mm,

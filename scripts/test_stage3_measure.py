@@ -392,6 +392,122 @@ def test_color_rect_rescue_keeps_good_frames_untouched():
     assert r["trusted"] and "rescue" not in r, r
 
 
+# ---------------------------------------------------------------- 画幅截断闸门
+# 合成一块**正对**的平面：640×480、恒深 0.4 m，相机在 base z=0.5 m 朝下
+# ⇒ base z 恒为 100 mm，像素比例 0.667 mm/px。这样「顶面点离图像边几像素」
+# 就只由块心位置决定，可以精确构造「贴边」与「居中」两种帧。
+SYNTH_K = np.array([[600.0, 0.0, 319.5], [0.0, 600.0, 239.5],
+                    [0.0, 0.0, 1.0]])
+SYNTH_MM_PER_PX = 400.0 / 600.0
+
+
+def _clip_frame(cx_mm, cy_mm, top_mm=100.0):
+    return {"depth": np.full((480, 640), 0.4, dtype=np.float64),
+            "color": np.full((480, 640, 3), 90, dtype=np.uint8),
+            "K": SYNTH_K, "R_bc": np.diag([1.0, -1.0, -1.0]),
+            "t_bc": np.array([0.0, 0.0, 0.5]),
+            "_block": _clip_block(cx_mm, cy_mm, top_mm)}
+
+
+def _clip_block(cx_mm, cy_mm, top_mm=100.0):
+    u = 319.5 + float(cx_mm) / SYNTH_MM_PER_PX
+    v = 239.5 - float(cy_mm) / SYNTH_MM_PER_PX
+    return {"idx": 0, "cx": float(cx_mm), "cy": float(cy_mm),
+            "top": float(top_mm), "h": 29.5, "low": False,
+            "uv": (u, v), "yaw_rect": 0.0, "yaw_trusted": True,
+            "class": "x", "class_share": 1.0,
+            "ext_rect": [29.5, 29.5], "rect_fill": 0.95}
+
+
+def _measure_synth(cx_mm, cy_mm):
+    """把 ``load_frame`` / ``find_blocks`` 换成合成帧，跑真正产测量入口。"""
+    import graspnet_candidates as gc
+    fr = _clip_frame(cx_mm, cy_mm)
+    ob_lf, ob_fb = gc.load_frame, gc.find_blocks
+    gc.load_frame = lambda d, **kw: fr
+    gc.find_blocks = lambda f, **kw: ([fr["_block"]], 0.0)
+    try:
+        return m3.measure_frame("/synth", window_xy_mm=[cx_mm, cy_mm])
+    finally:
+        gc.load_frame, gc.find_blocks = ob_lf, ob_fb
+
+
+@case
+def test_measure_frame_flags_truncated_face():
+    """顶面贴到画幅边 ⇒ ``usable=False`` 且带原因；居中 ⇒ 可用。
+
+    这是**生产**测量链的闸门（不是入口实验那个）：中心一旦沿「相机→塔」
+    方向偏 +5~+7 mm，融合中位数就跟着偏，而且两视点会一起偏（同一批位姿），
+    `pose_consistency` 查不出来。
+    """
+    mid = _measure_synth(0.0, 0.0)
+    assert mid["found"] and mid["usable"] is True, mid
+    assert mid["framing"]["clipped"] is False, mid["framing"]
+    assert mid["framing"]["clear_px"] > 100.0, mid["framing"]
+
+    # 190 mm → u≈604.5 px，块的 25 mm 圈已经出右边
+    edge = _measure_synth(190.0, 0.0)
+    assert edge["found"], edge
+    assert edge["usable"] is False and edge["framing"]["clipped"] is True, edge
+    assert edge["framing"]["reason"], "判不可用必须带原因"
+
+    # 反向变异：闸门收到 0 ⇒ 贴边帧必须「变得可用」（说明红是闸门给的）
+    orig = m3.TOP_FACE_CLEAR_PX
+    m3.TOP_FACE_CLEAR_PX = 0.0
+    try:
+        assert _measure_synth(190.0, 0.0)["usable"] is True, \
+            "变异没让用例变红，用例是空转"
+    finally:
+        m3.TOP_FACE_CLEAR_PX = orig
+
+
+@case
+def test_measure_layer_drops_truncated_frames():
+    """贴边帧不进融合，且要在 `frames_dropped` 里留痕（审计用）。"""
+    orig = m3.measure_frame
+
+    def fake(d, **kw):
+        bad = os.path.basename(d) == "p2"
+        return {"found": True, "frame": os.path.basename(d),
+                "usable": not bad, "framing": {"clipped": bad,
+                                               "clear_px": 0.0 if bad else 200.0},
+                "center_base_mm": [422.0, -115.0] if not bad else [429.0, -115.0],
+                "top_mm": 32.0, "yaw_deg": 0.5, "yaw_color_deg": 0.5,
+                "yaw_trusted": True}
+
+    m3.measure_frame = fake
+    try:
+        rec = m3.measure_layer([("pose1", ["p1"]), ("pose2", ["p2"])],
+                               window_xy_mm=[422.65, -114.86], layer=2)
+    finally:
+        m3.measure_frame = orig
+    assert rec["merged"]["found"] is True, rec["merged"]
+    assert rec["merged"]["center_base_mm"][0] == 422.0, \
+        ("贴边帧进了融合", rec["merged"])
+    assert rec["frames_dropped"] == [{"pose": "pose2", "frame": "p2",
+                                      "clear_px": 0.0}], rec["frames_dropped"]
+    assert rec["poses"][1]["n_dropped"] == 1, rec["poses"][1]
+
+
+@case
+def test_measure_layer_all_frames_dropped_is_fail_closed():
+    """一整个视点全贴边 ⇒ 该视点算「没测到」，不许拿它凑数。"""
+    orig = m3.measure_frame
+    m3.measure_frame = lambda d, **kw: {
+        "found": True, "frame": os.path.basename(d), "usable": False,
+        "framing": {"clipped": True, "clear_px": 3.0},
+        "center_base_mm": [422.0, -115.0], "top_mm": 32.0,
+        "yaw_deg": 0.5, "yaw_color_deg": 0.5, "yaw_trusted": True}
+    try:
+        rec = m3.measure_layer([("pose1", ["p1"]), ("pose2", ["p2"])],
+                               window_xy_mm=[422.65, -114.86], layer=2)
+    finally:
+        m3.measure_frame = orig
+    assert rec["merged"]["found"] is False, ("全贴边还量出了塔顶", rec["merged"])
+    assert rec["consistency"]["ok"] is False, rec["consistency"]
+    assert len(rec["frames_dropped"]) == 2, rec["frames_dropped"]
+
+
 # ---------------------------------------------------------------- 跑
 def main():
     failed = 0
