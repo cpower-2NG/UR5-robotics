@@ -766,6 +766,52 @@ def test_nudge_delta_sign_and_mod90():
 
 
 @case
+def test_nudge_delta_yaw_quadrant_rotates_approach_only():
+    """`--nudge-yaw-quadrant` 只改**接近朝向**，不改任何 δ。
+
+    方块对 90° 自对称 ⇒ 转 90° 夹另一对侧面仍是同一个合法抓取，所以平移与
+    转角判据必须逐字节不动，只有 `yaw_from_deg`（tool0 绕 z 的朝向）跟着转。
+    这条是方向帧判别实验的**前提**：指轴转了 90°，夹爪系里的侧推就该跟着转。
+
+    反向变异：把 `+ 90.0 * quad` 从 `yaw_from` 那行删掉 ⇒ 第 1 条立刻变红；
+    若误加在 `dyaw` 上 ⇒ 第 3 条变红。
+    """
+    tgt = [422.65, -114.86]
+    meas = [421.0, -120.0]
+    base = e.nudge_delta(meas, 82.0, tgt, yaw_sign=1.0)
+    q1 = e.nudge_delta(meas, 82.0, tgt, yaw_sign=1.0, yaw_quadrant=1)
+    q2 = e.nudge_delta(meas, 82.0, tgt, yaw_sign=1.0, yaw_quadrant=2)
+    q3 = e.nudge_delta(meas, 82.0, tgt, yaw_sign=1.0, yaw_quadrant=3)
+
+    # 1) 朝向确实转了 90°（折 180 之后，差值的绝对值是 90）
+    diff = e.pp.fold_yaw_180(q1["yaw_from_deg"] - base["yaw_from_deg"])
+    assert_close(abs(diff), 90.0, 1e-9, (base["yaw_from_deg"],
+                                         q1["yaw_from_deg"]))
+    # 82° → −8°：落在 (−90, +90] 里的那一支
+    assert_close(q1["yaw_from_deg"], -8.0, 1e-9, q1["yaw_from_deg"])
+
+    # 2) 平移一格不动
+    for d in (q1, q2, q3):
+        for k in ("dx_mm", "dy_mm", "d_mm"):
+            assert_close(d[k], base[k], 1e-9, k)
+    # 3) 转角的**判据**不动（块按 90° 周期，等价解）
+    for d in (q1, q2, q3):
+        assert_close(d["dyaw_deg"], base["dyaw_deg"], 1e-9)
+        assert_close(d["dyaw_block_deg"], base["dyaw_block_deg"], 1e-9)
+
+    # 4) 平行两指绕工具轴转 180° 只是两根手指互换 ⇒ 0≡2、1≡3
+    assert_close(q2["yaw_from_deg"], base["yaw_from_deg"], 1e-9)
+    assert_close(q3["yaw_from_deg"], q1["yaw_from_deg"], 1e-9)
+
+    # 5) 诊断档（--nudge-zero）必须把**转过的**朝向原样发给计划：
+    #    否则转了 90° 的接近会退回原朝向，实验就白做了。
+    z = e.applied_nudge_command(q1, zero=True)
+    assert_close(z["yaw_from_deg"], q1["yaw_from_deg"], 1e-9)
+    assert_close(z["dyaw_deg"], 0.0, 1e-9)
+    assert_close(z["dx_mm"], 0.0, 1e-9)
+
+
+@case
 def test_applied_nudge_command_zero_only_touches_motion():
     """`--nudge-zero` 只把平移/转角置零，yaw 的朝向基准与实测 δ 本身不动。
 

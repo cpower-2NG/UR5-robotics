@@ -230,7 +230,7 @@ NUDGE_SELF_MM = 25.0
 
 
 def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
-                yaw_sign=1.0, delta_deg=0.0):
+                yaw_sign=1.0, delta_deg=0.0, yaw_quadrant=0):
     """「目标 − 实测」→ 要下的平移 δ(mm) 与 tool0 转角 δ(°)。纯函数。
 
     ``yaw_sign`` / ``delta_deg`` 与 `stage2_round.yaw_for_arm` **同一套映射**
@@ -244,11 +244,21 @@ def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
     返回里两个角分开写：
     · ``dyaw_deg`` —— **tool0** 要转多少（喂给 `build_nudge`）；
     · ``dyaw_block_deg`` —— 块**应跟着转**多少（= sign·dyaw_deg，用于对账）。
+
+    ``yaw_quadrant``（0–3，`--nudge-yaw-quadrant`）把**接近朝向**再加 k·90°。
+    方块对 90° 自对称 ⇒ 夹这一对侧面与夹那一对侧面是同一个合法抓取，所以
+    这个数不改任何判据；它只改 tool0 绕 z 的朝向。用途是**方向帧判别**：
+    零位移档实测的 ≈5 mm 侧推全落在世界 −y，而那些样本的指轴也都在 75–90°
+    （≈世界 +y）——两者重合，分不出「推在夹爪系里」还是「推在世界系里」。
+    把指轴转 90°，夹爪系的推就该跟着转到 ±x，世界系的推则仍留在 −y。
+    ``dyaw`` 本身按 mod 90 折，绕 90° 转一次不变（块的等价解）。
     """
     sign = float(yaw_sign)
+    quad = int(yaw_quadrant) % 4
     dx = float(target_xy_mm[0]) - float(measured_xy_mm[0])
     dy = float(target_xy_mm[1]) - float(measured_xy_mm[1])
-    yaw_from = pp.fold_yaw_180(sign * float(measured_yaw_deg) + float(delta_deg))
+    yaw_from = pp.fold_yaw_180(sign * float(measured_yaw_deg) + float(delta_deg)
+                               + 90.0 * quad)
     yaw_to = pp.fold_yaw_180(float(delta_deg))
     dyaw = float(s2.signed_err_mod90(yaw_to, yaw_from))
     return {"dx_mm": dx, "dy_mm": dy, "d_mm": math.hypot(dx, dy),
@@ -1439,8 +1449,11 @@ def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
         return dict(base, status="person_review", reason=why)
 
     cmd = nudge_delta(merged["center_base_mm"], yaw_c, slot_mm,
-                      yaw_sign=sign, delta_deg=delta)
+                      yaw_sign=sign, delta_deg=delta,
+                      yaw_quadrant=int(getattr(args, "nudge_yaw_quadrant", 0)
+                                       or 0))
     base["commanded"] = {k: round(float(v), 3) for k, v in cmd.items()}
+    base["yaw_quadrant"] = int(getattr(args, "nudge_yaw_quadrant", 0) or 0)
     zero = bool(getattr(args, "nudge_zero", False))
     applied = applied_nudge_command(cmd, zero=zero)
     base["applied"] = {k: round(float(v), 3) for k, v in applied.items()}
@@ -1621,6 +1634,7 @@ def mode_nudge(args, ctx):
            "release": {"open_mm": float(args.nudge_open),
                        "dwell_s": float(args.nudge_dwell),
                        "clearance_mm": float(args.nudge_clearance)},
+           "yaw_quadrant": int(getattr(args, "nudge_yaw_quadrant", 0) or 0),
            "max_shift_mm": pp.NUDGE_MAX_SHIFT_MM,
            "max_yaw_deg": pp.NUDGE_MAX_YAW_DEG,
            "rows": rows, "summary": summ, "stop_reason": stop}
@@ -1773,6 +1787,9 @@ def main(argv=None):
     ap.add_argument("--nudge-zero", action="store_true",
                     help="⑤ 诊断档：实测 δ 只记录、不执行，只走「接近→闭合→"
                          "松开→退开」，用来查 nudge 里那个恒定侧推出在哪一步")
+    ap.add_argument("--nudge-yaw-quadrant", type=int, default=0, choices=(0, 1, 2, 3),
+                    help="⑤ 接近朝向再加 k·90°（方块 90° 自对称，仍是合法抓取）。"
+                         "用来做方向帧判别：夹爪系里的侧推会跟着转，世界系里的不转")
     ap.add_argument("--no-self-return", action="store_true",
                     help="把「塔上那块」交回人手动拿走；默认由机器人自己抓回拾取区")
     ap.add_argument("--resume", action="store_true",
