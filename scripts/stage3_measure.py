@@ -39,6 +39,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.dont_write_bytecode = True
 
+import cv2                                                        # noqa: E402
 import numpy as np                                                # noqa: E402
 
 import graspnet_candidates as gc                                   # noqa: E402
@@ -84,6 +85,17 @@ COLOR_HALF_PX = 80
 #: 颜色掩码可信门槛：轮廓填充率 + 像素数。
 COLOR_FILL_MIN = 0.85
 COLOR_MIN_PIXELS = 300
+#: 贴块异物的**救援**：原掩码判假时，用一个「边长 = 块顶面真边长」的正方形去切。
+#: 起因（2026-11-01 正式档）：塔位左侧贴着一片**同色异物**，颜色漫水把它一起收进来，
+#: 外接尺寸从 29 mm 撑到 36.9 mm、fill 掉到 0.75，10 次里判假作废 2 次
+#: （nudge-07/09，`no_colour_yaw`）。那片异物的**整片区域没有有效深度**（深度图
+#: 空洞），所以按深度同高带分不开；能分开它的只有「顶面必须是这么大」这条先验 ——
+#: 方块是立方体，顶面边长就是块高。**只在判假时启用**，判真的帧一个字节都不动。
+COLOR_SIDE_PAD_MM = 2.0
+COLOR_SIDE_SEARCH_MM = 6.0
+COLOR_SIDE_STEP_MM = 1.0
+#: 被切掉的像素比例上限：切太多说明这不是「块 + 一点粘连」，救援放弃。
+COLOR_RESCUE_MAX_EXCL = 0.30
 
 
 def color_face_mask(frame, uv, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
@@ -124,11 +136,142 @@ def color_face_mask(frame, uv, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
     return mask
 
 
-def color_rect_yaw(frame, block, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
+def _plane_xy_of_mask(frame, mask, z_top_m):
+    """掩码内每个像素 → ``z=z_top`` 平面上的 base 系 xy（米），形状 ``(N,2)``。"""
+    K, R, t = frame.get("K"), frame.get("R_bc"), frame.get("t_bc")
+    if K is None or R is None or t is None:
+        return None
+    R = np.asarray(R, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    vs, us = np.nonzero(mask)
+    if us.size == 0:
+        return None
+    Kinv = np.linalg.inv(np.asarray(K, dtype=np.float64))
+    rays = Kinv @ np.stack([us, vs, np.ones(us.size, dtype=np.float64)])
+    dirs = (R @ rays).T                                  # 相机方向 → base 系
+    dz = dirs[:, 2]
+    good = np.abs(dz) > 1e-9
+    if not np.any(good):
+        return None
+    s = np.zeros(us.size, dtype=np.float64)
+    s[good] = (float(z_top_m) - t[2]) / dz[good]
+    return (dirs * s[:, None] + t)[:, :2]
+
+
+def _project_base_xy(frame, xy_m, z_top_m):
+    """``z=z_top`` 平面上的 base xy（米）→ 像素坐标 ``(N,2)``。"""
+    K, R, t = frame.get("K"), frame.get("R_bc"), frame.get("t_bc")
+    if K is None or R is None or t is None:
+        return None
+    K = np.asarray(K, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    xy = np.asarray(xy_m, dtype=np.float64).reshape(-1, 2)
+    P = np.column_stack([xy, np.full(len(xy), float(z_top_m))])
+    Pc = (P - t) @ R                                     # base → 相机
+    if np.any(np.abs(Pc[:, 2]) < 1e-9):
+        return None
+    uv = (K @ Pc.T).T
+    return uv[:, :2] / uv[:, 2:3]
+
+
+def _square_corners(centre_xy_m, yaw_deg, side_mm):
+    """边长 ``side_mm``、朝向 ``yaw_deg`` 的正方形四个角（base xy，米）。"""
+    a = math.radians(float(yaw_deg))
+    e1 = np.array([math.cos(a), math.sin(a)])
+    e2 = np.array([-math.sin(a), math.cos(a)])
+    h = float(side_mm) / 2000.0
+    c = np.asarray(centre_xy_m, dtype=np.float64).reshape(2)
+    return np.array([c + h * (e1 + e2), c + h * (e1 - e2),
+                     c - h * (e1 + e2), c - h * (e1 - e2)])
+
+
+def _poly_mask(shape, corners_px):
+    m = np.zeros(shape[:2], dtype=np.uint8)
+    cv2.fillPoly(m, [np.round(np.asarray(corners_px)).astype(np.int32)], 1)
+    return m
+
+
+def _rescue_by_side(frame, mask, block, yaw_deg, side_mm, z_top_m):
+    """用「顶面边长已知」把贴着的同色异物切出掩码，返回重拟合结果或 None。
+
+    在**深度给的中心**（``block['cx'/'cy']``，与颜色无关）附近网格搜一个
+    边长 ``side_mm + 2*COLOR_SIDE_PAD_MM`` 的正方形，取覆盖掩码像素最多的一处；
+    框外像素视为异物切掉，在剩下的核上重做 ``mask_rect_yaw``。
+
+    新 ``fill`` **不是**重拟合自带的比值（那会是自证的），而是「原掩码覆盖
+    『重拟合出的真边长正方形』的比例」—— 块被遮掉一半、或颜色只长了一半，
+    这个值都会掉下来。
+    """
+    pts = _plane_xy_of_mask(frame, mask, z_top_m)
+    n_all = int(cv2.countNonZero(mask))
+    if pts is None or n_all < COLOR_MIN_PIXELS:
+        return None
+    half = (float(side_mm) + 2.0 * COLOR_SIDE_PAD_MM) / 2000.0
+    a = math.radians(float(yaw_deg))
+    e1 = np.array([math.cos(a), math.sin(a)])
+    e2 = np.array([-math.sin(a), math.cos(a)])
+    c0 = np.array([float(block["cx"]), float(block["cy"])]) / 1000.0
+    rel = pts - c0
+    along, across = rel @ e1, rel @ e2
+    n = int(round(COLOR_SIDE_SEARCH_MM / COLOR_SIDE_STEP_MM))
+    best_k, best_d = -1, [0.0, 0.0]
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            du = i * COLOR_SIDE_STEP_MM / 1000.0
+            dv = j * COLOR_SIDE_STEP_MM / 1000.0
+            k = int(np.count_nonzero((np.abs(along - du) <= half)
+                                     & (np.abs(across - dv) <= half)))
+            d2 = du * du + dv * dv
+            if k > best_k or (k == best_k and d2 < best_d[0] ** 2
+                              + best_d[1] ** 2):
+                best_k, best_d = k, [du, dv]
+    centre = c0 + best_d[0] * e1 + best_d[1] * e2
+    cut_px = _project_base_xy(
+        frame, _square_corners(centre, yaw_deg,
+                               float(side_mm) + 2.0 * COLOR_SIDE_PAD_MM),
+        z_top_m)
+    if cut_px is None:
+        return None
+    core = mask & _poly_mask(mask.shape, cut_px)
+    n_core = int(cv2.countNonZero(core))
+    if n_core < COLOR_MIN_PIXELS:
+        return None
+    excl = 1.0 - n_core / float(n_all)
+    if excl > COLOR_RESCUE_MAX_EXCL:
+        return None
+    r = sg.mask_rect_yaw(core, frame["K"], frame["R_bc"], frame["t_bc"],
+                         z_top_m)
+    if r is None:
+        return None
+    # 覆盖：用**重拟合出的**中心/朝向、按真边长算方框，量原掩码盖住了多少。
+    box_px = _project_base_xy(
+        frame, _square_corners(centre, r["yaw_deg"], float(side_mm)), z_top_m)
+    if box_px is None:
+        return None
+    box = _poly_mask(mask.shape, box_px)
+    n_box = int(cv2.countNonZero(box))
+    if n_box == 0:
+        return None
+    r["fill"] = float(cv2.countNonZero(mask & box)) / float(n_box)
+    r["n_pixels"] = n_core
+    r["rescue"] = {"excl": round(float(excl), 4),
+                   "shift_mm": [round(best_d[0] * 1000.0, 2),
+                                round(best_d[1] * 1000.0, 2)],
+                   "n_all_px": n_all,
+                   "cut_ext_mm": r["ext_mm"]}
+    return r
+
+
+def color_rect_yaw(frame, block, half_px=COLOR_HALF_PX, tol=COLOR_TOL,
+                   side_mm=None):
     """颜色掩码 → 最小外接矩形 → **base 系** yaw（复用 ``sg.mask_rect_yaw``）。
 
     与深度 ``yaw_rect`` 并行记录、事后对比；两者不一致时以本值为主 ——
     它的输入与深度无关，不会被侧面污染。
+
+    给了 ``side_mm``（块顶面真边长）且原掩码判假时，走一次 ``_rescue_by_side``：
+    贴块同色异物会被切掉重算。**判真的帧原样返回**，不受影响。
     """
     mask = color_face_mask(frame, block["uv"], half_px=half_px, tol=tol)
     z_top = float(block["top"]) / 1000.0
@@ -140,7 +283,17 @@ def color_rect_yaw(frame, block, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
     r["trusted"] = bool(r["fill"] >= COLOR_FILL_MIN
                         and r["n_pixels"] >= COLOR_MIN_PIXELS)
     r["reason"] = ""
-    return r
+    if r["trusted"] or side_mm is None:
+        return r
+    fix = _rescue_by_side(frame, mask, block, r["yaw_deg"],
+                          float(side_mm), z_top)
+    if fix is None:
+        r["reason"] = "贴块异物切不掉"
+        return r
+    fix["trusted"] = bool(fix["fill"] >= COLOR_FILL_MIN
+                          and fix["n_pixels"] >= COLOR_MIN_PIXELS)
+    fix["reason"] = "" if fix["trusted"] else "救援后仍不可信"
+    return fix
 
 
 def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
@@ -200,7 +353,7 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
     if top is None:
         return out
     yaw = top.get("yaw_rect")
-    cyaw = color_rect_yaw(frame, top)
+    cyaw = color_rect_yaw(frame, top, side_mm=block_h_mm)
     out.update({
         "center_base_mm": [round(float(top["cx"]), 2),
                            round(float(top["cy"]), 2)],
@@ -217,6 +370,9 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
         "yaw_color_ext_mm": cyaw["ext_mm"],
         "yaw_color_fill": round(float(cyaw["fill"]), 3),
         "yaw_color_n_px": int(cyaw["n_pixels"]),
+        # 判假后走没走「贴块异物救援」、切掉了多少 —— 只为事后审计，不参与判分。
+        "yaw_color_reason": cyaw.get("reason", ""),
+        "yaw_color_rescue": cyaw.get("rescue"),
         "ext_rect_mm": top.get("ext_rect"),
         "rect_fill": top.get("rect_fill"),
         "class": top.get("class"),

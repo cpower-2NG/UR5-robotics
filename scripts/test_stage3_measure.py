@@ -240,6 +240,104 @@ def test_scan_biases_summary():
     assert s["median_mm"] == 0.5 and s["n_positive"] == 2, s
 
 
+# ------------------------------------------------- 颜色掩码 / 贴块异物救援
+# 这里的帧是**合成**的：一台正俯视相机看 z=0 平面上的一块正方形色块，
+# 可选在一条边上贴一块同色异物。用它盯两件事：
+#   1) 干净块必须可信、yaw 打在真值上；
+#   2) 贴了异物后掩码判假（复现 nudge-07/09 的 fill 0.71–0.79），
+#      给了 ``side_mm`` 的救援必须把异物切掉、把 yaw 拉回来。
+F_SYNTH = 600.0
+SYNTH_WH = (480, 640)
+
+
+def _synth_frame(yaw_deg=0.0, tab_mm=0.0, tab_w_mm=9.0,
+                 side_mm=29.5, cam_h_mm=360.0, cx_mm=50.0, cy_mm=20.0):
+    """正俯视相机 + z=0 平面上的正方形色块（可带贴边异物）→ 假 frame。"""
+    h, w = SYNTH_WH
+    K = np.array([[F_SYNTH, 0.0, (w - 1) / 2.0],
+                  [0.0, F_SYNTH, (h - 1) / 2.0],
+                  [0.0, 0.0, 1.0]])
+    R = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+    t = np.array([cx_mm / 1000.0, cy_mm / 1000.0, cam_h_mm / 1000.0])
+    vs, us = np.mgrid[0:h, 0:w]
+    rays = np.stack([(us - K[0, 2]) / K[0, 0],
+                     (vs - K[1, 2]) / K[1, 1],
+                     np.ones(us.shape)], -1)
+    dirs = rays @ R.T                                       # 相机 → base
+    s = (0.0 - t[2]) / dirs[..., 2]
+    P = dirs * s[..., None] + t                             # (h,w,3) base
+    a = np.radians(yaw_deg)
+    e1 = np.array([np.cos(a), np.sin(a)])
+    e2 = np.array([-np.sin(a), np.cos(a)])
+    rel = P[..., :2] - t[:2]
+    x = rel @ e1
+    y = rel @ e2
+    half = side_mm / 2000.0
+    on = (np.abs(x) <= half) & (np.abs(y) <= half)
+    if tab_mm:
+        on |= ((x <= -half) & (x >= -half - tab_mm / 1000.0)
+               & (np.abs(y) <= tab_w_mm / 2000.0))
+    img = np.full((h, w, 3), 150, dtype=np.uint8)
+    img[on] = (20, 90, 100)
+    blk_ = {"uv": [(w - 1) / 2.0, (h - 1) / 2.0], "top": 0.0,
+            "cx": cx_mm, "cy": cy_mm, "h": side_mm}
+    return {"color": img, "depth": None, "K": K, "R_bc": R, "t_bc": t,
+            "_block": blk_}
+
+
+def _yaw_err_mod90(a, b):
+    d = (float(a) - float(b)) % 90.0
+    return min(d, 90.0 - d)
+
+
+@case
+def test_color_rect_clean_square_trusted():
+    fr = _synth_frame(yaw_deg=17.0)
+    r = m3.color_rect_yaw(fr, fr["_block"], side_mm=29.5)
+    assert r["trusted"], r
+    assert 0.85 <= r["fill"] <= 1.0, r
+    assert _yaw_err_mod90(r["yaw_deg"], 17.0) <= 1.0, r
+    assert 27.0 <= max(r["ext_mm"]) <= 32.0, r
+
+
+@case
+def test_color_rect_tab_is_untrusted_and_rescued():
+    """贴了异物 ⇒ 原掩码判假；给 side_mm 就得救回来，不给就得判假。"""
+    fr = _synth_frame(yaw_deg=17.0, tab_mm=9.0)
+    bad = m3.color_rect_yaw(fr, fr["_block"], side_mm=None)
+    assert not bad["trusted"], ("贴异物却没判假，用例失效", bad)
+    assert max(bad["ext_mm"]) > 31.0, bad
+    good = m3.color_rect_yaw(fr, fr["_block"], side_mm=29.5)
+    assert good["trusted"], good
+    assert good.get("rescue"), ("没走救援路径", good)
+    assert _yaw_err_mod90(good["yaw_deg"], 17.0) <= 2.0, good
+    assert max(good["ext_mm"]) <= 34.0, good
+    # 反向变异：把「最多能切多少」压到 0 ⇒ 救援必须放弃、判回不可信。
+    orig = m3.COLOR_RESCUE_MAX_EXCL
+    m3.COLOR_RESCUE_MAX_EXCL = 0.0
+    try:
+        dead = m3.color_rect_yaw(fr, fr["_block"], side_mm=29.5)
+    finally:
+        m3.COLOR_RESCUE_MAX_EXCL = orig
+    assert not dead["trusted"], ("变异没让用例变红，用例是空转", dead)
+
+
+@case
+def test_color_rect_rescue_rejects_wrong_size_prior():
+    """side_mm 给错（远小于块）时，救援不许硬救 —— 覆盖判据要能挡住。"""
+    fr = _synth_frame(yaw_deg=17.0, tab_mm=9.0)
+    r = m3.color_rect_yaw(fr, fr["_block"], side_mm=15.0)
+    assert not r["trusted"], ("边长先验给错还判可信", r)
+
+
+@case
+def test_color_rect_rescue_keeps_good_frames_untouched():
+    """判真的帧不许被救援碰过（判真即返回，连 rescue 字段都不该有）。"""
+    fr = _synth_frame(yaw_deg=-8.0)
+    r = m3.color_rect_yaw(fr, fr["_block"], side_mm=29.5)
+    assert r["trusted"] and "rescue" not in r, r
+
+
 # ---------------------------------------------------------------- 跑
 def main():
     failed = 0
