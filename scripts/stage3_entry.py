@@ -314,13 +314,57 @@ def neighbour_shift(before_list, after_list, match_mm=30.0):
     return out
 
 
-def applied_nudge_command(cmd, zero=False):
+# nudge 的第二次闭合会把块沿**指轴**推走：Δ = (E·â)·â，â 是 tool0 的 x 轴。
+# E 是**世界（base）系**里的一个固定矢量，不是夹爪系的固定量 —— 2026-11-01 低 yaw
+# 判别档（指轴从 ±y 转到 ±x，位移也跟着从 −y 转到 −x）+ 12 行三模型最小二乘：
+# 投影模型 RMS 1.22 mm，世界系固定位移 2.50、夹爪系固定 2.82。台账第一百八十九轮。
+# â 与 −â 是**同一根指轴**（平行两指换手不算换姿态）⇒ Δ 对 180° 不变；
+# 这条在物理上是必需的，也被测试钉住。
+NUDGE_BIAS_XY_MM = (-2.05, -4.78)      # |E| = 5.20 mm，方向 −113.3°
+
+
+def nudge_push_pred(bias_xy_mm, yaw_deg):
+    """预测「闭合那一下」把块推走多少：``E`` 沿指轴的分量再沿指轴返回。
+
+    只保留沿指轴的那一维：垂着指轴的方向上两指没有推力面，块不动
+    （12 行实测的 ⟂ 分量 ≤0.34 mm，都在噪声地板里）。
+
+    反向变异：把 ``yaw_deg`` 换成「指轴 = tool0 的 y」、或把分量换成 E 本身，
+    都会让 `test_nudge_bias_comp_cancels_predicted_push` 变红。
+    """
+    ex, ey = float(bias_xy_mm[0]), float(bias_xy_mm[1])
+    t = math.radians(float(yaw_deg))
+    ax, ay = math.cos(t), math.sin(t)      # 指轴 = tool0 x（数据定的，见上）
+    s = ex * ax + ey * ay
+    return s * ax, s * ay
+
+
+def nudge_bias_comp(spec):
+    """`--nudge-bias-comp "x,y"` → ``(x, y)`` mm（base 系）；空 ⇒ 不补偿。
+
+    不给默认值：E 只在 4 号格附近 8 mm 内估过（台账第一百八十九轮「未决 1」），
+    静默套一个常数比不补偿更危险 —— 换位置若不成立，人会以为是别的地方坏了。
+    """
+    if spec is None or str(spec).strip() == "":
+        return None
+    vals = [float(v) for v in str(spec).replace("，", ",").split(",") if v.strip()]
+    if len(vals) != 2:
+        raise SystemExit("--nudge-bias-comp 要两个数（x,y，mm），拿到 %r" % (spec,))
+    return (vals[0], vals[1])
+
+
+def applied_nudge_command(cmd, zero=False, bias_xy_mm=None):
     """这次**真正发给计划**的指令；``cmd`` 是实测 δ，另存一份留作对账。
 
     ``zero=True``（`--nudge-zero`，诊断用）：平移与转角全置零，只走
     「接近 → 闭合 → 松开 → 退开」。2026-11-01 真机 5 次显示 nudge 自带一个
     ≈5.3 mm、与指令无关的恒定侧推（详见仓外台账第一百八十七轮）；这一档用来
     分辨它是出在这四个动作上，还是出在横移/扭转上。
+
+    ``bias_xy_mm``（`--nudge-bias-comp`）：预补偿。闭合时块会被推走 Δ，
+    就在**横移目标**里减掉 Δ（不动接近点），落点回到「实测 + 想要的 δ」。
+    这一手只依赖「Δ 可预测」，不假定 E 是臂的定位残差还是测量的固定偏置
+    —— 两者对补偿等价（台账第一百八十九轮 §未决）。
     """
     keys = ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg",
             "yaw_from_deg", "yaw_to_deg")
@@ -329,6 +373,13 @@ def applied_nudge_command(cmd, zero=False):
         for k in ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg"):
             if k in out:
                 out[k] = 0.0
+    if bias_xy_mm is not None and "dx_mm" in out and "dy_mm" in out:
+        px, py = nudge_push_pred(bias_xy_mm, out.get("yaw_from_deg", 0.0))
+        out["dx_mm"] -= px
+        out["dy_mm"] -= py
+        out["d_mm"] = math.hypot(out["dx_mm"], out["dy_mm"])
+        out["push_pred_x_mm"] = px
+        out["push_pred_y_mm"] = py
     return out
 
 
@@ -1455,12 +1506,16 @@ def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
     base["commanded"] = {k: round(float(v), 3) for k, v in cmd.items()}
     base["yaw_quadrant"] = int(getattr(args, "nudge_yaw_quadrant", 0) or 0)
     zero = bool(getattr(args, "nudge_zero", False))
-    applied = applied_nudge_command(cmd, zero=zero)
+    bias = nudge_bias_comp(getattr(args, "nudge_bias_comp", None))
+    applied = applied_nudge_command(cmd, zero=zero, bias_xy_mm=bias)
     base["applied"] = {k: round(float(v), 3) for k, v in applied.items()}
+    if bias is not None:
+        base["bias_comp_mm"] = [round(float(bias[0]), 3),
+                                round(float(bias[1]), 3)]
     if zero:
         base["note"] = "nudge-zero 诊断：实测 δ 只记录、不执行"
-    elif (abs(cmd["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
-            or abs(cmd["dyaw_deg"]) > pp.NUDGE_MAX_YAW_DEG):
+    elif (abs(applied["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
+            or abs(applied["dyaw_deg"]) > pp.NUDGE_MAX_YAW_DEG):
         return dict(base, status="out_of_range",
                     reason="δ 超单次上限（%.0f mm / %.0f°）—— 该走完整抓放，"
                            "硬拽会把块拖到邻块上"
@@ -1635,6 +1690,8 @@ def mode_nudge(args, ctx):
                        "dwell_s": float(args.nudge_dwell),
                        "clearance_mm": float(args.nudge_clearance)},
            "yaw_quadrant": int(getattr(args, "nudge_yaw_quadrant", 0) or 0),
+           "bias_comp_mm": nudge_bias_comp(
+               getattr(args, "nudge_bias_comp", None)),
            "max_shift_mm": pp.NUDGE_MAX_SHIFT_MM,
            "max_yaw_deg": pp.NUDGE_MAX_YAW_DEG,
            "rows": rows, "summary": summ, "stop_reason": stop}
@@ -1787,6 +1844,10 @@ def main(argv=None):
     ap.add_argument("--nudge-zero", action="store_true",
                     help="⑤ 诊断档：实测 δ 只记录、不执行，只走「接近→闭合→"
                          "松开→退开」，用来查 nudge 里那个恒定侧推出在哪一步")
+    ap.add_argument("--nudge-bias-comp", type=str, default=None, metavar="EX,EY",
+                    help="⑤ 预补偿：闭合那一下会把块沿指轴推走 (E·â)·â，E 给在 base 系"
+                         "（mm）。横移目标里减掉预测的 Δ。现值 \"-2.05,-4.78\""
+                         "（台账第一百八十九轮），但只在 4 号格附近估过")
     ap.add_argument("--nudge-yaw-quadrant", type=int, default=0, choices=(0, 1, 2, 3),
                     help="⑤ 接近朝向再加 k·90°（方块 90° 自对称，仍是合法抓取）。"
                          "用来做方向帧判别：夹爪系里的侧推会跟着转，世界系里的不转")

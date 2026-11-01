@@ -845,6 +845,98 @@ def test_applied_nudge_command_zero_only_touches_motion():
 
 
 @case
+def test_nudge_push_pred_is_jaw_axis_projection():
+    """预测的侧推只取 E 沿**指轴（tool0 x）**的分量，且指轴转 180° 就翻号。
+
+    这一条是第一百八十九轮的判据本身：指轴 +y 时推 −y、−y 时推 +y
+    （实测 −4.86 vs +3.87）。反向变异：换成「E 原样返回」（那会把侧向也算进去）、
+    或把指轴取成 tool0 y，下面的数和翻号关系都对不上。
+    """
+    E = (-2.05, -4.78)
+    # 指轴 = +x：只剩 E 的 x 分量
+    px, py = e.nudge_push_pred(E, 0.0)
+    assert_close(px, -2.05, 1e-9, "yaw=0 沿指轴")
+    assert_close(py, 0.0, 1e-9, "yaw=0 垂直指轴必须为 0")
+    # 指轴 = +y：只剩 E 的 y 分量
+    px, py = e.nudge_push_pred(E, 90.0)
+    assert_close(px, 0.0, 1e-9)
+    assert_close(py, -4.78, 1e-9, "yaw=90 沿指轴")
+    # 平行两指换手不算换姿态 ⇒ â 与 −â 是同一根指轴，预测必须**不变**
+    # （写成 δ·â 就会随 180° 翻号，那是错的：实测 jaw +85° 与 −85° 两次都是推 −y）
+    for yaw in (84.78, -85.48, 12.0):
+        a = e.nudge_push_pred(E, yaw)
+        b = e.nudge_push_pred(E, yaw + 180.0)
+        for u, v in zip(a, b):
+            assert_close(u, v, 1e-9, "180° 不变")
+    # 量级不超过 |E|
+    for yaw in (0.0, 45.0, 137.0):
+        px, py = e.nudge_push_pred(E, yaw)
+        assert (px ** 2 + py ** 2) ** 0.5 <= 5.20 + 1e-9
+
+
+@case
+def test_nudge_bias_comp_cancels_predicted_push():
+    """补偿后块落在「实测 + 想要的 δ」；不补偿则偏一个 Δ，符号给反则偏两个。
+
+    合成端到端：闭合时块被推走 Δ（就用模型的预测当「真值」），
+    横移按 ``applied`` 走，则终态 = 实测 + Δ + applied。
+    """
+    E = (-2.05, -4.78)
+    meas = [421.0, -120.0]
+    want = (3.0, -2.0)
+    for yaw in (0.0, 84.78, -85.48):
+        target = [meas[0] + want[0], meas[1] + want[1]]
+        cmd = e.nudge_delta(meas, yaw, target, yaw_sign=1.0)
+        push = e.nudge_push_pred(E, cmd["yaw_from_deg"])
+
+        def final(applied):
+            return (meas[0] + push[0] + applied["dx_mm"],
+                    meas[1] + push[1] + applied["dy_mm"])
+
+        # 1) 不补偿：被推走一个 Δ
+        raw = final(e.applied_nudge_command(cmd))
+        assert_close(raw[0] - target[0], push[0], 1e-9, "yaw %.1f 不补偿 x" % yaw)
+        assert_close(raw[1] - target[1], push[1], 1e-9, "yaw %.1f 不补偿 y" % yaw)
+
+        # 2) 补偿：落在目标上
+        comp = e.applied_nudge_command(cmd, bias_xy_mm=E)
+        got = final(comp)
+        assert_close(got[0], target[0], 1e-9, "yaw %.1f 补偿后 x" % yaw)
+        assert_close(got[1], target[1], 1e-9, "yaw %.1f 补偿后 y" % yaw)
+
+        # 3) 符号给反：误差翻倍（这一条守住「减」而不是「加」）
+        bad = e.applied_nudge_command(cmd, bias_xy_mm=(-E[0], -E[1]))
+        wrong = final(bad)
+        assert_close(wrong[0] - target[0], 2.0 * push[0], 1e-9, "反号 x")
+        assert_close(wrong[1] - target[1], 2.0 * push[1], 1e-9, "反号 y")
+
+    # 4) 诊断档 + 补偿：δ 置零后，横移目标应当是 −Δ（把推走的那一下拉回来）
+    cmd0 = e.nudge_delta(meas, 84.78, meas, yaw_sign=1.0)
+    z = e.applied_nudge_command(cmd0, zero=True, bias_xy_mm=E)
+    px, py = e.nudge_push_pred(E, z["yaw_from_deg"])
+    assert_close(z["dx_mm"], -px, 1e-9)
+    assert_close(z["dy_mm"], -py, 1e-9)
+    assert_close(z["dyaw_deg"], 0.0, 1e-9)
+
+
+@case
+def test_nudge_bias_comp_spec_parsing():
+    """`--nudge-bias-comp` 只收两个数；空 ⇒ 不补偿（不静默套常数）。"""
+    assert e.nudge_bias_comp(None) is None
+    assert e.nudge_bias_comp("") is None
+    assert e.nudge_bias_comp("  ") is None
+    assert e.nudge_bias_comp("-2.05,-4.78") == (-2.05, -4.78)
+    assert e.nudge_bias_comp("-2.05, -4.78") == (-2.05, -4.78)
+    assert e.nudge_bias_comp("-2.05，-4.78") == (-2.05, -4.78)   # 中文逗号
+    try:
+        e.nudge_bias_comp("1,2,3")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("三个数应当拒收")
+
+
+@case
 def test_nearby_blocks_keeps_only_ring():
     """离格心 [25, 90] mm 的其它块才算邻块；目标自己、过远的、low 的都不算。"""
     blocks = [blk(0, 0.0, 0.0, 31.0, 29.5),          # 目标自己（距离 0）
