@@ -933,7 +933,7 @@ def place_one(args, board, chain, scene, grid, analysis, item, slot_mm,
               z_bias_mm=0.0, plan_kwargs=None, exec_kwargs=None):
     """抓一块放到塔位 ``surface_mm`` 上并测量；返回记录。
 
-    ``exec_kwargs`` 可带 ``upto`` —— 遮挡实验停在 ``place_approach``；
+    ``exec_kwargs`` 可带 ``upto`` —— 遮挡实验停在 ``to_slot``（carry 高度）；
     测量在调用方做（停下时相机不在 survey 位）。
     """
     plan_kwargs = dict(plan_kwargs or {})
@@ -1384,7 +1384,7 @@ def occlusion_place_xy(base_merged, slot_mm):
 
 
 def mode_occlusion(args, ctx):
-    """③ 持块遮挡：夹着块停在 place_approach，看下层塔顶还在不在。"""
+    """③ 持块遮挡：夹着块停在 carry 高度（``to_slot``），看下层塔顶还在不在。"""
     board, chain, scene, grid, slot_mm, pad_mm, zcal = ctx
     heights = [int(v) for v in str(args.heights).split(",") if v]
     cdir = os.path.join(args.run_dir, "entry-occlusion")
