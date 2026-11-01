@@ -584,20 +584,24 @@ def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP, q_start=None):
                     "%s 有单个关节要转 %.1f°（上限 %.0f°）—— 整圈翻转不是解法，"
                     "应换一支 IK 的等价角（见 unwrap_near）"
                     % (where, np.degrees(jump), np.degrees(MAX_JOINT_SWING)))
-            if jump > max_jump and not first:
-                n = int(np.ceil(jump / max_jump))
-                for i in range(1, n):
-                    qi = prev_q + (q - prev_q) * (i / n)
-                    # 端点都远离奇异，**插值点**不一定：q5 一过零就落在奇异上
-                    ws = check_wrist(chain, qi)
-                    if ws:
-                        raise PlanError("插点 %s_split%d 的腕 2 只有 %.2f°，"
-                                        "离奇异位形不足 %.2f°（下限）"
-                                        % (w["name"], i, ws[0], ws[1]))
-                    out.append({"name": "%s_split%d" % (w["name"], i),
-                                "q": [float(v) for v in qi],
-                                "duration": float(duration_for(prev_q, qi))})
-                    added += 1
+            # 端点都远离奇异，**插值点**不一定：q5 一过零就落在奇异上。
+            # 第一跳虽然不插点（见上），中间点一样要查 —— 否则「不插点」会
+            # 顺手把这条检查一起跳过（2026-11-01 首跳 wrist_2 ±89.8° 翻越就是这么漏的）。
+            n = 8 if first else (int(np.ceil(jump / max_jump))
+                                 if jump > max_jump else 0)
+            for i in range(1, n):
+                qi = prev_q + (q - prev_q) * (i / n)
+                ws = check_wrist(chain, qi)
+                if ws:
+                    raise PlanError("插点 %s_split%d 的腕 2 只有 %.2f°，"
+                                    "离奇异位形不足 %.2f°（下限）"
+                                    % (w["name"], i, ws[0], ws[1]))
+                if first:
+                    continue
+                out.append({"name": "%s_split%d" % (w["name"], i),
+                            "q": [float(v) for v in qi],
+                            "duration": float(duration_for(prev_q, qi))})
+                added += 1
         out.append(w)
         prev_q = q
         first = False

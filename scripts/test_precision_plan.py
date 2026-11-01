@@ -699,6 +699,35 @@ def test_split_jumps_checks_first_hop(chain):
 
 
 @case
+def test_split_jumps_checks_first_hop_interpolation(chain):
+    """第一跳「只判不插点」不能顺手把**插值点**的奇异检查一起跳过。
+
+    两头都远离奇异，直线中间照样能穿过腕 2 的 0°：−89° → +89° 只有 178°
+    （未超 `MAX_JOINT_SWING`，不报整圈翻转），但 JTC 照字面走下去，中点就
+    落在奇异上 —— 2026-11-01 修首跳时真出过这个漏网（台账第一百八十七轮）。
+    """
+    i = chain.move_joints.index("wrist_2_joint")
+    base = [0.5] * 6
+    q0 = list(base)
+    q0[i] = np.radians(-89.0)
+    cross = list(base)
+    cross[i] = np.radians(89.0)
+    wps = [{"name": "approach", "q": cross, "duration": 2.0}]
+    try:
+        pp.split_jumps(wps, chain, max_jump=1.0, q_start=q0)
+    except pp.PlanError as e:
+        assert "腕 2" in str(e), e
+    else:
+        raise AssertionError("首跳插值穿过腕 2 奇异，护栏没拦")
+    # 反向对照：同一跳但中间不穿奇异 ⇒ 不许误伤
+    ok = list(base)
+    ok[i] = np.radians(-30.0)
+    wps2 = [{"name": "approach", "q": ok, "duration": 2.0}]
+    out2, added2 = pp.split_jumps(wps2, chain, max_jump=1.0, q_start=q0)
+    assert added2 == 0 and out2 == wps2, (added2, out2)
+
+
+@case
 def test_finish_plan_passes_q_start_to_split_jumps(chain):
     """接线：`stage3_round._finish_plan` 必须把 q_start 交下去。
 
