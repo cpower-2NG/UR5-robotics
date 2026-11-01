@@ -151,6 +151,31 @@ def test_occlusion_separates_tower_from_held_block():
 
 
 @case
+def test_occlusion_place_uses_measured_center():
+    """③ 放置目标必须是实测塔顶中心 —— 用格心会把块放到塔边摔下去。
+
+    事故号：2026-11-01 第 1 层档，实测 (423.26, −104.11) vs 格心 (422.65, −114.86)，
+    差 10.76 mm，块落到格 1 附近。
+    反向变异：`occlusion_place_xy` 里返回 `slot_mm` ⇒ 本用例必须变红。
+    """
+    slot = [422.65, -114.86]
+    base = {"center_base_mm": [423.26, -104.11], "top_mm": 31.99}
+    xy = e.occlusion_place_xy(base, slot)
+    assert_close(xy[0], 423.26)
+    assert_close(xy[1], -104.11)
+    # 差多少必须真是 10.76 —— 免得将来谁把两处都改成格心还自洽
+    d = ((xy[0] - slot[0]) ** 2 + (xy[1] - slot[1]) ** 2) ** 0.5
+    assert 10.5 < d < 11.0, d
+    # 量不到中心 ⇒ 停，不许静默退回格心（那正是事故路径）
+    try:
+        e.occlusion_place_xy({}, slot)
+    except e.EntryStop as exc:
+        assert "格心" in str(exc.why), exc.why
+    else:
+        raise AssertionError("缺中心时没停，会退回格心 → 掉块")
+
+
+@case
 def test_occlusion_ignores_low_and_far():
     top = 61.0
     blocks = [blk(1, 422.0, -115.0, top, top, low=True),

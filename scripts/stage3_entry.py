@@ -1315,6 +1315,24 @@ def mode_release(args, ctx):
     return 2 if stop else 0
 
 
+def occlusion_place_xy(base_merged, slot_mm):
+    """③ 放上塔顶时用的 xy：**实测**塔顶中心，量不到就停（不许退回格心）。
+
+    2026-11-01 第 1 层档的事故：塔是人手搭的，实测中心 (423.26, −104.11)
+    偏离 `grid.json` 中心格 (422.65, −114.86) **10.76 mm**；按格心放 ⇒ 29.5 mm
+    的块只在塔上搭接 ~4 mm，5 mm 自由下落一冲就从塔边滑掉（落到格 1 附近），
+    而执行器 rc=0、脚本照样打印「已经放到塔顶」。
+
+    反向变异：把这里的返回值改成 ``slot_mm``，`test_stage3_entry.py` 里
+    `test_occlusion_place_uses_measured_center` 必须变红。
+    """
+    center = (base_merged or {}).get("center_base_mm")
+    if not center:
+        raise EntryStop("③ 基准测量没给出塔顶中心，不敢按格心放（会掉块）——"
+                        "重测塔位")
+    return [float(center[0]), float(center[1])]
+
+
 def mode_occlusion(args, ctx):
     """③ 持块遮挡：夹着块停在 place_approach，看下层塔顶还在不在。"""
     board, chain, scene, grid, slot_mm, pad_mm, zcal = ctx
@@ -1346,6 +1364,11 @@ def mode_occlusion(args, ctx):
                     "%d 层塔顶量到 %.1f mm，应有 %.1f mm（差 %+.1f mm）——"
                     "塔位没清空或块数不对，拆掉重搭"
                     % (h, base["merged"]["top_mm"], tower_top_mm, dh))
+            # 放置目标必须是**实测**塔顶中心，不能是 grid.json 的格心：
+            # 塔是人手搭的，1 层档实测已偏格心 10.76 mm；按格心放 = 块大部分悬空，
+            # 29.5 mm 见方只搭接 ~4 mm，5 mm 自由下落一冲就从塔边滑掉
+            # （2026-11-01 第 1 层档实测事故，块落到格 1 附近）。
+            tower_xy = occlusion_place_xy(base["merged"], slot_mm)
             # ---- 夹着块停在 place_approach
             frame_dir, extras = capture_pick(args, board, scene, hdir, "pick")
             analysis = analyse_pick(frame_dir, extras, hdir)
@@ -1354,7 +1377,7 @@ def mode_occlusion(args, ctx):
                             slot_mm, tower_top_mm, hdir, "hold",
                             survey_top_mm=tower_top_mm,
                             z_bias_mm=zcal["tower"],
-                            plan_kwargs={"tower_xy_mm": slot_mm,
+                            plan_kwargs={"tower_xy_mm": tower_xy,
                                          "tower_top_mm": tower_top_mm,
                                          "tower_half_edge": args.tower_half_edge},
                             exec_kwargs={"upto": "place_approach"})
@@ -1385,6 +1408,21 @@ def mode_occlusion(args, ctx):
                                   "place_approach")
             if rc != 0:
                 raise EntryStop("补完放置失败（rc=%d，从 %s）" % (rc, nxt), rc)
+            # 放完必须**量一次**再宣布成功：执行器 rc=0 只说明轨迹走完了，
+            # 不说明块还在塔上 —— 2026-11-01 第 1 层档就是这么掉了块还打印
+            # 「已经放到塔顶」的。塔顶没长到 h+1 层就地停，别把废档带进下一轮。
+            top_after_mm = pad_mm + (h + 1) * m3.BLOCK_TRUE_H_MM
+            pair2 = _survey_pair(top_after_mm, slot_mm, args.d_mm)
+            after = measure_pair(board, chain, scene, hdir, "after", pair2,
+                                 grid, slot_mm, layer=h + 1,
+                                 z_bias_mm=zcal["tower"])
+            ok2, dh2 = layer_height_check(after["merged"]["top_mm"],
+                                          top_after_mm)
+            if not ok2:
+                raise EntryStop(
+                    "放完塔顶量到 %.1f mm，应有 %+.1f 层对应的 %.1f mm"
+                    "（差 %+.1f mm）——块没放上去（掉了？），就地停"
+                    % (after["merged"]["top_mm"], h + 1, top_after_mm, dh2))
         except EntryStop as exc:
             stop = exc.why
             break
