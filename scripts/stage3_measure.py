@@ -102,8 +102,24 @@ def pad_z_mm(grid):
     return round(float(T[2, 3]) * 1000.0, 3)
 
 
-#: 颜色掩码：从块中心 9×9 中位色出发做 4 连通生长，通道最大差 < 这个值。
+#: 颜色掩码：从块中心 9×9 中位色出发做 4 连通生长，判据是
+#: **色相 / 饱和度 / 明度各自贴住种子**，不是「RGB 通道最大差」。
+#: 为什么换（2026-11-01，台账第一百九十九轮）：块被自身阴影压暗时，通道差判据
+#: 会把旁边的**灰色地面**一起收进来 —— 暗黄种子 (105,80,56) 与灰地面 (100,95,90)
+#: 的通道最大差只有 34 < 45，掩码沿阴影长出一条尾巴，外接尺寸从 29.5 mm 撑到
+#: 33–47 mm，`fill` 还常判合格（入口③ 66 帧里 8 帧）。灰地面**没有色相、饱和度≈0**，
+#: 块顶面饱和度≈0.45 ⇒ 饱和度和明度两项分得干净，色相反而分不开（两者都在 ~30°）。
+#: 实测：ext 偏差中位 3.11→1.16 mm（调参集）/ 3.93→1.44 mm（另一批 run 的 50 帧），
+#: 同状态跨视点 yaw 极差中位 1.07→0.17°。
 COLOR_TOL = 45.0
+#: 色相容差（度，取环形最短距离）。
+COLOR_HUE_TOL_DEG = 15.0
+#: 饱和度容差（0–1）。**这是真正把块顶面与灰影分开的那一项。**
+COLOR_SAT_TOL = 0.18
+#: 明度容差（0–1）。放得宽：阴影下的同一面本来就该收进来。
+COLOR_VAL_TOL = 0.45
+#: 种子饱和度低于此值就认为块本身无彩（白/灰块），判据退回 RGB 通道差 ``COLOR_TOL``。
+COLOR_ACHROMATIC_SAT = 0.12
 #: 颜色掩码的搜索半窗（像素）。块在 1280×720 里约 76–82 px 宽，80 px 够。
 COLOR_HALF_PX = 80
 #: 颜色掩码可信门槛：轮廓填充率 + 像素数。
@@ -120,6 +136,41 @@ COLOR_SIDE_SEARCH_MM = 6.0
 COLOR_SIDE_STEP_MM = 1.0
 #: 被切掉的像素比例上限：切太多说明这不是「块 + 一点粘连」，救援放弃。
 COLOR_RESCUE_MAX_EXCL = 0.30
+
+
+def _hsv1(rgb):
+    """单个 RGB 三元组 → ``(h_deg, s, v)``；``s``/``v`` 归一到 0–1。"""
+    c = np.asarray(rgb, dtype=np.float64) / 255.0
+    mx, mn = float(c.max()), float(c.min())
+    d = mx - mn
+    s = d / mx if mx > 1e-6 else 0.0
+    if d < 1e-6:
+        return 0.0, s, mx
+    r, g, b = (float(v) for v in c)
+    if mx == r:
+        hh = ((g - b) / d) % 6.0
+    elif mx == g:
+        hh = (b - r) / d + 2.0
+    else:
+        hh = (r - g) / d + 4.0
+    return hh * 60.0, s, mx
+
+
+def _same_face_colour(px, seed, tol=COLOR_TOL):
+    """像素是否属于与种子同一块「同色面」。
+
+    有彩种子走色相/饱和度/明度三项；无彩种子（白/灰块）退回 RGB 通道差 ——
+    灰块的颜色信息全在明度里，HSV 那三项对它没有区分力。
+    """
+    hs, ss, vs = _hsv1(seed)
+    if ss < COLOR_ACHROMATIC_SAT:
+        return float(np.abs(np.asarray(px, dtype=np.float64)
+                            - np.asarray(seed, dtype=np.float64)).max()) < tol
+    hp, sp, vp = _hsv1(px)
+    d = abs(hp - hs)
+    d = min(d, 360.0 - d)
+    return (d < COLOR_HUE_TOL_DEG and abs(sp - ss) < COLOR_SAT_TOL
+            and abs(vp - vs) < COLOR_VAL_TOL)
 
 
 def color_face_mask(frame, uv, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
@@ -153,7 +204,7 @@ def color_face_mask(frame, uv, half_px=COLOR_HALF_PX, tol=COLOR_TOL):
         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
             ny, nx = y + dy, x + dx
             if 0 <= ny < sh and 0 <= nx < sw and not local[ny, nx]:
-                if np.abs(sub[ny, nx] - seed).max() < tol:
+                if _same_face_colour(sub[ny, nx], seed, tol):
                     local[ny, nx] = True
                     q.append((ny, nx))
     mask[v0:v1, u0:u1] = local.astype(np.uint8)

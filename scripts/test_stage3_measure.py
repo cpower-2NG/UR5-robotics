@@ -251,7 +251,8 @@ SYNTH_WH = (480, 640)
 
 
 def _synth_frame(yaw_deg=0.0, tab_mm=0.0, tab_w_mm=9.0,
-                 side_mm=29.5, cam_h_mm=360.0, cx_mm=50.0, cy_mm=20.0):
+                 side_mm=29.5, cam_h_mm=360.0, cx_mm=50.0, cy_mm=20.0,
+                 block_rgb=(20, 90, 100), shadow=None, shade=None):
     """正俯视相机 + z=0 平面上的正方形色块（可带贴边异物）→ 假 frame。"""
     h, w = SYNTH_WH
     K = np.array([[F_SYNTH, 0.0, (w - 1) / 2.0],
@@ -278,7 +279,17 @@ def _synth_frame(yaw_deg=0.0, tab_mm=0.0, tab_w_mm=9.0,
         on |= ((x <= -half) & (x >= -half - tab_mm / 1000.0)
                & (np.abs(y) <= tab_w_mm / 2000.0))
     img = np.full((h, w, 3), 150, dtype=np.uint8)
-    img[on] = (20, 90, 100)
+    if shadow:
+        # 与块**贴边**的一条灰影：颜色是「块被自己的阴影压暗」还是「灰地面」
+        # 在通道差判据下分不开，正是 COLOR_SAT_TOL 要挡的那个东西。
+        sw = shadow.get("w_mm", 12.0) / 1000.0
+        sl = shadow.get("len_mm", side_mm * 1.4) / 2000.0
+        sh_on = ((x >= half) & (x <= half + sw) & (np.abs(y) <= sl))
+        img[sh_on] = shadow.get("rgb", (100, 95, 90))
+    img[on] = block_rgb
+    if shade:
+        # 块**自己**被阴影压暗的那一半：色相与饱和度不变、只有明度掉。
+        img[on & (x >= 0.0)] = shade.get("rgb", (70, 53, 37))
     blk_ = {"uv": [(w - 1) / 2.0, (h - 1) / 2.0], "top": 0.0,
             "cx": cx_mm, "cy": cy_mm, "h": side_mm}
     return {"color": img, "depth": None, "K": K, "R_bc": R, "t_bc": t,
@@ -328,6 +339,49 @@ def test_color_rect_rescue_rejects_wrong_size_prior():
     fr = _synth_frame(yaw_deg=17.0, tab_mm=9.0)
     r = m3.color_rect_yaw(fr, fr["_block"], side_mm=15.0)
     assert not r["trusted"], ("边长先验给错还判可信", r)
+
+
+@case
+def test_color_rect_ignores_adjacent_grey_shadow():
+    """块旁贴边的**灰影**不许进掩码 —— 它和暗黄块的通道差只有 34，靠饱和度分开。
+
+    复现 2026-11-01 入口③：暗黄块 (105,80,56) 旁边的灰地面 (100,95,90) 在
+    「通道最大差 < 45」下会被一起收进来，掩码外接从 29.5 mm 撑到 33–47 mm，
+    而 `fill` 往往还判合格 —— 只能靠色相/饱和度/明度三项挡住。
+    """
+    fr = _synth_frame(yaw_deg=13.0, block_rgb=(105, 80, 56),
+                      shadow={"rgb": (100, 95, 90), "w_mm": 12.0})
+    r = m3.color_rect_yaw(fr, fr["_block"], side_mm=29.5)
+    assert r["trusted"], r
+    assert max(r["ext_mm"]) <= 31.5, ("灰影进了掩码", r)
+    assert _yaw_err_mod90(r["yaw_deg"], 13.0) <= 1.0, r
+    # 反向变异：把饱和度门放开 ⇒ 灰影必须进来、外接尺寸必须撑破。
+    orig = m3.COLOR_SAT_TOL
+    m3.COLOR_SAT_TOL = 2.0
+    try:
+        bad = m3.color_rect_yaw(fr, fr["_block"], side_mm=29.5)
+    finally:
+        m3.COLOR_SAT_TOL = orig
+    assert max(bad["ext_mm"]) > 33.0, ("变异没让用例变红，用例是空转", bad)
+
+
+@case
+def test_color_rect_keeps_block_own_shaded_half():
+    """块**自己**暗下去的一半必须留在掩码里 —— 阴影只改明度，不改色相/饱和度。
+
+    这条守的是 ``COLOR_VAL_TOL``：收得太死就会把阴影面切掉、外接尺寸缩水。
+    """
+    fr = _synth_frame(yaw_deg=-6.0, block_rgb=(105, 80, 56),
+                      shade={"rgb": (70, 53, 37)})
+    r = m3.color_rect_yaw(fr, fr["_block"], side_mm=29.5)
+    assert r["trusted"], r
+    # 看**短边**：只留一半的掩码是个 29.5×14.7 的矩形，`fill` 照样 0.94 判合格，
+    # 长边也还是 29.5 —— 只有短边会塌。
+    assert min(r["ext_mm"]) >= 27.5, ("自己暗掉的一半被切掉了", r)
+    # 阴影面被切掉的帧会「判假 → 走救援 → 救援把尺寸补回 33.5 mm 的框」，
+    # 光看 ext 是发现不了的；没走救援才说明掩码本身完整。
+    assert "rescue" not in r, ("块自己的一半被切掉、走了救援", r)
+    assert _yaw_err_mod90(r["yaw_deg"], -6.0) <= 1.0, r
 
 
 @case
