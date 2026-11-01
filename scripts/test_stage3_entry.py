@@ -744,6 +744,39 @@ def test_nudge_delta_sign_and_mod90():
 
 
 @case
+def test_applied_nudge_command_zero_only_touches_motion():
+    """`--nudge-zero` 只把平移/转角置零，yaw 的朝向基准与实测 δ 本身不动。
+
+    反向变异：`zero` 分支若漏置某一项（或落到了 `cmd` 上原地改），
+    下面「原样对照」和「四项全零」两条必有一条变红。
+    """
+    cmd = e.nudge_delta([421.0, -120.0], 84.0, [422.65, -114.86],
+                        yaw_sign=1.0)
+    keep = dict(cmd)
+
+    # 默认档：原样发给计划，且**不改动传入的 cmd**
+    out = e.applied_nudge_command(cmd)
+    assert out == {k: float(v) for k, v in keep.items()}, out
+    assert cmd == keep, "applied_nudge_command 改了传进来的 cmd"
+
+    # 诊断档：平移与转角四项全零，朝向基准 / δ 记录不变
+    z = e.applied_nudge_command(cmd, zero=True)
+    for k in ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg"):
+        assert_close(z[k], 0.0, 1e-9, k)
+    assert_close(z["yaw_from_deg"], keep["yaw_from_deg"], 1e-9)
+    assert_close(z["yaw_to_deg"], keep["yaw_to_deg"], 1e-9)
+
+    # 置零后 nudge_row 不许崩：没有指令方向 ⇒ gain/perp 记 None，
+    # 但位移量照报 —— 诊断档要的就是那个位移。
+    before = _merged(421.0, -120.0, 84.0)
+    after = _merged(421.0, -125.0, 84.0)
+    row = e.nudge_row(1, z, before, after, [422.65, -114.86])
+    assert row["push"]["gain_xy"] is None, row["push"]
+    assert_close(row["push"]["d_actual_mm"], 5.0, 0.01)
+    assert e.format_nudge_line("nudge-99", row)
+
+
+@case
 def test_nearby_blocks_keeps_only_ring():
     """离格心 [25, 90] mm 的其它块才算邻块；目标自己、过远的、low 的都不算。"""
     blocks = [blk(0, 0.0, 0.0, 31.0, 29.5),          # 目标自己（距离 0）

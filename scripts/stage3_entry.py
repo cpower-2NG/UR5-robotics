@@ -304,6 +304,24 @@ def neighbour_shift(before_list, after_list, match_mm=30.0):
     return out
 
 
+def applied_nudge_command(cmd, zero=False):
+    """这次**真正发给计划**的指令；``cmd`` 是实测 δ，另存一份留作对账。
+
+    ``zero=True``（`--nudge-zero`，诊断用）：平移与转角全置零，只走
+    「接近 → 闭合 → 松开 → 退开」。2026-11-01 真机 5 次显示 nudge 自带一个
+    ≈5.3 mm、与指令无关的恒定侧推（详见仓外台账第一百八十七轮）；这一档用来
+    分辨它是出在这四个动作上，还是出在横移/扭转上。
+    """
+    keys = ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg",
+            "yaw_from_deg", "yaw_to_deg")
+    out = {k: float(cmd[k]) for k in keys if k in cmd}
+    if zero:
+        for k in ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg"):
+            if k in out:
+                out[k] = 0.0
+    return out
+
+
 def nudge_row(rep, cmd, before, after, target_xy_mm,
               xy_tol_mm=NUDGE_XY_TOL_MM, yaw_tol_deg=NUDGE_YAW_TOL_DEG):
     """一次矫正的前后对账：实走 δ、push gain、带转角、终态过不过门。
@@ -1380,7 +1398,12 @@ def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
     cmd = nudge_delta(merged["center_base_mm"], yaw_c, slot_mm,
                       yaw_sign=sign, delta_deg=delta)
     base["commanded"] = {k: round(float(v), 3) for k, v in cmd.items()}
-    if (abs(cmd["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
+    zero = bool(getattr(args, "nudge_zero", False))
+    applied = applied_nudge_command(cmd, zero=zero)
+    base["applied"] = {k: round(float(v), 3) for k, v in applied.items()}
+    if zero:
+        base["note"] = "nudge-zero 诊断：实测 δ 只记录、不执行"
+    elif (abs(cmd["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
             or abs(cmd["dyaw_deg"]) > pp.NUDGE_MAX_YAW_DEG):
         return dict(base, status="out_of_range",
                     reason="δ 超单次上限（%.0f mm / %.0f°）—— 该走完整抓放，"
@@ -1417,10 +1440,11 @@ def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
              "top": m3.BLOCK_TRUE_H_MM, "h": m3.BLOCK_TRUE_H_MM}
     try:
         plan = s3r.nudge_plan(chain, q_start, block, blocks,
-                              shift_xy_mm=(cmd["dx_mm"], cmd["dy_mm"]),
-                              dyaw_deg=cmd["dyaw_deg"],
+                              shift_xy_mm=(applied["dx_mm"],
+                                           applied["dy_mm"]),
+                              dyaw_deg=applied["dyaw_deg"],
                               surface_m=float(pad_mm) / 1000.0,
-                              yaw_block_deg=cmd["yaw_from_deg"],
+                              yaw_block_deg=applied["yaw_from_deg"],
                               open_mm=float(args.nudge_open),
                               survey_tool0=pair[0])
     except pp.PlanError as exc:
@@ -1437,7 +1461,7 @@ def _nudge_once(args, board, chain, scene, grid, cdir, rdir, tag, slot_mm,
                          move=False)
     nb0 = scan_near(os.path.join(rdir, "frame-%s-pose1" % tag), slot_mm)
     nb1 = scan_near(os.path.join(rdir, "frame-%s-after-pose1" % tag), slot_mm)
-    row = nudge_row(rep, cmd, merged, after["merged"], slot_mm)
+    row = nudge_row(rep, applied, merged, after["merged"], slot_mm)
     row.update(base)
     row.update({"status": "ok", "after_merged": after["merged"],
                 "survey_tool0": pair[0],
@@ -1698,6 +1722,9 @@ def main(argv=None):
                     help="⑤ 矫正前开环放置用的停留（s）")
     ap.add_argument("--nudge-clearance", type=float, default=3.0,
                     help="⑤ 矫正前开环放置用的间隙（mm）；默认入口② 最优组")
+    ap.add_argument("--nudge-zero", action="store_true",
+                    help="⑤ 诊断档：实测 δ 只记录、不执行，只走「接近→闭合→"
+                         "松开→退开」，用来查 nudge 里那个恒定侧推出在哪一步")
     ap.add_argument("--no-self-return", action="store_true",
                     help="把「塔上那块」交回人手动拿走；默认由机器人自己抓回拾取区")
     ap.add_argument("--resume", action="store_true",
