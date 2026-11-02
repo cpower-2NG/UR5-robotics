@@ -17,6 +17,11 @@
 5. **测量位姿随塔高上移**：`stage3_survey_tool0` 让相机—塔顶距离恒为 D
    （默认 331 mm，复现阶段 2 的 `stage2close`）。固定 `stage2high` 已知顶面碎、
    yaw 不可信（2026-10-27 B2），固定 `stage2close` 在 5 层时只剩 ~214 mm。
+6. **放置偏置补偿**：每层量完记 b̂ = 实测 − **命令**；命令目标 = 期望目标 − b̂
+   （b̂ = 先验种子 + 本轮已测各层的均值，`--bias-comp none` 退回纯开环）。
+   **种子必需**：第 1 层若不补、第 2 层补满，两层之间就有个 ≈|b̂| 的折角，
+   而判分看的正是相对对中。种子优先级 `--bias-seed` > `<run>/bias_estimate.json`。
+   这个偏置住「块 ↔ 夹爪」之间，闭环组也消不掉；超 15 mm 按失败停轮。
 
 真机纪律（每次会话重来，不继承上次）
 ────────────────────────────────────
@@ -202,6 +207,148 @@ def closed_loop_yaw(prev_merged):
     return m3.metric_yaw(prev_merged or {})
 
 
+# ---------------------------------------------------------------- 放置偏置补偿
+#: 偏置上限（mm）。超过它**不是偏置，是失败**（块掉了 / 没抓住 / 塔被撞了），
+#: 按失败停轮，不用它去推下一层 —— 拿一个 30 mm 的「偏置」补偿下一层，
+#: 只会把塔越推越歪，而且事后从数据上看不出是哪一步坏的。
+BIAS_LIMIT_MM = 15.0
+
+
+def bias_from_layer(measured_mm, commanded_mm, limit_mm=BIAS_LIMIT_MM):
+    """一层放完后：``实测块顶中心 − 命令目标`` = 这一层的放置偏置 b̂。
+
+    返回 ``(bias, why)``：正常时 ``bias=[bx, by]``（mm）、``why=None``；
+    判不了时 ``bias=None``、``why`` 是原因（``measured_missing`` / 超上限）。
+
+    **为什么必须有这一项**：机放的块落地后系统性偏向 base 的 (−x, −y) ——
+    入口② open50/dwell0.5 五次均值 (−3.56, −2.56) mm、|dxy| σ 0.84 mm；今天三次
+    机放对格心 (−3.4, +0.6)/(−2.8, +0.8)/(−0.9, +0.4)（方位角 170°/164°/156°，稳）。
+    这个 offset 住**块与夹爪之间**，不在「目标 → 臂」这条链上 ⇒ 闭环组把下一层
+    目标改成「上一层实测中心」也消不掉它。只有显式预补偿（命令 = 期望 − b̂）能压。
+    """
+    if measured_mm is None or commanded_mm is None:
+        return None, "measured_missing"
+    bx = float(measured_mm[0]) - float(commanded_mm[0])
+    by = float(measured_mm[1]) - float(commanded_mm[1])
+    mag = math.hypot(bx, by)
+    if not math.isfinite(mag):
+        return None, "bias_nonfinite"
+    if mag > float(limit_mm):
+        return None, ("bias_too_large: 实测比命令偏 %.2f mm（上限 %.1f）"
+                      "—— 这不是偏置，是失败" % (mag, limit_mm))
+    return [bx, by], None
+
+
+def applied_bias(bias_hist, mode="adaptive", seed=None):
+    """这一层要用的 b̂（mm）：``种子 + 本轮已测各层`` 的均值。
+
+    ``none`` ⇒ ``[0, 0]``（纯开环）。**种子是必需的，不是优化**：第 1 层没有
+    本轮历史，不补；第 2 层补满 b̂ ⇒ 第 1↔2 层之间凭空多出一个 ≈|b̂| 的**折角**。
+    判分看的是**相对**对中，4 mm 的折角直接把「≤5 mm」吃掉 —— 而物理上
+    「相对第 1 层放准第 2 层」本来就要求先知道 b̂，轮内数据给不了，只能给先验。
+    """
+    if mode != "adaptive":
+        return [0.0, 0.0]
+    vals = ([list(seed)] if seed else []) + list(bias_hist or [])
+    if not vals:
+        return [0.0, 0.0]
+    n = float(len(vals))
+    return [sum(float(b[0]) for b in vals) / n,
+            sum(float(b[1]) for b in vals) / n]
+
+
+def target_with_bias(desired_mm, bias_hist, mode="adaptive", seed=None):
+    """``期望目标 − b̂``：命令给臂的目标。``desired`` 仍是要落到的那个点。"""
+    b = applied_bias(bias_hist, mode, seed=seed)
+    return [float(desired_mm[0]) - b[0], float(desired_mm[1]) - b[1]]
+
+
+def commanded_target_m(desired_m, bias_hist, mode="adaptive", seed=None):
+    """米制包装：臂与计划用 m，b̂ 用 mm —— 换算只在这一行，并由测试把守。"""
+    t = target_with_bias([float(v) * 1000.0 for v in desired_m],
+                         bias_hist, mode, seed=seed)
+    return [t[0] / 1000.0, t[1] / 1000.0]
+
+
+#: 轮间累积的偏置估计（写在 run 目录下）。下一轮默认拿它当种子 ——
+#: 不这样做，每轮第 1 层都只能不补，每轮都会重新造一次那个折角。
+BIAS_ESTIMATE_FILE = "bias_estimate.json"
+
+
+def parse_bias_seed(spec):
+    """``"bx,by"``（mm，允许中文逗号）→ ``[bx, by]``；空 ⇒ ``None``。"""
+    if spec is None:
+        return None
+    text = str(spec).strip().replace("，", ",")
+    if not text:
+        return None
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 2:
+        raise ValueError("--bias-seed 要两个数（bx,by），实得 %r" % (spec,))
+    try:
+        return [float(parts[0]), float(parts[1])]
+    except ValueError:
+        raise ValueError("--bias-seed 不是数：%r" % (spec,))
+
+
+def load_bias_estimate(path):
+    """读轮间估计；坏文件当没有（**不猜**，但也不让一次坏文件炸掉整轮）。"""
+    try:
+        doc = json.load(open(path))
+    except (OSError, ValueError):
+        return None
+    val = doc.get("bias_mm")
+    if not val or len(val) != 2:
+        return None
+    try:
+        return [float(val[0]), float(val[1])]
+    except (TypeError, ValueError):
+        return None
+
+
+def write_bias_estimate(rdir, doc):
+    """把本轮的 b̂ 并进 ``<run>/bias_estimate.json``：下一轮第 1 层就有先验。
+
+    没有测量（离线预检 / 第一层就停）⇒ 不写，返回 ``None``。
+    """
+    hist = [h["bias_mm"] for h in (doc.get("bias_history") or [])]
+    if not hist:
+        return None
+    path = os.path.join(rdir, BIAS_ESTIMATE_FILE)
+    try:
+        prev = json.load(open(path))
+    except (OSError, ValueError):
+        prev = None
+    merged = merge_bias_estimate(prev, hist)
+    if merged is None:
+        return None
+    n = float(len(hist))
+    merged["rounds"] = list((prev or {}).get("rounds") or []) + [
+        {"round": doc.get("round"), "n": len(hist),
+         "bias_mm": [round(sum(float(h[0]) for h in hist) / n, 3),
+                     round(sum(float(h[1]) for h in hist) / n, 3)]}]
+    with open(path, "w") as fh:
+        json.dump(merged, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return merged
+
+
+def merge_bias_estimate(prev, new_layers):
+    """把本轮的 b̂ 并进轮间估计：``n`` 加权平均，返回落盘用的 dict。"""
+    prev = prev or {}
+    n0 = int(prev.get("n") or 0)
+    vals = [list(map(float, prev.get("bias_mm") or [0.0, 0.0]))] * n0
+    vals += [list(map(float, b)) for b in (new_layers or [])]
+    if not vals:
+        return None
+    n = len(vals)
+    return {"version": 1, "model": "constant",
+            "bias_mm": [round(sum(v[0] for v in vals) / n, 3),
+                        round(sum(v[1] for v in vals) / n, 3)],
+            "n": n,
+            "rounds": list(prev.get("rounds") or [])}
+
+
 # ---------------------------------------------------------------- 选块
 def build_items(analysis, scene, n, arm="geometric", zcal=None):
     """候选池 → 逐层要抓的块（按候选离块心最近排序，不按颜色）。"""
@@ -299,6 +446,23 @@ def run_round(args):
 
     os.makedirs(args.run_dir, exist_ok=True)
     rdir = args.run_dir
+    # 偏置先验：命令行 > run 目录里上一轮攒下的估计 > 无。
+    # 没有它，每轮第 1 层都只能不补，第 1↔2 层之间就有一个 ≈|b̂| 的折角。
+    try:
+        b_seed = parse_bias_seed(getattr(args, "bias_seed", None))
+    except ValueError as exc:
+        print("!! %s" % exc)
+        return 2
+    b_seed_src = "arg" if b_seed else None
+    if b_seed is None:
+        b_seed = load_bias_estimate(os.path.join(rdir, BIAS_ESTIMATE_FILE))
+        b_seed_src = "estimate" if b_seed else None
+    if b_seed and args.bias_comp == "adaptive":
+        print("偏置先验 b̂₀=(%+.2f, %+.2f) mm（来源：%s）—— 第 1 层也补偿，"
+              "避免 1↔2 层之间那个 ≈|b̂| 的折角"
+              % (b_seed[0], b_seed[1],
+                 "命令行 --bias-seed" if b_seed_src == "arg"
+                 else "run 目录上一轮的估计"))
     round_no = args.round
     if round_no is None:
         if args.measure_only:
@@ -388,6 +552,12 @@ def run_round(args):
                     "block_h_used_mm", "yaw_grasp_deg", "yaw_place_deg",
                     "yaw_source", "yaw_note")} for it in items],
         "layers": [], "terminal": None, "stop_reason": None,
+        # 轮内自适应放置偏置补偿：mode=none 时逐字节复现旧的「纯开环」语义。
+        "bias_comp": {"mode": args.bias_comp, "limit_mm": BIAS_LIMIT_MM,
+                      "seed_mm": (None if b_seed is None
+                                  else [round(v, 3) for v in b_seed]),
+                      "seed_source": b_seed_src},
+        "bias_history": [],
         "human_review": ({"approved": True, "note": args.review_note or ""}
                          if args.review_ok else None),
     }
@@ -429,13 +599,16 @@ def run_round(args):
         else:
             view_xy = slot_mm
         # 放置目标：主组固定格心；闭环组用上一层实测中心 / yaw。
-        slot_target = [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0]
+        # **期望目标**（要落到的点，判分与报告看它）与**命令目标**（给臂的点）
+        # 从这一层起分开：命令 = 期望 − b̂，b̂ = 先验种子 + 本轮已测各层的均值。
+        # b̂ 住「块 ↔ 夹爪」之间，闭环也消不掉，只能这样显式预补偿。
+        desired_target = [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0]
         yaw_place = float(item["yaw_place_deg"])
         yaw_place_src = "plan"          # 主组：目标就是计划里的块朝向
         if args.group == "closed" and prev and prev["merged"].get("found"):
             lm = prev["merged"]
-            slot_target = [lm["center_base_mm"][0] / 1000.0,
-                           lm["center_base_mm"][1] / 1000.0]
+            desired_target = [lm["center_base_mm"][0] / 1000.0,
+                              lm["center_base_mm"][1] / 1000.0]
             pyaw, pyaw_src = closed_loop_yaw(lm)
             if pyaw is None:
                 stop = "closed_yaw_%s（第 %d 层，缺可用的彩色 yaw）" % (
@@ -445,6 +618,10 @@ def run_round(args):
             yaw_place = pyaw
             yaw_place_src = pyaw_src
         item = dict(item, yaw_place_deg=yaw_place)
+        b_applied = applied_bias(doc["bias_history"], args.bias_comp,
+                                 seed=b_seed)
+        slot_target = commanded_target_m(desired_target, doc["bias_history"],
+                                         args.bias_comp, seed=b_seed)
         surface_m = surface_mm / 1000.0
         survey_top_m = surface_m + m3.BLOCK_TRUE_H_MM / 1000.0
         pair = pp.stage3_survey_tool0(
@@ -491,6 +668,13 @@ def run_round(args):
                 "yaw_place_deg": round(yaw_place, 3),
                 # 闭环目标来自哪一路 yaw —— 事后能解释每一层的朝向是怎么来的。
                 "yaw_place_source": yaw_place_src,
+                # 期望（该落在哪）/ 命令（实际让臂去哪）/ 本层用的 b̂。
+                # 三者分开记，事后才能分辨「补偿生效」与「塔本来就放歪了」。
+                "desired_center_base_mm": [round(v * 1000.0, 2)
+                                           for v in desired_target],
+                "commanded_center_base_mm": [round(v * 1000.0, 2)
+                                             for v in slot_target],
+                "applied_bias_mm": [round(v, 3) for v in b_applied],
                 "predicted_center_base_mm": [round(v * 1000.0, 2)
                                              for v in pred_xy],
                 # 松手瞬间的块顶 = 表面 + 5 mm 放置间隙 + 真高。
@@ -499,13 +683,19 @@ def run_round(args):
                     + m3.BLOCK_TRUE_H_MM, 2),
             },
             "measured": None,
+            # 本层「实测 − 命令」；下一层的预补偿就用它的历史均值。
+            "placement_bias_mm": None,
         }
         doc["layers"].append(rec)
         _dump(os.path.join(cdir, "round.json"), doc)
-        print("第 %d 层：块 #%d %s → (%.1f, %.1f) mm，表面 %.2f mm，"
+        print("第 %d 层：块 #%d %s → 命令 (%.1f, %.1f) mm%s，表面 %.2f mm，"
               "carry %.1f mm"
               % (k, item["block_idx"], item.get("class") or "?",
                  slot_target[0] * 1000.0, slot_target[1] * 1000.0,
+                 ("（期望 %.1f, %.1f，b̂=(%+.2f, %+.2f)）"
+                  % (desired_target[0] * 1000.0, desired_target[1] * 1000.0,
+                     b_applied[0], b_applied[1])
+                  if any(b_applied) else ""),
                  surface_mm, float(meta["carry_z"]) * 1000.0))
 
         if not args.go:
@@ -555,11 +745,37 @@ def run_round(args):
         if (meas.get("consistency") or {}).get("ok") is not True:
             stop = "pose_mismatch"
             break
+        # 这一层落地偏了多少 —— 下一层用它预补偿。超上限按失败停轮，
+        # 不拿一个「块掉了 / 没抓住」的大数去把下一层推得更歪。
+        bias, bwhy = bias_from_layer(
+            merged.get("center_base_mm"),
+            [slot_target[0] * 1000.0, slot_target[1] * 1000.0])
+        rec["placement_bias_mm"] = (None if bias is None
+                                    else [round(v, 3) for v in bias])
+        if bwhy:
+            stop = "layer%02d_%s" % (k, bwhy)
+            print("!! 第 %d 层：%s" % (k, bwhy))
+            _dump(os.path.join(cdir, "round.json"), doc)
+            break
+        doc["bias_history"].append({"layer": k,
+                                    "bias_mm": [round(v, 3) for v in bias]})
+        print("  放置偏置 b̂=(%+.2f, %+.2f) mm —— %s"
+              % (bias[0], bias[1],
+                 "下一层按历史均值预补偿" if args.bias_comp == "adaptive"
+                 else "补偿关闭（--bias-comp none），只记账"))
         prev = {"merged": merged,
                 "surface_est_mm": meas.get("surface_est_mm"),
                 "next_surface_est_mm": meas.get("next_surface_est_mm")}
         last_pair = pair
         _dump(os.path.join(cdir, "round.json"), doc)
+
+    # 本轮的 b̂ 并进 run 目录的估计：下一轮（含第 1 层）直接有先验。
+    merged_est = write_bias_estimate(rdir, doc)
+    if merged_est:
+        print("偏置估计更新：b̂=(%+.2f, %+.2f) mm，n=%d → %s"
+              % (merged_est["bias_mm"][0], merged_est["bias_mm"][1],
+                 merged_est["n"],
+                 os.path.join(rdir, BIAS_ESTIMATE_FILE)))
 
     # ---- 离线预检到此为止：只验证计划能不能生成，不判分（没有测量）。
     if not args.go:
@@ -694,6 +910,13 @@ def main(argv=None):
                     help="塔体 box 半边长（m）：块半宽 + 余量")
     ap.add_argument("--place-open-mm", type=float, default=None)
     ap.add_argument("--release-dwell-s", type=float, default=None)
+    ap.add_argument("--bias-comp", choices=("adaptive", "none"), default="adaptive",
+                    help="轮内自适应放置偏置补偿（默认 adaptive）：每层量完把"
+                         "「实测 − 命令」记进 bias_history，下一层命令目标 = "
+                         "期望目标 − 历史均值。none = 旧的纯开环语义，只记不补。")
+    ap.add_argument("--bias-seed", default=None,
+                    help="偏置先验 bx,by（mm），第 1 层也补；不给就吃 "
+                         "<run-dir>/bias_estimate.json（上一轮攒下的）")
     ap.add_argument("--terminal-wait-s", type=float, default=10.0)
     ap.add_argument("--review-ok", action="store_true",
                     help="人眼复核已通过（逐层数值之外必须由人确认）")

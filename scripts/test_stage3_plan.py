@@ -153,6 +153,150 @@ def test_eih_group_refuses_instead_of_silently_running_open():
 
 
 @case
+def test_bias_from_layer_is_measured_minus_commanded():
+    """b̂ = 实测 − **命令**（不是期望）。两者分开记，否则补偿会被算两遍。"""
+    cmd = (422.65, -114.86)
+    bias, why = s3r.bias_from_layer((419.0, -118.0), cmd)
+    assert why is None, why
+    assert_close(bias[0], 419.0 - 422.65, 1e-9, "bx")
+    assert_close(bias[1], -118.0 + 114.86, 1e-9, "by")
+    # 没有测量 ⇒ 判不了，不能默认 0（默认 0 = 悄悄退回开环）。
+    b2, why2 = s3r.bias_from_layer(None, cmd)
+    assert b2 is None and why2 == "measured_missing", (b2, why2)
+
+
+@case
+def test_bias_over_limit_is_a_failure_not_a_bias():
+    """30 mm 的「偏置」是块掉了 / 没抓住 —— 停轮，不许拿去推下一层。"""
+    cmd = (422.65, -114.86)
+    bias, why = s3r.bias_from_layer((422.65 + 30.0, -114.86), cmd)
+    assert bias is None, "超上限必须拒绝，实得 %r" % (bias,)
+    assert why and why.startswith("bias_too_large"), why
+    # 上限之内照收：刚好 15.0 mm 不拒（判据是 >）。
+    ok, why_ok = s3r.bias_from_layer((422.65 + 15.0, -114.86), cmd)
+    assert why_ok is None and ok[0] == 15.0, (ok, why_ok)
+
+
+@case
+def test_target_with_bias_cancels_a_repeating_offset():
+    """轮内自适应：命令 = 期望 − 历史均值；下一层若偏得一样多，就落在期望上。"""
+    desired = (422.65, -114.86)
+    # 第 1 层没有历史 ⇒ 不猜，命令 = 期望。
+    assert s3r.target_with_bias(desired, []) == [422.65, -114.86]
+    # mode=none ⇒ 旧的纯开环语义，逐字节一样。
+    hist = [[-3.0, -2.0]]
+    assert s3r.target_with_bias(desired, hist, "none") == [422.65, -114.86]
+    # 历史均值 (−3, −2) ⇒ 命令右移 3、下移 2，抵消掉那个固定偏置。
+    t = s3r.target_with_bias(desired, hist)
+    assert_close(t[0], 422.65 + 3.0, 1e-9, "命令 x")
+    assert_close(t[1], -114.86 + 2.0, 1e-9, "命令 y")
+    # 性质：若这一层仍偏 (−3, −2)，落点 = 命令 + b̂ = 期望。
+    bias, _ = s3r.bias_from_layer((t[0] - 3.0, t[1] - 2.0),
+                                  (t[0], t[1]))
+    assert_close(bias[0], -3.0, 1e-9, "b̂x")
+    assert_close(t[0] + bias[0], desired[0], 1e-9, "落点 x 回到期望")
+    # 历史取均值，不是最后一条：两层 (−3,−2)、(−1,−4) ⇒ (−2,−3)。
+    t2 = s3r.target_with_bias(desired, [[-3.0, -2.0], [-1.0, -4.0]])
+    assert_close(t2[0], 422.65 + 2.0, 1e-9, "均值 x")
+    assert_close(t2[1], -114.86 + 3.0, 1e-9, "均值 y")
+
+
+@case
+def test_commanded_target_converts_mm_bias_into_metres():
+    """接线那一行：期望是米、b̂ 是毫米 —— 换算错了塔会偏 1000 倍。"""
+    desired_m = (0.42265, -0.11486)
+    t = s3r.commanded_target_m(desired_m, [[-3.0, -2.0]])
+    assert_close(t[0], 0.42565, 1e-9, "命令 x（m）")
+    assert_close(t[1], -0.11286, 1e-9, "命令 y（m）")
+    assert s3r.commanded_target_m(desired_m, []) == [0.42265, -0.11486]
+    assert (s3r.commanded_target_m(desired_m, [[-3.0, -2.0]], "none")
+            == [0.42265, -0.11486])
+
+
+@case
+def test_bias_seed_compensates_layer_one():
+    """**种子是必需的**：没有它，第 1 层不补、第 2 层补满 ⇒ 1↔2 层一个 |b̂| 折角。
+
+    判分看相对对中，4 mm 折角直接吃掉「≤5 mm」。种子让第 1 层也补偿。
+    """
+    desired = (422.65, -114.86)
+    seed = [-3.5, -2.5]
+    # 第 1 层：历史空，但种子在 ⇒ 命令 = 期望 − 种子。
+    t1 = s3r.target_with_bias(desired, [], seed=seed)
+    assert_close(t1[0], 426.15, 1e-9, "第 1 层命令 x")
+    assert_close(t1[1], -112.36, 1e-9, "第 1 层命令 y")
+    # 第 2 层：种子与实测一起平均（不是丢掉种子）。
+    t2 = s3r.target_with_bias(desired, [[-2.5, -1.5]], seed=seed)
+    assert_close(t2[0], 422.65 + 3.0, 1e-9, "均值 x")
+    assert_close(t2[1], -114.86 + 2.0, 1e-9, "均值 y")
+    # mode=none 时种子也不许生效。
+    assert s3r.target_with_bias(desired, [], "none", seed=seed) == [422.65, -114.86]
+
+    # 性质检验：种子 = 真实偏置 b 时，每层的落点都落在期望上、层间无折角。
+    b = [-3.0, -2.0]
+    land = [s3r.target_with_bias(desired, hist, seed=b) for hist in
+            ([], [b], [b, b])]
+    for t in land:
+        assert_close(t[0] + b[0], desired[0], 1e-9, "落点 x")
+        assert_close(t[1] + b[1], desired[1], 1e-9, "落点 y")
+    for i in range(1, len(land)):
+        assert_close(land[i][0] - land[i - 1][0], 0.0, 1e-9, "层间无折角")
+
+
+@case
+def test_bias_seed_parsing_and_round_estimate():
+    """``--bias-seed`` 的解析与轮间估计的合并（下一轮第 1 层的先验从这来）。"""
+    assert s3r.parse_bias_seed(None) is None
+    assert s3r.parse_bias_seed("") is None
+    assert s3r.parse_bias_seed("  ") is None
+    assert s3r.parse_bias_seed("-3.56,-2.56") == [-3.56, -2.56]
+    assert s3r.parse_bias_seed("-3.56, -2.56") == [-3.56, -2.56]
+    assert s3r.parse_bias_seed("-3.56，-2.56") == [-3.56, -2.56]   # 中文逗号
+    for bad in ("1", "1,2,3", "a,b"):
+        try:
+            s3r.parse_bias_seed(bad)
+        except ValueError:
+            continue
+        raise AssertionError("坏种子 %r 必须被拒" % (bad,))
+
+    # 第 1 轮：两层 b̂ → 估计 = 它们的均值，n=2。
+    e1 = s3r.merge_bias_estimate(None, [[-3.0, -2.0], [-1.0, -4.0]])
+    assert e1["n"] == 2 and e1["bias_mm"] == [-2.0, -3.0], e1
+    # 第 2 轮：再加一层 ⇒ n 加权，不是只留最后一轮。
+    e2 = s3r.merge_bias_estimate(e1, [[0.0, 0.0]])
+    assert e2["n"] == 3, e2
+    assert_close(e2["bias_mm"][0], -4.0 / 3.0, 1e-3, "合并 x")   # 落盘保留 3 位
+    assert_close(e2["bias_mm"][1], -2.0, 1e-9, "合并 y")
+
+    # 落盘→读回：下一轮的种子就是这么来的；坏文件当没有，不炸整轮。
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, s3r.BIAS_ESTIMATE_FILE)
+        with open(p, "w") as fh:
+            json.dump(e2, fh)
+        assert s3r.load_bias_estimate(p) == e2["bias_mm"]
+        with open(p, "w") as fh:
+            fh.write("{not json")
+        assert s3r.load_bias_estimate(p) is None
+        with open(p, "w") as fh:
+            json.dump({"bias_mm": [1.0]}, fh)
+        assert s3r.load_bias_estimate(p) is None
+
+
+@case
+def test_bias_comp_flag_reaches_the_round():
+    """``--bias-comp`` 必须是真开关：拼错的取值要在解析期就拒，不能静默补/不补。"""
+    base = ["--run-dir", "/tmp/x", "--urdf", "/tmp/u.urdf", "--n-layers", "3"]
+    rc = None
+    try:
+        s3r.main(base + ["--bias-comp", "bogus"])
+    except SystemExit as exc:          # argparse 对非法取值 exit(2)
+        rc = exc.code
+    assert rc == 2, "非法 --bias-comp 应被 argparse 拒，实得 %r" % (rc,)
+
+
+@case
 def test_survey_pose_tracks_tower_top():
     """相机—塔顶距离恒定；塔越高 tool0 越高。"""
     d = pp.STAGE3_SURVEY_DEFAULT_D
