@@ -1057,6 +1057,10 @@ def build_place(chain, q_start, block, slot, surface_z, carry_z,
 #: 是「根本没放对」，该走完整抓放；拿 nudge 硬拽只会把块拖到邻块上去。
 NUDGE_MAX_SHIFT_MM = 15.0
 NUDGE_MAX_YAW_DEG = 15.0
+#: 塔体护栏给 nudge 留的**竖直余量**（m）：被矫正的块踩在箱顶，块底由 FK
+#: 推、IK 残差 ≤0.1 mm，不留余量时同一目标的不同 IK 支会给出相反的碰撞判决。
+#: 0.5 mm 只吸收残差与 z 标定偏差，真撞进去照样判红。
+NUDGE_BOX_TOP_TOL = 0.0005
 
 
 def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
@@ -1134,13 +1138,25 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
     if tower_box is not None:
         grasp_depth_m = wz - (grip_z_local - TOOL0_TO_BARE_FINGERTIP)
         below_tip = wz - grasp_depth_m + TOOL0_TO_BARE_FINGERTIP
+        # 箱顶按 `NUDGE_BOX_TOP_TOL` 压下去一点：被矫正的块**本来就踩在箱顶**
+        # （box 顶 = 块底面），而箱内判定用的是 FK 推出来的块底，IK 残差
+        # ≤0.1 mm 就足以让它时而 `zb >= 箱顶`（跳过）、时而差一丝毫进去 ——
+        # 同一目标不同 IK 支会给出相反的判决，DP 于是被迫整链换支
+        # （2026-11-02 离线复现：第 2 层选了 w1=−180° 那一支，单跳 208.9°）。
+        # 0.5 mm 的余量只吸收残差与 z 偏差，真撞进去照样判红。
+        guard_box = (tower_box[0], tower_box[1], tower_box[2], tower_box[3],
+                     tower_box[4], tower_box[5] - NUDGE_BOX_TOP_TOL)
 
         def guard(qa, qb, _below=below_tip):
             ok, worst = check_guard(chain, qa, qb, TABLE_PLANE_Z)
             if not ok:
                 return False, worst
+            # ``off_xy`` 必须是二元组：nudge 的 tool0 是**对齐实测块心**的
+            # （见上面动作序列），块心相对 tool0 就是 0；传 ``None`` 会在
+            # `check_held_block` 里 `off_xy[0]` 崩（2026-11-02 离线复现：
+            # 只要给了 tower_box 就必崩，第 1 层没有塔所以一直没暴露）。
             ok2, w2 = check_held_block(chain, qa, qb, held_half_edge, wz,
-                                       _below, tower_box, None)
+                                       _below, guard_box, (0.0, 0.0))
             if not ok2:
                 return False, w2
             return True, worst

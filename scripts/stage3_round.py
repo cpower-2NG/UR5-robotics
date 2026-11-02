@@ -54,23 +54,26 @@ import stage3_measure as m3                                        # noqa: E402
 import stage3_score as s3                                          # noqa: E402
 import urkin                                                      # noqa: E402
 
-GROUPS = ("open", "closed", "eih")
+GROUPS = ("open", "closed", "eih", "nudge")
 ARMS = ("geometric", "zero", "graspnet")
 
-#: 真正实现了的组。``eih``（eye-in-hand 第二对照组）＝把一层拆成「抓 → 载运」
-#: 与「载运 → 放」两段，在 carry 处按**期望顶高**量一次塔顶再改目标
-#: （2026-11-02 落地；入口③ 三层都量得到，见台账第 207 轮）。
-IMPLEMENTED_GROUPS = ("open", "closed", "eih")
+#: 真正实现了的组。
+#: ``eih``（eye-in-hand 第二对照组）＝把一层拆成「抓 → 载运」与「载运 → 放」
+#: 两段，在 carry 处按**期望顶高**量一次塔顶再改目标（2026-11-02 落地；
+#: 入口③ 三层都量得到，见台账第 207 轮）。
+#: ``nudge``（放置后矫正第三对照组）＝放置流程与 ``open`` 完全一样（期望目标
+#: 固定格心、开环放），量完之后**只夹不抬**把块推到目标，再量一次。判分与
+#: 下一层的表面用矫正后的实测；b̂ 记账仍用矫正前那次（见层循环里的注释）。
+IMPLEMENTED_GROUPS = ("open", "closed", "eih", "nudge")
 
 
 def unsupported_group(group):
     """``group`` 还没实现时返回拒绝原因；实现了返回 ``None``。"""
     if group in IMPLEMENTED_GROUPS:
         return None
-    return ("--group %s 还没有实现：eih 组要把一层拆成「抓 → 载运」与"
-            "「载运 → 放」两段、在 carry 处按期望顶高挑出塔顶再改目标。"
-            "现在选它只会跑成开环组、却把结果记成 eih —— fail-closed，拒绝执行。"
-            % group)
+    return ("--group %s 不在 %s 里（已知组 %s）。闸门排在抓帧/动臂**之前**，"
+            "免得跑成开环组却把结果记成别的组 —— fail-closed，拒绝执行。"
+            % (group, IMPLEMENTED_GROUPS, GROUPS))
 
 
 # ---------------------------------------------------------------- z 标定
@@ -198,6 +201,398 @@ def nudge_plan(chain, q_start, block, blocks, shift_xy_mm=(0.0, 0.0),
         open_mm=open_mm, survey_tool0=survey_tool0, tower_box=tower_box,
         held_half_edge=held_half_edge)
     return _finish_plan(wps, checks, meta, q_start, chain)
+
+
+# ---------------------------------------------------------------- 后矫正（⑤）
+#: 矫正后判据 = 契约 §4.1 的门（≤5 mm / ≤5°），**不新编数**。第 1 层没有下层，
+#: 就按「目标 = 格心 + 0°」算；主轮里同样是这两个数，换成「相对下层实测」。
+NUDGE_XY_TOL_MM = 5.0
+NUDGE_YAW_TOL_DEG = 5.0
+#: 排查「有没有顶动邻块」的半径（mm，离目标格心）。手指半开 50 mm ⇒
+#: 半径 90 mm 已把两指行程全包住。
+NUDGE_NEAR_MM = 90.0
+#: 该半径内、离目标格心比这更近的簇，当成被矫正的那块自己
+#: （块半对角线 17.7 mm；矫正量上限 15 mm，两者加起来仍 <25）。
+NUDGE_SELF_MM = 25.0
+
+
+def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
+                yaw_sign=1.0, delta_deg=0.0, yaw_quadrant=0):
+    """「目标 − 实测」→ 要下的平移 δ(mm) 与 tool0 转角 δ(°)。纯函数。
+
+    ``yaw_sign`` / ``delta_deg`` 与 `stage2_round.yaw_for_arm` **同一套映射**
+    （``tool0_yaw = sign·θ + δ``）；目标块朝向是 0（格线方向），对应的 tool0
+    角正好是 ``δ``。
+
+    方块按 **90° 周期**折最短角（`stage2_round.signed_err_mod90` 同口径）：
+    方块的正面/侧面互换，转 87° 与转 −3° 是同一件事。`fold_yaw_180` 那一次
+    折是给夹爪挑一支更短的等价解，不是近似。
+
+    返回里两个角分开写：
+    · ``dyaw_deg`` —— **tool0** 要转多少（喂给 `build_nudge`）；
+    · ``dyaw_block_deg`` —— 块**应跟着转**多少（= sign·dyaw_deg，用于对账）。
+
+    ``yaw_quadrant``（0–3，`--nudge-yaw-quadrant`）把**接近朝向**再加 k·90°。
+    方块对 90° 自对称 ⇒ 夹这一对侧面与夹那一对侧面是同一个合法抓取，所以
+    这个数不改任何判据；它只改 tool0 绕 z 的朝向。用途是**方向帧判别**：
+    零位移档实测的 ≈5 mm 侧推全落在世界 −y，而那些样本的指轴也都在 75–90°
+    （≈世界 +y）——两者重合，分不出「推在夹爪系里」还是「推在世界系里」。
+    把指轴转 90°，夹爪系的推就该跟着转到 ±x，世界系的推则仍留在 −y。
+    ``dyaw`` 本身按 mod 90 折，绕 90° 转一次不变（块的等价解）。
+    """
+    sign = float(yaw_sign)
+    quad = int(yaw_quadrant) % 4
+    dx = float(target_xy_mm[0]) - float(measured_xy_mm[0])
+    dy = float(target_xy_mm[1]) - float(measured_xy_mm[1])
+    yaw_from = pp.fold_yaw_180(sign * float(measured_yaw_deg) + float(delta_deg)
+                               + 90.0 * quad)
+    yaw_to = pp.fold_yaw_180(float(delta_deg))
+    dyaw = float(s2.signed_err_mod90(yaw_to, yaw_from))
+    return {"dx_mm": dx, "dy_mm": dy, "d_mm": math.hypot(dx, dy),
+            "dyaw_deg": dyaw, "dyaw_block_deg": sign * dyaw,
+            "yaw_from_deg": float(yaw_from), "yaw_to_deg": float(yaw_to)}
+
+
+def nearby_blocks(blocks, target_xy_mm, radius_mm=NUDGE_NEAR_MM,
+                  exclude_mm=NUDGE_SELF_MM):
+    """离目标格心 ``[exclude_mm, radius_mm]`` 内的**其它**块（诊断顶没顶邻块）。
+
+    ``low`` 的簇（连接件 / 台面噪声）不算。
+    """
+    out = []
+    for b in blocks or []:
+        if b.get("low"):
+            continue
+        d = math.hypot(float(b["cx"]) - float(target_xy_mm[0]),
+                       float(b["cy"]) - float(target_xy_mm[1]))
+        if float(exclude_mm) <= d <= float(radius_mm):
+            out.append({"idx": b.get("idx"),
+                        "center_mm": [round(float(b["cx"]), 2),
+                                      round(float(b["cy"]), 2)],
+                        "top_mm": round(float(b.get("top", 0.0)), 2),
+                        "dist_mm": round(d, 2)})
+    return sorted(out, key=lambda r: r["dist_mm"])
+
+
+def nudge_push_pred(bias_xy_mm, yaw_deg):
+    """预测「闭合那一下」把块推走多少：``E`` 沿指轴的分量再沿指轴返回。
+
+    只保留沿指轴的那一维：垂着指轴的方向上两指没有推力面，块不动
+    （12 行实测的 ⟂ 分量 ≤0.34 mm，都在噪声地板里）。
+
+    反向变异：把 ``yaw_deg`` 换成「指轴 = tool0 的 y」、或把分量换成 E 本身，
+    都会让 `test_nudge_bias_comp_cancels_predicted_push` 变红。
+    """
+    ex, ey = float(bias_xy_mm[0]), float(bias_xy_mm[1])
+    t = math.radians(float(yaw_deg))
+    ax, ay = math.cos(t), math.sin(t)      # 指轴 = tool0 x（数据定的，见上）
+    s = ex * ax + ey * ay
+    return s * ax, s * ay
+
+
+def nudge_bias_comp(spec):
+    """`--nudge-bias-comp "x,y"` → ``(x, y)`` mm（base 系）；空 ⇒ 不补偿。
+
+    不给默认值：E 只在 4 号格附近 8 mm 内估过（台账第一百八十九轮「未决 1」），
+    静默套一个常数比不补偿更危险 —— 换位置若不成立，人会以为是别的地方坏了。
+    """
+    if spec is None or str(spec).strip() == "":
+        return None
+    vals = [float(v) for v in str(spec).replace("，", ",").split(",") if v.strip()]
+    if len(vals) != 2:
+        raise SystemExit("--nudge-bias-comp 要两个数（x,y，mm），拿到 %r" % (spec,))
+    return (vals[0], vals[1])
+
+
+def applied_nudge_command(cmd, zero=False, bias_xy_mm=None):
+    """这次**真正发给计划**的指令；``cmd`` 是实测 δ，另存一份留作对账。
+
+    ``zero=True``（`--nudge-zero`，诊断用）：平移与转角全置零，只走
+    「接近 → 闭合 → 松开 → 退开」。2026-11-01 真机 5 次显示 nudge 自带一个
+    ≈5.3 mm、与指令无关的恒定侧推（详见仓外台账第一百八十七轮）；这一档用来
+    分辨它是出在这四个动作上，还是出在横移/扭转上。
+
+    ``bias_xy_mm``（`--nudge-bias-comp`）：预补偿。闭合时块会被推走 Δ，
+    就在**横移目标**里减掉 Δ（不动接近点），落点回到「实测 + 想要的 δ」。
+    这一手只依赖「Δ 可预测」，不假定 E 是臂的定位残差还是测量的固定偏置
+    —— 两者对补偿等价（台账第一百八十九轮 §未决）。
+    """
+    keys = ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg",
+            "yaw_from_deg", "yaw_to_deg")
+    out = {k: float(cmd[k]) for k in keys if k in cmd}
+    if zero:
+        for k in ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg"):
+            if k in out:
+                out[k] = 0.0
+    if bias_xy_mm is not None and "dx_mm" in out and "dy_mm" in out:
+        px, py = nudge_push_pred(bias_xy_mm, out.get("yaw_from_deg", 0.0))
+        out["dx_mm"] -= px
+        out["dy_mm"] -= py
+        out["d_mm"] = math.hypot(out["dx_mm"], out["dy_mm"])
+        out["push_pred_x_mm"] = px
+        out["push_pred_y_mm"] = py
+    return out
+
+
+def nudge_row(rep, cmd, before, after, target_xy_mm,
+              xy_tol_mm=NUDGE_XY_TOL_MM, yaw_tol_deg=NUDGE_YAW_TOL_DEG):
+    """一次矫正的前后对账：实走 δ、push gain、带转角、终态过不过门。
+
+    ``before`` / ``after`` 是矫正前后的 ``merged``（`stage3_measure` 融合值）。
+    **yaw 判据一律走彩色掩码**（契约 §4.2.5），深度 ``yaw_deg`` 只报告：
+    两个估计器逐次差 1.43 倍，拿深度当 ``ok`` 会把合格的矫正判红。
+
+    ``ok=None``（``reason="no_colour_yaw"``）= 证明不了，转人评 —— 与
+    `stage3_measure.pose_consistency` 同一口径。
+    """
+    def centre(m):
+        return [float(m["center_base_mm"][0]), float(m["center_base_mm"][1])]
+
+    def yaw_color(m):
+        y = m.get("yaw_color_deg")
+        return None if y is None else float(y)
+
+    def err_vs_target(c):
+        return math.hypot(float(target_xy_mm[0]) - c[0],
+                          float(target_xy_mm[1]) - c[1])
+
+    bc, ac = centre(before), centre(after)
+    by, ay = yaw_color(before), yaw_color(after)
+    yaw_err0 = None if by is None else float(s2.signed_err_mod90(by, 0.0))
+    yaw_err1 = None if ay is None else float(s2.signed_err_mod90(ay, 0.0))
+    dyaw_act = (None if (by is None or ay is None)
+                else float(s2.signed_err_mod90(ay, by)))
+    dyaw_cmd = float(cmd["dyaw_block_deg"])
+    yaw_gain = (None if (dyaw_act is None or abs(dyaw_cmd) < 1e-9)
+                else dyaw_act / dyaw_cmd)
+
+    # 实走 δ：沿指令方向的有符号投影比（push gain）+ 侧向走偏（粘滑/推力偏）。
+    dx, dy = ac[0] - bc[0], ac[1] - bc[1]
+    d_act = math.hypot(dx, dy)
+    cx, cy = float(cmd["dx_mm"]), float(cmd["dy_mm"])
+    d_cmd = math.hypot(cx, cy)
+    if d_cmd > 1e-9:
+        gain = (dx * cx + dy * cy) / (d_cmd * d_cmd)
+        perp = abs(-dx * cy + dy * cx) / d_cmd
+    else:
+        gain, perp = None, d_act
+
+    e0, e1 = err_vs_target(bc), err_vs_target(ac)
+    if yaw_err1 is None:
+        ok, reason = None, "no_colour_yaw"
+    else:
+        ok = bool(e1 <= float(xy_tol_mm) and abs(yaw_err1) <= float(yaw_tol_deg))
+        reason = "ok" if ok else "still_off"
+
+    def state(c, e, y, ye):
+        return {"center_mm": [round(c[0], 2), round(c[1], 2)],
+                "xy_err_mm": round(e, 2), "yaw_color_deg": y,
+                "yaw_err_deg": None if ye is None else round(ye, 2)}
+
+    return {"rep": int(rep),
+            "commanded": {k: round(float(v), 3) for k, v in cmd.items()},
+            "before": dict(state(bc, e0, by, yaw_err0),
+                           yaw_depth_deg=before.get("yaw_deg"),
+                           top_mm=before.get("top_mm")),
+            "after": dict(state(ac, e1, ay, yaw_err1),
+                          yaw_depth_deg=after.get("yaw_deg"),
+                          top_mm=after.get("top_mm")),
+            "push": {"d_actual_mm": round(d_act, 2),
+                     "gain_xy": None if gain is None else round(gain, 2),
+                     "perp_mm": round(perp, 2),
+                     "d_cmd_mm": round(d_cmd, 2)},
+            "yaw": {"dyaw_actual_deg": (None if dyaw_act is None
+                                        else round(dyaw_act, 2)),
+                    "dyaw_expected_deg": round(dyaw_cmd, 2),
+                    "gain_yaw": (None if yaw_gain is None
+                                 else round(yaw_gain, 2))},
+            "delta_xy_mm": round(e0 - e1, 2),
+            "final_ok": ok, "reason": reason,
+            "tol": {"xy_mm": float(xy_tol_mm),
+                    "yaw_deg": float(yaw_tol_deg)}}
+
+
+def nudge_pose_gate(before, after=None):
+    """契约 §4.2.5 的多姿态一致性门 —— 过门返回 ``None``，否则返回人评理由。
+
+    ``after`` 省略（``None``）= 只查矫正前那一次（还没动臂，用来决定夹不夹）。
+
+    ``before`` / ``after`` 是 ``stage3_measure`` 的融合值；这里只读它自己记下的
+    两视点差（``center_span_mm`` / ``yaw_color_span_deg``），不重算。
+
+    为什么要单独补这一道（2026-11-01 实测）：nudge 这条路径原来只取融合后的
+    ``center_base_mm``，把离散度记进 row.json 就没人看了。零位移诊断档第 1 次
+    的两个视点相差 **11.17 mm**（超过契约的 10 mm 门），却仍被记成一条普通的
+    ``status: ok``，混进了 ``n_final_ok``。几十次跑下来这种东西会把结论带偏，
+    而且从汇总里根本看不出来。
+
+    ``span`` 缺失 = 只有一个视点能测到 ⇒ **证明不了一致**，同样转人评
+    （与 ``stage3_measure.pose_consistency`` 的 ``ok=None`` 同一口径）。
+    """
+    pairs = [("矫正前", before or {})]
+    if after is not None:
+        pairs.append(("矫正后", after or {}))
+    bad = []
+    for name, m in pairs:
+        sp = m.get("center_span_mm")
+        ys = m.get("yaw_color_span_deg")
+        if sp is None or ys is None:
+            bad.append("%s只有一个视点能测到（证明不了一致）" % name)
+            continue
+        if sp > m3.POSE_XY_TOL_MM:
+            bad.append("%s两视点差 %.1f mm > %.0f mm"
+                       % (name, sp, m3.POSE_XY_TOL_MM))
+        if ys > m3.POSE_YAW_TOL_DEG:
+            bad.append("%s两视点 yaw 差 %.1f° > %.0f°"
+                       % (name, ys, m3.POSE_YAW_TOL_DEG))
+    return "；".join(bad) or None
+
+
+def tower_candidates(meas):
+    """塔位测量里 pose1 第一帧的候选簇（**含目标块自己**）。
+
+    nudge 要用它把「被矫正的那块」在 `check_block_gap` 里排除掉；取不到就返回
+    空表 —— 调用方退回「只放这一块」的单簇世界，不猜。
+    """
+    try:
+        return list(meas["poses"][0]["frames"][0]["diag"]["candidates"])
+    except (KeyError, IndexError, TypeError):
+        return []
+
+
+def nudge_block_ref(merged, meas, tol_mm=10.0):
+    """实测塔顶 → ``build_nudge`` 的 ``block`` 与 ``blocks``（含邻块）。
+
+    用**真高**（29.5 mm）而不是实测顶高：nudge 的夹持深度 = 块高 − 18.5 mm，
+    高度读出偏差不该混进来。中心取两视点融合值。
+
+    测量中心与帧内最近候选差 > ``tol_mm`` ⇒ 对不上（块可能被撞/量错），
+    返回 ``None``，调用方不夹。
+    """
+    bcx, bcy = (float(v) for v in merged["center_base_mm"])
+    cands = tower_candidates(meas)
+    idx = -1
+    if cands:
+        near = min(cands, key=lambda c: math.hypot(c["cx"] - bcx,
+                                                   c["cy"] - bcy))
+        if math.hypot(near["cx"] - bcx, near["cy"] - bcy) > float(tol_mm):
+            return None
+        idx = int(near["idx"])
+    blocks = [{"idx": int(c["idx"]), "cx": float(c["cx"]),
+               "cy": float(c["cy"])} for c in cands]
+    if not blocks:
+        blocks = [{"idx": idx, "cx": bcx, "cy": bcy}]
+    block = {"idx": idx, "cx": bcx, "cy": bcy,
+             "top": float(merged.get("top_mm") or m3.BLOCK_TRUE_H_MM),
+             "h": m3.BLOCK_TRUE_H_MM}
+    return block, blocks
+
+
+def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
+                      round_no, merged, meas, desired_target, surface_mm,
+                      surface_m, tower_xy, pair):
+    """第 k 层放好、量完之后：**只夹不抬**把块推到目标，退开再量一次。
+
+    返回 ``(row, stop, after_meas)``。``row`` 落进 ``rec["nudge"]``；
+    ``stop`` 非空 ＝ 这一层不能再往上叠（块可能还在指间 / 量不住 / 偏得根本
+    不是「放歪」）；``after_meas`` 是矫正后的完整测量，没矫正就是 ``None``。
+
+    为什么超限要**停轮**而不是像入口⑤ 那样跳过继续：入口⑤ 每次是一个独立样本，
+    跳过只少一条；主轮里这一层已经在塔上了，偏到 15 mm 说明塔本身出了问题，
+    往上叠只会放大。
+    """
+    target_mm = [desired_target[0] * 1000.0, desired_target[1] * 1000.0]
+    row = {"target_mm": [round(v, 2) for v in target_mm]}
+    yaw_c = merged.get("yaw_color_deg")
+    if yaw_c is None or not merged.get("yaw_color_trusted"):
+        row.update({"mode": "skipped", "reason": "no_colour_yaw"})
+        return row, "nudge_no_colour_yaw", None
+    why = nudge_pose_gate(merged, None)
+    if why:
+        row.update({"mode": "skipped", "reason": "person_review", "detail": why})
+        return row, "nudge_pose_review", None
+
+    cmd = nudge_delta(merged["center_base_mm"], yaw_c, target_mm,
+                      yaw_sign=float(scene.get("yaw_sign", 1.0)),
+                      delta_deg=float(scene.get("finger_axis_delta_deg", 0.0)))
+    bias = nudge_bias_comp(args.nudge_bias_comp)
+    applied = applied_nudge_command(cmd, bias_xy_mm=bias)
+    row["commanded"] = {kk: round(float(v), 3) for kk, v in cmd.items()}
+    row["applied"] = {kk: round(float(v), 3) for kk, v in applied.items()}
+    if bias is not None:
+        row["bias_comp_mm"] = [round(float(v), 3) for v in bias]
+    if (abs(applied["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
+            or abs(applied["dyaw_deg"]) > pp.NUDGE_MAX_YAW_DEG):
+        row.update({"mode": "skipped", "reason": "out_of_range"})
+        return row, "nudge_out_of_range", None
+
+    ref = nudge_block_ref(merged, meas)
+    if ref is None:
+        row.update({"mode": "skipped", "reason": "centre_mismatch"})
+        return row, "nudge_centre_mismatch", None
+    block, blocks = ref
+    # 塔体 box 的顶取**被矫正这一块的底面**（= 它脚下那层的表面）：块本来就
+    # 站在箱顶上，箱再往上一分就是「持块包络进箱」误报。第 1 层没有塔
+    # （``tower_xy`` 为 ``None``）→ 不开护栏，与 `build_stack` 同一口径。
+    tower_box = pp.tower_box_from(tower_xy, surface_mm, args.tower_half_edge)
+    q_start = s2.chain_q(board.joints(
+        os.path.join(cdir, "joints-layer%02d-nudge" % k)))
+    try:
+        plan = nudge_plan(chain, q_start, block, blocks,
+                          shift_xy_mm=(applied["dx_mm"], applied["dy_mm"]),
+                          dyaw_deg=applied["dyaw_deg"],
+                          surface_m=surface_m,
+                          yaw_block_deg=applied["yaw_from_deg"],
+                          open_mm=float(args.nudge_open_mm),
+                          survey_tool0=pair[0], tower_box=tower_box,
+                          held_half_edge=args.tower_half_edge)
+    except (pp.PlanError, RuntimeError, ValueError) as exc:
+        row.update({"mode": "skipped", "reason": "plan_rejected",
+                    "detail": str(exc)})
+        return row, "nudge_plan_failed", None
+    plan_path = write_plan(os.path.join(cdir, "plan-layer%02d-nudge.json" % k),
+                           plan)
+    row["plan"] = os.path.relpath(plan_path, cdir)
+    rc = board.exec_plan(plan_path,
+                         os.path.join(cdir, "log-layer%02d-nudge.jsonl" % k),
+                         go=True)
+    row["exec_rc"] = rc
+    if rc != 0:
+        return row, "nudge_exec_rc=%d" % rc, None
+
+    # 计划最后一条航点就停在 pair[0]，不用再走一趟。
+    dirs1 = capture_frames(
+        board, os.path.join(cdir, "frame-layer%02d-nudge-pose1" % k),
+        "stage3-r%02d-l%02d-np1" % (round_no, k),
+        scene.get("terminal_frames", 3))
+    rc2 = go_move(board, chain, cdir, "layer%02d-nudge-pose2" % k, pair[1],
+                  args.urdf)
+    if rc2 != 0:
+        return row, "nudge_survey_pose2_rc=%d" % rc2, None
+    dirs2 = capture_frames(
+        board, os.path.join(cdir, "frame-layer%02d-nudge-pose2" % k),
+        "stage3-r%02d-l%02d-np2" % (round_no, k),
+        scene.get("terminal_frames", 3))
+    after = m3.measure_layer(
+        [("pose1", dirs1), ("pose2", dirs2)],
+        grid=grid, window_xy_mm=target_mm, layer=k,
+        z_bias_mm=zcal["tower"], block_h_mm=m3.BLOCK_TRUE_H_MM,
+        radius_mm=m3.TOWER_RADIUS_MM, metric_source="after_nudge")
+    after_merged = after.get("merged") or {}
+    if not after_merged.get("found"):
+        row.update(nudge_row(k, applied, merged, merged, target_mm))
+        row.update({"mode": "failed", "reason": "after_missing"})
+        return row, "nudge_after_missing", after
+    row.update(nudge_row(k, applied, merged, after_merged, target_mm))
+    row["mode"] = "nudged"
+    if (after.get("consistency") or {}).get("ok") is not True:
+        row["after_pose_reason"] = (after.get("consistency") or {}).get("reason")
+        return row, "nudge_after_pose_mismatch", after
+    why = nudge_pose_gate(None, after_merged)
+    if why:
+        row["after_pose_reason"] = why
+        return row, "nudge_after_review", after
+    return row, None, after
 
 
 def predicted_place(item, slot_m):
@@ -925,6 +1320,33 @@ def run_round(args):
         if (meas.get("consistency") or {}).get("ok") is not True:
             stop = "pose_mismatch"
             break
+        # ---- nudge 组：量完之后**只夹不抬**把块推到目标，退开再量一次。
+        # 判分与下一层的表面用**矫正后**的实测；b̂ 记账仍用矫正前那次 ——
+        # b̂ 描述的是「开环放置落哪」，拿矫正后的值记会把补偿器教成
+        # 「我放得很准」，下一层不再补，那 4–5 mm 系统偏置会原样回来。
+        if args.group == "nudge":
+            nrow, nstop, after = nudge_after_place(
+                args, board, chain, scene, grid, zcal, cdir, k, round_no,
+                merged, meas, desired_target, surface_mm, surface_m,
+                tower_xy, pair)
+            rec["nudge"] = nrow
+            rec["measured_before_nudge"] = meas
+            _dump(os.path.join(cdir, "round.json"), doc)
+            if nstop:
+                stop = nstop
+                print("!! 第 %d 层 nudge 停在：%s —— 不续跑，交给人判读"
+                      % (k, nstop))
+                break
+            after_merged = after.get("merged") or {}
+            print("  nudge：误差 %.2f → %.2f mm，yaw %.2f → %.2f°，残余 %s"
+                  % (nrow["before"]["xy_err_mm"], nrow["after"]["xy_err_mm"],
+                     float("nan") if nrow["before"]["yaw_err_deg"] is None
+                     else nrow["before"]["yaw_err_deg"],
+                     float("nan") if nrow["after"]["yaw_err_deg"] is None
+                     else nrow["after"]["yaw_err_deg"],
+                     "过门" if nrow["final_ok"] else nrow["reason"]))
+            rec["measured"] = after
+            meas, merged = after, after_merged
         # 这一层落地偏了多少 —— 下一层用它预补偿。超上限按失败停轮，
         # 不拿一个「块掉了 / 没抓住」的大数去把下一层推得更歪。
         bias, bwhy = bias_from_layer(
@@ -1097,6 +1519,13 @@ def main(argv=None):
     ap.add_argument("--bias-seed", default=None,
                     help="偏置先验 bx,by（mm），第 1 层也补；不给就吃 "
                          "<run-dir>/bias_estimate.json（上一轮攒下的）")
+    ap.add_argument("--nudge-open-mm", type=float, default=40.0,
+                    help="nudge 组矫正时的张开宽度（mm）：够跨进两侧、又不把"
+                         "行程撑到邻块上")
+    ap.add_argument("--nudge-bias-comp", default=None,
+                    help="nudge 组：预扣「闭合那一下」的推力，格式 x,y（mm，"
+                         "base 系，例 -2.05,-4.78）。不给就不补偿 —— E 只在"
+                         "4 号格附近估过，换位置若不成立，人容易以为别处坏了")
     ap.add_argument("--terminal-wait-s", type=float, default=10.0)
     ap.add_argument("--review-ok", action="store_true",
                     help="人眼复核已通过（逐层数值之外必须由人确认）")

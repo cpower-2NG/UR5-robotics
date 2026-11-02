@@ -148,12 +148,76 @@ def test_group_gate_refuses_unknown_names_before_moving():
     assert s3r.unsupported_group("open") is None
     assert s3r.unsupported_group("closed") is None
     assert s3r.unsupported_group("eih") is None, "eih 已实现，不该再被拒"
+    assert s3r.unsupported_group("nudge") is None, "nudge 已实现，不该再被拒"
     why = s3r.unsupported_group("nope")
     assert why and "nope" in why, "未知组名必须给出明确的拒绝原因"
     import argparse
     ns = argparse.Namespace(group="nope", scene="/nonexistent/scene.json")
     rc = s3r.run_round(ns)
     assert rc == 2, "run_round 对未知组应返回 2（fail-closed），实得 %r" % (rc,)
+
+
+@case
+def test_nudge_plan_is_executable_plan_json(chain):
+    """`s3r.nudge_plan` 是主轮 nudge 组真正调的入口（不是 `pp.build_nudge`）。
+
+    它多了一层 `_finish_plan`（拆跳变段 + 执行器要的 version/q_start/meta.checks）。
+    只测 `pp.build_nudge` 会漏掉这一层：航点数被 `split_jumps` 改动过，
+    `meta["checks"]` 与航点必须仍一一对应，否则执行器闸门在真机上才报错。
+    """
+    blocks, _cand, q0 = scene(chain)
+    bx = nudge_block()
+    sur = PAD_Z
+    plan = s3r.nudge_plan(chain, q0, bx, blocks,
+                          shift_xy_mm=(3.0, -2.0), dyaw_deg=4.0,
+                          surface_m=sur, yaw_block_deg=1.5,
+                          tower_box=pp.tower_box_from((bx["cx"], bx["cy"]),
+                                                      sur * 1000.0))
+    assert plan["version"] == 2, plan["version"]
+    assert len(plan["q_start"]) == 6
+    assert plan["waypoints"], "空计划"
+    assert len(plan["meta"]["checks"]) == len(plan["waypoints"]), \
+        "checks 与航点数对不上（执行器会拒）"
+    names = [w["name"] for w in plan["waypoints"]]
+    for want in NUDGE_NAMES:
+        assert want in names, "缺航点 %s：%s" % (want, names)
+    assert names[-1] == "nudge_survey", "最后一条必须是 survey（轮内接着抓帧）"
+    # 每一步都要有 q 与预检，缺一个执行器就不认。
+    for w in plan["waypoints"]:
+        assert len(w["q"]) == 6 and "name" in w
+    # 超限必须在**写计划之前**就拒（`PlanError`），不能生成一张坏计划。
+    try:
+        s3r.nudge_plan(chain, q0, bx, blocks,
+                       shift_xy_mm=(40.0, 0.0), surface_m=sur,
+                       yaw_block_deg=1.5)
+    except pp.PlanError:
+        pass
+    else:
+        raise AssertionError("40 mm 平移必须拒（上限 15 mm）")
+
+
+@case
+def test_nudge_block_ref_matches_measured_centre_to_candidate():
+    """nudge 要的 ``block`` 必须来自**当次候选表**，不能自己编一个 idx。
+
+    换位置后邻块也在候选里；认错块 = 拿邻块的位置去算张开与碰撞。
+    """
+    cands = [{"idx": 3, "cx": 422.0, "cy": -114.0},
+             {"idx": 7, "cx": 500.0, "cy": -114.0}]
+    meas = {"poses": [{"frames": [{"diag": {"candidates": cands}}]}]}
+    merged = {"center_base_mm": [420.0, -116.0], "top_mm": 148.2}
+    block, blocks = s3r.nudge_block_ref(merged, meas)
+    assert block["idx"] == 3, block
+    assert_close(block["cx"], 420.0, 1e-9, "block.cx 用实测中心")
+    assert_close(block["h"], s3r.m3.BLOCK_TRUE_H_MM, 1e-9, "h 相对脚下那层")
+    assert_close(block["top"], 148.2, 1e-9, "top 是绝对顶高")
+    assert [c["idx"] for c in blocks] == [3, 7], blocks
+    # 实测中心离**所有**候选都超过 tol ⇒ 判不了是哪块：返回 None 让调用方停轮。
+    far = {"center_base_mm": [470.0, -116.0], "top_mm": 148.2}
+    assert s3r.nudge_block_ref(far, meas) is None, "认不出块必须返回 None"
+    # 候选表都拿不到（测量坏了）：退回实测中心，不假装有 idx。
+    b2, bl2 = s3r.nudge_block_ref(merged, {})
+    assert b2["idx"] == -1 and len(bl2) == 1, (b2, bl2)
 
 
 @case
@@ -749,6 +813,55 @@ def test_nudge_plan_json_is_executable_shape(chain):
     assert_close(plan["meta"]["survey_tool0"][0], pair[0][0], 1e-4,
                  "survey 收尾位（meta 保留 4 位）")
     assert_close(plan["meta"]["shift_norm_mm"], np.hypot(3.0, -2.0), 1e-3)
+
+
+@case
+def test_nudge_after_a_layer_solves_on_the_near_branch(chain):
+    """第 2 层及以上的 nudge 必须**接在当前那一支上**，不能整链换支。
+
+    2026-11-02 离线复现的两个坑（都在这一条里钉死）：
+
+    1. `build_nudge` 把 ``off_xy=None`` 传给 `check_held_block` ⇒ 一给塔体 box
+       就 ``TypeError``（第 1 层没有塔，所以入口⑤ 一直没暴露）。
+    2. 箱顶 = 被矫正块的底面，块底由 FK 推、IK 残差 ≤0.1 mm ⇒ 判定在「贴住」
+       与「侵入一丝毫」之间摇摆，不同 IK 支给出相反结果，DP 被迫整链换到
+       w1=−180° 那一支（单跳 208.9°）。`NUDGE_BOX_TOP_TOL` 就是为这个加的。
+
+    判据：能生成计划、每段单跳 ≤180°（不然 `split_jumps` 就拒了）、
+    末位回到起点（survey 就是起点，不用再走一趟）。
+    """
+    blocks, cand, q0 = scene(chain)
+    q = q0
+    for k in (1, 2):                     # 先叠到第 2 层，臂停在它的 survey 位
+        surf_k = surface_for(k)
+        wps, _checks, _meta = one_layer(
+            chain, q, blocks, cand, k,
+            tower_top_mm=(surf_k * 1000.0 if k > 1 else None),
+            tower_xy_mm=(SLOT_MM if k > 1 else None))
+        q = np.asarray(wps[-1]["q"], float)
+
+    surf = surface_for(2)
+    slot = (SLOT_MM[0] / 1000.0, SLOT_MM[1] / 1000.0)
+    top_mm = (surf + H_BLK) * 1000.0
+    pair = pp.stage3_survey_tool0(surf + H_BLK, slot)
+    bx = {"idx": 0, "cx": SLOT_MM[0], "cy": SLOT_MM[1],
+          "top": top_mm, "h": H_BLK * 1000.0}
+    plan = s3r.nudge_plan(              # 传了 tower_box ⇒ 两条老路都会崩/换支
+        chain, q, bx, [{"idx": 0, "cx": SLOT_MM[0], "cy": SLOT_MM[1]}],
+        shift_xy_mm=(3.0, -2.0), dyaw_deg=4.0, surface_m=surf,
+        yaw_block_deg=1.5, open_mm=40.0, survey_tool0=pair[0],
+        tower_box=pp.tower_box_from(SLOT_MM, surf * 1000.0, 0.020),
+        held_half_edge=0.020)
+
+    prev = np.asarray(plan["q_start"], float)
+    for w in plan["waypoints"]:
+        qq = np.asarray(w["q"], float)
+        jump = float(np.abs(np.degrees(qq - prev)).max())
+        assert jump < 180.0, "%s 单跳 %.1f° —— 换支了" % (w["name"], jump)
+        prev = qq
+    assert [w["name"] for w in plan["waypoints"]][-1] == "nudge_survey"
+    assert_close(float(np.abs(prev - np.asarray(plan["q_start"])).max()), 0.0,
+                 1e-9, "survey 必须回到起点（同一趟测量位）")
 
 
 def main():
