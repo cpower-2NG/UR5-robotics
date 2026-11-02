@@ -52,6 +52,23 @@ import urkin                                                      # noqa: E402
 GROUPS = ("open", "closed", "eih")
 ARMS = ("geometric", "zero", "graspnet")
 
+#: 真正实现了的组。``eih``（eye-in-hand 第二对照组）只占了个名字：它要把一层
+#: 拆成「抓 → 载运」与「载运 → 放」两段、在 carry 处量一次塔顶再改目标，现在
+#: 没有任何一段。选它只会**跑成开环**、却把 round.json 的 ``group`` 记成 ``eih``
+#: —— 一份贴着错标签的结果比没跑更坏（入口③ 刚踩过「绿了但测的不是那件事」）。
+#: 因此**拒绝执行**，而不是静默降级。
+IMPLEMENTED_GROUPS = ("open", "closed")
+
+
+def unsupported_group(group):
+    """``group`` 还没实现时返回拒绝原因；实现了返回 ``None``。"""
+    if group in IMPLEMENTED_GROUPS:
+        return None
+    return ("--group %s 还没有实现：eih 组要把一层拆成「抓 → 载运」与"
+            "「载运 → 放」两段、在 carry 处按期望顶高挑出塔顶再改目标。"
+            "现在选它只会跑成开环组、却把结果记成 eih —— fail-closed，拒绝执行。"
+            % group)
+
 
 # ---------------------------------------------------------------- z 标定
 def load_zcal(path):
@@ -255,6 +272,10 @@ def go_move(board, chain, cdir, tag, xyz, urdf):
 
 
 def run_round(args):
+    why = unsupported_group(args.group)
+    if why:                      # 放在最前：任何动臂动作之前就拒
+        print("!! " + why)
+        return 2
     try:
         scene = s2.load_scene(args.scene)
     except ValueError as exc:

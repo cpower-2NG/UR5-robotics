@@ -138,6 +138,21 @@ def test_closed_loop_yaw_refuses_without_colour():
 
 
 @case
+def test_eih_group_refuses_instead_of_silently_running_open():
+    """``--group eih`` 只占了个名字：选它必须被拒，不能跑成开环还记成 eih。"""
+    assert s3r.unsupported_group("open") is None
+    assert s3r.unsupported_group("closed") is None
+    why = s3r.unsupported_group("eih")
+    assert why and "eih" in why, "eih 必须给出明确的拒绝原因"
+    # 真入口：要在**任何动臂动作之前**返回 2。scene 故意给个不存在的路径——
+    # 若闸门排在 load_scene 之后，这里就会因别的原因失败而暴露出次序错了。
+    import argparse
+    ns = argparse.Namespace(group="eih", scene="/nonexistent/scene.json")
+    rc = s3r.run_round(ns)
+    assert rc == 2, "run_round 对 eih 应返回 2（fail-closed），实得 %r" % (rc,)
+
+
+@case
 def test_survey_pose_tracks_tower_top():
     """相机—塔顶距离恒定；塔越高 tool0 越高。"""
     d = pp.STAGE3_SURVEY_DEFAULT_D
