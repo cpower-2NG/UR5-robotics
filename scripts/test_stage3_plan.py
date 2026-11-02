@@ -197,6 +197,90 @@ def test_nudge_plan_is_executable_plan_json(chain):
 
 
 @case
+def test_nudge_plan_retries_equivalent_yaw_on_joint_swing(chain):
+    """关节跳变超限 → 换一个 ±90° 的等价朝向重试；别的拒绝**不许**重试。
+
+    2026-11-02 round-04 第 3 层真机：块实测 yaw 84.155°（方块 90° 对称 ⇒
+    等价于 −5.845°），`fold_yaw_180` 折完仍是 84.155°，`nudge_approach` 要让
+    wrist_3 转 199.1° 被 `MAX_JOINT_SWING` 拦下，整轮停住。这里把「第一次必拒」
+    注入进去，钉住两件事：① 会换写法重试并成功；② `dyaw` 逐字不变——
+    换的是朝向的写法，不是扭转量。
+
+    反向变异：删掉重试循环 → 本测试抛 `JointSwingError` 变红；
+    把 `except pp.JointSwingError` 放宽成 `except pp.PlanError` →
+    下面「别的拒绝只调一次」变红。
+    """
+    blocks, _cand, q0 = scene(chain)
+    bx = nudge_block()
+    sur = PAD_Z
+    real = pp.build_nudge
+    calls = []
+
+    def fake_once(*a, **kw):
+        calls.append(kw.get("yaw_shift_deg", 0.0))
+        if len(calls) == 1:
+            raise pp.JointSwingError(
+                "起点 → 航点 nudge_approach 有单个关节要转 199.1°（上限 180°）")
+        return real(*a, **kw)
+
+    try:
+        pp.build_nudge = fake_once
+        plan = s3r.nudge_plan(chain, q0, bx, blocks,
+                              shift_xy_mm=(0.0, 0.0), dyaw_deg=5.845,
+                              surface_m=sur, yaw_block_deg=84.155,
+                              tower_box=pp.tower_box_from(
+                                  (bx["cx"], bx["cy"]), sur * 1000.0))
+    finally:
+        pp.build_nudge = real
+    assert len(calls) >= 2, "超限后没重试：%r" % (calls,)
+    assert plan["meta"]["yaw_shift_deg"] != calls[0], \
+        "重试换了朝向却没记进 meta：%r" % (plan["meta"],)
+    assert abs(plan["meta"]["yaw_shift_deg"]) in (90.0, 180.0), plan["meta"]
+    assert_close(plan["meta"]["dyaw_deg"], 5.845, 1e-9)
+
+    # 非跳变类的拒绝必须原样抛出：换朝向救不回「平移超限 / 邻块太近 / 撞箱」，
+    # 重试只会把真原因掩盖成别的报错。
+    calls2 = []
+
+    def fake_other(*a, **kw):
+        calls2.append(kw.get("yaw_shift_deg", 0.0))
+        raise pp.PlanError("矫正平移 40.0 mm 超过 15 mm 上限")
+
+    try:
+        pp.build_nudge = fake_other
+        try:
+            s3r.nudge_plan(chain, q0, bx, blocks, shift_xy_mm=(3.0, 0.0),
+                           surface_m=sur, yaw_block_deg=84.155)
+        except pp.JointSwingError:
+            raise AssertionError("普通 PlanError 被当成可重试的跳变错误")
+        except pp.PlanError:
+            pass
+        else:
+            raise AssertionError("普通 PlanError 居然被吞掉")
+    finally:
+        pp.build_nudge = real
+    assert len(calls2) == 1, "普通 PlanError 被重试了 %d 次" % len(calls2)
+
+
+@case
+def test_build_nudge_yaw_shift_is_same_grasp(chain):
+    """`yaw_shift_deg` 只改朝向的写法：起始角 +k·90°、末端角同步、dyaw 不变。"""
+    blocks, _cand, q0 = scene(chain)
+    bx = nudge_block()
+    w0, _c0, m0 = pp.build_nudge(chain, q0, bx, dyaw_deg=5.845,
+                                 surface_z=PAD_Z, yaw_block_deg=5.845)
+    w1, _c1, m1 = pp.build_nudge(chain, q0, bx, dyaw_deg=5.845,
+                                 surface_z=PAD_Z, yaw_block_deg=5.845,
+                                 yaw_shift_deg=-90.0)
+    assert_close(m0["yaw_shift_deg"], 0.0, 1e-9)
+    assert_close(m1["yaw_shift_deg"], -90.0, 1e-9)
+    assert_close(m1["yaw_from_deg"], m0["yaw_from_deg"] - 90.0, 1e-9)
+    assert_close(m1["yaw_to_deg"], m0["yaw_to_deg"] - 90.0, 1e-9)
+    assert_close(m1["dyaw_deg"], m0["dyaw_deg"], 1e-9)
+    assert [w["name"] for w in w1] == [w["name"] for w in w0]
+
+
+@case
 def test_nudge_block_ref_matches_measured_centre_to_candidate():
     """nudge 要的 ``block`` 必须来自**当次候选表**，不能自己编一个 idx。
 

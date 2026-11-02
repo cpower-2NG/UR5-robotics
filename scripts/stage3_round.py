@@ -193,6 +193,10 @@ def move_plan(chain, q_start, xyz, name="move"):
     return _finish_plan(wps, checks, meta, q_start, chain)
 
 
+#: 方块对 90° 自对称 ⇒ 接近朝向的等价写法就这四种，按「离当前腕角最近」试。
+_NUDGE_YAW_SHIFTS = (0.0, -90.0, 90.0, 180.0)
+
+
 def nudge_plan(chain, q_start, block, blocks, shift_xy_mm=(0.0, 0.0),
                dyaw_deg=0.0, surface_m=pp.TABLE_PLANE_Z, yaw_block_deg=0.0,
                open_mm=None, survey_tool0=None, tower_box=None,
@@ -202,13 +206,36 @@ def nudge_plan(chain, q_start, block, blocks, shift_xy_mm=(0.0, 0.0),
     与 `layer_plan` 同一个收尾（`_finish_plan`），执行器只认这一种 JSON。
     ``block`` 与 `build_nudge` 同形（``cx``/``cy`` mm、``h`` mm 相对脚下那层）；
     ``yaw_block_deg`` 是**当前 tool0 yaw**（不是实测块 yaw，换算在调用方）。
+
+    朝向的等价写法：方块对 90° 自对称 ⇒ ``yaw_block_deg + k·90°`` 是**同一个
+    抓取**。`nudge_delta` 折的是 mod 180（`fold_yaw_180`），块实测落在 84° 附近
+    时折完还是 84°，腕 3 要为这份「本该只有 6°」的差异转 199.1°——2026-11-02
+    round-04 第 3 层就是这么被 `MAX_JOINT_SWING` 拦下的。这里按「离当前 tool0
+    朝向最近」的顺序试等价写法，**只对 `JointSwingError` 重试**：超限平移、
+    邻块太近、护栏撞箱换朝向也救不回来，重试只会把真问题掩盖成别的报错。
     """
-    wps, checks, meta = pp.build_nudge(
-        chain, q_start, block, shift_xy_mm=shift_xy_mm, dyaw_deg=dyaw_deg,
-        surface_z=surface_m, yaw_block_deg=yaw_block_deg, blocks=blocks,
-        open_mm=open_mm, survey_tool0=survey_tool0, tower_box=tower_box,
-        held_half_edge=held_half_edge)
-    return _finish_plan(wps, checks, meta, q_start, chain)
+    cur_yaw = float(chain.pose(q_start)[1][2])
+
+    def _near(shift):
+        return abs(pp.fold_yaw_180(float(yaw_block_deg) + shift - cur_yaw))
+
+    last = None
+    for shift in sorted(_NUDGE_YAW_SHIFTS, key=_near):
+        try:
+            wps, checks, meta = pp.build_nudge(
+                chain, q_start, block, shift_xy_mm=shift_xy_mm,
+                dyaw_deg=dyaw_deg, surface_z=surface_m,
+                yaw_block_deg=yaw_block_deg, blocks=blocks,
+                open_mm=open_mm, survey_tool0=survey_tool0,
+                tower_box=tower_box, held_half_edge=held_half_edge,
+                yaw_shift_deg=shift)
+        except pp.JointSwingError as exc:
+            last = exc
+            continue
+        return _finish_plan(wps, checks, meta, q_start, chain)
+    if last is not None:
+        raise last
+    raise pp.PlanError("nudge 没有可试的等价朝向（_NUDGE_YAW_SHIFTS 为空）")
 
 
 # ---------------------------------------------------------------- 后矫正（⑤）

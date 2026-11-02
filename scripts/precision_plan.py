@@ -186,6 +186,17 @@ class PlanError(RuntimeError):
     """预检不过。抛这个而不是 sys.exit，测试里能直接断言。"""
 
 
+class JointSwingError(PlanError):
+    """单个关节跳变超过 `MAX_JOINT_SWING`。
+
+    单独一支子类是为了让调用方能**只对这一种拒绝**换等价解重试：方块的朝向
+    按 90° 周期自对称，接近朝向整体 ±90° 是**同一个抓取**，换一个写法就可能
+    把跳变压下来（2026-11-02 round-04 第 3 层：块实测 84.155°，等价于 −5.845°，
+    前者 wrist_3 要转 199.1° 被拦，后者最大跳变只有 28.2°）。其它 `PlanError`
+    （超限平移、邻块太近、护栏撞箱）换朝向也救不回来，重试只会掩盖真问题。
+    """
+
+
 def down_rotation(yaw_deg=0.0):
     """竖直朝下：R = Rz(ψ) · Rx(π)。"""
     return Rot.from_euler("z", yaw_deg, degrees=True).as_matrix() @ \
@@ -611,7 +622,7 @@ def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP, q_start=None):
             jump = float(np.max(np.abs(q - prev_q)))
             if jump > MAX_JOINT_SWING:
                 where = "起点 → 航点 %s" % w["name"] if first else "航点 %s" % w["name"]
-                raise PlanError(
+                raise JointSwingError(
                     "%s 有单个关节要转 %.1f°（上限 %.0f°）—— 整圈翻转不是解法，"
                     "应换一支 IK 的等价角（见 unwrap_near）"
                     % (where, np.degrees(jump), np.degrees(MAX_JOINT_SWING)))
@@ -1116,7 +1127,7 @@ NUDGE_BOX_TOP_TOL = 0.0005
 def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
                 surface_z=TABLE_PLANE_Z, yaw_block_deg=0.0, blocks=None,
                 open_mm=None, survey_tool0=None, tower_box=None,
-                held_half_edge=0.020):
+                held_half_edge=0.020, yaw_shift_deg=0.0):
     """放置后矫正：**只夹不抬**，把已经放下的块平移 δxy / 原地转 δyaw。
 
     为什么有这个原语（2026-11-01 用户提出，第一百八十五轮记账）
@@ -1165,8 +1176,12 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
     surf = float(surface_z)
     top_abs = surf + wz
     bx, by = block["cx"] / 1000.0, block["cy"] / 1000.0
-    yaw0 = fold_yaw_180(yaw_block_deg)
-    yaw1 = fold_yaw_180(yaw_block_deg + dyaw_deg)
+    # ``yaw_shift_deg``：方块对 90° 自对称 ⇒ 接近朝向整体加 k·90° 是**同一个
+    # 抓取**。调用方在下面这种情况下用它换一个等价写法（见 `JointSwingError`）：
+    # 实测块 yaw 落在 84° 附近时，`fold_yaw_180` 折完还是 84°，腕 3 得为这一
+    # 份「本该只有 6°」的朝向差异转 199°。``dyaw`` 不动，扭转量逐字不变。
+    yaw0 = fold_yaw_180(yaw_block_deg + yaw_shift_deg)
+    yaw1 = fold_yaw_180(yaw_block_deg + dyaw_deg + yaw_shift_deg)
 
     # 高度算式与 `build_pick` 完全同源：先在「相对台面」的坐标里解出本地
     # tool0 z（软限位那对常量也是按台面平面标定的），再整体抬到 surf。
@@ -1249,6 +1264,7 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
             "shift_norm_mm": round(shift_mm, 3),
             "dyaw_deg": round(dyaw_deg, 3),
             "yaw_from_deg": round(yaw0, 3), "yaw_to_deg": round(yaw1, 3),
+            "yaw_shift_deg": round(float(yaw_shift_deg), 3),
             "target_xy_mm": [round(tx * 1000.0, 2), round(ty * 1000.0, 2)],
             "grip_z": round(grip_z, 4), "approach_z": round(approach_z, 4),
             "open_mm": round(open_used, 1),
