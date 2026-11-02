@@ -175,6 +175,60 @@ def test_synthetic_flat_table_no_blocks():
     assert blocks == [], '平地不该报块：%r' % blocks
 
 
+def _synth_frame_edge_artifact():
+    """块 + 画幅底边的深度伪影，两者在俯视网格上连成一簇（-b 帧的复现）。
+
+    台面 z=0，相机朝下、R=diag(1,-1,-1)、t=(0,0,0.5) ⇒ z_base = 0.5 − 深度。
+    块顶 0.470 m → 30 mm；底边 8 行读 0.455 m → 45 mm（伪影方向：比真顶面**高**）。
+    """
+    h, w = 240, 320
+    fx = fy = 400.0
+    cx, cy = 160.0, 120.0
+    depth = np.full((h, w), 0.500, dtype=np.float32)
+    color = np.full((h, w, 3), 40, dtype=np.uint8)
+    # 36×36 mm 块，投影像素约 30×30
+    depth[194:224, 145:175] = 0.470
+    color[194:224, 145:175] = (220, 30, 30)
+    # 伪影：从块的下沿一路画到画幅最后一行。深度更小 ⇒ xy 更靠近光轴，
+    # 于是尽管在图上是上下相接，俯视网格里仍与块连成同一簇（就是 -b 的形态）。
+    depth[224:h, 145:175] = 0.455
+    color[224:h, 145:175] = (220, 30, 30)
+    return {'depth': depth, 'color': color,
+            'R_bc': np.diag([1.0, -1.0, -1.0]),
+            't_bc': np.array([0.0, 0.0, 0.500]),
+            'K': np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])}
+
+
+@case
+def test_synthetic_edge_artifact_does_not_steal_the_top():
+    """底边伪影点数越过簇的 ~3% 时，97 分位顶高会被拽到伪影上（frame-hold-b）。"""
+    frame = _synth_frame_edge_artifact()
+    blocks, _ = gc.find_blocks(frame)
+    high = [b for b in blocks if not b['low']]
+    assert len(high) == 1, '应只有 1 块，实际 %r' % [
+        (round(b['cx']), round(b['cy']), round(b['h'], 1)) for b in high]
+    b = high[0]
+    assert abs(b['h'] - 30.0) < 3.5, (
+        '顶高被底边伪影拽走了：%.1f mm（应≈30，伪影在 45）' % b['h'])
+
+
+@case
+def test_synthetic_edge_artifact_mutation_margin_off():
+    """变异：把边距关掉 ⇒ 同一帧必须复现「顶高 ≈45 mm」的错误，否则这测试是空的。"""
+    frame = _synth_frame_edge_artifact()
+    old = gc.EDGE_MARGIN_PX
+    gc.EDGE_MARGIN_PX = 0
+    try:
+        blocks, _ = gc.find_blocks(frame)
+    finally:
+        gc.EDGE_MARGIN_PX = old
+    high = [b for b in blocks if not b['low']]
+    assert len(high) == 1, high
+    assert high[0]['h'] > 40.0, (
+        '关掉边距后应复现伪影（>40 mm），实际 %.1f —— 合成帧没造出退化条件'
+        % high[0]['h'])
+
+
 # ---------------------------------------------------------------- 几何
 def _rect_pts(w, h, deg, n=40, center=(0.0, 0.0)):
     """矩形边界上的点（米）；用于验最小外接矩形。"""

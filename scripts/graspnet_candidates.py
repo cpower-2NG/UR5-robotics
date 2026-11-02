@@ -70,6 +70,14 @@ MAX_TILT_DEG = 35.0
 # 0.0285 抄的是旧规划器的 place_z（= 台面 + 块高），**别拿它算高度**。
 TABLE_Z = 0.0285
 ANCHOR_MM = 12.0
+#: 图像边缘这个宽度内的深度点**不参与分块**。D435i 在画幅边上给的是伪影：
+#: 实测 ``frame-hold-b`` 底边 705–719 行读到比真顶面高 13 mm 的斜条，与旁边的
+#: 块在 4 mm 网格上连成同一簇；它只要占簇点数的 3%，97 分位「顶高」就从
+#: 32.4 mm 跳到 45.4 mm，整簇被判成不是塔顶（同批另两帧只占 1.6% / 0.8% 就没事）。
+#: 取 **16** 不是 20：实测伪影带是画幅最后 15 行，16 够用；再往上就会把
+#: pick-02 那块贴底的块（顶面中心 v=702，离底 18 px）从 9 块减到 8 块，
+#: 动了阶段 2 的归档基准。贴着画幅的记录值本来就不可信，先只切掉确定坏的那圈。
+EDGE_MARGIN_PX = 16
 GRASPNET_ROOT = os.path.expanduser("~/robotics/third_party/graspness_unofficial")
 CKPT = os.path.expanduser("~/robotics/third_party/graspnet-baseline/logs/checkpoint-rs.tar")
 
@@ -139,6 +147,16 @@ def backproject(depth, K):
                   (vs - cy) / fy * depth,
                   depth], -1)[valid]
     return P, np.stack([us[valid], vs[valid]], -1)
+
+
+def edge_mask(pix, shape, margin_px):
+    """像素是否离画幅四边都 ≥ ``margin_px``。``margin_px<=0`` 时全 True。"""
+    if not margin_px:
+        return np.ones(len(pix), dtype=bool)
+    h, w = shape[:2]
+    u, v = pix[:, 0], pix[:, 1]
+    return ((u >= margin_px) & (u < w - margin_px)
+            & (v >= margin_px) & (v < h - margin_px))
 
 
 def _shift_or(a):
@@ -344,6 +362,8 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
     # 高度上限：单块（阶段 2）用 70 mm 足够；塔顶要能把整根柱子容进来
     # （5 层 ≈ 150 mm），阶段 3 传 max_h_mm=220。单位与 min_h_mm 一致，都是毫米。
     m = (Pb[:, 2] > table_z + 0.005) & (Pb[:, 2] < table_z + max_h_mm / 1000.0)
+    # 画幅边缘的深度不可信（见 EDGE_MARGIN_PX）：它会把假高度掺进真块那一簇。
+    m = m & edge_mask(pix, depth.shape, EDGE_MARGIN_PX)
     Q, qpix = Pb[m], pix[m]
     if len(Q) == 0:
         return [], table_z
