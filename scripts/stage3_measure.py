@@ -389,6 +389,38 @@ def color_rect_yaw(frame, block, half_px=COLOR_HALF_PX, tol=COLOR_TOL,
     return fix
 
 
+#: 顶面连通块的点数下限：占选中点的这个比例以下 = 零星点，不算顶面的一部分。
+#: 实测（2026-11-02，5 层遮挡帧）：真顶面 8038~8453 点，混进来的画幅底边伪影
+#: 只有 12~93 点（0.15~1.1 %），却能把 bbox 往下拉 40 px，把「看得见」误判成
+#: 「贴边不可用」。取 5 % 离两头都很远。
+TOP_FACE_MIN_FRAC = 0.05
+TOP_FACE_MIN_PTS = 50
+
+
+def _largest_face_only(vv, uu):
+    """丢掉像素上不与顶面连通的零星点，只留下够大的连通块。
+
+    顶面在图像上是一整块连续面；同一高度上别处的散点（深度伪影、邻块边角）
+    在像素上不连着，却会把 min/max 拉到画幅边上。按 4 连通拆开后，
+    点数不到 5 % 的块丢掉。
+    """
+    y0, y1 = int(vv.min()), int(vv.max())
+    x0, x1 = int(uu.min()), int(uu.max())
+    occ = np.zeros((y1 - y0 + 1, x1 - x0 + 1), bool)
+    occ[vv - y0, uu - x0] = True
+    lab, n_lab = gc.label4(occ)
+    if n_lab <= 1:
+        return vv, uu
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0                                  # 0 是背景
+    need = max(TOP_FACE_MIN_PTS, TOP_FACE_MIN_FRAC * len(vv))
+    keep = np.where(sizes >= need)[0]
+    if len(keep) == 0:                            # 全都很小 ⇒ 留最大的那块
+        keep = [int(sizes.argmax())]
+    m = np.isin(lab[vv - y0, uu - x0], keep)
+    return vv[m], uu[m]
+
+
 def top_face_framing(frame, cx_mm, cy_mm, ztop_mm, radius_mm=25.0,
                      band_mm=3.0, clear_px=TOP_FACE_CLEAR_PX):
     """量一簇的顶面离图像边缘还剩多少像素 —— 判断顶面有没有被切掉。
@@ -410,11 +442,11 @@ def top_face_framing(frame, cx_mm, cy_mm, ztop_mm, radius_mm=25.0,
     if n < 50:
         return {"n": n, "clear_px": 0.0, "span_px": [0.0, 0.0],
                 "clipped": True, "reason": "顶面点太少（%d < 50）" % n}
-    vv, uu = pix[sel, 1], pix[sel, 0]
+    vv, uu = _largest_face_only(pix[sel, 1], pix[sel, 0])
     h, w = depth.shape
     clear = min(float(uu.min()), float((w - 1) - uu.max()),
                 float(vv.min()), float((h - 1) - vv.max()))
-    return {"n": n, "clear_px": round(clear, 1),
+    return {"n": n, "n_kept": int(len(vv)), "clear_px": round(clear, 1),
             "span_px": [round(float(uu.max() - uu.min()), 1),
                         round(float(vv.max() - vv.min()), 1)],
             "clipped": bool(clear < float(clear_px)),

@@ -20,6 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import stage3_entry as e                                            # noqa: E402
+import stage3_measure as m3                                         # noqa: E402
 import stage3_round as s3r                                          # noqa: E402
 
 CASES = []
@@ -222,6 +223,39 @@ def test_top_face_clear_threshold_is_load_bearing():
     assert e.top_face_framing(low, 0.0, 510.0, SYNTH_ZTOP)["clipped"] is True
     assert e.top_face_framing(low, 0.0, 510.0, SYNTH_ZTOP,
                               clear_px=0.0)["clipped"] is False
+
+
+@case
+def test_largest_face_only_drops_border_specks():
+    """同高度上画幅边那一小撮散点不许把顶面的 bbox 拉到边上。
+
+    实测（2026-11-02，5 层遮挡帧）：真顶面 8038~8453 点、伪影 12~93 点。
+    反向变异：把 ``TOP_FACE_MIN_FRAC`` 调到 0 ⇒ 下面 v 的最大值必被拉到 711。
+    """
+    # 40×40 的实心顶面 + 底边 (600,710) 处 2×2 的散点
+    vv = np.concatenate([np.repeat(np.arange(300, 340), 40),
+                         np.array([710, 710, 711, 711])])
+    uu = np.concatenate([np.tile(np.arange(620, 660), 40),
+                         np.array([600, 601, 600, 601])])
+    v2, u2 = m3._largest_face_only(vv, uu)
+    assert len(v2) == 1600, '散点没被丢掉：留下 %d 点' % len(v2)
+    assert v2.max() < 340, '顶面 bbox 仍被散点拉到 v=%d' % v2.max()
+    assert u2.min() >= 620, '顶面 bbox 仍被散点拉到 u=%d' % u2.min()
+
+
+@case
+def test_top_face_framing_ignores_border_speck():
+    """端到端：同一高度、半径圈内的一撮画幅散点 ⇒ 不判 clipped。
+
+    合成帧是竖直相机，半径给 700 mm 才能把底边的散点圈进来（真实帧是斜视
+    相机，同高度的散点天然落在 25 mm 圈里）。判的是「散点不影响结论」这件事。
+    """
+    fr = synth_frame((640, 360))
+    fr["depth"][700:704, 610:616] = 0.90          # 底边一撮同深度散点
+    f = e.top_face_framing(fr, 0.0, 0.0, SYNTH_ZTOP, radius_mm=700.0)
+    assert f["n_kept"] < f["n"], '合成帧没造出「顶面 + 散点」，测试是空的：%r' % f
+    assert f["clipped"] is False, f
+    assert f["clear_px"] > 300.0, '顶面 bbox 仍被散点拉到边上：%r' % f
 
 
 @case
