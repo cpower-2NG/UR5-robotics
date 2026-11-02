@@ -85,6 +85,9 @@ PICK_RETURN_GAP_MM = 85.0
 PICK_RETURN_MARGIN_MM = 25.0
 #: 塔上那块在计划里的伪块序号 —— 拾取区的真 idx 从 0 起，−1 不会撞。
 TOWER_BLOCK_IDX = -1
+#: 自动拆塔一次最多拆几层：主组上限 5 层，留 1 层余量。超了说明塔或测量
+#: 不对（比如同一层被拆了两次还没判空），fail-closed，交给人。
+TEARDOWN_MAX_LAYERS = 6
 
 
 class EntryStop(Exception):
@@ -509,13 +512,13 @@ def resume_tower_action(msg, meas, last_merged, resume):
     return "return" if ((meas or {}).get("merged") or last_merged) else "stop"
 
 
-def tower_clear_now(board, scene, cdir, tag, grid, window_xy_mm,
+def tower_state_now(board, scene, cdir, tag, grid, window_xy_mm,
                     radius_mm=TOWER_CLEAR_RADIUS_MM,
                     cell_idx=m3.TOWER_CELL_IDX):
-    """人清完塔位后**不动臂**就地核一次：还有块就停。
+    """**不动臂**就地量一次塔位，返回 ``(meas, msg)``（``msg`` 空 = 塔位空）。
 
-    只在刚做完 ``measure_pair``（臂停在 survey 位姿 2）之后调用 ——
-    那时相机本来就对着塔位，不必再走一趟。
+    只在臂本来就在塔上方巡检位时调用（刚跑完一条巡检终点在上方的计划）。
+    自动拆塔每拆一层都要靠它拿到**新的塔顶**，所以把「量」和「判红」拆开。
     """
     n = int(scene.get("terminal_frames", 3))
     dirs = s3r.capture_frames(board, os.path.join(cdir, "frame-%s" % tag),
@@ -524,7 +527,15 @@ def tower_clear_now(board, scene, cdir, tag, grid, window_xy_mm,
                             window_xy_mm=window_xy_mm, layer=0,
                             z_bias_mm=0.0, radius_mm=float(radius_mm))
     _dump(os.path.join(cdir, "measure-%s.json" % tag), meas)
-    msg = tower_occupancy_verdict(meas.get("merged"), cell_idx)
+    return meas, tower_occupancy_verdict(meas.get("merged"), cell_idx)
+
+
+def tower_clear_now(board, scene, cdir, tag, grid, window_xy_mm,
+                    radius_mm=TOWER_CLEAR_RADIUS_MM,
+                    cell_idx=m3.TOWER_CELL_IDX):
+    """人清完塔位后**不动臂**就地核一次：还有块就停。"""
+    meas, msg = tower_state_now(board, scene, cdir, tag, grid, window_xy_mm,
+                                radius_mm=radius_mm, cell_idx=cell_idx)
     if msg:
         raise EntryStop(msg + " —— 还没清空，不往下跑")
     return meas
@@ -669,9 +680,10 @@ def tower_block_item(merged, scene, zcal, arm="geometric"):
     """把「塔上那块」的实测值包装成 ``build_items`` 同款的 item（拆塔用）。
 
     ``merged`` = 上一轮塔顶的融合测量（``measure_pair(...)["merged"]``）。
-    中心 / yaw 直接用；``h`` 用 ``顶高 − z 标定(tower)`` —— ``build_pick``
-    的抓取高度整个锚在**台面**（``TABLE_PLANE_Z``），塔上的块只是 ``wz``
-    比台面上的块大了一个块高（垫 + 29.5）。
+    中心 / yaw 直接用；``h`` 用 ``顶高 − z 标定(tower)`` —— 这是**块顶离台面**
+    的高度（三层塔 ≈ 91 mm）。**物理块高另给 ``block_true_h_mm`` = 29.5 mm**：
+    ``build_pick`` 的抓取/放置几何锚在块底（``wz − block_h``），两个量混用会
+    把指尖指到最底层（2026-11-02 拆塔事故）。
 
     yaw 只有 ``yaw_rect`` 一个来源（没有像素最小外接矩形），按几何臂的
     ``sign·θ + δ`` 走；量不到 yaw 时 ``yaw_for_arm`` 会返回 0 并标
@@ -704,6 +716,9 @@ def tower_block_item(merged, scene, zcal, arm="geometric"):
             "grasp_at": scene.get("grasp_at", "block_center"),
             "block_h_raw_mm": round(h_mm, 3),
             "block_h_used_mm": round(h_mm, 3),
+            # 塔上的块：上面两个数是**块顶离台面**，不是块高。
+            "block_true_h_mm": round(float(scene.get("block_true_h_mm")
+                                           or m3.BLOCK_TRUE_H_MM), 3),
             "yaw_grasp_deg": round(float(yg), 3),
             "yaw_place_deg": round(float(yp), 3),
             "yaw_source": src, "yaw_note": why}
@@ -726,7 +741,9 @@ def place_one(args, board, chain, scene, grid, analysis, item, slot_mm,
     js = board.joints(os.path.join(cdir, "joints-%s" % tag))
     q_start = s2.chain_q(js)
     surface_m = float(surface_mm) / 1000.0
-    carry_z = pp.stage3_carry_z(item["block_h_used_mm"] / 1000.0, surface_m)
+    carry_z = pp.stage3_carry_z(
+        float(item.get("block_true_h_mm", item["block_h_used_mm"])) / 1000.0,
+        surface_m)
     try:
         plan = s3r.layer_plan(chain, q_start, item, analysis["blocks"],
                               [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0],
@@ -782,13 +799,21 @@ def return_to_pick(args, board, chain, scene, cdir, tag, grid, slot_mm,
                    merged, zcal, rdir=None):
     """**机器人自己**把塔上那块抓下来、放回拾取区空位，再回核塔位清空。
 
-    这是「拆塔」的最小形态，不引入新传感器：
-    · 抓哪儿 = 上一轮塔顶实测（中心 / yaw / 顶高），``tower_block_item`` 包装；
-    · 放哪儿 = **新抓一帧**拾取区，``free_slot_mm`` 选空位；
-    · 收尾 = 计划的巡检位就设在塔上方，跑完**原地**``tower_clear_now`` 核空。
+    ``verify=True`` 的原语义（入口老路径）：核完还有块 ⇒ 直接停。
+    """
+    rec, _meas, _msg = return_to_pick_once(
+        args, board, chain, scene, cdir, tag, grid, slot_mm, merged, zcal,
+        rdir=rdir, verify=True)
+    return rec
 
-    计划从**当前实测关节角**起（刚在拾取巡检位抓完帧），一条计划走完
-    「拾取位 → 塔上方抓块 → 抬到载运高 → 拾取区空位放下 → 回塔上方」。
+
+def return_to_pick_once(args, board, chain, scene, cdir, tag, grid, slot_mm,
+                        merged, zcal, rdir=None, verify=True):
+    """单层回位：抓塔顶那块 → 拾取区空位 → 就地量一次塔位。
+
+    返回 ``(rec, meas_after, msg)``；``msg`` 空 = 塔位已空。``verify=True``
+    时「没空」直接 ``EntryStop``（入口老路径的行为）；自动拆塔传 ``False``，
+    把 ``meas_after`` 当下一层的塔顶继续拆。
     """
     rdir = rdir or cdir
     os.makedirs(rdir, exist_ok=True)
@@ -803,8 +828,9 @@ def return_to_pick(args, board, chain, scene, cdir, tag, grid, slot_mm,
     pair = _survey_pair(merged["top_mm"], merged["center_base_mm"], args.d_mm)
     js = board.joints(os.path.join(cdir, "joints-%s" % tag))
     q_start = s2.chain_q(js)
-    carry_z = pp.stage3_carry_z(item["block_h_used_mm"] / 1000.0,
-                                pp.TABLE_PLANE_Z)
+    carry_z = pp.stage3_carry_z(
+        float(item.get("block_true_h_mm", item["block_h_used_mm"])) / 1000.0,
+        pp.TABLE_PLANE_Z)
     try:
         plan = s3r.layer_plan(chain, q_start, item, analysis["blocks"],
                               [spot["xy_mm"][0] / 1000.0,
@@ -840,9 +866,73 @@ def return_to_pick(args, board, chain, scene, cdir, tag, grid, slot_mm,
     print("  回位：塔上那块 → 拾取区 %s（离最近块 %s mm，离边 %s mm，yaw %s）"
           % (spot["xy_mm"], spot["gap_mm"], spot["edge_mm"],
              item["yaw_source"]))
-    tower_clear_now(board, scene, cdir, tag + "-clear", grid, slot_mm,
-                    cell_idx=args.tower_cell_idx)
-    return rec
+    if verify:
+        tower_clear_now(board, scene, cdir, tag + "-clear", grid, slot_mm,
+                        cell_idx=args.tower_cell_idx)
+        return rec, None, None
+    meas_after, msg = tower_state_now(board, scene, cdir, tag + "-clear", grid,
+                                      slot_mm,
+                                      cell_idx=args.tower_cell_idx)
+    rec["tower_after"] = (meas_after.get("merged") or {})
+    return rec, meas_after, msg
+
+
+def teardown_tower(args, board, chain, scene, grid, cdir, slot_mm, zcal,
+                   tag="teardown", max_layers=TEARDOWN_MAX_LAYERS):
+    """塔位非空 ⇒ **机器人自己**逐层拆回拾取区，直到塔位空。
+
+    主轮开工时调用（``stage3_round.run_round``）：上一轮的塔还立着是正常状态，
+    不再压给人。每一层都是「量塔顶 → 抓最上层 → 回拾取区空位 → 就地核塔」，
+    与 ``return_to_pick`` 同一条计划形态；层数不靠猜，靠塔顶高度下降判定。
+
+    判红即停（fail-closed）：量不到塔顶、执行判红、或拆完一层塔顶没降够
+    （≈ 一块高）—— 可能抓空/滑落，原地交给人看，绝不继续往下拆。
+    """
+    global _URDF
+    _URDF = args.urdf
+    tdir = os.path.join(cdir, tag)
+    os.makedirs(tdir, exist_ok=True)
+    meas, msg = measure_tower(args, board, chain, scene, grid, tdir,
+                              tag="precheck")
+    rows = []
+    while msg:
+        merged = (meas or {}).get("merged") or {}
+        if not merged.get("found"):
+            raise EntryStop("拆塔：判定塔位有块，但量不到塔顶 —— 不瞎抓")
+        if len(rows) >= int(max_layers):
+            raise EntryStop("拆塔：已拆 %d 层塔位还没空（上限 %d）—— "
+                            "停下来看现场" % (len(rows), int(max_layers)))
+        top_before = float(merged["top_mm"])
+        rec, meas_after, msg = return_to_pick_once(
+            args, board, chain, scene, tdir, tag + "-%02d" % (len(rows) + 1),
+            grid, slot_mm, merged, zcal, verify=False)
+        rec["top_before_mm"] = round(top_before, 2)
+        rows.append(rec)
+        if not msg:
+            meas = meas_after
+            break
+        after = (meas_after or {}).get("merged") or {}
+        if not after.get("found"):
+            raise EntryStop("拆塔：拆完一层后塔位判有块、却量不到塔顶 —— 停")
+        drop = top_before - float(after["top_mm"])
+        if drop < m3.BLOCK_TRUE_H_MM * 0.5:
+            raise EntryStop("拆塔：塔顶只降了 %.2f mm（应 ≈%.1f）—— 可能没抓到"
+                            "或抓空，停在原地看" % (drop, m3.BLOCK_TRUE_H_MM))
+        if drop > m3.BLOCK_TRUE_H_MM * 1.5:
+            # 2026-11-02 事故的形态：一次把两层以上整体带起来。抓歪了还继续拆，
+            # 会把塔拆到别的格位上 —— 停在这里，让人看爪里到底是什么。
+            raise EntryStop("拆塔：塔顶降了 %.2f mm（≈%.1f 层，应 ≈%.1f）—— "
+                            "一次抓多了，停在原地看爪里"
+                            % (drop, drop / m3.BLOCK_TRUE_H_MM,
+                               m3.BLOCK_TRUE_H_MM))
+        meas = meas_after
+    doc = {"kind": "stage3-teardown", "n_removed": len(rows),
+           "max_layers": int(max_layers), "rows": rows,
+           "final": (meas or {}).get("merged") or {},
+           "final_empty": msg is None}
+    _dump(os.path.join(cdir, tag, "teardown.json"), doc)
+    print("  拆塔：%d 层已回位，塔位已空" % len(rows))
+    return doc
 
 
 # ---------------------------------------------------------------- 模式

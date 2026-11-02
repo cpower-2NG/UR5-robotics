@@ -128,14 +128,58 @@ def test_grasp_formula_and_clamp(chain):
     low = dict(blocks[0], top=2.0, h=2.0)
     _, _, m_low = pp.build_pick(chain, q0, cand, low, [low], (0.45, -0.25))
     assert abs(m_low["grasp_z"] - pp.GRASP_Z_MIN) < 1e-9, m_low["grasp_z"]
-    # 高块：算出来高于上限 ⇒ 压到 0.2242
+    # 高块：算出来高于上限 ⇒ 压到 0.2242。块真的 200 mm 高、底面在台面，
+    # 所以必须显式给 block_h_m（漏给会被新护栏拒，见下一条测试）。
     tall = dict(blocks[0], top=200.0, h=200.0)
-    _, _, m_tall = pp.build_pick(chain, q0, cand, tall, [tall], (0.45, -0.25))
+    _, _, m_tall = pp.build_pick(chain, q0, cand, tall, [tall], (0.45, -0.25),
+                                 block_h_m=0.200)
     assert abs(m_tall["grasp_z"] - pp.GRASP_Z_MAX) < 1e-9, m_tall["grasp_z"]
     # 抓取下限 = **裸指尖**离台面 10 mm，不再借用「放置下降高度」当理由
     assert abs(pp.GRASP_Z_MIN - (pp.GRASP_TIP_MIN_Z
                                  + pp.TOOL0_TO_BARE_FINGERTIP)) < 1e-12
     assert abs(pp.GRASP_Z_MIN - 0.2142) < 1e-9, pp.GRASP_Z_MIN
+
+
+@case
+def test_tower_block_grasp_anchors_to_block_bottom(chain):
+    """拆塔（2026-11-02 事故回归）：块顶 91.34 mm、块高 29.5 mm。
+
+    旧代码把块顶当块高 ⇒ 绝对 277 mm 被 `GRASP_Z_MAX` 截到 224.2 mm ⇒ 指尖
+    落在台面上 20 mm（最底层），一抓把三层全带起来。现在几何锚在块底：
+    指尖应落在**顶层那块内部**、离块底 ≈11 mm，抓取深度仍是名义 18.5 mm。
+    """
+    blocks, cand, q0 = scene(chain)
+    top_mm, bh_mm = 91.34, 29.5
+    tower = dict(blocks[0], cx=520.0, cy=330.0, top=top_mm, h=top_mm)
+    _, _, meta = pp.build_pick(chain, q0, cand, tower, [tower], (0.45, -0.25),
+                               block_h_m=bh_mm / 1000.0)
+    bottom_m = (top_mm - bh_mm) / 1000.0
+    assert abs(meta["block_bottom_mm"] - bottom_m * 1000) < 1e-6, meta
+    assert abs(meta["block_true_h_mm"] - bh_mm) < 1e-6, meta
+    tip_m = meta["grasp_z"] - pp.TOOL0_TO_BARE_FINGERTIP
+    # 指尖在顶层块内，离块底 ≈11 mm（与台面块同一条式子），绝不是台面 20 mm
+    assert bottom_m + 0.005 < tip_m < top_mm / 1000.0, tip_m * 1000
+    # meta 的 z 值只留到 0.1 mm，比较容差按这个分辨率给
+    assert abs(tip_m - bottom_m - (bh_mm / 1000.0
+                                   - meta["grasp_depth_mm"] / 1000.0)) < 1e-4, \
+        tip_m * 1000
+    assert abs(meta["grasp_depth_mm"] - 18.5) < 1e-6, meta["grasp_depth_mm"]
+    # 放置高度按**块高 29.5** 算 ⇒ 与台面块同级（≈0.2209 m），不是抬高 62 mm
+    assert meta["place_z"] < 0.23, meta["place_z"]
+    assert meta["approach_z"] > top_mm / 1000.0, "接近点必须在块顶之上"
+
+
+@case
+def test_tower_item_without_block_h_is_rejected(chain):
+    """漏给 block_h_m 而块顶又高得不像台面块 ⇒ 计划期就拒（事故形态的闸门）。"""
+    blocks, cand, q0 = scene(chain)
+    tower = dict(blocks[0], top=91.34, h=91.34)
+    try:
+        pp.build_pick(chain, q0, cand, tower, [tower], (0.45, -0.25))
+    except pp.PlanError as exc:
+        assert "block_h_m" in str(exc), exc
+    else:
+        raise AssertionError("块顶 91 mm 却没给 block_h_m，居然过了")
 
 
 @case

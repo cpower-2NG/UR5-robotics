@@ -78,15 +78,22 @@ from scipy.spatial.transform import Rotation as Rot               # noqa: E402
 import urkin                                                      # noqa: E402
 
 # ---- 几何常量（出处见模块 docstring）
+# ``TOOL0_TO_BARE_FINGERTIP`` **是外径**：tool0 → 指尖外沿。两指**内侧**有机械
+# 结构（指根/夹爪本体），物体能伸进去的深度比这个数小 —— **不许拿「指长 − 塔高」
+# 判断够不够得着**（2026-11-02 用户纠正）。判断能不能抓，只看**被夹那块自己**：
+# 指尖必须落在块内、块底之上（下面这条护栏）。
+TOOL0_TO_BARE_FINGERTIP = 0.2042
 # `TOOL0_TO_FINGERTIP` 这个**参数** = 裸指尖（闭合，tool0→指尖 204.2 mm）减去
 # A1 那批方块的高度 28.5 mm。所以 `wz + TOOL0_TO_FINGERTIP + c` 这个式子里的
 # 「指尖」落在**顶面以下 (204.2 − 28.5 − ...) **，夹持深度与块高无关。
 # 要报「指尖在顶面下多深」时必须用**裸指尖**这个数，不能用参数。
-TOOL0_TO_BARE_FINGERTIP = 0.2042
 TOOL0_TO_FINGERTIP = 0.1757
 APPROACH_CLEARANCE = 0.05
 GRASP_CLEARANCE = 0.01
 LIFT_HEIGHT = 0.15
+# 指尖离**块底**的最小高度。小于它，两指内侧的机械结构就可能骑到块下的支撑面上
+# （塔的下层 / 台面）；测量噪声 ±2–3 mm，留 5 mm。标准式子给的是 ≈11 mm。
+FINGERTIP_MIN_ABOVE_BLOCK_BOTTOM = 0.005
 PLACE_CLEARANCE = 0.005        # 放置时**块底**离台面多高（松开后落这 5 mm）
 PLACE_APPROACH_GAP = 0.04      # 放置接近点比下降点高多少（沿旧值的 0.2542−0.2142）
 # 抓取时**裸指尖**离台面的下限。0.2142 这个老数值碰巧 = 0.2042 + 0.010，
@@ -95,6 +102,11 @@ PLACE_APPROACH_GAP = 0.04      # 放置接近点比下降点高多少（沿旧�
 GRASP_TIP_MIN_Z = 0.010
 GRASP_Z_MIN = GRASP_TIP_MIN_Z + TOOL0_TO_BARE_FINGERTIP   # 0.2142
 GRASP_Z_MAX = GRASP_Z_MIN + 0.010      # 上限给 10 mm：块高 30~35 mm，实测够用
+# ⚠ `GRASP_Z_MIN/MAX` 是「**块底**抬到台面高度时」的 tool0 上下限。块底不在台面
+# （拆塔时那是塔上的块）时，这两个界限要**跟着块底一起抬**，不能直接拿去截绝对 z
+# —— 2026-11-02 拆三层塔：91.34 的块顶被当成块高，绝对 z 277 mm 被截到 224 mm，
+# 指尖落到 20 mm，一抓把三层全带起来。见 `build_pick(block_h_m=...)`。
+MAX_TABLE_BLOCK_TOP_M = 0.050          # 摆在台面上的块，块顶不会高过这个
 # 腕 2（第 5 关节）离 0 至少这么远。0 就是腕奇异（1、3 轴重合），
 # A/B 两次实测腕 2 = −89.8°，余量极大；这个数只是防止 IK 挑到另一支解。
 WRIST_MIN_RAD = 0.15
@@ -708,7 +720,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
                grip_speed_pct=None, release_speed_pct=None,
                release_dwell_s=0.0, surface_z=None, carry_z=None,
                survey_tool0=None, tower_box=None, held_half_edge=0.020,
-               held_off_xy=None, place_clearance=None):
+               held_off_xy=None, place_clearance=None, block_h_m=None):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -753,7 +765,19 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
       `PLACE_CLEARANCE` = 5 mm，阶段 2 逐字节不变。入口实测（2026-11-01）：
       5 mm 时块是**自由落体砸在垫子上**（五次 Δz 极差 0.15 mm，落 3.8 mm），
       落定后的 xy/yaw 散乱；3/4 mm 是「放下去」而不是「掉下去」的对照。
+    · ``block_h_m``：这块的**物理块高**（m）。``None`` = 沿用老语义「块顶高
+      就是块高」（台面上的块成立，逐字节不变）。**塔上的块必须显式给**：
+      ``wz`` 是块顶离台面的高度，块底 = ``wz − block_h_m``，抓取/放置几何
+      全锚在块底。2026-11-02 拆塔事故就是漏了这个参数 —— 91.34 被当块高，
+      `GRASP_Z_MAX` 把绝对 277 mm 截成 224 mm，指尖落到最底层。
     """
+    if block_h_m is None and (block["h"] if block.get("h") is not None
+                              else block["top"]) / 1000.0 > MAX_TABLE_BLOCK_TOP_M:
+        raise PlanError(
+            "块顶离台面 %.1f mm > %.0f mm —— 这不是摆在台面上的块，"
+            "必须显式给 block_h_m（否则抓取高度会被 GRASP_Z_MAX 截到台面层）"
+            % ((block["h"] if block.get("h") is not None else block["top"]),
+               MAX_TABLE_BLOCK_TOP_M * 1000.0))
     yaw_grasp_raw = float(yaw_grasp_deg)
     yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg)
     yaw_place = yaw_grasp_deg if yaw_place_deg is None else yaw_place_deg
@@ -772,19 +796,41 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     # 放置高度都按台面建）。拿绝对 top 当 wz 会把那 6 mm 原样带进抓取高度，
     # 指尖就少抓 6 mm —— 正好是用户说的「抓得更浅」那一类误差。
     wz = (block["h"] if block.get("h") is not None else block["top"]) / 1000.0
-    approach_z = wz + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE
-    grasp_z = float(np.clip(wz + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE,
-                            GRASP_Z_MIN, GRASP_Z_MAX))
+    # 块底离台面多高 + 这块本身的物理高度。台面上的块 bottom=0、bh=wz，
+    # 下面三行与改动前**逐字节等价**。
+    bh = wz if block_h_m is None else float(block_h_m)
+    bottom = wz - bh
+    if bottom < -1e-6:
+        raise PlanError("块底算出 %.1f mm（负）—— block_h_m=%.1f 比块顶高 %.1f "
+                        "还大，参数给反了" % (bottom * 1000, bh * 1000, wz * 1000))
+    approach_z = bottom + bh + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE
+    # GRASP_Z_MIN/MAX 是「块底 = 台面」时的 tool0 界限 ⇒ 整段平移到块底。
+    grasp_z = bottom + float(np.clip(
+        bh + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE, GRASP_Z_MIN, GRASP_Z_MAX))
     lift_z = wz + TOOL0_TO_FINGERTIP + LIFT_HEIGHT
     # 阶段 3：载运高度必须先高过塔顶的放置接近点，否则 to_slot 会在塔侧横移。
     lift_used = lift_z if carry_z is None else max(lift_z, float(carry_z))
     # 放置高度按**这一块**挂多长算（旧代码写死 0.2142，等于把 A1 的 28.5 mm 块高
     # 编进常量里；29.6 mm 的块会压进台面 1.1 mm）。
     grasp_depth_m = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
+    # 指尖不许扎过块底：超过块高就说明高度参数与块高对不上（拆塔事故的形态）。
+    if grasp_depth_m > bh + 1e-9:
+        raise PlanError("夹持深度 %.1f mm > 块高 %.1f mm —— 指尖会戳到块底以下，"
+                        "高度参数和块高对不上" % (grasp_depth_m * 1000, bh * 1000))
+    # 指尖离块底太近也不行：两指**内侧**有机械结构（指长 204.2 是外径），
+    # 贴到块底就会骑到块下的支撑面（塔的下层/台面）上 —— 2026-11-02 用户纠正。
+    tip_z = grasp_z - TOOL0_TO_BARE_FINGERTIP
+    if tip_z < bottom + FINGERTIP_MIN_ABOVE_BLOCK_BOTTOM - 1e-9:
+        raise PlanError(
+            "指尖 %.1f mm 只比块底高 %.1f mm（下限 %.0f mm）—— 两指内侧有机械"
+            "结构，不能贴着支撑面抓" % (
+                tip_z * 1000, (tip_z - bottom) * 1000,
+                FINGERTIP_MIN_ABOVE_BLOCK_BOTTOM * 1000))
     table_z = TABLE_PLANE_Z if surface_z is None else float(surface_z)
     clearance_m = (PLACE_CLEARANCE if place_clearance is None
                    else float(place_clearance))
-    place_z, place_approach_z = place_heights(wz, grasp_depth_m,
+    # **块挂多长**用这块自己的块高，不用块顶高度（塔上的块两者差一整个塔高）。
+    place_z, place_approach_z = place_heights(bh, grasp_depth_m,
                                               table_z=table_z,
                                               clearance=clearance_m)
     # 抓取偏心（块心估计 − 抓点）。默认**不**拿它补放置目标：第 6 轮实测
@@ -815,13 +861,13 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     if tower_box is not None:
         # 块底相对 tool0 的距离：裸指尖 204.2 mm + 夹持深度。
         # 少了裸指尖这一项，块会被当成贴在法兰下，塔体护栏等于没开。
-        below_tip = wz - grasp_depth_m + TOOL0_TO_BARE_FINGERTIP
+        below_tip = bh - grasp_depth_m + TOOL0_TO_BARE_FINGERTIP
 
         def guard(qa, qb, _below=below_tip):
             ok, worst = check_guard(chain, qa, qb, TABLE_PLANE_Z)
             if not ok:
                 return False, worst
-            ok2, w2 = check_held_block(chain, qa, qb, held_half_edge, wz,
+            ok2, w2 = check_held_block(chain, qa, qb, held_half_edge, bh,
                                        _below, tower_box, held_off_xy)
             if not ok2:
                 return False, w2
@@ -863,6 +909,10 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     meta = {"kind": "pick", "block_idx": block["idx"], "class": block["class"],
             "block_top_mm": round(block["top"], 2),
             "block_h_mm": round(wz * 1000, 2),
+            # 塔上的块：`block_h_mm` 是**块顶离台面**，物理块高看这两个新键。
+            "block_true_h_mm": round(bh * 1000, 2),
+            "block_bottom_mm": round(bottom * 1000, 2),
+            "fingertip_z_mm": round((grasp_z - TOOL0_TO_BARE_FINGERTIP) * 1000, 2),
             "wz_measured_mm": round(block["top"], 2),
             "wz_used_mm": round(wz * 1000, 2),
             "table_z_mm": round(block["top"] - wz * 1000, 2),
