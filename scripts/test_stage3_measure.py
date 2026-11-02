@@ -92,6 +92,29 @@ def test_pick_tower_top_empty_window_is_none():
     assert best is None and diag["n_window"] == 0
 
 
+@case
+def test_pick_tower_top_can_gate_by_expected_height():
+    """eye-in-hand 在 carry 处：手里那块更高，**按高度认塔顶**，不取最高簇。
+
+    入口③ 三层实测：持块顶 170 / 215 / 273 mm，塔顶 31.8 / 90.8 / 149.8 mm。
+    不给期望顶高时「最高簇」就是手里那块 —— 这正是旧记录假阴性的来源。
+    """
+    blocks = [blk(1, 422.0, -114.0, 150.0, 148.0),   # 手里那块（更高）
+              blk(2, 423.0, -115.0, 90.8, 89.0),     # 塔顶
+              blk(3, 421.0, -113.0, 40.0, 38.0)]     # 更低的邻层
+    top, _ = m3.pick_tower_top(blocks, [422.0, -114.0])
+    assert top["idx"] == 1, "不给期望时旧行为是取最高簇"
+    top2, diag2 = m3.pick_tower_top(blocks, [422.0, -114.0],
+                                    expected_top_mm=90.8)
+    assert top2 is not None and top2["idx"] == 2, top2
+    assert_close(diag2["expected_top_mm"], 90.8, 1e-9)
+    assert diag2["n_window"] == 1, diag2
+    # 期望值落在两簇之间 ⇒ 一簇都不选（**fail-closed**，不退回「最高簇」）
+    top3, diag3 = m3.pick_tower_top(blocks, [422.0, -114.0],
+                                    expected_top_mm=120.0)
+    assert top3 is None and diag3["n_window"] == 0, diag3
+
+
 # ---------------------------------------------------------------- 融合
 @case
 def test_fuse_frames_median_and_yaw():

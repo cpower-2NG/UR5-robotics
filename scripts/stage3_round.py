@@ -57,12 +57,10 @@ import urkin                                                      # noqa: E402
 GROUPS = ("open", "closed", "eih")
 ARMS = ("geometric", "zero", "graspnet")
 
-#: 真正实现了的组。``eih``（eye-in-hand 第二对照组）只占了个名字：它要把一层
-#: 拆成「抓 → 载运」与「载运 → 放」两段、在 carry 处量一次塔顶再改目标，现在
-#: 没有任何一段。选它只会**跑成开环**、却把 round.json 的 ``group`` 记成 ``eih``
-#: —— 一份贴着错标签的结果比没跑更坏（入口③ 刚踩过「绿了但测的不是那件事」）。
-#: 因此**拒绝执行**，而不是静默降级。
-IMPLEMENTED_GROUPS = ("open", "closed")
+#: 真正实现了的组。``eih``（eye-in-hand 第二对照组）＝把一层拆成「抓 → 载运」
+#: 与「载运 → 放」两段，在 carry 处按**期望顶高**量一次塔顶再改目标
+#: （2026-11-02 落地；入口③ 三层都量得到，见台账第 207 轮）。
+IMPLEMENTED_GROUPS = ("open", "closed", "eih")
 
 
 def unsupported_group(group):
@@ -135,6 +133,47 @@ def layer_plan(chain, q_start, item, blocks, slot_m, surface_m,
         release_dwell_s=(release_dwell_s if release_dwell_s is not None
                          else scene.get("release_dwell_s", 0.0)),
         place_clearance=place_clearance)
+    return _finish_plan(wps, checks, meta, q_start, chain)
+
+
+def place_plan(chain, q_start, item, slot_m, surface_m, carry_z,
+               tower_xy_mm=None, tower_top_mm=None, survey_tool0=None,
+               scene=None, place_open_mm=None, release_dwell_s=None,
+               tower_half_edge=0.020, place_clearance=None,
+               grasp_ecc_mm=None):
+    """eye-in-hand 组的**后半段**：已夹着块停在 carry，按新目标放下。
+
+    与 `layer_plan` 唯一的区别是起点（carry 处当次实测关节角）与不含抓取段。
+    护栏用**同一套**塔体 box（`pp.tower_box_from`），不许这里少开一项 ——
+    目标改过之后最容易出的就是「横移扫过塔顶」。
+    """
+    scene = scene or {}
+    block = dict(item["block"])
+    block["h"] = float(item["block_h_used_mm"])
+    # 持块包络要用「放置那一刻」块心相对 tool0 的偏置：抓取时的偏心随夹着块
+    # 转腕一起转，转角 = yaw_place − yaw_grasp。抓点就是块心时偏心为 0。
+    ex, ey = (float(v) / 1000.0 for v in (grasp_ecc_mm or (0.0, 0.0)))
+    dyaw = math.radians(float(item["yaw_place_deg"])
+                        - float(pp.fold_yaw_180(item["yaw_grasp_deg"])))
+    held_off_xy = (ex * math.cos(dyaw) - ey * math.sin(dyaw),
+                   ex * math.sin(dyaw) + ey * math.cos(dyaw))
+    wps, checks, meta = pp.build_place(
+        chain, list(q_start), block, slot_m, surface_m, float(carry_z),
+        yaw_place_deg=item["yaw_place_deg"],
+        yaw_grasp_deg=item["yaw_grasp_deg"],
+        open_mm=(place_open_mm if place_open_mm is not None
+                 else scene.get("place_open_mm")),
+        survey_tool0=survey_tool0,
+        tower_box=pp.tower_box_from(tower_xy_mm, tower_top_mm,
+                                    float(tower_half_edge)),
+        held_half_edge=float(tower_half_edge),
+        held_off_xy=held_off_xy,
+        release_dwell_s=(release_dwell_s if release_dwell_s is not None
+                         else scene.get("release_dwell_s", 0.0)),
+        release_speed_pct=scene.get("release_open_speed_pct"),
+        place_clearance=place_clearance)
+    meta["kind"] = "place"
+    meta["layer_surface_mm"] = round(float(surface_m) * 1000.0, 2)
     return _finish_plan(wps, checks, meta, q_start, chain)
 
 
@@ -212,6 +251,10 @@ def closed_loop_yaw(prev_merged):
 #: 按失败停轮，不用它去推下一层 —— 拿一个 30 mm 的「偏置」补偿下一层，
 #: 只会把塔越推越歪，而且事后从数据上看不出是哪一步坏的。
 BIAS_LIMIT_MM = 15.0
+
+#: eye-in-hand 在 carry 处允许的「小修正」上限（mm）。超过它就不是测量细化，
+#: 是塔被撞了 / 上一层其实没量准 —— 停轮查，不拿大数改目标硬放。
+EIH_MAX_CORRECTION_MM = 10.0
 
 
 def bias_from_layer(measured_mm, commanded_mm, limit_mm=BIAS_LIMIT_MM):
@@ -605,7 +648,10 @@ def run_round(args):
         desired_target = [slot_mm[0] / 1000.0, slot_mm[1] / 1000.0]
         yaw_place = float(item["yaw_place_deg"])
         yaw_place_src = "plan"          # 主组：目标就是计划里的块朝向
-        if args.group == "closed" and prev and prev["merged"].get("found"):
+        # eih 组的**初始**目标与闭环组相同（上一层实测中心）——它的增量是
+        # 走到 carry 之后再量一次、把目标改掉，见下面的分段执行。
+        if (args.group in ("closed", "eih")
+                and prev and prev["merged"].get("found")):
             lm = prev["merged"]
             desired_target = [lm["center_base_mm"][0] / 1000.0,
                               lm["center_base_mm"][1] / 1000.0]
@@ -697,6 +743,140 @@ def run_round(args):
                      b_applied[0], b_applied[1])
                   if any(b_applied) else ""),
                  surface_mm, float(meta["carry_z"]) * 1000.0))
+
+        # ---- eye-in-hand：先走到 carry（`to_slot`），量一次塔顶，改目标再放。
+        # 第 1 层没有下层塔顶可量（垫面 2 mm < MIN_H_MM），整层走普通路径。
+        if args.group == "eih" and k >= 2:
+            cm = None
+            if args.go:
+                rc_c = board.exec_plan(
+                    plan_path,
+                    os.path.join(cdir, "log-layer%02d-carry.jsonl" % k),
+                    go=True, upto="to_slot")
+                rec["exec_rc_carry"] = rc_c
+                _dump(os.path.join(cdir, "round.json"), doc)
+                if rc_c != 0:
+                    stop = "exec_rc_carry=%d" % rc_c
+                    print("!! 第 %d 层走到 carry 判红（rc=%d）—— 块还在爪里，"
+                          "停在原地" % (k, rc_c))
+                    break
+                q_carry = s2.chain_q(board.joints(
+                    os.path.join(cdir, "joints-layer%02d-carry" % k)))
+                dirs_c = capture_frames(
+                    board, os.path.join(cdir, "frame-layer%02d-carry" % k),
+                    "stage3-r%02d-l%02d-carry" % (round_no, k),
+                    scene.get("terminal_frames", 3))
+                # 按**期望顶高**认塔顶：手里那块高 74–123 mm，按「最高簇」取
+                # 会量到它（入口③ 的旧记录正是这么错的）。
+                cm_meas = m3.measure_layer(
+                    [("carry", dirs_c)], grid=grid, window_xy_mm=view_xy,
+                    layer=k, z_bias_mm=zcal["tower"],
+                    block_h_mm=m3.BLOCK_TRUE_H_MM,
+                    radius_mm=m3.TOWER_RADIUS_MM, metric_source="carry",
+                    expected_top_mm=(prev or {}).get("merged", {}).get("top_mm"))
+                cm = cm_meas.get("merged") or {}
+                rec["eih"] = {"mode": "measured", "measured": cm_meas}
+                _dump(os.path.join(cdir, "round.json"), doc)
+                if not cm.get("found"):
+                    stop = "eih_measured_missing"
+                    print("!! 第 %d 层：carry 处没量到塔顶（按期望顶高）—— "
+                          "停轮，不拿旧目标硬放" % k)
+                    break
+            else:
+                # 离线：没有实测。按**初值**走一遍分段，只验运动学与护栏。
+                to_slot_wp = next((w for w in plan["waypoints"]
+                                   if w["name"] == "to_slot"), None)
+                if to_slot_wp is None:
+                    stop = "eih_plan_missing_to_slot"
+                    print("!! 第 %d 层计划里没有 to_slot —— 无法分段" % k)
+                    break
+                q_carry = np.asarray(to_slot_wp["q"], dtype=float)
+                rec["eih"] = {"mode": "plan_only"}
+
+            if cm is not None:
+                nyaw, nyaw_src = m3.metric_yaw(cm)
+                if nyaw is None:
+                    stop = "eih_yaw_%s" % nyaw_src
+                    print("!! 第 %d 层：carry 处彩色 yaw 判不了（%s）—— 停轮，"
+                          "不拿深度顶替" % (k, nyaw_src))
+                    break
+                new_desired = [float(cm["center_base_mm"][0]) / 1000.0,
+                               float(cm["center_base_mm"][1]) / 1000.0]
+                corr_mm = [(new_desired[0] - desired_target[0]) * 1000.0,
+                           (new_desired[1] - desired_target[1]) * 1000.0]
+            else:
+                nyaw, nyaw_src = yaw_place, "plan"
+                new_desired, corr_mm = list(desired_target), [0.0, 0.0]
+
+            if math.hypot(corr_mm[0], corr_mm[1]) > EIH_MAX_CORRECTION_MM:
+                stop = "eih_correction_too_large"
+                print("!! 第 %d 层：carry 实测比上一层记录偏 %.1f mm（上限 "
+                      "%.0f）—— 这不是「小修正」，停轮查塔"
+                      % (k, math.hypot(corr_mm[0], corr_mm[1]),
+                         EIH_MAX_CORRECTION_MM))
+                break
+
+            desired_before_mm = [desired_target[0] * 1000.0,
+                                 desired_target[1] * 1000.0]
+            desired_target = new_desired
+            b_applied = applied_bias(doc["bias_history"], args.bias_comp,
+                                     seed=b_seed)
+            slot_target = commanded_target_m(desired_target,
+                                             doc["bias_history"],
+                                             args.bias_comp, seed=b_seed)
+            item = dict(item, yaw_place_deg=nyaw)
+            try:
+                plan = place_plan(
+                    chain, q_carry, item, slot_target, surface_m, carry_z,
+                    tower_xy_mm=tower_xy, tower_top_mm=tower_top,
+                    survey_tool0=pair[0], scene=scene,
+                    place_open_mm=args.place_open_mm,
+                    release_dwell_s=args.release_dwell_s,
+                    tower_half_edge=args.tower_half_edge,
+                    # 抓取偏心必须从**抓取那一段**的 meta 来：这里是块心相对
+                    # tool0 的偏置，换目标重规划时不能当成 0。
+                    grasp_ecc_mm=meta.get("grasp_ecc_mm"))
+            except (pp.PlanError, RuntimeError, ValueError) as exc:
+                stop = "eih_place_plan_failed: %s" % exc
+                print("!! 第 %d 层改目标后的放置计划失败：%s" % (k, exc))
+                break
+            plan_path = write_plan(
+                os.path.join(cdir, "plan-layer%02d-place.json" % k), plan)
+            meta = plan["meta"]
+            pred_xy, _bh = predicted_place(item, slot_target)
+            rec.update({"plan": os.path.relpath(plan_path, cdir),
+                        "yaw_source": nyaw_src})
+            rec["planned"].update({
+                "yaw_place_deg": round(nyaw, 3),
+                "yaw_place_source": nyaw_src,
+                "desired_center_base_mm": [round(v * 1000.0, 2)
+                                           for v in desired_target],
+                "commanded_center_base_mm": [round(v * 1000.0, 2)
+                                             for v in slot_target],
+                "applied_bias_mm": [round(v, 3) for v in b_applied],
+                "predicted_center_base_mm": [round(v * 1000.0, 2)
+                                             for v in pred_xy],
+                "place_z_mm": round(float(meta["place_z"]) * 1000.0, 2),
+                "carry_z_mm": round(float(meta["carry_z"]) * 1000.0, 2),
+                "surface_z_mm": round(surface_mm, 2),
+                "tower_box": meta.get("tower_box")})
+            rec["eih"].update({
+                # 段 A（抓 → carry，旧目标）也留个指针：改目标后 rec["plan"]
+                # 指向的是段 B，事后要能回看这两段到底各让臂走到哪。
+                "plan_carry": os.path.relpath(
+                    os.path.join(cdir, "plan-layer%02d.json" % k), cdir),
+                "correction_mm": [round(corr_mm[0], 3),
+                                  round(corr_mm[1], 3)],
+                "correction_norm_mm": round(math.hypot(*corr_mm), 3),
+                "desired_before_mm": [round(v, 2) for v in desired_before_mm],
+                "yaw_place_deg": round(nyaw, 3),
+                "yaw_place_source": nyaw_src,
+                "single_view": True})
+            _dump(os.path.join(cdir, "round.json"), doc)
+            print("  eih：目标改为 (%.2f, %.2f) mm（修正 %+.2f, %+.2f mm，"
+                  "|%.2f| mm）"
+                  % (slot_target[0] * 1000.0, slot_target[1] * 1000.0,
+                     corr_mm[0], corr_mm[1], math.hypot(*corr_mm)))
 
         if not args.go:
             print("只规划不执行（没加 --go）。计划 → %s" % plan_path)

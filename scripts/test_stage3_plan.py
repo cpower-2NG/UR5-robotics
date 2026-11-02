@@ -138,18 +138,22 @@ def test_closed_loop_yaw_refuses_without_colour():
 
 
 @case
-def test_eih_group_refuses_instead_of_silently_running_open():
-    """``--group eih`` 只占了个名字：选它必须被拒，不能跑成开环还记成 eih。"""
+def test_group_gate_refuses_unknown_names_before_moving():
+    """没实现的组名必须在**任何动臂动作之前**被拒 —— 不静默降级成开环。
+
+    ``eih`` 2026-11-02 起已实现（条目在 `IMPLEMENTED_GROUPS`），所以这里用
+    一个**不在 GROUPS 里**的名字验闸门本身还活着。scene 故意给个不存在的
+    路径：闸门若排在 `load_scene` 之后，就会因别的原因失败而暴露次序错了。
+    """
     assert s3r.unsupported_group("open") is None
     assert s3r.unsupported_group("closed") is None
-    why = s3r.unsupported_group("eih")
-    assert why and "eih" in why, "eih 必须给出明确的拒绝原因"
-    # 真入口：要在**任何动臂动作之前**返回 2。scene 故意给个不存在的路径——
-    # 若闸门排在 load_scene 之后，这里就会因别的原因失败而暴露出次序错了。
+    assert s3r.unsupported_group("eih") is None, "eih 已实现，不该再被拒"
+    why = s3r.unsupported_group("nope")
+    assert why and "nope" in why, "未知组名必须给出明确的拒绝原因"
     import argparse
-    ns = argparse.Namespace(group="eih", scene="/nonexistent/scene.json")
+    ns = argparse.Namespace(group="nope", scene="/nonexistent/scene.json")
     rc = s3r.run_round(ns)
-    assert rc == 2, "run_round 对 eih 应返回 2（fail-closed），实得 %r" % (rc,)
+    assert rc == 2, "run_round 对未知组应返回 2（fail-closed），实得 %r" % (rc,)
 
 
 @case
@@ -564,6 +568,61 @@ def test_place_clearance_knob(chain):
 
 
 # ---------------------------------------------------------------- 后矫正 nudge
+@case
+def test_build_place_matches_pick_place_geometry(chain):
+    """后半段与整条 pick 的放置几何**逐值相同** —— 换目标重规划不能顺手改高度。
+
+    eye-in-hand 把一层切成两段：段 A 抓，段 B 放。两段必须用同一套
+    `place_heights` / 夹持深度；差一点就是「改目标时把块按错高度放下」。
+    """
+    blocks, cand, q0 = scene(chain)
+    block = dict(blocks[0], h=29.5)
+    slot = (SLOT_MM[0] / 1000.0, SLOT_MM[1] / 1000.0)
+    wps1, _, m1 = pp.build_pick(chain, q0, cand, block, blocks, slot,
+                                surface_z=PAD_Z, grasp_at="block_center")
+    q_carry = next(np.asarray(w["q"], dtype=float)
+                   for w in wps1 if w["name"] == "to_slot")
+    wps2, checks2, m2 = pp.build_place(
+        chain, q_carry, block, slot, PAD_Z, m1["carry_z"],
+        open_mm=40.0, survey_tool0=m1["survey_tool0"])
+    assert [w["name"] for w in wps2] == ["to_slot", "place_approach",
+                                         "place", "retreat", "survey_place"]
+    assert len(checks2) == len(wps2)
+    assert m2["kind"] == "place"
+    for key in ("place_z", "place_approach_z", "block_below_tip_mm",
+                "grasp_depth_mm", "carry_z"):
+        assert_close(m2[key], m1[key], 1e-9, key)
+    # 第一条航点在 carry 高度、**先横移**：place_approach 才下降
+    by = {w["name"]: w for w in wps2}
+    z_carry = float(chain.fk(by["to_slot"]["q"])[2, 3])
+    z_ap = float(chain.fk(by["place_approach"]["q"])[2, 3])
+    assert_close(z_carry, m1["carry_z"], 1e-3, "to_slot 高度")
+    assert z_carry > z_ap, "改目标后必须先在 carry 高度横移，再下降"
+    pe, _ = pp.pose_residual(chain, by["place"]["q"],
+                             (slot[0], slot[1], m2["place_z"]), 0.0)
+    assert pe < 0.1, "place 没落到目标：%.3f mm" % pe
+    # carry 低于 place_approach ⇒ 拒绝（斜切下去会撞塔）
+    try:
+        pp.build_place(chain, q_carry, block, slot, PAD_Z,
+                       m2["place_approach_z"] - 0.01)
+    except pp.PlanError:
+        pass
+    else:
+        raise AssertionError("carry_z 低于 place_approach 时必须拒")
+
+
+@case
+def test_tower_box_from_is_the_single_source():
+    """两个规划入口共用同一个塔体 box —— 差一个余量就是一个多判、一个漏判。"""
+    b = pp.tower_box_from((422.0, -114.0), 100.0, 0.020)
+    assert abs(b[5] - 0.100) < 1e-12 and b[4] == 0.0
+    half = 0.020 + pp.TOWER_BOX_MARGIN
+    assert_close(b[0], 0.422 - half, 1e-12, "x0")
+    assert_close(b[1], 0.422 + half, 1e-12, "x1")
+    assert pp.tower_box_from(None, 100.0) is None
+    assert pp.tower_box_from((0.0, 0.0), None) is None
+
+
 NUDGE_NAMES = ["nudge_approach", "nudge_grip", "nudge_shift", "nudge_twist",
                "nudge_release", "nudge_retreat", "nudge_survey"]
 

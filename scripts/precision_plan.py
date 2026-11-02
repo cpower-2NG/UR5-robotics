@@ -688,6 +688,20 @@ def stage3_carry_z(block_h_m, surface_z_m, grasp_gap=0.05):
     return max(lift_z, place_approach + float(grasp_gap))
 
 
+def _open_action(mm):
+    if mm is None:
+        return {"gripper": "open"}
+    return {"gripper": "open_to", "mm": float(mm)}
+
+
+def _with_speed(action, speed):
+    if action is None or speed is None:
+        return action
+    a = dict(action)
+    a["speed"] = int(speed)
+    return a
+
+
 def build_pick(chain, q_start, cand, block, blocks, slot,
                yaw_grasp_deg=0.0, yaw_place_deg=None, yaw_source="zero",
                pick_open_mm=None, place_open_mm=None, grasp_at="candidate",
@@ -743,18 +757,6 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     yaw_grasp_raw = float(yaw_grasp_deg)
     yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg)
     yaw_place = yaw_grasp_deg if yaw_place_deg is None else yaw_place_deg
-
-    def _open_action(mm):
-        if mm is None:
-            return {"gripper": "open"}
-        return {"gripper": "open_to", "mm": float(mm)}
-
-    def _with_speed(action, speed):
-        if action is None or speed is None:
-            return action
-        a = dict(action)
-        a["speed"] = int(speed)
-        return a
 
     if grasp_at == "block_center":
         # 块心 = 顶面点聚类质心（与放置目标/判分同一个量），单位 mm → m。
@@ -900,6 +902,22 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     return wps, checks, meta
 
 
+def tower_box_from(tower_xy_mm, tower_top_mm, tower_half_edge=0.020):
+    """上一层实测塔顶（mm）→ 塔体 box ``(x0, x1, y0, y1, z0, z1)``（m）。
+
+    两个规划入口（`build_stack` / `build_place`）必须用**同一个** box ——
+    差一个余量就是一个多判、一个漏判。缺任一项就返回 ``None``（护栏不开，
+    第 1 层本来就没有塔）。
+    """
+    if tower_xy_mm is None or tower_top_mm is None:
+        return None
+    cx = float(tower_xy_mm[0]) / 1000.0
+    cy = float(tower_xy_mm[1]) / 1000.0
+    half = float(tower_half_edge) + TOWER_BOX_MARGIN
+    return (cx - half, cx + half, cy - half, cy + half,
+            0.0, float(tower_top_mm) / 1000.0)
+
+
 def build_stack(chain, q_start, cand, block, blocks, slot, surface_z,
                 tower_xy_mm=None, tower_top_mm=None, survey_tool0=None,
                 carry_z=None, tower_half_edge=0.020, **kwargs):
@@ -914,19 +932,123 @@ def build_stack(chain, q_start, cand, block, blocks, slot, surface_z,
     ``survey_tool0``：收尾巡检位（通常取 `stage3_survey_tool0(...)[0]`）；
     其余参数透传 `build_pick`。
     """
-    tower_box = None
-    if tower_xy_mm is not None and tower_top_mm is not None:
-        cx = float(tower_xy_mm[0]) / 1000.0
-        cy = float(tower_xy_mm[1]) / 1000.0
-        half = float(tower_half_edge) + TOWER_BOX_MARGIN
-        tower_box = (cx - half, cx + half, cy - half, cy + half,
-                     0.0, float(tower_top_mm) / 1000.0)
+    tower_box = tower_box_from(tower_xy_mm, tower_top_mm, tower_half_edge)
     wps, checks, meta = build_pick(
         chain, q_start, cand, block, blocks, slot,
         surface_z=surface_z, carry_z=carry_z, survey_tool0=survey_tool0,
         tower_box=tower_box, held_half_edge=tower_half_edge, **kwargs)
     meta["kind"] = "stack"
     meta["layer_surface_mm"] = round(float(surface_z) * 1000.0, 2)
+    return wps, checks, meta
+
+
+def build_place(chain, q_start, block, slot, surface_z, carry_z,
+                yaw_place_deg=0.0, yaw_grasp_deg=0.0, open_mm=None,
+                survey_tool0=None, tower_box=None, held_half_edge=0.020,
+                held_off_xy=None, release_dwell_s=0.0, release_speed_pct=None,
+                place_clearance=None):
+    """**放置后半段**：已夹着块停在 carry 高度 → to_slot → place_approach
+    → place → retreat → survey_place。
+
+    用途只有一个：eye-in-hand 组在 carry 处抓一帧、量一次塔顶，把目标改掉之后
+    重规划这一半。整条 `build_pick` 从抓取开始重解是错的 —— 块已经在手里了，
+    起点的关节角也不是原来那个（阶段 2 的教训：多段计划共用 q_start 会被执行器
+    闸门拒掉）。
+
+    与 `build_pick` 的后半段**同源同式**：同一个 `place_heights`、同样的
+    `check_guard` + `check_held_block`、同样的松手 dwell 与张开速度。区别只有
+    起点（当次实测关节角）与 `slot`（改过的目标）。
+
+    ``carry_z`` **必给**，而且就是当前 tool0 的高度：第一条航点 `to_slot` 让臂
+    **先在这个高度横移到新目标上方，再垂直下降**。少了这一步，改过的目标会让臂
+    斜着从塔侧切下去 —— 持块包络正好扫过塔顶（`stage3_carry_z` 的注释讲的
+    是同一件事）。
+
+    ``block`` 与 `build_pick` 同形：``cx``/``cy``（mm）、``h``（mm，块高，
+    由调用方换成扣过拾取侧偏差的 ``block_h_used_mm``）。
+    """
+    wz = (block["h"] if block.get("h") is not None else block["top"]) / 1000.0
+    table_z = TABLE_PLANE_Z if surface_z is None else float(surface_z)
+    clearance_m = (PLACE_CLEARANCE if place_clearance is None
+                   else float(place_clearance))
+    # 夹持深度必须与抓取时同源：同一 wz ⇒ 同一 grasp_z ⇒ 同一深度。
+    # 混用会让块高偏差以 (block_h − wz) 叠进放置高度（契约 §2 的技术事实）。
+    grasp_z = float(np.clip(wz + TOOL0_TO_FINGERTIP + GRASP_CLEARANCE,
+                            GRASP_Z_MIN, GRASP_Z_MAX))
+    grasp_depth_m = wz - (grasp_z - TOOL0_TO_BARE_FINGERTIP)
+    place_z, place_approach_z = place_heights(wz, grasp_depth_m,
+                                              table_z=table_z,
+                                              clearance=clearance_m)
+
+    yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg)
+    yaw_place = yaw_grasp_deg if yaw_place_deg is None else yaw_place_deg
+    sx, sy = float(slot[0]), float(slot[1])
+    lift_used = float(carry_z)
+    if lift_used < place_approach_z - 1e-9:
+        raise PlanError(
+            "carry_z %.1f mm 低于本层 place_approach %.1f mm —— 从塔侧直接切"
+            "下降会撞塔" % (lift_used * 1000, place_approach_z * 1000))
+
+    if held_off_xy is None:
+        # 块心相对 tool0 的偏置（m）。抓点就是块心时是 (0,0)；抓点不是块心时
+        # **必须由调用方算好传进来**（`place_plan` 从上一段 meta 的
+        # `grasp_ecc_mm` 按 Δyaw 旋转得到）—— 这里不自己猜。
+        held_off_xy = (0.0, 0.0)
+
+    guard = None
+    if tower_box is not None:
+        below_tip = wz - grasp_depth_m + TOOL0_TO_BARE_FINGERTIP
+
+        def guard(qa, qb, _below=below_tip):
+            ok, worst = check_guard(chain, qa, qb, TABLE_PLANE_Z)
+            if not ok:
+                return False, worst
+            ok2, w2 = check_held_block(chain, qa, qb, held_half_edge, wz,
+                                       _below, tower_box, held_off_xy)
+            if not ok2:
+                return False, w2
+            return True, worst
+
+    survey_xyz = (SURVEY_TOOL0["place"] if survey_tool0 is None
+                  else tuple(survey_tool0))
+    specs = [
+        ("to_slot", (sx, sy, lift_used), yaw_place, None, None),
+        ("place_approach", (sx, sy, place_approach_z), yaw_place, None, None),
+        ("place", (sx, sy, place_z), yaw_place,
+         _with_speed(_open_action(open_mm), release_speed_pct), None),
+        ("retreat", (sx, sy, place_approach_z), yaw_place, None, None),
+        ("survey_place", survey_xyz, 0.0, None, None),
+    ]
+    qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
+                       yaws=[y for _, _, y, _, _ in specs], guard=guard)
+    wps, checks = [], []
+    q = q_start
+    for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
+        q, c = add_move(wps, chain, name, xyz, q, yaw, TABLE_PLANE_Z,
+                        after=after, before=before, q=q_solved, guard=guard)
+        checks.append(c)
+    if release_dwell_s:
+        for w in wps:
+            if w["name"] == "place":
+                w["dwell_s"] = round(float(release_dwell_s), 3)
+    meta = {"kind": "place", "block_idx": block.get("idx"),
+            "block_h_mm": round(wz * 1000, 2),
+            "grasp_depth_mm": round(grasp_depth_m * 1000, 2),
+            "block_below_tip_mm": round((wz - grasp_depth_m) * 1000, 2),
+            "place_z": round(place_z, 4),
+            "place_approach_z": round(place_approach_z, 4),
+            "place_clearance_mm": round(clearance_m * 1000, 2),
+            "carry_z": round(lift_used, 4),
+            "place_target_mm": [round(sx * 1000, 2), round(sy * 1000, 2)],
+            "surface_z_mm": round(table_z * 1000.0, 2),
+            "tower_box": ([round(float(v), 4) for v in tower_box]
+                          if tower_box is not None else None),
+            "survey_tool0": [round(float(v), 4) for v in survey_xyz],
+            "yaw_grasp_deg": round(float(yaw_grasp_deg), 3),
+            "yaw_place_deg": round(float(yaw_place), 3),
+            "place_open_mm": open_mm,
+            "release_speed_pct": release_speed_pct,
+            "release_dwell_s": round(float(release_dwell_s or 0.0), 3)}
     return wps, checks, meta
 
 

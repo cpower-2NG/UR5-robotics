@@ -55,6 +55,9 @@ TOWER_RADIUS_MM = 50.0
 MAX_H_MM = 220.0
 #: 低于这个高度的东西不算块（沿用阶段 2）。
 MIN_H_MM = 15.0
+#: 按高度认塔顶的容差（mm）。入口③ 用它把「手里那块」和「塔顶」分开，
+#: 三层实测塔顶偏差 0.2–2.6 mm、持块与塔顶相距 74–123 mm，6 mm 两边都够开。
+EXPECTED_TOP_TOL_MM = 6.0
 
 #: 两视点一致性门（沿用阶段 2 的 6° / 10 mm；z 同按 10 mm 算位置）。
 POSE_XY_TOL_MM = 10.0
@@ -456,21 +459,34 @@ def top_face_framing(frame, cx_mm, cy_mm, ztop_mm, radius_mm=25.0,
 
 
 def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
-                   min_h_mm=MIN_H_MM):
+                   min_h_mm=MIN_H_MM, expected_top_mm=None,
+                   top_tol_mm=EXPECTED_TOP_TOL_MM):
     """塔窗内取**最高**的合格簇；返回 ``(block|None, diag)``。
 
     只认 ``low=False`` 且高度 ≥``min_h_mm`` 的簇 —— 低处的连接件/台面噪声
     不参与。窗内有多簇时取 ``top`` 最大者：塔顶就是最高的那一层。
+
+    ``expected_top_mm``（可选）＝**按高度认塔顶**：只保留
+    ``|top − expected_top| ≤ top_tol_mm`` 的簇。eye-in-hand 在 carry 处抓帧时
+    必须给 —— 那时手里还夹着块，它的顶面比塔顶高 74–120 mm，按「最高簇」取
+    会量到手里那块（入口③ 的旧记录正是这么错的）。
     """
     wx, wy = float(window_xy_mm[0]), float(window_xy_mm[1])
     cands = []
     for b in blocks:
         if b.get("low") or b.get("h", 0.0) < min_h_mm:
             continue
+        if (expected_top_mm is not None
+                and abs(float(b.get("top", 0.0)) - float(expected_top_mm))
+                > float(top_tol_mm)):
+            continue
         d = math.hypot(b["cx"] - wx, b["cy"] - wy)
         if d <= radius_mm:
             cands.append(dict(b, _dist_mm=round(d, 2)))
     diag = {"n_window": len(cands),
+            "expected_top_mm": (None if expected_top_mm is None
+                                else round(float(expected_top_mm), 2)),
+            "top_tol_mm": float(top_tol_mm),
             "window_xy_mm": [round(wx, 2), round(wy, 2)],
             "radius_mm": float(radius_mm),
             "candidates": [{"idx": b["idx"], "cx": round(b["cx"], 2),
@@ -485,7 +501,8 @@ def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
 def measure_frame(frame_dir, grid=None, window_xy_mm=None,
                   z_bias_mm=0.0, block_h_mm=BLOCK_TRUE_H_MM,
                   radius_mm=TOWER_RADIUS_MM, max_h_mm=MAX_H_MM,
-                  min_h_mm=MIN_H_MM, frame=None):
+                  min_h_mm=MIN_H_MM, frame=None, expected_top_mm=None,
+                  top_tol_mm=EXPECTED_TOP_TOL_MM):
     """一帧 → 塔顶观测。
 
     ``grid`` / ``window_xy_mm``：至少给一个；都没给就报错（塔窗不能靠猜）。
@@ -500,7 +517,9 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
     blocks, table_z = gc.find_blocks(frame, max_h_mm=max_h_mm,
                                      min_h_mm=min_h_mm)
     top, diag = pick_tower_top(blocks, window_xy_mm, radius_mm=radius_mm,
-                               min_h_mm=min_h_mm)
+                               min_h_mm=min_h_mm,
+                               expected_top_mm=expected_top_mm,
+                               top_tol_mm=top_tol_mm)
     out = {"frame": os.path.basename(os.path.abspath(frame_dir)),
            "found": top is not None,
            "window_xy_mm": [round(float(window_xy_mm[0]), 2),
@@ -649,7 +668,8 @@ def pose_consistency(fused_poses, xy_tol_mm=POSE_XY_TOL_MM,
 def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,
                   z_bias_mm=0.0, block_h_mm=BLOCK_TRUE_H_MM,
                   radius_mm=TOWER_RADIUS_MM, max_h_mm=MAX_H_MM,
-                  min_h_mm=MIN_H_MM, metric_source="immediate"):
+                  min_h_mm=MIN_H_MM, metric_source="immediate",
+                  expected_top_mm=None, top_tol_mm=EXPECTED_TOP_TOL_MM):
     """一层的完整测量：``[(视点名, [帧目录, …]), …]`` → 观测记录。
 
     逐帧测 → 每视点融合 → 两视点一致性 → 再融合成该层唯一取值。
@@ -667,7 +687,9 @@ def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,
         frames = [measure_frame(d, grid=grid, window_xy_mm=window_xy_mm,
                                 z_bias_mm=z_bias_mm, block_h_mm=block_h_mm,
                                 radius_mm=radius_mm, max_h_mm=max_h_mm,
-                                min_h_mm=min_h_mm) for d in dirs]
+                                min_h_mm=min_h_mm,
+                                expected_top_mm=expected_top_mm,
+                                top_tol_mm=top_tol_mm) for d in dirs]
         # ``usable=False`` = 顶面贴到画幅边（`TOP_FACE_CLEAR_PX`）：中心会偏
         # +5~+7 mm，**不进融合**。全被剔掉就按「这一视点没测到」处理。
         kept = [f for f in frames if f.get("usable", True)]
@@ -689,7 +711,11 @@ def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,
                             if window_xy_mm is not None else
                             (grid_center(grid) if grid else None)),
            "poses": poses, "consistency": cons, "merged": merged,
-           "frames_dropped": dropped}
+           "frames_dropped": dropped,
+           # 给了期望顶高 ⇒ 这次是按高度认塔顶（eye-in-hand 在 carry 处），
+           # 记下来，事后能分辨「量的是塔」还是「量到了手里那块」。
+           "expected_top_mm": (None if expected_top_mm is None
+                               else round(float(expected_top_mm), 2))}
     if merged.get("found"):
         out["surface_est_mm"] = round(merged["top_mm"] - float(block_h_mm)
                                       - float(z_bias_mm), 2)
