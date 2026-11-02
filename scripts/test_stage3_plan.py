@@ -631,6 +631,53 @@ def test_place_clearance_knob(chain):
                  why="间隙少 2 mm，place_z 正好低 2 mm")
 
 
+# ---------------------------------------------------------------- 拆塔（回位）
+@case
+def test_layer_plan_teardown_item_grabs_top_layer(chain):
+    """拆塔项走**真入口那条路**（layer_plan → build_stack → build_pick）。
+
+    2026-11-02 事故回归：``block_h_used_mm``（块顶 91 mm）被当成块高，
+    绝对 277 mm 被 `GRASP_Z_MAX` 截到 224.2 mm，指尖落到最底层 20 mm，
+    一抓把三层全带起来。这里断言指尖落在**顶层块内部**、放置高度按 29.5 mm。
+    """
+    blocks, cand, q0 = scene(chain)
+    top_mm, bh_mm = 91.34, 29.5
+    slot = (0.45, -0.25)                     # 拾取区回位空位
+    tower = dict(blocks[0], cx=SLOT_MM[0], cy=SLOT_MM[1],
+                 top=top_mm, h=top_mm)
+    cand_t = dict(cand, xyz_base=[SLOT_MM[0] / 1000.0, SLOT_MM[1] / 1000.0,
+                                  top_mm / 1000.0])
+    item = {"block": tower, "cand": cand_t, "block_idx": 99, "class": "cyan",
+            "block_h_raw_mm": top_mm, "block_h_used_mm": top_mm,
+            "block_true_h_mm": bh_mm,
+            "yaw_grasp_deg": 0.0, "yaw_place_deg": 0.0, "yaw_source": "zero",
+            "grasp_at": "block_center"}
+    plan = s3r.layer_plan(chain, q0, item, [tower], slot, pp.TABLE_PLANE_Z,
+                          carry_z=pp.stage3_carry_z(bh_mm / 1000.0,
+                                                    pp.TABLE_PLANE_Z),
+                          place_open_mm=50.0, release_dwell_s=0.0, scene={})
+    m = plan["meta"]
+    assert_close(m["block_true_h_mm"], bh_mm, why="meta 要记物理块高")
+    assert_close(m["block_bottom_mm"], top_mm - bh_mm, why="块底 = 块顶 − 块高")
+    tip_mm = m["grasp_z"] * 1000.0 - pp.TOOL0_TO_BARE_FINGERTIP * 1000.0
+    assert top_mm - bh_mm + 5.0 < tip_mm < top_mm, \
+        "指尖 %.2f mm 不在顶层块内（块底 %.2f / 块顶 %.2f）" % (
+            tip_mm, top_mm - bh_mm, top_mm)
+    assert m["place_z"] < 0.23, \
+        "放置高度 %.4f 仍按块顶 91 mm 算 —— 会凭空抬高一个塔高" % m["place_z"]
+
+    # 漏给 block_true_h_mm：块顶 91 mm 不像台面块 ⇒ 计划期就拒（不是抓歪了才发现）
+    bad = dict(item)
+    bad.pop("block_true_h_mm")
+    try:
+        s3r.layer_plan(chain, q0, bad, [tower], slot, pp.TABLE_PLANE_Z,
+                       carry_z=0.42, place_open_mm=50.0, scene={})
+    except pp.PlanError as exc:
+        assert "block_h_m" in str(exc), exc
+    else:
+        raise AssertionError("拆塔项漏了 block_true_h_mm 居然能出计划")
+
+
 # ---------------------------------------------------------------- 后矫正 nudge
 @case
 def test_build_place_matches_pick_place_geometry(chain):
@@ -813,6 +860,33 @@ def test_nudge_plan_json_is_executable_shape(chain):
     assert_close(plan["meta"]["survey_tool0"][0], pair[0][0], 1e-4,
                  "survey 收尾位（meta 保留 4 位）")
     assert_close(plan["meta"]["shift_norm_mm"], np.hypot(3.0, -2.0), 1e-3)
+
+
+@case
+def test_nudge_plan_twist_only_still_solves(chain):
+    """`--nudge-axes yaw`（只扭转）这一档：shift 全零、dyaw 非零，计划照样可执行。
+
+    主流程从 round-04 起就走这一档（2026-11-02 用户拍板）。反向变异：把
+    ``shift_xy_mm`` 换成非零值不会红（这是合法输入），真正的钉子在下一条
+    ``shift_norm_mm`` 必须是 0 —— 若某天有人把「只扭转」实现成「顺手也推一点」，
+    这里立刻红。
+    """
+    _, _, q0 = scene(chain)
+    bx = nudge_block()
+    slot = (SLOT_MM[0] / 1000.0, SLOT_MM[1] / 1000.0)
+    pair = pp.stage3_survey_tool0(PAD_Z + H_BLK, slot)
+    plan = s3r.nudge_plan(chain, q0, bx, [bx],
+                          shift_xy_mm=(0.0, 0.0), dyaw_deg=6.0,
+                          surface_m=PAD_Z, yaw_block_deg=1.5, open_mm=50.0,
+                          survey_tool0=pair[0])
+    assert_close(plan["meta"]["shift_norm_mm"], 0.0, 1e-9,
+                 "只扭转档不许带平移")
+    assert_close(plan["meta"]["dyaw_deg"], 6.0, 1e-6)
+    assert [w["name"].split("_split")[0] for w in plan["waypoints"]] \
+        == NUDGE_NAMES, [w["name"] for w in plan["waypoints"]]
+    acts = {w.get("after", {}).get("gripper") for w in plan["waypoints"]
+            if w.get("after")}
+    assert "close" in acts and "open_to" in acts, acts
 
 
 @case

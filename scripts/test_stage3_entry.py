@@ -675,6 +675,164 @@ def test_return_to_pick_red_exec_stops():
 
 
 @case
+def test_tower_block_item_keeps_top_and_true_height_apart():
+    """拆塔项：``h`` 是**块顶离台面**，``block_true_h_mm`` 才是物理块高。
+
+    2026-11-02 事故的直接入口 —— 两者混用会把指尖指到最底层。
+    """
+    merged = {"found": True, "top_mm": 92.61,
+              "center_base_mm": [422.09, -112.69],
+              "yaw_deg": 0.237, "yaw_trusted": True, "class": "cyan"}
+    item = e.tower_block_item(merged, {}, {"tower": 1.266})
+    assert_close(item["block_h_used_mm"], 92.61 - 1.266,
+                 why="h 是块顶高（扣塔位 z 标定）")
+    assert_close(item["block_true_h_mm"], m3.BLOCK_TRUE_H_MM,
+                 why="物理块高就是 29.5 mm")
+    assert item["block_h_used_mm"] > 2 * m3.BLOCK_TRUE_H_MM, \
+        "三层塔的块顶应远高于一块 —— 混用会算错抓取高度"
+    # scene 里给了真块高就取它（标定/换块时不用改代码）
+    item2 = e.tower_block_item(merged, {"block_true_h_mm": 31.0},
+                               {"tower": 1.266})
+    assert_close(item2["block_true_h_mm"], 31.0, why="scene 覆盖优先")
+
+
+@case
+def test_teardown_tower_dismantles_until_empty():
+    """3 层塔：逐层回位，靠塔顶高度下降推进，最后塔位空。"""
+    import tempfile
+    import types
+    tops = [92.5, 63.0, 33.5]
+
+    def merged_at(i):
+        return {"found": True, "top_mm": tops[i],
+                "center_base_mm": [422.0 + i, -115.0 - i],
+                "yaw_deg": float(i), "yaw_trusted": True}
+
+    calls = []
+    state = {"i": 0}
+
+    def fake_measure(*a, **k):
+        return {"merged": merged_at(state["i"])}, "塔上有块"
+
+    def fake_return(args, board, chain, scene, cdir, tag, grid, slot, merged,
+                    zcal, **k):
+        calls.append(merged["top_mm"])
+        state["i"] += 1
+        after = (merged_at(state["i"]) if state["i"] < len(tops)
+                 else {"found": False})
+        return {"tag": tag}, {"merged": after}, (
+            "还有块" if after.get("found") else None)
+
+    orig = (e.measure_tower, e.return_to_pick_once)
+    e.measure_tower = fake_measure
+    e.return_to_pick_once = fake_return
+    args = types.SimpleNamespace(urdf="x.urdf", d_mm=330.0,
+                                 tower_half_edge=0.02, tower_cell_idx=4)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            doc = e.teardown_tower(args, None, None, {}, None, td,
+                                   [422.65, -114.86], {"tower": 1.0})
+    finally:
+        e.measure_tower, e.return_to_pick_once = orig
+    assert doc["n_removed"] == 3 and doc["final_empty"], doc
+    assert calls == tops, calls
+    assert [r["top_before_mm"] for r in doc["rows"]] == tops
+
+
+@case
+def test_teardown_tower_stops_when_top_does_not_drop():
+    """拆完一层塔顶没降够（抓空/滑落）⇒ 停，不继续拆。"""
+    import tempfile
+    import types
+
+    def fake_measure(*a, **k):
+        return {"merged": {"found": True, "top_mm": 92.5,
+                           "center_base_mm": [422.0, -115.0]}}, "塔上有块"
+
+    def fake_return(*a, **k):
+        return ({"tag": "t"},
+                {"merged": {"found": True, "top_mm": 92.4,
+                            "center_base_mm": [422.0, -115.0]}},
+                "还有块")
+
+    orig = (e.measure_tower, e.return_to_pick_once)
+    e.measure_tower = fake_measure
+    e.return_to_pick_once = fake_return
+    args = types.SimpleNamespace(urdf="x.urdf", d_mm=330.0,
+                                 tower_half_edge=0.02, tower_cell_idx=4)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                e.teardown_tower(args, None, None, {}, None, td,
+                                 [422.65, -114.86], {"tower": 1.0})
+            except e.EntryStop as exc:
+                assert "只降了" in exc.why, exc.why
+            else:
+                raise AssertionError("塔顶没降还继续拆")
+    finally:
+        e.measure_tower, e.return_to_pick_once = orig
+
+
+@case
+def test_teardown_tower_stops_when_top_drops_two_layers():
+    """拆完一层塔顶降了 ≈两层（59 mm）⇒ 停 —— 一抓抓多了，正是 11-02 事故形态。"""
+    import tempfile
+    import types
+
+    def fake_measure(*a, **k):
+        return {"merged": {"found": True, "top_mm": 92.5,
+                           "center_base_mm": [422.0, -115.0]}}, "塔上有块"
+
+    def fake_return(*a, **k):
+        return ({"tag": "t"},
+                {"merged": {"found": True, "top_mm": 33.5,
+                            "center_base_mm": [422.0, -115.0]}},
+                "还有块")
+
+    orig = (e.measure_tower, e.return_to_pick_once)
+    e.measure_tower = fake_measure
+    e.return_to_pick_once = fake_return
+    args = types.SimpleNamespace(urdf="x.urdf", d_mm=330.0,
+                                 tower_half_edge=0.02, tower_cell_idx=4)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            try:
+                e.teardown_tower(args, None, None, {}, None, td,
+                                 [422.65, -114.86], {"tower": 1.0})
+            except e.EntryStop as exc:
+                assert "一次抓多了" in exc.why, exc.why
+            else:
+                raise AssertionError("塔顶降了 59 mm（两层）还继续拆")
+    finally:
+        e.measure_tower, e.return_to_pick_once = orig
+
+
+@case
+def test_teardown_tower_empty_is_noop():
+    """塔位本来就空：一层不拆、不动臂。"""
+    import tempfile
+    import types
+    moved = []
+
+    def fake_measure(*a, **k):
+        return {"merged": {"found": False}}, None
+
+    orig = (e.measure_tower, e.return_to_pick_once)
+    e.measure_tower = fake_measure
+    e.return_to_pick_once = lambda *a, **k: moved.append(1)
+    args = types.SimpleNamespace(urdf="x.urdf", d_mm=330.0,
+                                 tower_half_edge=0.02, tower_cell_idx=4)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            doc = e.teardown_tower(args, None, None, {}, None, td,
+                                   [422.65, -114.86], {"tower": 1.0})
+    finally:
+        e.measure_tower, e.return_to_pick_once = orig
+    assert doc["n_removed"] == 0 and doc["final_empty"], doc
+    assert moved == [], "塔位空时不该有回位动作"
+
+
+@case
 def test_load_rows_reads_and_sorts():
     """续跑：只认 rep 是整数的 row.json，按 rep 排序。"""
     import json
@@ -1178,6 +1336,82 @@ def test_nudge_row_gain_and_gate():
 
 
 @case
+def test_nudge_axes_yaw_only_zeroes_translation():
+    """`--nudge-axes yaw` = 只扭转：平移整段置零、转角原样保留。
+
+    2026-11-02 round-10 实测：扭转增益 0.84–1.16 很稳，横移增益 0.23–1.55、
+    ⟂ 分量 0.11–5.06 mm，用户据此定下主流程「只收扭转那一段」。这条测试钉住
+    「置零的是平移、不是把整条指令清掉」——变异：把 axes 判断写成整体置零，
+    这里 dyaw 会变 0 而红。
+    """
+    cmd = dict(e.nudge_delta([421.0, -3.0], 6.0, [425.0, 0.0]))
+    both = e.applied_nudge_command(cmd)
+    assert_close(both["dx_mm"], 4.0, 1e-9)
+    assert_close(both["dy_mm"], 3.0, 1e-9)
+    assert abs(both["dyaw_deg"]) > 1e-9, both
+
+    yaw = e.applied_nudge_command(cmd, axes=("yaw",))
+    assert_close(yaw["dx_mm"], 0.0, 1e-9, "只扭转 ⇒ dx 必须为 0")
+    assert_close(yaw["dy_mm"], 0.0, 1e-9, "只扭转 ⇒ dy 必须为 0")
+    assert_close(yaw["d_mm"], 0.0, 1e-9, "只扭转 ⇒ d 必须为 0")
+    assert_close(yaw["dyaw_deg"], both["dyaw_deg"], 1e-9, "转角不许被削掉")
+    assert_close(yaw["yaw_from_deg"], both["yaw_from_deg"], 1e-9,
+                 "接近朝向不许动 —— 它是 build_nudge 的夹持朝向")
+
+    # 只横移（诊断档）：转角置零、平移保留；预补偿只在有 xy 时生效
+    xy = e.applied_nudge_command(cmd, axes=("xy",), bias_xy_mm=(1.0, 0.0))
+    assert_close(xy["dyaw_deg"], 0.0, 1e-9)
+    assert abs(xy["dx_mm"]) > 1e-9 and "push_pred_x_mm" in xy, xy
+    yaw_bias = e.applied_nudge_command(cmd, axes=("yaw",), bias_xy_mm=(1.0, 0.0))
+    assert "push_pred_x_mm" not in yaw_bias, "不横移就不该有预扣量"
+
+
+@case
+def test_nudge_row_judges_only_executed_axes():
+    """只扭转那一档里，xy 偏差**不**参与 ``final_ok``；yaw 偏差仍然算。
+
+    不给这层区分，主组每层都会 `still_off`（横移没人管），信号被淹掉；
+    反过来若把两轴都放过，就是偷偷放松契约 §4.1 的 5 mm 门 —— 所以这里
+    同时钉住「yaw 超 5° 照样红」。
+    """
+    cmd = dict(e.nudge_delta([421.0, 0.0], 6.0, [425.0, 0.0]))
+    before = _merged(421.0, 0.0, 6.0)
+    after = _merged(428.0, 0.0, 1.0)          # xy 差 3 mm 起步、没矫正
+    row = e.nudge_row(1, cmd, before, after, [425.0, 0.0], axes=("yaw",))
+    assert row["after"]["xy_err_mm"] == 3.0
+    assert row["final_ok"] is True, row
+    assert row["axes"] == ["yaw"], row
+
+    # 同样这组数据，若声明两轴都做，xy 越 5 mm 门才判红（契约 §4.1 的 5 mm）
+    row2 = e.nudge_row(2, cmd, before, _merged(433.0, 0.0, 1.0), [425.0, 0.0])
+    assert row2["final_ok"] is False and row2["reason"] == "still_off", row2
+    row3 = e.nudge_row(3, cmd, before, _merged(433.0, 0.0, 1.0), [425.0, 0.0],
+                       axes=("yaw",))
+    assert row3["final_ok"] is True, "只扭转时 xy 越界不该判红"
+    # yaw 仍未修好 ⇒ 两档都红
+    for ax in (None, ("yaw",)):
+        bad = e.nudge_row(4, cmd, before, _merged(425.0, 0.0, 6.5),
+                          [425.0, 0.0], **({} if ax is None else {"axes": ax}))
+        assert bad["final_ok"] is False, (ax, bad)
+
+
+@case
+def test_nudge_enabled_needs_explicit_axes_outside_nudge_group():
+    """主组只有**显式**给 `--nudge-axes` 才做放后矫正；不给就是纯开环。
+
+    主组 round-01..03 是纯开环跑的，默认打开等于把主组悄悄改版。
+    """
+    A = types.SimpleNamespace
+    assert s3r.nudge_enabled(A(group="nudge", nudge_axes=None)) is True
+    assert s3r.nudge_enabled(A(group="open", nudge_axes=None)) is False
+    assert s3r.nudge_enabled(A(group="open", nudge_axes="yaw")) is True
+    assert s3r.nudge_enabled(A(group="closed", nudge_axes=None)) is False
+    assert s3r.nudge_axes(A(group="nudge", nudge_axes=None)) == ("xy", "yaw")
+    assert s3r.nudge_axes(A(group="open", nudge_axes="yaw")) == ("yaw",)
+    assert s3r.nudge_axes(A(group="open", nudge_axes="both")) == ("xy", "yaw")
+
+
+@case
 def test_nudge_pose_gate_enforces_contract_4_2_5():
     """契约 §4.2.5：两视点差 ≤10 mm / ≤6°，超了或证明不了 ⇒ 转人评，不许记成 ok。
 
@@ -1208,6 +1442,13 @@ def test_nudge_pose_gate_enforces_contract_4_2_5():
     # 只查矫正前（``after`` 省略）时不许凭空判「矫正后」缺测
     assert e.nudge_pose_gate(ok_b) is None
     assert e.nudge_pose_gate(bad_x) is not None
+
+    # 反过来：只查矫正后（``before=None``）时不许凭空判「矫正前」缺测 ——
+    # 主轮 nudge 的续跑门就是这么调的（stage3_round.py 里 `nudge_pose_gate(None, after)`）。
+    # 2026-11-02 round-10 第一次真机跑就因为这条把每层都判成「矫正前只有一个视点」。
+    assert e.nudge_pose_gate(None, ok_a) is None, e.nudge_pose_gate(None, ok_a)
+    why = e.nudge_pose_gate(None, dict(ok_a, center_span_mm=12.0))
+    assert why and "矫正后" in why and "矫正前" not in why, why
 
     # 反向变异：把门拆掉（阈值放到无穷远）必须让上面那几条都放行，
     # 否则说明是别的分支在拦，测试根本没测到门。

@@ -30,6 +30,8 @@
   无手无遮挡；
 · 任何一层执行判红 / 测量缺失 / 多视点不一致 ⇒ **停在原地，不续跑**
   （块可能还在爪里或半放），交给人判读；
+· 每轮 `--go` 开工先量塔位：非空 ⇒ **机器人自己逐层拆回拾取区**
+  （`stage3_entry.teardown_tower`），塔位空了才开始本轮 —— 轮间不压人拆塔；
 · 不 push。
 """
 import argparse
@@ -118,10 +120,16 @@ def layer_plan(chain, q_start, item, blocks, slot_m, surface_m,
     block = dict(item["block"])
     # build_pick 用 block["h"] 当 ``wz``；这里换成**扣过拾取侧偏差**的值。
     block["h"] = float(item["block_h_used_mm"])
+    # ``wz`` 是**块顶离台面**。物理块高另给：台面上的块留空（build_pick 沿用
+    # 「块顶 = 块高」，逐字节不变）；塔上的块（拆塔）块顶 91 mm 而块高只有
+    # 29.5 mm，漏给会被 build_pick 的护栏当场拒，不会悄悄抓到最底层。
+    _bh = item.get("block_true_h_mm")
+    block_h_m = None if _bh is None else float(_bh) / 1000.0
     wps, checks, meta = pp.build_stack(
         chain, list(q_start), item["cand"], block, blocks, slot_m, surface_m,
         tower_xy_mm=tower_xy_mm, tower_top_mm=tower_top_mm,
         survey_tool0=survey_tool0, carry_z=carry_z,
+        block_h_m=block_h_m,
         tower_half_edge=float(tower_half_edge),
         yaw_grasp_deg=item["yaw_grasp_deg"],
         yaw_place_deg=item["yaw_place_deg"],
@@ -304,7 +312,29 @@ def nudge_bias_comp(spec):
     return (vals[0], vals[1])
 
 
-def applied_nudge_command(cmd, zero=False, bias_xy_mm=None):
+def nudge_axes(args):
+    """`--nudge-axes` → 这次要执行的轴元组；``None`` = 不单独指定，按组默认。
+
+    空值（没传）在 `--group nudge` 下等价 ``("xy","yaw")``；传了值就同时
+    表示「这轮要做放后矫正」——主组（``--group open``）靠它按需打开这条路径。
+    """
+    spec = getattr(args, "nudge_axes", None)
+    spec = "both" if spec is None else str(spec)
+    return {"both": ("xy", "yaw"), "xy": ("xy",), "yaw": ("yaw",)}[spec]
+
+
+def nudge_enabled(args):
+    """这轮要不要做放后矫正：nudge 组一律要；其它组**只在显式给了
+    `--nudge-axes` 时**才要（主流程采用「只扭转」那一档，用户 2026-11-02 拍板）。
+
+    显式给值而不是给主组设个默认值：默认打开等于把主组悄悄改版，而主组
+    round-01..03 是纯开环跑的，不能让人以为前后同一条件。
+    """
+    return args.group == "nudge" or getattr(args, "nudge_axes", None) is not None
+
+
+def applied_nudge_command(cmd, zero=False, bias_xy_mm=None,
+                          axes=("xy", "yaw")):
     """这次**真正发给计划**的指令；``cmd`` 是实测 δ，另存一份留作对账。
 
     ``zero=True``（`--nudge-zero`，诊断用）：平移与转角全置零，只走
@@ -316,6 +346,10 @@ def applied_nudge_command(cmd, zero=False, bias_xy_mm=None):
     就在**横移目标**里减掉 Δ（不动接近点），落点回到「实测 + 想要的 δ」。
     这一手只依赖「Δ 可预测」，不假定 E 是臂的定位残差还是测量的固定偏置
     —— 两者对补偿等价（台账第一百八十九轮 §未决）。
+
+    ``axes``（`--nudge-axes`）：只执行列表里的轴，缺的轴指令置零。
+    ``("xy","yaw")`` = 原行为；``("yaw",)`` = **只扭转**（主流程采用的那一档，
+    2026-11-02 用户拍板）；``("xy",)`` = 只横移（诊断用）。
     """
     keys = ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg",
             "yaw_from_deg", "yaw_to_deg")
@@ -324,7 +358,21 @@ def applied_nudge_command(cmd, zero=False, bias_xy_mm=None):
         for k in ("dx_mm", "dy_mm", "d_mm", "dyaw_deg", "dyaw_block_deg"):
             if k in out:
                 out[k] = 0.0
-    if bias_xy_mm is not None and "dx_mm" in out and "dy_mm" in out:
+    # ``axes``（`--nudge-axes`）只执行其中几轴：2026-11-02 round-10 实测
+    # 扭转增益 0.84–1.16 稳定、横移增益 0.23–1.55 且 ⟂ 分量 0.11–5.06 mm，
+    # 用户据此定下「只收扭转那一段」⇒ ``axes=("yaw",)`` 时把平移整段置零。
+    # **置零而不是删键**：`nudge_plan` 与 `nudge_row` 都要读 dx/dy/d_mm，
+    # 缺键会让 gain/对账那一套拿不到 0；``_requested`` 里另存原始值备查。
+    axes = tuple(axes)
+    if "xy" not in axes:
+        for k in ("dx_mm", "dy_mm", "d_mm"):
+            if k in out:
+                out[k] = 0.0
+    if "yaw" not in axes:
+        for k in ("dyaw_deg", "dyaw_block_deg"):
+            if k in out:
+                out[k] = 0.0
+    if bias_xy_mm is not None and "xy" in axes and "dx_mm" in out and "dy_mm" in out:
         px, py = nudge_push_pred(bias_xy_mm, out.get("yaw_from_deg", 0.0))
         out["dx_mm"] -= px
         out["dy_mm"] -= py
@@ -335,7 +383,8 @@ def applied_nudge_command(cmd, zero=False, bias_xy_mm=None):
 
 
 def nudge_row(rep, cmd, before, after, target_xy_mm,
-              xy_tol_mm=NUDGE_XY_TOL_MM, yaw_tol_deg=NUDGE_YAW_TOL_DEG):
+              xy_tol_mm=NUDGE_XY_TOL_MM, yaw_tol_deg=NUDGE_YAW_TOL_DEG,
+              axes=("xy", "yaw")):
     """一次矫正的前后对账：实走 δ、push gain、带转角、终态过不过门。
 
     ``before`` / ``after`` 是矫正前后的 ``merged``（`stage3_measure` 融合值）。
@@ -381,7 +430,15 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
     if yaw_err1 is None:
         ok, reason = None, "no_colour_yaw"
     else:
-        ok = bool(e1 <= float(xy_tol_mm) and abs(yaw_err1) <= float(yaw_tol_deg))
+        # ``axes``：没矫正的那一轴不参与 ``final_ok`` —— 只扭转的档位里
+        # 横移本来就没人管，拿它判红等于每层都「still_off」（实测仍会照常
+        # 落盘、不停止，但信号会被噪声淹掉）。
+        ok = True
+        if "xy" in axes:
+            ok = ok and e1 <= float(xy_tol_mm)
+        if "yaw" in axes:
+            ok = ok and abs(yaw_err1) <= float(yaw_tol_deg)
+        ok = bool(ok)
         reason = "ok" if ok else "still_off"
 
     def state(c, e, y, ye):
@@ -390,6 +447,7 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
                 "yaw_err_deg": None if ye is None else round(ye, 2)}
 
     return {"rep": int(rep),
+            "axes": list(axes),
             "commanded": {k: round(float(v), 3) for k, v in cmd.items()},
             "before": dict(state(bc, e0, by, yaw_err0),
                            yaw_depth_deg=before.get("yaw_deg"),
@@ -415,7 +473,10 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
 def nudge_pose_gate(before, after=None):
     """契约 §4.2.5 的多姿态一致性门 —— 过门返回 ``None``，否则返回人评理由。
 
-    ``after`` 省略（``None``）= 只查矫正前那一次（还没动臂，用来决定夹不夹）。
+    ``after`` 省略（``None``）= 只查矫正前那一次（还没动臂，用来决定夹不夹）；
+    ``before`` 传 ``None`` = 只查矫正后那一次（矫正已经做完，只看结果）。
+    **两侧都要按「传没传」判断**：把缺失的一侧当成空字典查，会凭空报
+    「只有一个视点能测到」，主轮里表现成每层都停轮（2026-11-02 真机 round-10 第一次撞上）。
 
     ``before`` / ``after`` 是 ``stage3_measure`` 的融合值；这里只读它自己记下的
     两视点差（``center_span_mm`` / ``yaw_color_span_deg``），不重算。
@@ -429,9 +490,11 @@ def nudge_pose_gate(before, after=None):
     ``span`` 缺失 = 只有一个视点能测到 ⇒ **证明不了一致**，同样转人评
     （与 ``stage3_measure.pose_consistency`` 的 ``ok=None`` 同一口径）。
     """
-    pairs = [("矫正前", before or {})]
+    pairs = []
+    if before is not None:
+        pairs.append(("矫正前", before))
     if after is not None:
-        pairs.append(("矫正后", after or {}))
+        pairs.append(("矫正后", after))
     bad = []
     for name, m in pairs:
         sp = m.get("center_span_mm")
@@ -502,7 +565,8 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
     往上叠只会放大。
     """
     target_mm = [desired_target[0] * 1000.0, desired_target[1] * 1000.0]
-    row = {"target_mm": [round(v, 2) for v in target_mm]}
+    axes = nudge_axes(args)
+    row = {"target_mm": [round(v, 2) for v in target_mm], "axes": list(axes)}
     yaw_c = merged.get("yaw_color_deg")
     if yaw_c is None or not merged.get("yaw_color_trusted"):
         row.update({"mode": "skipped", "reason": "no_colour_yaw"})
@@ -516,7 +580,7 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
                       yaw_sign=float(scene.get("yaw_sign", 1.0)),
                       delta_deg=float(scene.get("finger_axis_delta_deg", 0.0)))
     bias = nudge_bias_comp(args.nudge_bias_comp)
-    applied = applied_nudge_command(cmd, bias_xy_mm=bias)
+    applied = applied_nudge_command(cmd, bias_xy_mm=bias, axes=axes)
     row["commanded"] = {kk: round(float(v), 3) for kk, v in cmd.items()}
     row["applied"] = {kk: round(float(v), 3) for kk, v in applied.items()}
     if bias is not None:
@@ -583,8 +647,9 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
         row.update(nudge_row(k, applied, merged, merged, target_mm))
         row.update({"mode": "failed", "reason": "after_missing"})
         return row, "nudge_after_missing", after
-    row.update(nudge_row(k, applied, merged, after_merged, target_mm))
-    row["mode"] = "nudged"
+    row.update(nudge_row(k, applied, merged, after_merged, target_mm,
+                         axes=axes))
+    row["mode"] = "twisted" if axes == ("yaw",) else "nudged"
     if (after.get("consistency") or {}).get("ok") is not True:
         row["after_pose_reason"] = (after.get("consistency") or {}).get("reason")
         return row, "nudge_after_pose_mismatch", after
@@ -923,10 +988,23 @@ def run_round(args):
         print("--n-layers 至少 1")
         return 2
     board = pr.Board(s2.BOARD_ALIAS, rdir)
+    teardown = None
     if args.go:
         print(">>> 需要人动手：确认急停就绪、两指行程内无手无遮挡；"
-              "执行器在板上还会核对 PLAYING / JTC / robot_mode")
+              "执行器在板上还会核对 PLAYING / JTC / robot_mode。"
+              "塔位若还有块，机器人会先自动拆塔回位（不需要人拆）")
         board.push()
+        # 开工先把上一轮的塔拆回拾取区（这个动作形态本身也要当次授权 ——
+        # 上面那句 + `--go` 的 STOP→PLAY 握手就是；不继承上一轮）。
+        import stage3_entry as se
+        try:
+            teardown = se.teardown_tower(args, board, chain, scene, grid, cdir,
+                                         slot_mm, zcal)
+        except se.EntryStop as exc:
+            print("!! 拆塔停：%s" % exc.why)
+            return exc.rc
+    else:
+        print("离线预演不拆塔：塔位若有块，真跑（--go）时会先自动拆塔回位")
 
     # ---- 抓帧（拾取巡检位）
     extra_frames = list(args.extra_frames or [])
@@ -989,6 +1067,9 @@ def run_round(args):
                    ("order", "block_idx", "class", "arm", "block_h_raw_mm",
                     "block_h_used_mm", "yaw_grasp_deg", "yaw_place_deg",
                     "yaw_source", "yaw_note")} for it in items],
+        # 开工时的自动拆塔（塔位本来就空则 n_removed=0）；明细在
+        # `<round>/teardown/teardown.json`。
+        "teardown": teardown,
         "layers": [], "terminal": None, "stop_reason": None,
         # 轮内自适应放置偏置补偿：mode=none 时逐字节复现旧的「纯开环」语义。
         "bias_comp": {"mode": args.bias_comp, "limit_mm": BIAS_LIMIT_MM,
@@ -1322,9 +1403,13 @@ def run_round(args):
             break
         # ---- nudge 组：量完之后**只夹不抬**把块推到目标，退开再量一次。
         # 判分与下一层的表面用**矫正后**的实测；b̂ 记账仍用矫正前那次 ——
-        # b̂ 描述的是「开环放置落哪」，拿矫正后的值记会把补偿器教成
-        # 「我放得很准」，下一层不再补，那 4–5 mm 系统偏置会原样回来。
-        if args.group == "nudge":
+        # b̂ 描述的是「开环放置落哪」，拿矫正后的值记会把补偿器教成「我放得
+        # 很准」，下一层不再补，那 4–5 mm 系统偏置会原样回来。这一句以前
+        # 只是注释（代码实际吃了矫正后的 merged），2026-11-02 round-10 的
+        # `bias_history` 与 `nudge.after` 逐层对得上，证实吃错了，这次改到
+        # 真的用矫正前那次。
+        bias_merged = merged
+        if nudge_enabled(args):
             nrow, nstop, after = nudge_after_place(
                 args, board, chain, scene, grid, zcal, cdir, k, round_no,
                 merged, meas, desired_target, surface_mm, surface_m,
@@ -1350,7 +1435,7 @@ def run_round(args):
         # 这一层落地偏了多少 —— 下一层用它预补偿。超上限按失败停轮，
         # 不拿一个「块掉了 / 没抓住」的大数去把下一层推得更歪。
         bias, bwhy = bias_from_layer(
-            merged.get("center_base_mm"),
+            bias_merged.get("center_base_mm"),
             [slot_target[0] * 1000.0, slot_target[1] * 1000.0])
         rec["placement_bias_mm"] = (None if bias is None
                                     else [round(v, 3) for v in bias])
@@ -1526,6 +1611,11 @@ def main(argv=None):
                     help="nudge 组：预扣「闭合那一下」的推力，格式 x,y（mm，"
                          "base 系，例 -2.05,-4.78）。不给就不补偿 —— E 只在"
                          "4 号格附近估过，换位置若不成立，人容易以为别处坏了")
+    ap.add_argument("--nudge-axes", choices=("both", "xy", "yaw"), default=None,
+                    help="放后矫正执行哪几轴：both=横移+扭转（nudge 组默认）、"
+                         "yaw=只扭转（主流程采用）、xy=只横移（诊断）。"
+                         "**主组给这个值 = 打开放后矫正**；不给 = 纯开环，"
+                         "与 round-01..03 同条件。")
     ap.add_argument("--terminal-wait-s", type=float, default=10.0)
     ap.add_argument("--review-ok", action="store_true",
                     help="人眼复核已通过（逐层数值之外必须由人确认）")
