@@ -1127,8 +1127,9 @@ NUDGE_BOX_TOP_TOL = 0.0005
 def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
                 surface_z=TABLE_PLANE_Z, yaw_block_deg=0.0, blocks=None,
                 open_mm=None, survey_tool0=None, tower_box=None,
-                held_half_edge=0.020, yaw_shift_deg=0.0):
-    """放置后矫正：**只夹不抬**，把已经放下的块平移 δxy / 原地转 δyaw。
+                held_half_edge=0.020, yaw_shift_deg=0.0, lift_mm=0.0):
+    """放置后矫正：夹住块**抬最小一步**（默认 0 = 只夹不抬），先绕块心扭转、
+    再平移，放回原高度松开。
 
     为什么有这个原语（2026-11-01 用户提出，第一百八十五轮记账）
     ────────────────────────────────────────────────────────────
@@ -1142,12 +1143,18 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
 
     动作序列
     ────────
-    ``nudge_approach → nudge_grip → nudge_shift → nudge_twist → nudge_release
-    → nudge_retreat → nudge_survey``
+    ``nudge_approach → nudge_grip → nudge_lift → nudge_twist → nudge_shift
+    → nudge_lower → nudge_release → nudge_retreat → nudge_survey``
 
     · tool0 的 xy 先对齐**实测块心**：绕 tool0 的 z 转就是绕块心那条竖线转，
       块心不跟着跑（真滑移由松手后的复测发现，这里不假装能保证）。
-    · `grip`/`shift`/`twist`/`release` **同高**：块始终贴着自己那一层，不抬。
+    · **先扭后移**（2026-11-03 用户拍板，台账第 224 轮）：扭转在块心上做，
+      平移跟着扭转后的姿态走。旧序列是「先移后扭」，扭转轴固定在**移动前**的
+      块心 —— 平移一旦走不准，扭转就绕着一个偏掉的轴，把平移误差搅成新的平移。
+    · `lift_mm`（2026-11-03 用户拍板，同上）：夹住后先抬这一小段，让块脱开
+      下面那层的摩擦再动 —— 贴着推时 push gain 不可预测（实测 0.23–1.55、
+      ⟂ 分量最大 5.06 mm）的大头就是表面摩擦。**默认 0 = 旧行为（只夹不抬）**；
+      抬升段本身也要过 `check_guard` / `check_held_block`。
     · 夹持深度沿用抓取那套算式（`GRASP_CLEARANCE`），够传力矩又不压块。
 
     会拒的情况（fail-closed，不写计划）
@@ -1233,15 +1240,28 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
         return {"gripper": "open"} if mm is None else {"gripper": "open_to",
                                                        "mm": float(mm)}
 
+    lift = max(0.0, float(lift_mm)) / 1000.0
     tx, ty = bx + dx_mm / 1000.0, by + dy_mm / 1000.0
+    work_z = grip_z + lift           # 抬起来之后所有「动手」的同一高度
     specs = [
         ("nudge_approach", (bx, by, approach_z), yaw0, None, _open(open_used)),
         ("nudge_grip", (bx, by, grip_z), yaw0,
          {"gripper": "close", "readback": True}, None),
-        ("nudge_shift", (tx, ty, grip_z), yaw0,
+    ]
+    if lift > 0.0:
+        specs.append(("nudge_lift", (bx, by, work_z), yaw0,
+                      {"gripper": "readback"}, None))
+    # 先扭（在块心上）后移；lift=0 时两者同在 grip_z，仍是「只夹不抬」旧行为。
+    specs += [
+        ("nudge_twist", (bx, by, work_z), yaw1,
          {"gripper": "readback"}, None),
-        ("nudge_twist", (tx, ty, grip_z), yaw1,
+        ("nudge_shift", (tx, ty, work_z), yaw1,
          {"gripper": "readback"}, None),
+    ]
+    if lift > 0.0:
+        specs.append(("nudge_lower", (tx, ty, grip_z), yaw1,
+                      {"gripper": "readback"}, None))
+    specs += [
         ("nudge_release", (tx, ty, grip_z), yaw1, _open(open_used), None),
         ("nudge_retreat", (tx, ty, approach_z), yaw1, None, None),
         ("nudge_survey", survey_xyz, 0.0, None, None),
@@ -1267,6 +1287,7 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
             "yaw_shift_deg": round(float(yaw_shift_deg), 3),
             "target_xy_mm": [round(tx * 1000.0, 2), round(ty * 1000.0, 2)],
             "grip_z": round(grip_z, 4), "approach_z": round(approach_z, 4),
+            "lift_mm": round(lift * 1000.0, 3),
             "open_mm": round(open_used, 1),
             "tower_box": ([round(float(v), 4) for v in tower_box]
                           if tower_box is not None else None),

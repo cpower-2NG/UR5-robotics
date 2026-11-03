@@ -1317,6 +1317,128 @@ def test_nudge_after_place_deadband_returns_no_after_measure():
         row["before"]["center_mm"] == row["after"]["center_mm"]), row
 
 
+def _nudge_run(after_seq, args=None, merged=None, target_yaw=6.0):
+    """跑一遍 `nudge_after_place` 的迭代循环（板子/臂/测量全打桩）。
+
+    `after_seq` 是每一次复测要返回的 ``measure_layer`` 结果，按顺序消费。
+    返回 ``(row, stop, after, n_measured)``。
+    """
+    import tempfile
+
+    args = args or types.SimpleNamespace(
+        nudge_axes="yaw", nudge_deadband_yaw_deg=1.0, nudge_deadband_xy_mm=1.0,
+        nudge_max_cycles=2, nudge_lift_mm=2.0, nudge_open_mm=40.0,
+        tower_half_edge=0.02, nudge_bias_comp=None, urdf="x.urdf")
+    merged = merged or {"center_base_mm": [425.0, 0.0], "yaw_color_deg": 0.0,
+                        "yaw_color_trusted": True, "center_span_mm": 0.5,
+                        "yaw_color_span_deg": 0.3, "top_mm": 29.5}
+    calls = {"measure": 0}
+    saved = (s3r.nudge_plan, s3r.capture_frames, s3r.go_move,
+             m3.measure_layer)
+    seq = list(after_seq)
+
+    def fake_measure(*a, **kw):
+        calls["measure"] += 1
+        return seq.pop(0)
+
+    s3r.nudge_plan = lambda *a, **kw: {"kind": "nudge"}
+    s3r.capture_frames = lambda *a, **kw: []
+    s3r.go_move = lambda *a, **kw: 0
+    m3.measure_layer = fake_measure
+    board = types.SimpleNamespace(
+        joints=lambda p: {"name": list(s3r.s2.JOINT_ORDER),
+                          "position": [0.0] * len(s3r.s2.JOINT_ORDER)},
+        exec_plan=lambda *a, **kw: 0)
+    try:
+        row, stop, after = s3r.nudge_after_place(
+            args, board, None, {"yaw_sign": 1.0, "finger_axis_delta_deg": 0.0},
+            None, {"tower": 0.0}, tempfile.mkdtemp(), 1, 6, merged, None,
+            [0.425, 0.0], 0.0, 0.0, None, [(0.42, -0.1, 0.3)] * 2,
+            yaw_target_deg=target_yaw)
+    finally:
+        (s3r.nudge_plan, s3r.capture_frames, s3r.go_move,
+         m3.measure_layer) = saved
+    return row, stop, after, calls["measure"]
+
+
+def _measured(yaw, cx=425.0, cy=0.0, trusted=True):
+    return {"merged": {"found": True, "center_base_mm": [cx, cy],
+                       "yaw_color_deg": yaw, "yaw_color_trusted": trusted,
+                       "center_span_mm": 0.5, "yaw_color_span_deg": 0.3,
+                       "top_mm": 29.5},
+            "consistency": {"ok": True}}
+
+
+@case
+def test_nudge_after_place_stops_when_first_cycle_is_in_gate():
+    """第一次矫正后复测已在 5° 门内 ⇒ **不再碰第二次**（迭代不是固定跑满）。"""
+    row, stop, after, n = _nudge_run([_measured(3.0)])
+    assert stop is None, stop
+    assert n == 1, n
+    assert row["n_cycles"] == 1, row
+    assert row["mode"] == "twisted", row["mode"]
+    assert row["stop_reason"] == "ok", row["stop_reason"]
+    assert row["final_ok"] is True, row
+    assert len(row["cycles"]) == 1, row["cycles"]
+
+
+@case
+def test_nudge_after_place_retries_once_with_new_measurement():
+    """第一次没进 5° 门 ⇒ 按**新实测**再矫正一次，第二次进门店就收工。
+
+    钉住：迭代用的是上一趟的复测（不是最初那份），且顶层 before 仍是
+    「第一次矫正前」（err -6°），不是第二次矫正前的 +6°。
+    """
+    # 目标 6°，第一次矫正后复测 12°（还需再扭 -6°，出 5° 门）⇒ 再来一次，6.2° 收工
+    row, stop, after, n = _nudge_run([_measured(12.0), _measured(6.2)])
+    assert stop is None, stop
+    assert n == 2, n
+    assert row["n_cycles"] == 2, row
+    assert row["stop_reason"] == "ok", row["stop_reason"]
+    assert row["final_ok"] is True, row
+    c1, c2 = row["cycles"]
+    assert c1["cycle"] == 1 and c2["cycle"] == 2, row["cycles"]
+    assert_close(c1["commanded"]["dyaw_deg"], 6.0, 0.5, "第一次指令")
+    assert_close(c2["commanded"]["dyaw_deg"], -6.0, 0.5, "第二次应按复测算")
+    assert_close(row["before"]["yaw_err_deg"], -6.0, 0.5,
+                 "顶层 before 是第一次矫正前")
+    assert_close(row["after"]["yaw_err_deg"], 0.2, 0.5,
+                 "顶层 after 是最后一次复测（6.2 − 6 = +0.2）")
+
+
+@case
+def test_nudge_after_place_stops_iterating_when_budget_exhausted():
+    """两次都没进门店 ⇒ 不再加次数，如实记 still_off，**不冒充过门**。"""
+    row, stop, after, n = _nudge_run([_measured(12.0), _measured(0.4)])
+    assert stop is None, stop
+    assert n == 2, n
+    assert row["n_cycles"] == 2, row
+    assert row["stop_reason"] == "budget", row["stop_reason"]
+    assert row["final_ok"] is False, row
+    assert row["reason"] == "still_off", row["reason"]
+
+
+@case
+def test_nudge_after_place_deadband_wider_than_gate_stops_iterating():
+    """死区比判分门还宽时（--nudge-deadband-yaw-deg 8 > 5）⇒ 死区说了算，第二趟不碰。
+
+    正常配置（死区 1° < 门 5°）下这条分支走不到：门内必然也在死区内，先按
+    ``ok`` 收工了。留它是因为参数可以反过来配，那时**不该再白碰一次块**。
+    """
+    args = types.SimpleNamespace(
+        nudge_axes="yaw", nudge_deadband_yaw_deg=8.0, nudge_deadband_xy_mm=1.0,
+        nudge_max_cycles=2, nudge_lift_mm=2.0, nudge_open_mm=40.0,
+        tower_half_edge=0.02, nudge_bias_comp=None, urdf="x.urdf")
+    # 目标 12°：第一次指令 -12°（> 8，照做）；复测 5° ⇒ 残差 -7°（出 5° 门）
+    # 但 |δ| = 7 ≤ 8 ⇒ 第二趟判死区，不再碰块
+    row, stop, after, n = _nudge_run([_measured(5.0)], args=args,
+                                     target_yaw=12.0)
+    assert n == 1, n
+    assert row["stop_reason"] == "deadband", row["stop_reason"]
+    assert row["n_cycles"] == 1, row
+    assert row["final_ok"] is False, row
+
+
 @case
 def test_applied_nudge_command_zero_only_touches_motion():
     """`--nudge-zero` 只把平移/转角置零，yaw 的朝向基准与实测 δ 本身不动。

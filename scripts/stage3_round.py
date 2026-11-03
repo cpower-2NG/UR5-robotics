@@ -200,8 +200,8 @@ _NUDGE_YAW_SHIFTS = (0.0, -90.0, 90.0, 180.0)
 def nudge_plan(chain, q_start, block, blocks, shift_xy_mm=(0.0, 0.0),
                dyaw_deg=0.0, surface_m=pp.TABLE_PLANE_Z, yaw_block_deg=0.0,
                open_mm=None, survey_tool0=None, tower_box=None,
-               held_half_edge=0.020):
-    """塔顶「只夹不抬」的放置后矫正计划（契约 §3 第 5 项）。
+               held_half_edge=0.020, lift_mm=0.0):
+    """塔顶的放置后矫正计划（契约 §3 第 5 项；`lift_mm` >0 时夹起来再动）。
 
     与 `layer_plan` 同一个收尾（`_finish_plan`），执行器只认这一种 JSON。
     ``block`` 与 `build_nudge` 同形（``cx``/``cy`` mm、``h`` mm 相对脚下那层）；
@@ -228,7 +228,7 @@ def nudge_plan(chain, q_start, block, blocks, shift_xy_mm=(0.0, 0.0),
                 yaw_block_deg=yaw_block_deg, blocks=blocks,
                 open_mm=open_mm, survey_tool0=survey_tool0,
                 tower_box=tower_box, held_half_edge=held_half_edge,
-                yaw_shift_deg=shift)
+                yaw_shift_deg=shift, lift_mm=lift_mm)
         except pp.JointSwingError as exc:
             last = exc
             continue
@@ -250,6 +250,14 @@ NUDGE_YAW_TOL_DEG = 5.0
 #: 平移取 1 mm，落在多帧中心散差（0.6–1.2 mm）量级。<0 或 0 = 关闭死区。
 NUDGE_DEADBAND_YAW_DEG = 1.0
 NUDGE_DEADBAND_XY_MM = 1.0
+#: 夹起来再动的最小一步（mm）。2026-11-03 用户拍板（台账第 224 轮）：
+#: 贴着下层推时表面摩擦是 push gain 不可预测的大头（0.23–1.55、⟂ 最大 5.06 mm）；
+#: 抬起让块脱开摩擦，gain 才可能稳定。取 2 mm —— 足够断开接触，又小到
+#: 落下时的落点扰动可控。**0 = 旧行为「只夹不抬」**。
+NUDGE_LIFT_MM = 2.0
+#: 一轮最多矫正几次（含第一次）。每次都要重新规划 + 退开复测（两视点）。
+#: 2 = 一次矫正后看复测，不过门再来一次；再多就开始和不叠层的代价失衡。
+NUDGE_MAX_CYCLES = 2
 #: 排查「有没有顶动邻块」的半径（mm，离目标格心）。手指半开 50 mm ⇒
 #: 半径 90 mm 已把两指行程全包住。
 NUDGE_NEAR_MM = 90.0
@@ -631,7 +639,8 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
                       round_no, merged, meas, desired_target, surface_mm,
                       surface_m, tower_xy, pair,
                       yaw_target_deg=0.0, yaw_target_src="plan"):
-    """第 k 层放好、量完之后：**只夹不抬**把块推到目标，退开再量一次。
+    """第 k 层放好、量完之后：夹住块**先绕块心扭转、再平移**（必要时抬最小一步），
+    退开复测；仍超门就按新实测再来一次（默认最多 2 次）。
 
     ``yaw_target_deg`` / ``yaw_target_src``：这一层的**朝向目标**与它的来源
     （``plan`` = 计划里的绝对朝向；``color`` = **下一层实测的彩色 yaw**）。
@@ -640,7 +649,9 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
 
     返回 ``(row, stop, after_meas)``。``row`` 落进 ``rec["nudge"]``；
     ``stop`` 非空 ＝ 这一层不能再往上叠（块可能还在指间 / 量不住 / 偏得根本
-    不是「放歪」）；``after_meas`` 是矫正后的完整测量，没矫正就是 ``None``。
+    不是「放歪」）；``after_meas`` 是**最后一次**矫正后的完整测量，一次都没
+    矫正（死区）就是 ``None``。逐次明细在 ``row["cycles"]``，顶层
+    ``before`` / ``after`` / ``final_ok`` 是「矫正前 → 最后一次复测」的合并口径。
 
     为什么超限要**停轮**而不是像入口⑤ 那样跳过继续：入口⑤ 每次是一个独立样本，
     跳过只少一条；主轮里这一层已经在塔上了，偏到 15 mm 说明塔本身出了问题，
@@ -660,10 +671,6 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
         row.update({"mode": "skipped", "reason": "person_review", "detail": why})
         return row, "nudge_pose_review", None
 
-    cmd = nudge_delta(merged["center_base_mm"], yaw_c, target_mm,
-                      yaw_sign=float(scene.get("yaw_sign", 1.0)),
-                      delta_deg=float(scene.get("finger_axis_delta_deg", 0.0)),
-                      target_yaw_deg=float(yaw_target_deg))
     # 死区（2026-11-03 用户拍板，台账第 222 轮）：这次要动的轴都已在门内就别碰块。
     # 判的是**实测偏差** ``cmd``，但只判 ``axes`` 里那几个门：没开的轴不在这次
     # 矫正的范围内，拿它的偏差挡门会让死区在主组（只扭转）永不触发 —— 实测
@@ -672,93 +679,174 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
                            NUDGE_DEADBAND_YAW_DEG) or 0.0)
     db_xy = float(getattr(args, "nudge_deadband_xy_mm",
                           NUDGE_DEADBAND_XY_MM) or 0.0)
-    if nudge_in_deadband(cmd, axes, db_yaw, db_xy):
-        row.update(nudge_row(k, cmd, merged, merged, target_mm,
-                             axes=axes, yaw_target_deg=yaw_target_deg))
-        row.update({"mode": "deadband", "reason": "within_deadband",
-                    "deadband_yaw_deg": round(db_yaw, 3),
-                    "deadband_xy_mm": round(db_xy, 3)})
-        return row, None, None
+    bias = None            # 第一次真要发指令时才算（死区路径要能完全不碰 args）
+    # 迭代（2026-11-03 用户拍板，台账第 224 轮）：每次复测仍超门就按**新实测**
+    # 再来一次（默认最多 2 次）。每次一个完整动作段，代价是一次规划 + 两视点复测。
+    max_cycles = max(1, int(getattr(args, "nudge_max_cycles",
+                                    NUDGE_MAX_CYCLES) or 1))
+    lift_mm = float(getattr(args, "nudge_lift_mm", NUDGE_LIFT_MM) or 0.0)
+    tower_box = None       # 同上，第一次真要发指令时再算
+    cur_merged, cur_meas = merged, meas
+    first_merged, first_applied = None, None
+    cycles, after = [], None
+    stop_why = None
+    for cyc in range(1, max_cycles + 1):
+        sfx = "" if cyc == 1 else str(cyc)
+        # 第 2 次起，用的「矫正前」是上一次的复测：那一份彩色 yaw 可能不可信 ——
+        # 没有可信 yaw 就没法算 δ，更不能拿半套数据硬扭（fail-closed，收工）。
+        if cyc > 1 and (cur_merged.get("yaw_color_deg") is None
+                        or not cur_merged.get("yaw_color_trusted")):
+            stop_why = "no_colour_yaw"
+            break
+        cmd = nudge_delta(cur_merged["center_base_mm"],
+                          cur_merged["yaw_color_deg"], target_mm,
+                          yaw_sign=float(scene.get("yaw_sign", 1.0)),
+                          delta_deg=float(scene.get("finger_axis_delta_deg",
+                                                    0.0)),
+                          target_yaw_deg=float(yaw_target_deg))
+        if nudge_in_deadband(cmd, axes, db_yaw, db_xy):
+            if cyc == 1:
+                row.update(nudge_row(k, cmd, cur_merged, cur_merged, target_mm,
+                                     axes=axes, yaw_target_deg=yaw_target_deg))
+                row.update({"mode": "deadband", "reason": "within_deadband",
+                            "deadband_yaw_deg": round(db_yaw, 3),
+                            "deadband_xy_mm": round(db_xy, 3)})
+                return row, None, None
+            # 矫正过、复测已在门内 ⇒ 收工（不再白碰一次块）
+            stop_why = "deadband"
+            break
+        if first_merged is None:
+            bias = nudge_bias_comp(args.nudge_bias_comp)
+            # 塔体 box 的顶取**被矫正这一块的底面**（= 它脚下那层的表面）：
+            # 块本来就站在箱顶上，箱再往上一分就是「持块包络进箱」误报。
+            # 第 1 层没有塔（``tower_xy`` 为 ``None``）→ 不开护栏。
+            tower_box = pp.tower_box_from(tower_xy, surface_mm,
+                                          args.tower_half_edge)
+        applied = applied_nudge_command(cmd, bias_xy_mm=bias, axes=axes)
+        if first_merged is None:
+            first_merged, first_applied = cur_merged, applied
+            row["commanded"] = {kk: round(float(v), 3)
+                                for kk, v in cmd.items()}
+            row["applied"] = {kk: round(float(v), 3)
+                              for kk, v in applied.items()}
+            if bias is not None:
+                row["bias_comp_mm"] = [round(float(v), 3) for v in bias]
+        if (abs(applied["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
+                or abs(applied["dyaw_deg"]) > pp.NUDGE_MAX_YAW_DEG):
+            if cyc == 1:
+                row.update({"mode": "skipped", "reason": "out_of_range"})
+                return row, "nudge_out_of_range", None
+            stop_why = "out_of_range"
+            break
+        ref = nudge_block_ref(cur_merged, cur_meas)
+        if ref is None:
+            if cyc == 1:
+                row.update({"mode": "skipped", "reason": "centre_mismatch"})
+                return row, "nudge_centre_mismatch", None
+            stop_why = "centre_mismatch"
+            break
+        block, blocks = ref
+        q_start = s2.chain_q(board.joints(
+            os.path.join(cdir, "joints-layer%02d-nudge%s" % (k, sfx))))
+        try:
+            plan = nudge_plan(chain, q_start, block, blocks,
+                              shift_xy_mm=(applied["dx_mm"], applied["dy_mm"]),
+                              dyaw_deg=applied["dyaw_deg"],
+                              surface_m=surface_m,
+                              yaw_block_deg=applied["yaw_from_deg"],
+                              open_mm=float(args.nudge_open_mm),
+                              survey_tool0=pair[0], tower_box=tower_box,
+                              held_half_edge=args.tower_half_edge,
+                              lift_mm=lift_mm)
+        except (pp.PlanError, RuntimeError, ValueError) as exc:
+            if cyc == 1:
+                row.update({"mode": "skipped", "reason": "plan_rejected",
+                            "detail": str(exc)})
+                return row, "nudge_plan_failed", None
+            row["stop_detail"] = str(exc)
+            stop_why = "plan_failed"
+            break
+        plan_path = write_plan(
+            os.path.join(cdir, "plan-layer%02d-nudge%s.json" % (k, sfx)), plan)
+        row["plan"] = os.path.relpath(plan_path, cdir)
+        rc = board.exec_plan(
+            plan_path,
+            os.path.join(cdir, "log-layer%02d-nudge%s.jsonl" % (k, sfx)),
+            go=True)
+        row["exec_rc"] = rc
+        if rc != 0:
+            if cyc == 1:
+                return row, "nudge_exec_rc=%d" % rc, None
+            stop_why = "exec_rc=%d" % rc
+            break
 
-    bias = nudge_bias_comp(args.nudge_bias_comp)
-    applied = applied_nudge_command(cmd, bias_xy_mm=bias, axes=axes)
-    row["commanded"] = {kk: round(float(v), 3) for kk, v in cmd.items()}
-    row["applied"] = {kk: round(float(v), 3) for kk, v in applied.items()}
-    if bias is not None:
-        row["bias_comp_mm"] = [round(float(v), 3) for v in bias]
-    if (abs(applied["d_mm"]) > pp.NUDGE_MAX_SHIFT_MM
-            or abs(applied["dyaw_deg"]) > pp.NUDGE_MAX_YAW_DEG):
-        row.update({"mode": "skipped", "reason": "out_of_range"})
-        return row, "nudge_out_of_range", None
+        # 计划最后一条航点就停在 pair[0]，不用再走一趟。
+        dirs1 = capture_frames(
+            board, os.path.join(cdir, "frame-layer%02d-nudge%s-pose1" % (k, sfx)),
+            "stage3-r%02d-l%02d-np%d" % (round_no, k, cyc),
+            scene.get("terminal_frames", 3))
+        rc2 = go_move(board, chain, cdir,
+                      "layer%02d-nudge%s-pose2" % (k, sfx), pair[1], args.urdf)
+        if rc2 != 0:
+            return row, "nudge_survey_pose2_rc=%d" % rc2, None
+        dirs2 = capture_frames(
+            board, os.path.join(cdir, "frame-layer%02d-nudge%s-pose2" % (k, sfx)),
+            "stage3-r%02d-l%02d-np%dp2" % (round_no, k, cyc),
+            scene.get("terminal_frames", 3))
+        after = m3.measure_layer(
+            [("pose1", dirs1), ("pose2", dirs2)],
+            grid=grid, window_xy_mm=target_mm, layer=k,
+            z_bias_mm=zcal["tower"], block_h_mm=m3.BLOCK_TRUE_H_MM,
+            radius_mm=m3.TOWER_RADIUS_MM, metric_source="after_nudge")
+        after_merged = after.get("merged") or {}
+        if not after_merged.get("found"):
+            row["cycles"] = cycles
+            if not cycles:
+                row.update(nudge_row(k, applied, cur_merged, cur_merged,
+                                     target_mm, axes=axes,
+                                     yaw_target_deg=yaw_target_deg))
+            row.update({"mode": "failed", "reason": "after_missing"})
+            return row, "nudge_after_missing", after
+        nrow = nudge_row(k, applied, cur_merged, after_merged, target_mm,
+                         axes=axes, yaw_target_deg=yaw_target_deg)
+        nrow["cycle"] = cyc
+        nrow["lift_mm"] = round(lift_mm, 3)
+        cycles.append(nrow)
+        row["cycles"] = cycles
+        row["plan"] = os.path.relpath(plan_path, cdir)
+        if (after.get("consistency") or {}).get("ok") is not True:
+            row.update(nudge_row(k, applied, first_merged, after_merged,
+                                 target_mm, axes=axes,
+                                 yaw_target_deg=yaw_target_deg))
+            row["mode"] = "twisted" if axes == ("yaw",) else "nudged"
+            row["n_cycles"] = cyc
+            row["after_pose_reason"] = (after.get("consistency") or {}).get(
+                "reason")
+            return row, "nudge_after_pose_mismatch", after
+        why = nudge_pose_gate(None, after_merged)
+        if why:
+            row.update(nudge_row(k, applied, first_merged, after_merged,
+                                 target_mm, axes=axes,
+                                 yaw_target_deg=yaw_target_deg))
+            row["mode"] = "twisted" if axes == ("yaw",) else "nudged"
+            row["n_cycles"] = cyc
+            row["after_pose_reason"] = why
+            return row, "nudge_after_review", after
+        if nrow["final_ok"] is True:
+            stop_why = "ok"
+            break
+        if nrow["final_ok"] is None:
+            stop_why = "no_colour_yaw"
+            break
+        cur_merged, cur_meas = after_merged, after
 
-    ref = nudge_block_ref(merged, meas)
-    if ref is None:
-        row.update({"mode": "skipped", "reason": "centre_mismatch"})
-        return row, "nudge_centre_mismatch", None
-    block, blocks = ref
-    # 塔体 box 的顶取**被矫正这一块的底面**（= 它脚下那层的表面）：块本来就
-    # 站在箱顶上，箱再往上一分就是「持块包络进箱」误报。第 1 层没有塔
-    # （``tower_xy`` 为 ``None``）→ 不开护栏，与 `build_stack` 同一口径。
-    tower_box = pp.tower_box_from(tower_xy, surface_mm, args.tower_half_edge)
-    q_start = s2.chain_q(board.joints(
-        os.path.join(cdir, "joints-layer%02d-nudge" % k)))
-    try:
-        plan = nudge_plan(chain, q_start, block, blocks,
-                          shift_xy_mm=(applied["dx_mm"], applied["dy_mm"]),
-                          dyaw_deg=applied["dyaw_deg"],
-                          surface_m=surface_m,
-                          yaw_block_deg=applied["yaw_from_deg"],
-                          open_mm=float(args.nudge_open_mm),
-                          survey_tool0=pair[0], tower_box=tower_box,
-                          held_half_edge=args.tower_half_edge)
-    except (pp.PlanError, RuntimeError, ValueError) as exc:
-        row.update({"mode": "skipped", "reason": "plan_rejected",
-                    "detail": str(exc)})
-        return row, "nudge_plan_failed", None
-    plan_path = write_plan(os.path.join(cdir, "plan-layer%02d-nudge.json" % k),
-                           plan)
-    row["plan"] = os.path.relpath(plan_path, cdir)
-    rc = board.exec_plan(plan_path,
-                         os.path.join(cdir, "log-layer%02d-nudge.jsonl" % k),
-                         go=True)
-    row["exec_rc"] = rc
-    if rc != 0:
-        return row, "nudge_exec_rc=%d" % rc, None
-
-    # 计划最后一条航点就停在 pair[0]，不用再走一趟。
-    dirs1 = capture_frames(
-        board, os.path.join(cdir, "frame-layer%02d-nudge-pose1" % k),
-        "stage3-r%02d-l%02d-np1" % (round_no, k),
-        scene.get("terminal_frames", 3))
-    rc2 = go_move(board, chain, cdir, "layer%02d-nudge-pose2" % k, pair[1],
-                  args.urdf)
-    if rc2 != 0:
-        return row, "nudge_survey_pose2_rc=%d" % rc2, None
-    dirs2 = capture_frames(
-        board, os.path.join(cdir, "frame-layer%02d-nudge-pose2" % k),
-        "stage3-r%02d-l%02d-np2" % (round_no, k),
-        scene.get("terminal_frames", 3))
-    after = m3.measure_layer(
-        [("pose1", dirs1), ("pose2", dirs2)],
-        grid=grid, window_xy_mm=target_mm, layer=k,
-        z_bias_mm=zcal["tower"], block_h_mm=m3.BLOCK_TRUE_H_MM,
-        radius_mm=m3.TOWER_RADIUS_MM, metric_source="after_nudge")
-    after_merged = after.get("merged") or {}
-    if not after_merged.get("found"):
-        row.update(nudge_row(k, applied, merged, merged, target_mm,
-                             axes=axes, yaw_target_deg=yaw_target_deg))
-        row.update({"mode": "failed", "reason": "after_missing"})
-        return row, "nudge_after_missing", after
-    row.update(nudge_row(k, applied, merged, after_merged, target_mm,
+    # 顶层对账 = 「矫正前」到「最后一次复测」；逐次明细在 row["cycles"]。
+    row.update(nudge_row(k, first_applied, first_merged,
+                         (after or {}).get("merged") or merged, target_mm,
                          axes=axes, yaw_target_deg=yaw_target_deg))
     row["mode"] = "twisted" if axes == ("yaw",) else "nudged"
-    if (after.get("consistency") or {}).get("ok") is not True:
-        row["after_pose_reason"] = (after.get("consistency") or {}).get("reason")
-        return row, "nudge_after_pose_mismatch", after
-    why = nudge_pose_gate(None, after_merged)
-    if why:
-        row["after_pose_reason"] = why
-        return row, "nudge_after_review", after
+    row["n_cycles"] = len(cycles)
+    row["stop_reason"] = stop_why or "budget"
     return row, None, after
 
 
@@ -1776,6 +1864,12 @@ def main(argv=None):
                     default=NUDGE_DEADBAND_XY_MM,
                     help="死区：实测 xy 偏差 ≤ 此值时算已对齐（默认 1.0 mm；"
                          "0 = 关闭）")
+    ap.add_argument("--nudge-lift-mm", type=float, default=NUDGE_LIFT_MM,
+                    help="夹住后先抬这么多再扭/移（默认 2.0 mm；"
+                         "0 = 旧行为「只夹不抬」）")
+    ap.add_argument("--nudge-max-cycles", type=int, default=NUDGE_MAX_CYCLES,
+                    help="一轮最多矫正几次（含第一次，默认 2）：每次复测仍超门"
+                         "就按新实测再来一次")
     ap.add_argument("--terminal-wait-s", type=float, default=10.0)
     ap.add_argument("--review-ok", action="store_true",
                     help="人眼复核已通过（逐层数值之外必须由人确认）")

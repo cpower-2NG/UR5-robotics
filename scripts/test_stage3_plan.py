@@ -818,8 +818,12 @@ def test_tower_box_from_is_the_single_source():
     assert pp.tower_box_from((0.0, 0.0), None) is None
 
 
-NUDGE_NAMES = ["nudge_approach", "nudge_grip", "nudge_shift", "nudge_twist",
+NUDGE_NAMES = ["nudge_approach", "nudge_grip", "nudge_twist", "nudge_shift",
                "nudge_release", "nudge_retreat", "nudge_survey"]
+#: 抬最小一步（lift_mm > 0）时多出来的两段
+NUDGE_LIFT_NAMES = ["nudge_approach", "nudge_grip", "nudge_lift",
+                    "nudge_twist", "nudge_shift", "nudge_lower",
+                    "nudge_release", "nudge_retreat", "nudge_survey"]
 
 
 def nudge_block():
@@ -830,7 +834,7 @@ def nudge_block():
 
 @case
 def test_nudge_plan_geometry(chain):
-    """矫正计划：先对齐块心、不抬升、平移到 δ、原地转到 δyaw。"""
+    """矫正计划：对齐块心 → 先绕块心扭转 → 平移到 δ；lift=0 时不抬。"""
     blocks, cand, q0 = scene(chain)
     bx = nudge_block()
     dx, dy, dyaw = 3.0, -2.0, 4.0
@@ -840,30 +844,34 @@ def test_nudge_plan_geometry(chain):
     assert [w["name"] for w in wps] == NUDGE_NAMES, [w["name"] for w in wps]
     assert len(checks) == len(wps)
     assert meta["kind"] == "nudge"
+    assert meta["lift_mm"] == 0.0, meta["lift_mm"]
 
     by = {w["name"]: w for w in wps}
     x0, y0 = bx["cx"] / 1000.0, bx["cy"] / 1000.0
-    # 1) 进/抓都在**实测块心**上；平移后落在 δ 的终点
+    # 1) 进/抓都在**实测块心**上；**扭转也在块心**上（先扭后移，
+    #    旧序列把扭转放在平移之后、绕的是移动前的块心）
     za, zg = meta["approach_z"], meta["grip_z"]
     for n, z in (("nudge_approach", za), ("nudge_grip", zg)):
         pe, _ = pp.pose_residual(chain, by[n]["q"], (x0, y0, z), 1.5)
         assert pe < 0.1, "%s 没对准块心：%.3f mm" % (n, pe)
-    for n, z in (("nudge_shift", zg), ("nudge_twist", zg),
-                 ("nudge_release", zg), ("nudge_retreat", za)):
+    pe, _ = pp.pose_residual(chain, by["nudge_twist"]["q"], (x0, y0, zg), 5.5)
+    assert pe < 0.1, "twist 不在块心上（先扭后移要求绕块心）：%.3f mm" % pe
+    for n, z in (("nudge_shift", zg), ("nudge_release", zg),
+                 ("nudge_retreat", za)):
         pe, _ = pp.pose_residual(chain, by[n]["q"],
-                                 (x0 + dx / 1000.0, y0 + dy / 1000.0, z), 1.5)
+                                 (x0 + dx / 1000.0, y0 + dy / 1000.0, z), 5.5)
         assert pe < 0.1, "%s 没落在 δ 终点：%.3f mm" % (n, pe)
-    # 2) **不抬**：抓住到松开这一段所有航点同高（这是「只夹不抬」的定义）
+    # 2) lift=0 ⇒ **不抬**：抓住到松开这一段所有航点同高（旧行为可原样退回）
     def z_of(n):
         return float(chain.fk(by[n]["q"])[2, 3])
 
     zs = [z_of(n) for n in ("nudge_grip", "nudge_shift",
                             "nudge_twist", "nudge_release")]
     assert max(zs) - min(zs) < 1e-6, \
-        "抓/移/转/松不在同一高度：%s（会变成抬起来）" % zs
+        "lift=0 时抓/转/移/松必须同高：%s" % zs
     assert z_of("nudge_approach") > z_of("nudge_grip") + 0.03, \
         "进给点必须高过夹持点至少 30 mm"
-    # 3) 转角只发生在 twist 这一步：shift 前仍是原 yaw，之后是 yaw + δ
+    # 3) 转角只发生在 twist 这一步：shift 已是 yaw + δ
     _, re_twist = pp.pose_residual(chain, by["nudge_twist"]["q"],
                                    chain.fk(by["nudge_twist"]["q"])[:3, 3],
                                    5.5)
@@ -878,6 +886,41 @@ def test_nudge_plan_geometry(chain):
                                  + pp.GRASP_CLEARANCE,
                                  pp.GRASP_Z_MIN, pp.GRASP_Z_MAX),
                  1e-9, "夹持高度")
+
+
+@case
+def test_nudge_plan_lifting_order_and_height(chain):
+    """`lift_mm > 0`：夹住后抬这一小段再扭/移，最后放回原高度松开。
+
+    2026-11-03 用户拍板（台账第 224 轮）：抬最小一步让块脱开下层摩擦，
+    push gain 才可能稳定。这里钉三件事：航点顺序、抬升量、以及**落下**
+    回到同一个 grip_z（否则松手高度变了，等于改了放置条件）。
+    """
+    blocks, cand, q0 = scene(chain)
+    bx = nudge_block()
+    wps, checks, meta = pp.build_nudge(
+        chain, q0, bx, shift_xy_mm=(3.0, -2.0), dyaw_deg=4.0,
+        surface_z=PAD_Z, yaw_block_deg=1.5, lift_mm=2.0)
+    assert [w["name"] for w in wps] == NUDGE_LIFT_NAMES, \
+        [w["name"] for w in wps]
+    by = {w["name"]: w for w in wps}
+
+    def z_of(n):
+        return float(chain.fk(by[n]["q"])[2, 3])
+
+    zg = meta["grip_z"]
+    assert_close(meta["lift_mm"], 2.0, 1e-9, "meta.lift_mm")
+    for n in ("nudge_lift", "nudge_twist", "nudge_shift"):
+        assert_close(z_of(n), zg + 0.002, 1e-6,
+                     "%s 应在 grip_z + 2 mm" % n)
+    # 落下回到原高度，松开高度与不抬档一致
+    assert_close(z_of("nudge_lower"), zg, 1e-6, "nudge_lower")
+    assert_close(z_of("nudge_release"), zg, 1e-6, "nudge_release")
+    # 抬起后扭转仍在块心上
+    x0, y0 = bx["cx"] / 1000.0, bx["cy"] / 1000.0
+    pe, _ = pp.pose_residual(chain, by["nudge_twist"]["q"],
+                             (x0, y0, zg + 0.002), 5.5)
+    assert pe < 0.1, "lift 档 twist 不在块心：%.3f mm" % pe
 
 
 @case
