@@ -1153,6 +1153,105 @@ def test_nudge_delta_yaw_quadrant_rotates_approach_only():
 
 
 @case
+def test_nudge_delta_target_yaw_shifts_only_rotation():
+    """`target_yaw_deg` = 块要去的**绝对**朝向；默认 0.0 与旧行为逐位一致。
+
+    目标从 0 挪到 φ，等价于把「要转的量」整体减 sign·φ（mod 90 折最短）。
+    平移三项必须一格不动 —— 目标是朝向，不是位姿。
+    """
+    tgt = [425.0, -114.86]
+    meas = [421.0, -120.0]
+    d0 = e.nudge_delta(meas, 7.0, tgt, yaw_sign=1.0)
+    assert_close(d0["dyaw_deg"], -7.0, 1e-9)
+    assert_close(d0["yaw_to_deg"], 0.0, 1e-9)
+
+    # 目标 3° ⇒ 块只要转 −4°
+    d3 = e.nudge_delta(meas, 7.0, tgt, yaw_sign=1.0, target_yaw_deg=3.0)
+    assert_close(d3["dyaw_deg"], -4.0, 1e-9)
+    assert_close(d3["yaw_to_deg"], 3.0, 1e-9)
+    for k in ("dx_mm", "dy_mm", "d_mm"):
+        assert_close(d3[k], d0[k], 1e-9, k)
+
+    # 实测正好等于目标 ⇒ 不用转
+    d_eq = e.nudge_delta(meas, 3.0, tgt, yaw_sign=1.0, target_yaw_deg=3.0)
+    assert_close(d_eq["dyaw_deg"], 0.0, 1e-9)
+
+    # 折 mod 90：目标 88°、实测 3° ⇒ 差 85° 折成 −5°
+    d_fold = e.nudge_delta(meas, 3.0, tgt, yaw_sign=1.0, target_yaw_deg=88.0)
+    assert_close(d_fold["dyaw_deg"], -5.0, 1e-9)
+
+    # 臂符号反过来：tool0 的转角反号，**块该转的角度不变**
+    dm = e.nudge_delta(meas, 7.0, tgt, yaw_sign=-1.0, target_yaw_deg=3.0)
+    assert_close(dm["dyaw_deg"], 4.0, 1e-9)
+    assert_close(dm["dyaw_block_deg"], -4.0, 1e-9)
+
+    # 带 finger_axis_delta：目标 tool0 角 = sign·target + δ
+    dd = e.nudge_delta(meas, 7.0, tgt, yaw_sign=1.0, delta_deg=2.5,
+                       target_yaw_deg=3.0)
+    assert_close(dd["yaw_to_deg"], 5.5, 1e-9)
+
+
+def _merged_trusted(cx, cy, yaw_color, top=31.5):
+    return {"found": True, "center_base_mm": [cx, cy], "top_mm": top,
+            "yaw_color_deg": yaw_color, "yaw_color_trusted": True}
+
+
+@case
+def test_nudge_yaw_target_first_layer_is_plan_then_follows_layer_below():
+    """第 1 层跟计划（绝对朝向），第 2 层往上跟**下一层实测**；判不了就停轮。
+
+    2026-11-03 用户拍板：nudge 目标不再锚 base 系绝对值，改跟下一层，这样
+    整招不依赖垫子/格线，与判分 ``yaw_rel_deg`` 同口径。变异检验：把 k≥2 的
+    分支退回 ``plan`` ⇒ 第 2、3 条立刻变红。
+    """
+    prev = {"merged": _merged_trusted(425.0, -114.0, 3.5)}
+    assert e.nudge_yaw_target(1, None, 0.0) == (0.0, "plan")
+    assert e.nudge_yaw_target(1, prev, 12.0) == (12.0, "plan"), "第 1 层不看下层"
+    assert e.nudge_yaw_target(2, prev, 0.0) == (3.5, "color")
+    assert e.nudge_yaw_target(5, prev, 0.0) == (3.5, "color")
+
+    # 判不了 ⇒ (None, 原因)，调用方停轮；**不许**退回计划值或深度 yaw
+    none_yaw = {"merged": _merged_trusted(425.0, -114.0, None)}
+    assert e.nudge_yaw_target(2, none_yaw, 0.0) == (None, "no_color_yaw")
+    untrusted = {"merged": dict(_merged_trusted(425.0, -114.0, 3.5),
+                                yaw_color_trusted=False)}
+    assert e.nudge_yaw_target(2, untrusted, 0.0) == (None,
+                                                     "color_yaw_untrusted")
+    # 第 2 层往上没有上一层实测 = 上一层是失败，不是缺省
+    assert e.nudge_yaw_target(2, None, 0.0) == (None, "no_prev_layer")
+    assert e.nudge_yaw_target(2, {"merged": {"found": False}},
+                              0.0) == (None, "no_prev_layer")
+
+
+@case
+def test_nudge_row_judges_against_the_layer_below():
+    """对账的 yaw 残差要按**这一层自己的目标**算，不是按绝对值 0。
+
+    塔已经在 8° 上，下层实测 8°，这层也落在 8.5° ⇒ 相对只差 0.5°，该过门；
+    旧口径（对 0）会判 8.5° 红，把「跟着下层走」的整条逻辑判死。
+    """
+    cmd = e.nudge_delta([421.0, 0.0], 8.5, [425.0, 0.0], target_yaw_deg=8.0)
+    before = _merged(421.0, 0.0, 8.5, top=61.0)
+    after = _merged(424.0, 0.0, 8.5, top=61.0)
+    row = e.nudge_row(1, cmd, before, after, [425.0, 0.0],
+                      axes=("yaw",), yaw_target_deg=8.0)
+    assert row["yaw_target_deg"] == 8.0, row
+    assert_close(row["before"]["yaw_err_deg"], 0.5, 1e-9)
+    assert_close(row["after"]["yaw_err_deg"], 0.5, 1e-9)
+    assert row["final_ok"] is True, row
+
+    # 同一份数据按旧口径（对 0）就是红的 —— 这就是这次改的东西
+    row0 = e.nudge_row(1, cmd, before, after, [425.0, 0.0], axes=("yaw",))
+    assert row0["final_ok"] is False and row0["reason"] == "still_off", row0
+
+    # 相对残差超 5° 照样红（没有放松契约 §4.1）
+    bad = _merged(424.0, 0.0, 14.0, top=61.0)
+    rowb = e.nudge_row(2, cmd, before, bad, [425.0, 0.0],
+                       axes=("yaw",), yaw_target_deg=8.0)
+    assert rowb["final_ok"] is False, rowb
+
+
+@case
 def test_applied_nudge_command_zero_only_touches_motion():
     """`--nudge-zero` 只把平移/转角置零，yaw 的朝向基准与实测 δ 本身不动。
 

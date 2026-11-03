@@ -252,12 +252,18 @@ NUDGE_SELF_MM = 25.0
 
 
 def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
-                yaw_sign=1.0, delta_deg=0.0, yaw_quadrant=0):
+                yaw_sign=1.0, delta_deg=0.0, yaw_quadrant=0,
+                target_yaw_deg=0.0):
     """「目标 − 实测」→ 要下的平移 δ(mm) 与 tool0 转角 δ(°)。纯函数。
 
     ``yaw_sign`` / ``delta_deg`` 与 `stage2_round.yaw_for_arm` **同一套映射**
-    （``tool0_yaw = sign·θ + δ``）；目标块朝向是 0（格线方向），对应的 tool0
-    角正好是 ``δ``。
+    （``tool0_yaw = sign·θ + δ``）；目标块朝向 ``target_yaw_deg``（base 系，
+    单位 °）对应的 tool0 角就是 ``sign·target_yaw_deg + δ``。
+
+    ``target_yaw_deg`` 默认 0.0 = 旧行为（对齐 ``grid.json`` 的格线方向）。
+    主轮从 2026-11-03 起传**下一层实测朝向** —— 判分 `yaw_rel_deg` 本来就是
+    「层 N vs 层 N−1」的相对量，把目标也改成相对量，这一招才不依赖垫子/格线，
+    换场景能复用（台账第 221 轮）。
 
     方块按 **90° 周期**折最短角（`stage2_round.signed_err_mod90` 同口径）：
     方块的正面/侧面互换，转 87° 与转 −3° 是同一件事。`fold_yaw_180` 那一次
@@ -281,7 +287,8 @@ def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
     dy = float(target_xy_mm[1]) - float(measured_xy_mm[1])
     yaw_from = pp.fold_yaw_180(sign * float(measured_yaw_deg) + float(delta_deg)
                                + 90.0 * quad)
-    yaw_to = pp.fold_yaw_180(float(delta_deg))
+    yaw_to = pp.fold_yaw_180(sign * float(target_yaw_deg)
+                             + float(delta_deg))
     dyaw = float(s2.signed_err_mod90(yaw_to, yaw_from))
     return {"dx_mm": dx, "dy_mm": dy, "d_mm": math.hypot(dx, dy),
             "dyaw_deg": dyaw, "dyaw_block_deg": sign * dyaw,
@@ -411,12 +418,16 @@ def applied_nudge_command(cmd, zero=False, bias_xy_mm=None,
 
 def nudge_row(rep, cmd, before, after, target_xy_mm,
               xy_tol_mm=NUDGE_XY_TOL_MM, yaw_tol_deg=NUDGE_YAW_TOL_DEG,
-              axes=("xy", "yaw")):
+              axes=("xy", "yaw"), yaw_target_deg=0.0):
     """一次矫正的前后对账：实走 δ、push gain、带转角、终态过不过门。
 
     ``before`` / ``after`` 是矫正前后的 ``merged``（`stage3_measure` 融合值）。
     **yaw 判据一律走彩色掩码**（契约 §4.2.5），深度 ``yaw_deg`` 只报告：
     两个估计器逐次差 1.43 倍，拿深度当 ``ok`` 会把合格的矫正判红。
+
+    ``yaw_target_deg`` 是这一层的朝向目标（base 系）。默认 0.0 = 对齐格线，
+    与判分旧口径一致；主轮现在传**下一层实测朝向**，与 `stage3_score.py`
+    的 ``yaw_rel_deg``（层 N vs 层 N−1 的彩色 yaw）同口径。
 
     ``ok=None``（``reason="no_colour_yaw"``）= 证明不了，转人评 —— 与
     `stage3_measure.pose_consistency` 同一口径。
@@ -434,8 +445,10 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
 
     bc, ac = centre(before), centre(after)
     by, ay = yaw_color(before), yaw_color(after)
-    yaw_err0 = None if by is None else float(s2.signed_err_mod90(by, 0.0))
-    yaw_err1 = None if ay is None else float(s2.signed_err_mod90(ay, 0.0))
+    yaw_err0 = None if by is None else float(
+        s2.signed_err_mod90(by, float(yaw_target_deg)))
+    yaw_err1 = None if ay is None else float(
+        s2.signed_err_mod90(ay, float(yaw_target_deg)))
     dyaw_act = (None if (by is None or ay is None)
                 else float(s2.signed_err_mod90(ay, by)))
     dyaw_cmd = float(cmd["dyaw_block_deg"])
@@ -475,6 +488,7 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
 
     return {"rep": int(rep),
             "axes": list(axes),
+            "yaw_target_deg": round(float(yaw_target_deg), 3),
             "commanded": {k: round(float(v), 3) for k, v in cmd.items()},
             "before": dict(state(bc, e0, by, yaw_err0),
                            yaw_depth_deg=before.get("yaw_deg"),
@@ -580,8 +594,14 @@ def nudge_block_ref(merged, meas, tol_mm=10.0):
 
 def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
                       round_no, merged, meas, desired_target, surface_mm,
-                      surface_m, tower_xy, pair):
+                      surface_m, tower_xy, pair,
+                      yaw_target_deg=0.0, yaw_target_src="plan"):
     """第 k 层放好、量完之后：**只夹不抬**把块推到目标，退开再量一次。
+
+    ``yaw_target_deg`` / ``yaw_target_src``：这一层的**朝向目标**与它的来源
+    （``plan`` = 计划里的绝对朝向；``color`` = **下一层实测的彩色 yaw**）。
+    主轮从 2026-11-03 起第 2 层往上都传下一层实测朝向 —— 与判分 `yaw_rel_deg`
+    同口径，塔自己跟自己走，不锚在 `grid.json` 那一刻的垫子上。
 
     返回 ``(row, stop, after_meas)``。``row`` 落进 ``rec["nudge"]``；
     ``stop`` 非空 ＝ 这一层不能再往上叠（块可能还在指间 / 量不住 / 偏得根本
@@ -593,7 +613,9 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
     """
     target_mm = [desired_target[0] * 1000.0, desired_target[1] * 1000.0]
     axes = nudge_axes(args)
-    row = {"target_mm": [round(v, 2) for v in target_mm], "axes": list(axes)}
+    row = {"target_mm": [round(v, 2) for v in target_mm], "axes": list(axes),
+           "yaw_target_deg": round(float(yaw_target_deg), 3),
+           "yaw_target_source": str(yaw_target_src)}
     yaw_c = merged.get("yaw_color_deg")
     if yaw_c is None or not merged.get("yaw_color_trusted"):
         row.update({"mode": "skipped", "reason": "no_colour_yaw"})
@@ -605,7 +627,8 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
 
     cmd = nudge_delta(merged["center_base_mm"], yaw_c, target_mm,
                       yaw_sign=float(scene.get("yaw_sign", 1.0)),
-                      delta_deg=float(scene.get("finger_axis_delta_deg", 0.0)))
+                      delta_deg=float(scene.get("finger_axis_delta_deg", 0.0)),
+                      target_yaw_deg=float(yaw_target_deg))
     bias = nudge_bias_comp(args.nudge_bias_comp)
     applied = applied_nudge_command(cmd, bias_xy_mm=bias, axes=axes)
     row["commanded"] = {kk: round(float(v), 3) for kk, v in cmd.items()}
@@ -671,11 +694,12 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
         radius_mm=m3.TOWER_RADIUS_MM, metric_source="after_nudge")
     after_merged = after.get("merged") or {}
     if not after_merged.get("found"):
-        row.update(nudge_row(k, applied, merged, merged, target_mm))
+        row.update(nudge_row(k, applied, merged, merged, target_mm,
+                             axes=axes, yaw_target_deg=yaw_target_deg))
         row.update({"mode": "failed", "reason": "after_missing"})
         return row, "nudge_after_missing", after
     row.update(nudge_row(k, applied, merged, after_merged, target_mm,
-                         axes=axes))
+                         axes=axes, yaw_target_deg=yaw_target_deg))
     row["mode"] = "twisted" if axes == ("yaw",) else "nudged"
     if (after.get("consistency") or {}).get("ok") is not True:
         row["after_pose_reason"] = (after.get("consistency") or {}).get("reason")
@@ -731,6 +755,32 @@ def closed_loop_yaw(prev_merged):
     彩色判不了 ⇒ 返回 ``None``，调用方**停轮**，不偷偷顶替。
     """
     return m3.metric_yaw(prev_merged or {})
+
+
+def nudge_yaw_target(k, prev, plan_yaw_deg):
+    """nudge 这一层的朝向目标 → ``(yaw_deg, 来源)``；判不了给 ``(None, 原因)``。
+
+    **第 1 层**没有下层可跟 ⇒ 用计划里的绝对朝向（``plan``，即格线方向）。
+    **第 2 层往上**一律跟**下一层实测**（`closed_loop_yaw`，彩色掩码那一路，
+    与判分同源）—— 塔自己跟自己走。
+
+    为什么不锚 base 系绝对值（2026-11-03 用户拍板，台账第 221 轮）：
+    格线纸是松的，垫系 10-27 → 11-03 已转 +3.72°。锚绝对朝向的话，整座塔
+    比**印刷格线**每层偏 ≈3.4°，而判分的 `yaw_rel_deg` 是相对量、看不见这一项；
+    更要紧的是这招换个场景（没垫子、垫子换了）就废。跟下一层走 = 只用相对量，
+    与判分同口径，技巧本身可复用。
+
+    ``prev`` 是上一层最终状态（**矫正后**的 ``merged``）。第 2 层往上缺它 /
+    彩色 yaw 不可信 ⇒ ``None``，调用方**停轮**（不拿深度 yaw、也不拿计划值
+    偷偷顶替，契约 §4.2.5）。离线预检在到达这里之前就 ``continue`` 了，
+    所以「没有 prev」在真机上只可能是上一层没量到 —— 那是失败，不是缺省。
+    """
+    if int(k) <= 1:
+        return float(plan_yaw_deg), "plan"
+    pm = (prev or {}).get("merged") or {}
+    if not pm.get("found"):
+        return None, "no_prev_layer"
+    return closed_loop_yaw(pm)
 
 
 # ---------------------------------------------------------------- 放置偏置补偿
@@ -1166,6 +1216,17 @@ def run_round(args):
                 break
             yaw_place = pyaw
             yaw_place_src = pyaw_src
+        # nudge 的**朝向目标**：第 1 层跟计划，第 2 层往上跟下一层实测
+        # （`nudge_yaw_target`）。在抓帧/发轨迹**之前**就定 —— 下层朝向判不了
+        # 就是这一层不该往上叠，停轮，而不是先叠上去再发现矫正不了。
+        nudge_yaw = nudge_yaw_src = None
+        if nudge_enabled(args):
+            nudge_yaw, nudge_yaw_src = nudge_yaw_target(k, prev, yaw_place)
+            if nudge_yaw is None:
+                stop = "nudge_yaw_%s（第 %d 层，缺可用的下层朝向）" % (
+                    nudge_yaw_src, k)
+                print("!! " + stop)
+                break
         item = dict(item, yaw_place_deg=yaw_place)
         b_applied = applied_bias(doc["bias_history"], args.bias_comp,
                                  seed=b_seed)
@@ -1440,7 +1501,8 @@ def run_round(args):
             nrow, nstop, after = nudge_after_place(
                 args, board, chain, scene, grid, zcal, cdir, k, round_no,
                 merged, meas, desired_target, surface_mm, surface_m,
-                tower_xy, pair)
+                tower_xy, pair,
+                yaw_target_deg=nudge_yaw, yaw_target_src=nudge_yaw_src)
             rec["nudge"] = nrow
             rec["measured_before_nudge"] = meas
             _dump(os.path.join(cdir, "round.json"), doc)
