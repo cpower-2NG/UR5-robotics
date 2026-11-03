@@ -289,6 +289,7 @@ nudge_bias_comp = s3r.nudge_bias_comp
 applied_nudge_command = s3r.applied_nudge_command
 nudge_row = s3r.nudge_row
 nudge_pose_gate = s3r.nudge_pose_gate
+nudge_after_place = s3r.nudge_after_place
 nudge_yaw_target = s3r.nudge_yaw_target
 
 

@@ -1283,6 +1283,32 @@ def test_nudge_in_deadband_skips_only_when_both_axes_are_aligned():
 
 
 @case
+def test_nudge_after_place_deadband_returns_no_after_measure():
+    """死区命中 ⇒ `(row, None, None)`：**没有「矫正后」这一趟测量**。
+
+    这个返回值形状是对调用方的契约：`after is None` = 块没被碰过，矫正前
+    那份实测就是矫正后那份。2026-11-03 第一版主循环无条件
+    `after.get("merged")`，死区一命中就 AttributeError —— 这条用例把它钉住。
+    """
+    args = types.SimpleNamespace(nudge_axes="yaw", nudge_deadband_yaw_deg=1.0,
+                                 nudge_deadband_xy_mm=1.0)
+    merged = {"center_base_mm": [425.0, 0.0], "yaw_color_deg": 0.0,
+              "yaw_color_trusted": True, "center_span_mm": 0.5,
+              "yaw_color_span_deg": 0.3}
+    row, stop, after = e.nudge_after_place(
+        args, None, None, {"yaw_sign": 1.0, "finger_axis_delta_deg": 0.0},
+        None, None, None, 1, 6, merged, None, [0.425, 0.0],
+        0.0, 0.0, [0.425, 0.0], None)
+    assert stop is None, stop
+    assert after is None, after
+    assert row["mode"] == "deadband" and row["reason"] == "within_deadband", row
+    assert row["deadband_yaw_deg"] == 1.0 and row["deadband_xy_mm"] == 1.0, row
+    # 前后同一份实测 ⇒ 记账上「实走 0」，不是拿它冒充一次矫正
+    assert row["before"] == row["after"] or (
+        row["before"]["center_mm"] == row["after"]["center_mm"]), row
+
+
+@case
 def test_applied_nudge_command_zero_only_touches_motion():
     """`--nudge-zero` 只把平移/转角置零，yaw 的朝向基准与实测 δ 本身不动。
 

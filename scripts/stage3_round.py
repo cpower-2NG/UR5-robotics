@@ -1552,16 +1552,28 @@ def run_round(args):
                 print("!! 第 %d 层 nudge 停在：%s —— 不续跑，交给人判读"
                       % (k, nstop))
                 break
-            after_merged = after.get("merged") or {}
-            print("  nudge：误差 %.2f → %.2f mm，yaw %.2f → %.2f°，残余 %s"
-                  % (nrow["before"]["xy_err_mm"], nrow["after"]["xy_err_mm"],
-                     float("nan") if nrow["before"]["yaw_err_deg"] is None
-                     else nrow["before"]["yaw_err_deg"],
-                     float("nan") if nrow["after"]["yaw_err_deg"] is None
-                     else nrow["after"]["yaw_err_deg"],
-                     "过门" if nrow["final_ok"] else nrow["reason"]))
-            rec["measured"] = after
-            meas, merged = after, after_merged
+            if after is None:
+                # 死区：整段夹/扭/松都没发 ⇒ 没有「矫正后」这一趟测量，
+                # `meas` / `merged` / `rec["measured"]` 保持矫正前那一份
+                # （块没被碰过，两者本来就该相同）。
+                print("  nudge：死区（yaw %.2f° ≤ %.2f°、xy %.2f mm ≤ %.2f mm）"
+                      "—— 未碰块"
+                      % (float(nrow["commanded"]["dyaw_deg"]),
+                         float(nrow["deadband_yaw_deg"]),
+                         float(nrow["commanded"]["d_mm"]),
+                         float(nrow["deadband_xy_mm"])))
+            else:
+                after_merged = after.get("merged") or {}
+                print("  nudge：误差 %.2f → %.2f mm，yaw %.2f → %.2f°，残余 %s"
+                      % (nrow["before"]["xy_err_mm"],
+                         nrow["after"]["xy_err_mm"],
+                         float("nan") if nrow["before"]["yaw_err_deg"] is None
+                         else nrow["before"]["yaw_err_deg"],
+                         float("nan") if nrow["after"]["yaw_err_deg"] is None
+                         else nrow["after"]["yaw_err_deg"],
+                         "过门" if nrow["final_ok"] else nrow["reason"]))
+                rec["measured"] = after
+                meas, merged = after, after_merged
         # 这一层落地偏了多少 —— 下一层用它预补偿。超上限按失败停轮，
         # 不拿一个「块掉了 / 没抓住」的大数去把下一层推得更歪。
         bias, bwhy = bias_from_layer(
