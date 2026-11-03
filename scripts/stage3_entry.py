@@ -277,9 +277,12 @@ def tol_offset_mm(lower_center_mm, upper_center_mm):
 # `stage3_round` 里落地过一次（主轮 nudge 组也要用），这里只留别名。
 NUDGE_XY_TOL_MM = s3r.NUDGE_XY_TOL_MM
 NUDGE_YAW_TOL_DEG = s3r.NUDGE_YAW_TOL_DEG
+NUDGE_DEADBAND_YAW_DEG = s3r.NUDGE_DEADBAND_YAW_DEG
+NUDGE_DEADBAND_XY_MM = s3r.NUDGE_DEADBAND_XY_MM
 NUDGE_NEAR_MM = s3r.NUDGE_NEAR_MM
 NUDGE_SELF_MM = s3r.NUDGE_SELF_MM
 nudge_delta = s3r.nudge_delta
+nudge_in_deadband = s3r.nudge_in_deadband
 nearby_blocks = s3r.nearby_blocks
 nudge_push_pred = s3r.nudge_push_pred
 nudge_bias_comp = s3r.nudge_bias_comp

@@ -607,8 +607,13 @@ def fuse_frames(records):
             # 颜色掩码的并行读数（独立于深度）。
             "yaw_color_deg": cyaw,
             "yaw_color_span_deg": cyaw_span,
-            "yaw_color_trusted": bool(found) and all(
-                r.get("yaw_color_trusted") for r in found),
+            # 可信判据 = **至少两帧可信投票**（2026-11-03 用户拍板，台账第 222 轮）。
+            # 原来是 ``all()``：一帧掩码坏掉（外接 31×30 mm、fill 0.81）就让整个
+            # 视点失票，round-05 的 L5 因此把「两视点其实只差约 1°」判成
+            # 「只有一个视点能测到」。数值聚合仍只收可信帧（上面 ``cyaws``），
+            # 所以放宽的是「这个视点算不算投了票」，不是「坏帧的值能不能进均值」。
+            "yaw_color_trusted": bool(found) and (
+                len(cyaws) >= min(2, len(found))),
             # 有几个可信帧真的投了票 / 一共有几帧出了彩色读数（审计用）。
             "yaw_color_votes": [len(cyaws), sum(
                 1 for r in found if r.get("yaw_color_deg") is not None)],

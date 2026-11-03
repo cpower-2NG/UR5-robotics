@@ -1252,6 +1252,37 @@ def test_nudge_row_judges_against_the_layer_below():
 
 
 @case
+def test_nudge_in_deadband_skips_only_when_both_axes_are_aligned():
+    """两轴都在门内才跳过；任一轴超门照旧矫正；门 <=0 = 关闭死区。
+
+    由来（台账第 222 轮，round-05 真机）：夹持循环本身沿 −x 拖 1.07–3.15 mm，
+    与这层要扭多少无关 —— L3 指令只有 +0.005° 仍拖了本轮最大的 3.15 mm。
+    变异检验：把 ``and`` 改成 ``or`` ⇒ 第 3、4 条必红；把 ``<=0`` 的关闭分支
+    删掉 ⇒ 最后两条必红。
+    """
+    tgt = [425.0, 0.0]
+    aligned = e.nudge_delta([425.0, 0.0], 8.0, tgt, target_yaw_deg=8.0)
+    assert e.nudge_in_deadband(aligned) is True, aligned
+
+    # 边界：正好等于门 ⇒ 判在门内（<=，不是 <）
+    edge = e.nudge_delta([425.5, 0.0], 9.0, tgt, target_yaw_deg=8.0)
+    assert e.nudge_in_deadband(edge, yaw_deg=1.0, xy_mm=0.5) is True, edge
+
+    # yaw 超门 ⇒ 哪怕 xy 为 0 也要矫正
+    yaw_late = e.nudge_delta([425.0, 0.0], 9.5, tgt, target_yaw_deg=8.0)
+    assert e.nudge_in_deadband(yaw_late) is False, yaw_late
+
+    # xy 超门 ⇒ 哪怕 yaw 为 0 也要矫正（将来开横移档时用得上）
+    xy_late = e.nudge_delta([426.5, 0.0], 8.0, tgt, target_yaw_deg=8.0)
+    assert e.nudge_in_deadband(xy_late) is False, xy_late
+
+    # 门 <=0 = 关闭，永不判「已在门内」（旧行为可以原样退回）
+    assert e.nudge_in_deadband(aligned, yaw_deg=0.0) is False
+    assert e.nudge_in_deadband(aligned, xy_mm=0.0) is False
+    assert e.nudge_in_deadband(aligned, yaw_deg=-1.0) is False
+
+
+@case
 def test_applied_nudge_command_zero_only_touches_motion():
     """`--nudge-zero` 只把平移/转角置零，yaw 的朝向基准与实测 δ 本身不动。
 

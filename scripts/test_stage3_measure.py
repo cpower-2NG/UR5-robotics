@@ -153,16 +153,28 @@ def test_fuse_frames_ignores_untrusted_color_yaw():
     bad = {"found": True, "frame": "bad", "center_base_mm": [422.0, -115.0],
            "top_mm": 32.0, "yaw_color_deg": 40.0, "yaw_color_trusted": False}
 
+    # 3 帧里 2 帧可信 ⇒ **算这个视点投了票**（2026-11-03 起，台账第 222 轮）；
+    # 但坏帧的值仍不许进均值。
     f = m3.fuse_frames([good(1.0), good(1.2), bad])
-    assert f["yaw_color_trusted"] is False, f          # 有不可信帧 ⇒ 整层不可信
+    assert f["yaw_color_trusted"] is True, f
     assert abs(f["yaw_color_deg"] - 1.1) < 0.2, \
         ("不可信帧污染了均值", f["yaw_color_deg"])
     assert f["yaw_color_votes"] == [2, 3], f["yaw_color_votes"]
+
+    # 2 帧里只有 1 帧可信 ⇒ 投票不足，仍不可信
+    f2 = m3.fuse_frames([good(1.0), bad])
+    assert f2["yaw_color_trusted"] is False, f2
+    assert f2["yaw_color_votes"] == [1, 2], f2["yaw_color_votes"]
+
+    # 单帧视点没有「第二票」可补，仍按那一帧自己的可信度
+    assert m3.fuse_frames([good(1.0)])["yaw_color_trusted"] is True
+    assert m3.fuse_frames([bad])["yaw_color_trusted"] is False
 
     # 全不可信 ⇒ 不给均值（否则 `pose_consistency` 会拿它算出「一致」）
     g = m3.fuse_frames([bad, dict(bad, frame="bad2")])
     assert g["yaw_color_deg"] is None, g
     assert g["yaw_color_votes"] == [0, 2], g["yaw_color_votes"]
+    assert g["yaw_color_trusted"] is False, g
 
 
 @case

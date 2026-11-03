@@ -243,6 +243,13 @@ def nudge_plan(chain, q_start, block, blocks, shift_xy_mm=(0.0, 0.0),
 #: 就按「目标 = 格心 + 0°」算；主轮里同样是这两个数，换成「相对下层实测」。
 NUDGE_XY_TOL_MM = 5.0
 NUDGE_YAW_TOL_DEG = 5.0
+#: 死区：实测偏差**两轴都在内**就不碰块（跳过整整一次夹/扭/松）。
+#: 依据是 round-05 真机（台账第 222 轮）：夹持循环本身沿 −x 拖 1.07–3.15 mm，
+#: 与这一层要扭多少基本无关（L3 只扭 0.005° 却拖了本轮最大的 3.15 mm）。
+#: 门宽取 1°，因为彩色 yaw 的逐帧散差 0.2–0.9°、而判分门是 5°；
+#: 平移取 1 mm，落在多帧中心散差（0.6–1.2 mm）量级。<0 或 0 = 关闭死区。
+NUDGE_DEADBAND_YAW_DEG = 1.0
+NUDGE_DEADBAND_XY_MM = 1.0
 #: 排查「有没有顶动邻块」的半径（mm，离目标格心）。手指半开 50 mm ⇒
 #: 半径 90 mm 已把两指行程全包住。
 NUDGE_NEAR_MM = 90.0
@@ -293,6 +300,24 @@ def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
     return {"dx_mm": dx, "dy_mm": dy, "d_mm": math.hypot(dx, dy),
             "dyaw_deg": dyaw, "dyaw_block_deg": sign * dyaw,
             "yaw_from_deg": float(yaw_from), "yaw_to_deg": float(yaw_to)}
+
+
+def nudge_in_deadband(cmd, yaw_deg=NUDGE_DEADBAND_YAW_DEG,
+                      xy_mm=NUDGE_DEADBAND_XY_MM):
+    """实测偏差是否**两轴都**已在死区内（决定这次要不要碰块）。纯函数。
+
+    ``cmd`` 是 ``nudge_delta`` 的输出（实测 δ，**不是**被 ``axes`` 置零后的
+    applied）。两个门任一 ≤0 = 关闭死区，永不判「已在门内」—— 关闭要能真的
+    退回旧行为，不能靠恰好没有偏差。
+
+    依据（台账第 222 轮，round-05 真机）：夹持循环本身沿 −x 拖 1.07–3.15 mm，
+    与这层要扭多少基本无关；L3 只扭 0.005° 仍拖了本轮最大的 3.15 mm。
+    """
+    y = float(yaw_deg)
+    x = float(xy_mm)
+    if y <= 0.0 or x <= 0.0:
+        return False
+    return abs(float(cmd["dyaw_deg"])) <= y and float(cmd["d_mm"]) <= x
 
 
 def nearby_blocks(blocks, target_xy_mm, radius_mm=NUDGE_NEAR_MM,
@@ -629,6 +654,22 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
                       yaw_sign=float(scene.get("yaw_sign", 1.0)),
                       delta_deg=float(scene.get("finger_axis_delta_deg", 0.0)),
                       target_yaw_deg=float(yaw_target_deg))
+    # 死区（2026-11-03 用户拍板，台账第 222 轮）：两轴都已在门内就别碰块。
+    # 判的是**实测偏差** ``cmd``（不是被 ``axes`` 置零后的 applied）：
+    # 只扭转档里 d_mm 恒为 0，若拿 applied 判，xy 门就成了摆设；反过来，
+    # 将来开横移档时也不会因为「这轴没开」而误跳过另一轴。
+    db_yaw = float(getattr(args, "nudge_deadband_yaw_deg",
+                           NUDGE_DEADBAND_YAW_DEG) or 0.0)
+    db_xy = float(getattr(args, "nudge_deadband_xy_mm",
+                          NUDGE_DEADBAND_XY_MM) or 0.0)
+    if nudge_in_deadband(cmd, db_yaw, db_xy):
+        row.update(nudge_row(k, cmd, merged, merged, target_mm,
+                             axes=axes, yaw_target_deg=yaw_target_deg))
+        row.update({"mode": "deadband", "reason": "within_deadband",
+                    "deadband_yaw_deg": round(db_yaw, 3),
+                    "deadband_xy_mm": round(db_xy, 3)})
+        return row, None, None
+
     bias = nudge_bias_comp(args.nudge_bias_comp)
     applied = applied_nudge_command(cmd, bias_xy_mm=bias, axes=axes)
     row["commanded"] = {kk: round(float(v), 3) for kk, v in cmd.items()}
@@ -1705,6 +1746,14 @@ def main(argv=None):
                          "yaw=只扭转（主流程采用）、xy=只横移（诊断）。"
                          "**主组给这个值 = 打开放后矫正**；不给 = 纯开环，"
                          "与 round-01..03 同条件。")
+    ap.add_argument("--nudge-deadband-yaw-deg", type=float,
+                    default=NUDGE_DEADBAND_YAW_DEG,
+                    help="死区：实测 yaw 偏差 ≤ 此值**且** xy 偏差 ≤ xy 门时，"
+                         "跳过整个夹/扭/松（默认 1.0°；0 = 关闭）")
+    ap.add_argument("--nudge-deadband-xy-mm", type=float,
+                    default=NUDGE_DEADBAND_XY_MM,
+                    help="死区：实测 xy 偏差 ≤ 此值时算已对齐（默认 1.0 mm；"
+                         "0 = 关闭）")
     ap.add_argument("--terminal-wait-s", type=float, default=10.0)
     ap.add_argument("--review-ok", action="store_true",
                     help="人眼复核已通过（逐层数值之外必须由人确认）")
