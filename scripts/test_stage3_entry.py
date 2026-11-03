@@ -1252,34 +1252,43 @@ def test_nudge_row_judges_against_the_layer_below():
 
 
 @case
-def test_nudge_in_deadband_skips_only_when_both_axes_are_aligned():
-    """两轴都在门内才跳过；任一轴超门照旧矫正；门 <=0 = 关闭死区。
+def test_nudge_in_deadband_judges_only_the_axes_being_corrected():
+    """只看**这次要动**的轴：没开的轴超出多远都不挡门；开的轴超门照旧矫正。
 
     由来（台账第 222 轮，round-05 真机）：夹持循环本身沿 −x 拖 1.07–3.15 mm，
     与这层要扭多少无关 —— L3 指令只有 +0.005° 仍拖了本轮最大的 3.15 mm。
-    变异检验：把 ``and`` 改成 ``or`` ⇒ 第 3、4 条必红；把 ``<=0`` 的关闭分支
-    删掉 ⇒ 最后两条必红。
+    只扭转档下实测 xy 偏差 1.39–4.94 mm，**两轴同判的话死区永不触发**，
+    等于没加（2026-11-03 第一版就是这么写的，提交前自检抓出来）。
+
+    变异检验：把「只判 axes 里的轴」改回「两轴同判」⇒ 第 2 条必红；
+    把 ``<=`` 改成 ``<`` ⇒ 第 3 条必红；把 ``<=0`` 的关闭分支删掉 ⇒ 最后三条必红。
     """
     tgt = [425.0, 0.0]
     aligned = e.nudge_delta([425.0, 0.0], 8.0, tgt, target_yaw_deg=8.0)
-    assert e.nudge_in_deadband(aligned) is True, aligned
+    # 只扭转档：xy 偏差 0 不是死的 0，但没开这一轴就不该挡门
+    assert e.nudge_in_deadband(aligned, ("yaw",)) is True, aligned
+    assert e.nudge_in_deadband(aligned, ("xy", "yaw")) is True, aligned
+
+    # 只扭转档 + xy 偏了 4.5 mm（round-05 实测 1.39–4.94 的量级）⇒ yaw 准就跳过
+    far_xy = e.nudge_delta([429.5, 0.0], 8.0, tgt, target_yaw_deg=8.0)
+    assert e.nudge_in_deadband(far_xy, ("yaw",)) is True, far_xy
+    # 同一份偏差，开了横移档 ⇒ xy 超门，必须矫正
+    assert e.nudge_in_deadband(far_xy, ("xy", "yaw")) is False, far_xy
 
     # 边界：正好等于门 ⇒ 判在门内（<=，不是 <）
     edge = e.nudge_delta([425.5, 0.0], 9.0, tgt, target_yaw_deg=8.0)
-    assert e.nudge_in_deadband(edge, yaw_deg=1.0, xy_mm=0.5) is True, edge
+    assert e.nudge_in_deadband(edge, ("xy", "yaw"),
+                               yaw_deg=1.0, xy_mm=0.5) is True, edge
 
-    # yaw 超门 ⇒ 哪怕 xy 为 0 也要矫正
+    # yaw 超门 ⇒ 哪怕 xy 为 0 也要矫正（只扭转档的主要判据）
     yaw_late = e.nudge_delta([425.0, 0.0], 9.5, tgt, target_yaw_deg=8.0)
+    assert e.nudge_in_deadband(yaw_late, ("yaw",)) is False, yaw_late
     assert e.nudge_in_deadband(yaw_late) is False, yaw_late
 
-    # xy 超门 ⇒ 哪怕 yaw 为 0 也要矫正（将来开横移档时用得上）
-    xy_late = e.nudge_delta([426.5, 0.0], 8.0, tgt, target_yaw_deg=8.0)
-    assert e.nudge_in_deadband(xy_late) is False, xy_late
-
     # 门 <=0 = 关闭，永不判「已在门内」（旧行为可以原样退回）
-    assert e.nudge_in_deadband(aligned, yaw_deg=0.0) is False
-    assert e.nudge_in_deadband(aligned, xy_mm=0.0) is False
-    assert e.nudge_in_deadband(aligned, yaw_deg=-1.0) is False
+    assert e.nudge_in_deadband(aligned, ("yaw",), yaw_deg=0.0) is False
+    assert e.nudge_in_deadband(aligned, ("xy", "yaw"), xy_mm=0.0) is False
+    assert e.nudge_in_deadband(aligned, ("xy", "yaw"), yaw_deg=-1.0) is False
 
 
 @case

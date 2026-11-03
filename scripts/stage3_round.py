@@ -302,22 +302,32 @@ def nudge_delta(measured_xy_mm, measured_yaw_deg, target_xy_mm,
             "yaw_from_deg": float(yaw_from), "yaw_to_deg": float(yaw_to)}
 
 
-def nudge_in_deadband(cmd, yaw_deg=NUDGE_DEADBAND_YAW_DEG,
+def nudge_in_deadband(cmd, axes=("xy", "yaw"), yaw_deg=NUDGE_DEADBAND_YAW_DEG,
                       xy_mm=NUDGE_DEADBAND_XY_MM):
-    """实测偏差是否**两轴都**已在死区内（决定这次要不要碰块）。纯函数。
+    """**这次要动的那些轴**，实测偏差是否都已在死区内（决定要不要碰块）。纯函数。
 
-    ``cmd`` 是 ``nudge_delta`` 的输出（实测 δ，**不是**被 ``axes`` 置零后的
-    applied）。两个门任一 ≤0 = 关闭死区，永不判「已在门内」—— 关闭要能真的
-    退回旧行为，不能靠恰好没有偏差。
+    ``cmd`` 是 ``nudge_delta`` 的输出（实测 δ，不是被 ``axes`` 置零后的 applied）。
+    ``axes`` 只筛「判哪几个门」，不筛数值 —— 没开的轴本来就不在这次矫正里，
+    拿它的偏差挡门等于让死区永不触发：主组只扭转档实测 xy 偏差 1.39–4.94 mm
+    （round-05 五层全量），**两轴同判的话一个门都过不去**，加死区等于没加。
+
+    两个门任一 ≤0 = 关闭死区，永不判「已在门内」—— 关闭要能真的退回旧行为，
+    不能靠恰好没有偏差。
 
     依据（台账第 222 轮，round-05 真机）：夹持循环本身沿 −x 拖 1.07–3.15 mm，
     与这层要扭多少基本无关；L3 只扭 0.005° 仍拖了本轮最大的 3.15 mm。
+    而不碰块时这笔拖动不存在 ⇒ 偏差已在噪声量级就该跳过。
     """
     y = float(yaw_deg)
     x = float(xy_mm)
     if y <= 0.0 or x <= 0.0:
         return False
-    return abs(float(cmd["dyaw_deg"])) <= y and float(cmd["d_mm"]) <= x
+    axes = tuple(axes)
+    if "yaw" in axes and abs(float(cmd["dyaw_deg"])) > y:
+        return False
+    if "xy" in axes and float(cmd["d_mm"]) > x:
+        return False
+    return True
 
 
 def nearby_blocks(blocks, target_xy_mm, radius_mm=NUDGE_NEAR_MM,
@@ -654,15 +664,15 @@ def nudge_after_place(args, board, chain, scene, grid, zcal, cdir, k,
                       yaw_sign=float(scene.get("yaw_sign", 1.0)),
                       delta_deg=float(scene.get("finger_axis_delta_deg", 0.0)),
                       target_yaw_deg=float(yaw_target_deg))
-    # 死区（2026-11-03 用户拍板，台账第 222 轮）：两轴都已在门内就别碰块。
-    # 判的是**实测偏差** ``cmd``（不是被 ``axes`` 置零后的 applied）：
-    # 只扭转档里 d_mm 恒为 0，若拿 applied 判，xy 门就成了摆设；反过来，
-    # 将来开横移档时也不会因为「这轴没开」而误跳过另一轴。
+    # 死区（2026-11-03 用户拍板，台账第 222 轮）：这次要动的轴都已在门内就别碰块。
+    # 判的是**实测偏差** ``cmd``，但只判 ``axes`` 里那几个门：没开的轴不在这次
+    # 矫正的范围内，拿它的偏差挡门会让死区在主组（只扭转）永不触发 —— 实测
+    # xy 偏差 1.39–4.94 mm 全过 1 mm 门。
     db_yaw = float(getattr(args, "nudge_deadband_yaw_deg",
                            NUDGE_DEADBAND_YAW_DEG) or 0.0)
     db_xy = float(getattr(args, "nudge_deadband_xy_mm",
                           NUDGE_DEADBAND_XY_MM) or 0.0)
-    if nudge_in_deadband(cmd, db_yaw, db_xy):
+    if nudge_in_deadband(cmd, axes, db_yaw, db_xy):
         row.update(nudge_row(k, cmd, merged, merged, target_mm,
                              axes=axes, yaw_target_deg=yaw_target_deg))
         row.update({"mode": "deadband", "reason": "within_deadband",
