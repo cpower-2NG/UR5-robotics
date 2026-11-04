@@ -30,6 +30,7 @@
   python3 precision_exec.py --plan pick.json --go --upto lift       # 真动
 """
 import argparse
+import glob
 import json
 import math
 import os
@@ -40,6 +41,29 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gripper_action as ga                                       # noqa: E402
+
+
+def resolve_port(explicit=None):
+    """串口：显式参数 > 环境变量 ``AG95_PORT`` > ``/dev/serial/by-id`` 自动选。
+
+    不写死 by-id 名字：那串是转接器的**硬件序列号**，公开仓不许出现
+    （AGENTS §1 红线 3），换一根转接线也会失效。``/dev/ttyUSB*`` 插拔会变号，
+    ``by-id`` 名字不会。
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("AG95_PORT")
+    if env:
+        return env
+    hits = (sorted(glob.glob("/dev/serial/by-id/usb-FTDI_*-if00-port0"))
+            or sorted(glob.glob("/dev/serial/by-id/usb-FTDI_*")))
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise SystemExit("找不到 FTDI 串口（/dev/serial/by-id/usb-FTDI_* 无匹配）"
+                         "—— 插好转接器，或用 AG95_PORT / --gripper-port 指定")
+    raise SystemExit("有多根 FTDI 串口，无法自动选：%s —— 用 AG95_PORT / --gripper-port 指定"
+                     % "  ".join(hits))
 
 ARM = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
@@ -97,8 +121,8 @@ def main():
     ap.add_argument("--settle", type=float, default=1.5, help="每条轨迹完成后再等几秒")
     ap.add_argument("--log", default=None,
                     help="JSONL 日志路径（默认：计划同目录、同名的 .jsonl）")
-    ap.add_argument("--gripper-port",
-                    default="/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0")
+    ap.add_argument("--gripper-port", default=None,
+                    help="串口设备（默认 AG95_PORT，或 by-id 里唯一那根 FTDI）")
     ap.add_argument("--gripper-slave", type=int, default=1)
     ap.add_argument("--gripper-force", type=int, default=50)
     ap.add_argument("--dry-run-gripper", action="store_true",
@@ -313,7 +337,7 @@ def main():
             print("!! 导不进 grasp_planner.gripper（%s）—— source 过 ROS 环境吗？"
                   " 也可以给 --grasp-planner-src" % e)
             raise
-        g = Ag95Gripper(node, port=args.gripper_port, baudrate=115200,
+        g = Ag95Gripper(node, port=resolve_port(args.gripper_port), baudrate=115200,
                         slave_id=args.gripper_slave, force=args.gripper_force,
                         stroke_mm=GRIP_OPEN_MM, open_mm=GRIP_OPEN_MM,
                         close_mm=GRIP_CLOSE_MM,

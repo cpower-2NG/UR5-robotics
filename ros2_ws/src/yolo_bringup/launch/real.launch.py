@@ -33,7 +33,8 @@
 要真夹取，AG-95 的**代码侧已经就绪**（`ag95` 后端的读/写/到位轮询都在
 `grasp_planner/gripper.py`，写路径由 `ag95_dry_run` 卡着，默认只读）。
 **硬件也已在位**（2026-10-02 复查：FT232R `0403:6001` 在 `/dev/ttyUSB0`，
-推荐的稳定路径是 `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0`；
+推荐的稳定路径是 `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_*-if00-port0`（glob，
+节点展开成唯一设备；by-id 真值含转接器序列号，不进公开仓）；
 `jetson` 已在 `dialout`；`pymodbus` 3.15.0 已装）——
 挡着的是**纪律**：写寄存器（初始化 / 开合）在夹爪装臂上时**等于真机动作**，
 只允许在「**夹爪拆下臂、放工作台、急停在手边**」时写。

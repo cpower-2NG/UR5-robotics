@@ -279,9 +279,11 @@ grasp_planner:
     sim_gripper_barely_moved: 0.02
     # 用 by-id 而不是 /dev/ttyUSB0：ttyUSB* 的编号**随插拔重新分配**，同机上若
     # 再插第二个 USB 串口设备就会**静默**开错口，症状是「夹爪没反应」——
-    # 与 D50/D60 同类。by-id 里的 `AB0P6UEX` 是这颗 **FT232R 的芯片序列号**，
-    # 不可克隆（2026-09-30 板端实测：重插后 ttyUSB 号变了，这条软链不变）。
-    ag95_port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0
+    # 与 D50/D60 同类。by-id 名字里的尾巴是这颗 **FT232R 的芯片序列号**，不可克隆
+    # （2026-09-30 板端实测：重插后 ttyUSB 号变了，这条软链不变），也**属设备身份**，
+    # 公开仓不许写（AGENTS §1 红线 3）⇒ 这里写 glob，节点侧展开成唯一设备
+    # （`gripper.resolve_serial_port`；命中不唯一会报错，不随便挑）。
+    ag95_port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_*-if00-port0
     ag95_baudrate: 115200
     ag95_slave_id: 1
     ag95_force: 50

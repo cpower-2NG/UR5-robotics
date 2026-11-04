@@ -51,6 +51,7 @@
 
 import argparse
 import functools
+import glob
 import inspect
 import sys
 import time
@@ -278,9 +279,24 @@ def _signature_of(client_cls) -> str:
         return "（连签名都读不到）"
 
 
+def _expand_port(port: str) -> str:
+    """把带 ``*`` 的串口路径展开成唯一设备；不含 ``*`` 时原样返回。
+
+    yaml 里写 glob（by-id 名字含转接器硬件序列号，公开仓不许出现，AGENTS §1 红线 3）。
+    命中不唯一就抛错 —— 不做「随便挑一个」。
+    """
+    if not port or "*" not in port:
+        return port
+    hits = sorted(glob.glob(port))
+    if len(hits) == 1:
+        return hits[0]
+    raise SystemExit("串口 glob %s 命中 %d 个设备：%s —— 请用 --port 指定唯一那条"
+                     % (port, len(hits), hits or "（无匹配，适配件插上了吗）"))
+
+
 def _make_client(ModbusSerialClient, port: str, baudrate: int, timeout: float):
     """造一个 RTU 客户端。**不 connect**，由调用点决定何时开串口。"""
-    return ModbusSerialClient(port=port, baudrate=baudrate, bytesize=8,
+    return ModbusSerialClient(port=_expand_port(port), baudrate=baudrate, bytesize=8,
                               parity="N", stopbits=1, timeout=timeout)
 
 

@@ -33,6 +33,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import redirect_stdout
@@ -275,6 +276,31 @@ def main() -> int:
     check("两处读调用都用探测出来的从站号参数名（**{kw: slave}）",
           len(read_calls) == 2 and all("**{kw: slave}" in ln for ln in read_calls),
           f"实际 {len(read_calls)} 处：{[ln.strip() for ln in read_calls]}")
+
+    # ---- 1c. 串口 glob 展开 ----------------------------------------------
+    # by-id 名字里带转接器**硬件序列号**（公开仓不许写，AGENTS §1 红线 3），
+    # 所以 yaml/脚本里只准写 glob。展开必须「唯一命中才开」，多个命中要报错 ——
+    # 随便挑一个正是 by-id 要防的静默开错口。
+    print("\n[1c] 串口 glob：唯一命中才开；不唯一/无命中必须报错")
+    with tempfile.TemporaryDirectory() as td:
+        one = os.path.join(td, "usb-FTDI_A-if00-port0")
+        open(one, "w").close()
+        check("唯一命中 → 展开成那一个",
+              PROBE._expand_port(os.path.join(td, "usb-FTDI_*")) == one)
+        check("不含 * → 原样返回", PROBE._expand_port(one) == one)
+        open(os.path.join(td, "usb-FTDI_B-if00-port0"), "w").close()
+        try:
+            PROBE._expand_port(os.path.join(td, "usb-FTDI_*"))
+            multi_ok = False
+        except SystemExit:
+            multi_ok = True
+        check("多个命中 → 报错，不随便挑", multi_ok)
+        try:
+            PROBE._expand_port(os.path.join(td, "usb-NOPE_*"))
+            none_ok = False
+        except SystemExit:
+            none_ok = True
+        check("无命中 → 报错", none_ok)
 
     # ---- 2. 换算：不重复实现 --------------------------------------------
     print("\n[2] 换算复用（不重复实现）")

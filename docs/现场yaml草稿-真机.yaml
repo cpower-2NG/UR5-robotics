@@ -94,7 +94,9 @@ grasp_planner:
     sim_gripper_close: 0.8
     sim_gripper_empty_threshold: 0.75
     sim_gripper_barely_moved: 0.02
-    ag95_port: /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0
+    # 占位符：真值是转接器硬件序列号，属设备身份，不进公开仓（AGENTS §1 红线 3）。
+    # 真值放仓外 ~/.config/ur5-vision-grasp/ 或板上 yaml；脚本侧也可用 AG95_PORT 覆盖。
+    ag95_port: /dev/serial/by-id/usb-FTDI_<adapter-serial>-if00-port0
     ag95_baudrate: 115200
     ag95_slave_id: 1
     ag95_force: 50

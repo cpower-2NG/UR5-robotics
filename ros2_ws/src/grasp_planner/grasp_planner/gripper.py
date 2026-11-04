@@ -99,6 +99,7 @@ AG-95 **不在机械臂的轨迹控制器里**，所以「把夹爪当第 7 个�
 """
 
 import functools
+import glob
 import inspect
 import threading
 import time
@@ -401,7 +402,7 @@ class Ag95Gripper(GripperBackend):
                  dry_run: bool = True, open_is_high: bool = True,
                  speed: Optional[int] = None):
         self._node = node
-        self._port = port
+        self._port = resolve_serial_port(port)
         self._baudrate = baudrate
         self._slave_id = slave_id
         self._force = force
@@ -916,6 +917,28 @@ class NullGripper(GripperBackend):
 
     def describe(self) -> str:
         return f"NullGripper(reason={self._reason!r}, 不驱动夹爪)"
+
+
+def resolve_serial_port(port: str) -> str:
+    """把带 ``*`` 的串口路径展开成唯一设备；不含 ``*`` 时原样返回。
+
+    yaml 里写 glob 而不是写死 by-id 名字：by-id 名字里带转接器**硬件序列号**，
+    公开仓不许出现（AGENTS §1 红线 3），换一根线也会失效。展开必须命中**唯一**
+    一个设备 —— 多个命中就抛错，不做「随便挑一个」（那正是 by-id 要防的静默开错口）。
+    """
+    if not port or "*" not in port:
+        return port
+    hits = sorted(glob.glob(port))
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise RuntimeError(
+            f"串口 glob 没有匹配：{port} —— 适配件插上了吗（`lsusb` 看 0403:6001）"
+        )
+    raise RuntimeError(
+        f"串口 glob 命中 {len(hits)} 个设备，无法自动选：{hits} —— "
+        f"把 ag95_port 写成其中唯一那一条"
+    )
 
 
 def make_gripper(node, backend: str, params: dict, send_joint_trajectory: Callable):

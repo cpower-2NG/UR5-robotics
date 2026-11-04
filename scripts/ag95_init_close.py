@@ -44,15 +44,42 @@ AG-95 **断电就丢初始化**（指示灯转红闪、位置回读归零），�
     python3 scripts/ag95_init_close.py --go       # 只做初始化（两指走到全开）
     python3 scripts/ag95_init_close.py --go --close   # 初始化 + 合拢到 0 mm
 
+串口：默认自动选 `/dev/serial/by-id/usb-FTDI_*-if00-port0`（**唯一一根**时）；
+多根或想指定，用环境变量 `AG95_PORT`。别用 `/dev/ttyUSB0`（插拔会变号）。
+
 退出码：0 成功、2 环境不满足（串口打不开 / 缺 pymodbus / 写失败）。
 """
 import argparse
+import glob
 import inspect
+import os
 import sys
 import time
 
-PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0"
 BAUD, SLAVE = 115200, 1
+
+
+def resolve_port(explicit=None):
+    """串口：显式参数 > 环境变量 ``AG95_PORT`` > ``/dev/serial/by-id`` 自动选。
+
+    不写死 by-id 名字：那串是转接器的**硬件序列号**，公开仓不许出现
+    （AGENTS §1 红线 3），换一根转接线也会失效。``/dev/ttyUSB*`` 插拔会变号，
+    ``by-id`` 名字不会。
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("AG95_PORT")
+    if env:
+        return env
+    hits = (sorted(glob.glob("/dev/serial/by-id/usb-FTDI_*-if00-port0"))
+            or sorted(glob.glob("/dev/serial/by-id/usb-FTDI_*")))
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise SystemExit("找不到 FTDI 串口（/dev/serial/by-id/usb-FTDI_* 无匹配）"
+                         "—— 插好转接器，或用 AG95_PORT / --port 指定")
+    raise SystemExit("有多根 FTDI 串口，无法自动选：%s —— 用 AG95_PORT / --port 指定"
+                     % "  ".join(hits))
 
 REG_INIT = 0x0100       # 初始化命令（只写）
 REG_FORCE = 0x0101      # 力（45–160 N）
@@ -127,6 +154,11 @@ class Gripper:
     @classmethod
     def open_port(cls):
         try:
+            port = resolve_port()
+        except SystemExit as exc:
+            print(f"❌ {exc}")
+            return None
+        try:
             from pymodbus.client import ModbusSerialClient
         except ImportError as exc:
             print(f"❌ 缺 pymodbus（{exc}）—— pip install pymodbus")
@@ -135,10 +167,10 @@ class Gripper:
         if kw is None:
             print("❌ 认不出 pymodbus 的从站关键字")
             return None
-        client = ModbusSerialClient(port=PORT, baudrate=BAUD, timeout=1.0,
+        client = ModbusSerialClient(port=port, baudrate=BAUD, timeout=1.0,
                                     parity="N", stopbits=1, bytesize=8)
         if not client.connect():
-            print(f"❌ 串口打不开：{PORT}")
+            print(f"❌ 串口打不开：{port}")
             return None
         return cls(client, slave_kw=kw)
 

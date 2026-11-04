@@ -111,6 +111,13 @@ PATTERNS = [
      re.compile(r'(?<![0-9A-Fa-f.])[0-9]{13}(?![0-9A-Fa-f])')),
     ('32 位 hex（疑似 machine-id / 秘钥指纹）',
      re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])')),
+    # FTDI 转接器在 /dev/serial/by-id 里的名字带**硬件序列号**（形如
+    # `usb-FTDI_<型号>_<序列号>-if00-port0`）—— 属设备身份（AGENTS §1 红线 3）。
+    # 一律写 glob `usb-FTDI_*` 或环境变量 AG95_PORT。只抓「下划线后 ≥6 位字母数字 +
+    # -ifNN-portN」的形状：型号专属名（`usb-FTDI_FT232R_USB_UART-if00-port0`）和
+    # 占位符 `<adapter-serial>` 都不命中。
+    ('串口 by-id 硬件序列号', re.compile(
+        r'by-id/usb-FTDI_[A-Za-z0-9_.-]*_[A-Za-z0-9]{6,}-if\d+-port\d+')),
 ]
 
 

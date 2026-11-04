@@ -37,12 +37,36 @@
 退出码：0 出了判决、1 有动作失败、2 环境/前置不满足。
 """
 import argparse
+import glob
 import inspect
+import os
 import sys
 import time
 
-PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_AB0P6UEX-if00-port0"
 BAUD, SLAVE = 115200, 1
+
+
+def resolve_port(explicit=None):
+    """串口：显式参数 > 环境变量 ``AG95_PORT`` > ``/dev/serial/by-id`` 自动选。
+
+    不写死 by-id 名字：那串是转接器的**硬件序列号**，公开仓不许出现
+    （AGENTS §1 红线 3），换一根转接线也会失效。``/dev/ttyUSB*`` 插拔会变号，
+    ``by-id`` 名字不会。
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("AG95_PORT")
+    if env:
+        return env
+    hits = (sorted(glob.glob("/dev/serial/by-id/usb-FTDI_*-if00-port0"))
+            or sorted(glob.glob("/dev/serial/by-id/usb-FTDI_*")))
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise SystemExit("找不到 FTDI 串口（/dev/serial/by-id/usb-FTDI_* 无匹配）"
+                         "—— 插好转接器，或用 AG95_PORT / --port 指定")
+    raise SystemExit("有多根 FTDI 串口，无法自动选：%s —— 用 AG95_PORT / --port 指定"
+                     % "  ".join(hits))
 
 REG_INIT = 0x0100        # 初始化命令（只写；写它会做一次全行程自检）
 REG_FORCE = 0x0101       # 力（45–160 N）
@@ -141,7 +165,8 @@ class Gripper:
         return last, time.time() - t0
 
     @classmethod
-    def open_port(cls, port=PORT):
+    def open_port(cls, port=None):
+        port = resolve_port(port)
         try:
             from pymodbus.client import ModbusSerialClient
         except ImportError as exc:
@@ -271,7 +296,8 @@ def run_cold_start(g, args, init_state):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="AG-95 速度寄存器 0x0104 生效性判决")
-    ap.add_argument("--port", default=PORT, help="串口设备")
+    ap.add_argument("--port", default=None,
+                    help="串口设备（默认 AG95_PORT，或 by-id 里唯一那根 FTDI）")
     ap.add_argument("--go", action="store_true",
                     help="**真的写寄存器、动手指**（不带它只读）")
     ap.add_argument("--with-init", action="store_true",
