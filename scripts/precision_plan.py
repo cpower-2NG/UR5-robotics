@@ -64,6 +64,7 @@ A/B 把腕转 180° 仍然抓成功，说明当前方块尺度下朝向不敏感
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -163,6 +164,10 @@ STAGE3_CAMERA_OFFSET = (-0.0319, 0.0851, -0.0247)
 # {300, 331, 365} mm 三档实测后定档。固定 stage2high 不可用（顶面碎、yaw 不可信）。
 STAGE3_SURVEY_DEFAULT_D = 0.331
 STAGE3_SURVEY_SECOND_OFFSET = (0.040, 0.030)   # 第二位姿相对第一位姿的平移（m）
+#: 两视点不一致时补拍位离原位的水平距离（mm）。取 20：量级上足够换开那个视角
+#: 的遮挡/高光（相机到塔顶 331 mm，20 mm ⇒ 视线偏约 3.5°），又小到仍能正对塔顶、
+#: 过得了 ``TOP_FACE_CLEAR_PX`` 画幅闸门。
+STAGE3_RETRY_SHIFT_MM = 20.0
 TOWER_BOX_MARGIN = 0.002       # 塔体 box 半边长 = 块半边长 + 2 mm
 HELD_BLOCK_MARGIN = 0.002      # 持块包络再放的余量
 
@@ -340,6 +345,26 @@ def stage3_survey_tool0(top_z_m, tower_xy_m, distance=STAGE3_SURVEY_DEFAULT_D,
     y = float(tower_xy_m[1]) - dy
     return [(x, y, z),
             (x + second_offset[0], y + second_offset[1], z)]
+
+
+def stage3_survey_retry_tool0(pose_xyz, pair, shift_mm=STAGE3_RETRY_SHIFT_MM):
+    """坏视点的**补拍位**（tool0，m）：原位水平挪 ``shift_mm``，方向垂直于原两视点基线。
+
+    只挪水平、高度不动：相机到塔顶的距离是测量链的标定口径（``distance``），
+    挪 20 mm 时距离只从 331.0 变 331.6 mm，可忽略；而沿基线挪只会靠近/远离
+    另一个视点，换不开那个视角的病根（遮挡 / 高光），所以取垂直方向。
+
+    ``pair`` 传**原始**两视点：基线方向只由它定，与这次是哪个视点坏了无关 ——
+    否则坏的是 pose1 还是 pose2 会得到两个镜像的补拍位，不可复现。
+    基线退化（两点重合）时退回 +x。
+    """
+    dx = float(pair[1][0]) - float(pair[0][0])
+    dy = float(pair[1][1]) - float(pair[0][1])
+    n = math.hypot(dx, dy)
+    ux, uy = (1.0, 0.0) if n < 1e-9 else (-dy / n, dx / n)
+    s = float(shift_mm) / 1000.0
+    return (float(pose_xyz[0]) + ux * s, float(pose_xyz[1]) + uy * s,
+            float(pose_xyz[2]))
 
 
 def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200):

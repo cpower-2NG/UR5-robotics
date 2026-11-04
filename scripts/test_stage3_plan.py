@@ -601,6 +601,115 @@ def test_survey_pose_tracks_tower_top():
         assert_close(p1[2], p0[2], 1e-12, "两个视点必须同高")
 
 
+@case
+def test_retry_pose_is_perpendicular_to_baseline():
+    """补拍位：只挪水平、距离恒为 ``STAGE3_RETRY_SHIFT_MM``、垂直于原两视点基线。
+
+    垂直于基线是为了换开那个视角的病根；沿基线挪只会靠近另一个视点。
+    两个视点各自补拍时方向必须**一致**（都由 pair[0]→pair[1] 定），
+    否则换谁坏会得到镜像的补拍位、不可复现。
+    """
+    pair = pp.stage3_survey_tool0(0.1475, (0.42265, -0.11486))
+    base = (pair[1][0] - pair[0][0], pair[1][1] - pair[0][1])
+    dirs = []
+    for idx in (0, 1):
+        p = pp.stage3_survey_retry_tool0(pair[idx], pair)
+        assert_close(p[2], pair[idx][2], 1e-12, "补拍不改高度")
+        d = (p[0] - pair[idx][0], p[1] - pair[idx][1])
+        assert_close(np.hypot(*d), pp.STAGE3_RETRY_SHIFT_MM / 1000.0, 1e-12,
+                     "水平位移")
+        assert_close(d[0] * base[0] + d[1] * base[1], 0.0, 1e-12,
+                     "必须垂直于基线")
+        dirs.append(d)
+    assert_close(dirs[0][0] * dirs[1][1] - dirs[0][1] * dirs[1][0], 0.0,
+                 1e-15, "两个方向不得镜像")
+    assert dirs[0][0] * dirs[1][0] + dirs[0][1] * dirs[1][1] > 0, dirs
+
+
+def _meas_two_poses(cover1, cover2, reason="pose_mismatch"):
+    """两视点的最小 meas 记录（只填挑坏视点要用的那几项）。"""
+    def pose(name, cov):
+        return {"name": name, "fused": {"found": True},
+                "frames": [{"usable": True, "face_cover": cov}]}
+    return {"poses": [pose("pose1", cover1), pose("pose2", cover2)],
+            "consistency": {"ok": False, "reason": reason}}
+
+
+@case
+def test_retry_bad_pose_replaces_only_the_bad_view():
+    """补拍只换**坏的那个视点**的帧组，好的原样留着（一致性仍比两个独立视点）。"""
+    pair = pp.stage3_survey_tool0(0.1475, (0.42265, -0.11486))
+    meas = _meas_two_poses(0.95, 0.27)
+    frames = [("pose1", ["g1", "g2"]), ("pose2", ["b1", "b2"])]
+    seen = {}
+    o_move, o_cap, o_ml = s3r.go_move, s3r.capture_frames, s3r.m3.measure_layer
+
+    def fake_move(board, chain, cdir, tag, xyz, urdf):
+        seen["move"] = (tag, xyz)
+        return 0
+
+    def fake_cap(board, prefix, tag, n):
+        seen["cap"] = (prefix, n)
+        return ["nr1", "nr2"]
+
+    def fake_ml(pose_frames, **kw):
+        seen["frames"] = pose_frames
+        return {"poses": [], "consistency": {"ok": True, "reason": "ok"},
+                "merged": {"found": True}}
+
+    s3r.go_move, s3r.capture_frames, s3r.m3.measure_layer = (
+        fake_move, fake_cap, fake_ml)
+    try:
+        meas2, row = s3r.retry_bad_pose(
+            None, None, "/tmp/x", 4, 2, pair, frames, meas, {}, "r.urdf",
+            20.0, 3)
+    finally:
+        s3r.go_move, s3r.capture_frames, s3r.m3.measure_layer = o_move, o_cap, o_ml
+
+    assert row["pose"] == "pose2" and row["index"] == 1, row
+    assert_close(seen["move"][1][0],
+                 pp.stage3_survey_retry_tool0(pair[1], pair)[0], 1e-12)
+    assert seen["frames"] == [("pose1", ["g1", "g2"]),
+                              ("pose2", ["nr1", "nr2"])], seen["frames"]
+    assert seen["cap"][1] == 3, seen
+    assert meas2["consistency"]["ok"] is True, meas2
+    assert row["consistency_before"]["reason"] == "pose_mismatch", row
+    assert row["cover_before"] == 0.27, row
+
+
+@case
+def test_retry_bad_pose_skips_without_coverage():
+    """没有 face_cover 依据就不动臂、不假装补拍过（返回原 meas + skipped）。"""
+    pair = pp.stage3_survey_tool0(0.1475, (0.42265, -0.11486))
+    meas = {"poses": [{"name": "pose1", "fused": {"found": True},
+                       "frames": [{"usable": True}]},
+                      {"name": "pose2", "fused": {"found": True},
+                       "frames": [{"usable": True}]}],
+            "consistency": {"ok": False, "reason": "pose_mismatch"}}
+    o_move = s3r.go_move
+
+    def boom(*a, **kw):
+        raise AssertionError("没有依据时不许动臂")
+
+    s3r.go_move = boom
+    try:
+        meas2, row = s3r.retry_bad_pose(
+            None, None, "/tmp/x", 4, 2, pair, [("pose1", []), ("pose2", [])],
+            meas, {}, "r.urdf", 20.0, 3)
+    finally:
+        s3r.go_move = o_move
+    assert meas2 is meas, "没补拍就得原样返回"
+    assert row == {"skipped": "no_face_cover"}, row
+
+
+@case
+def test_retry_pose_shift_is_configurable():
+    """位移是参数（真机若发现 20 mm 仍坏，可只改参数不改几何）。"""
+    pair = pp.stage3_survey_tool0(0.1475, (0.42265, -0.11486))
+    p = pp.stage3_survey_retry_tool0(pair[0], pair, shift_mm=35.0)
+    assert_close(np.hypot(p[0] - pair[0][0], p[1] - pair[0][1]), 0.035, 1e-12)
+
+
 # ---------------------------------------------------------------- 运动学
 def scene(chain):
     """合成拾取场景：一块 29.5 mm，邻块 78 mm 外。"""

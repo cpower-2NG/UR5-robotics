@@ -1205,6 +1205,51 @@ def go_move(board, chain, cdir, tag, xyz, urdf):
                            go=True)
 
 
+def retry_bad_pose(board, chain, cdir, round_no, k, pair, pose_frames,
+                   meas, measure_kwargs, urdf, shift_mm, n_frames):
+    """两视点判红时的**补拍一次**：把深度完整度最低的视点换位重拍，再重测这一层。
+
+    2026-11-04 用户拍板（选项 B）：一个坏视点不该整轮白跑。换的位姿 =
+    原位沿**原两视点基线的垂直方向**平移 ``shift_mm``
+    （``pp.stage3_survey_retry_tool0``）——病根是那个视角上的遮挡/高光，
+    沿基线挪只会靠近另一个视点。只补拍**一个**视点、只补**一次**：换位后
+    仍然不一致就说明不是视角问题，继续补只会拖长真机时间、掩盖真缺陷。
+
+    ``pose_frames`` 是 ``[(视点名, [帧目录, …])]``，与 ``meas["poses"]`` 同序；
+    坏的那个整组替换，好的原样留着 —— 一致性判据因此仍是「两个**独立**视点」。
+
+    返回 ``(meas2, row)``：
+    · 真的补拍了 ⇒ ``meas2`` 是重测结果，``row`` 记原位/新位与两次一致性；
+    · 没有依据挑视点（全都没记 ``face_cover``）⇒ ``(meas, {"skipped": …})``，
+      不动臂、不假装补拍过。
+    移动或抓帧失败 ⇒ 抛 ``RuntimeError``，由调用方 fail-closed 停轮（臂停在
+    探测位，不续跑）。
+    """
+    idx = m3.suspect_pose_index(meas)
+    if idx is None:
+        return meas, {"skipped": "no_face_cover"}
+    name = pose_frames[idx][0]
+    xyz = pp.stage3_survey_retry_tool0(pair[idx], pair, shift_mm=shift_mm)
+    tag = "layer%02d-%s-retry" % (k, name)
+    rc = go_move(board, chain, cdir, tag, xyz, urdf)
+    if rc != 0:
+        raise RuntimeError("pose_retry_move_rc=%d（视点 %s）" % (rc, name))
+    dirs = capture_frames(board, os.path.join(cdir, "frame-%s" % tag),
+                          "stage3-r%02d-l%02d-%s-r" % (round_no, k, name),
+                          n_frames)
+    frames2 = list(pose_frames)
+    frames2[idx] = (name, dirs)
+    meas2 = m3.measure_layer(frames2, **measure_kwargs)
+    row = {"pose": name, "index": idx,
+           "from_base_mm": [round(float(v) * 1000.0, 2) for v in pair[idx]],
+           "to_base_mm": [round(float(v) * 1000.0, 2) for v in xyz],
+           "shift_mm": round(float(shift_mm), 2),
+           "cover_before": m3.pose_coverage(meas["poses"][idx]),
+           "consistency_before": meas.get("consistency"),
+           "consistency_after": meas2.get("consistency")}
+    return meas2, row
+
+
 def run_round(args):
     why = unsupported_group(args.group)
     if why:                      # 放在最前：任何动臂动作之前就拒
@@ -1681,13 +1726,46 @@ def run_round(args):
         dirs2 = capture_frames(board, os.path.join(cdir, "frame-layer%02d-pose2" % k),
                                "stage3-r%02d-l%02d-p2" % (round_no, k),
                                scene.get("terminal_frames", 3))
-        meas = m3.measure_layer(
-            [("pose1", dirs1), ("pose2", dirs2)],
+        pose_frames = [("pose1", dirs1), ("pose2", dirs2)]
+        measure_kwargs = dict(
             grid=grid, window_xy_mm=view_xy, layer=k,
             z_bias_mm=zcal["tower"],
             block_h_mm=m3.BLOCK_TRUE_H_MM,
             radius_mm=m3.TOWER_RADIUS_MM)
+        meas = m3.measure_layer(pose_frames, **measure_kwargs)
         rec["measured"] = meas
+        retried = False
+        # ---- 两视点不一致 ⇒ 补拍一次（2026-11-04 用户拍板，选项 B）。
+        # 只在 `pose_mismatch` 上补：`single_pose` / `no_color_yaw` 是「缺数据」，
+        # 换位救不回来，照样 fail-closed 停轮。
+        if ((meas.get("consistency") or {}).get("reason") == "pose_mismatch"
+                and int(getattr(args, "pose_retry", 1)) >= 1):
+            rec["measured_pre_retry"] = meas
+            try:
+                meas2, rrow = retry_bad_pose(
+                    board, chain, cdir, round_no, k, pair, pose_frames, meas,
+                    measure_kwargs, args.urdf,
+                    float(getattr(args, "pose_retry_shift_mm",
+                                  pp.STAGE3_RETRY_SHIFT_MM)),
+                    scene.get("terminal_frames", 3))
+            except RuntimeError as exc:
+                stop = str(exc)
+                print("!! 第 %d 层补拍失败：%s —— 停在原地，不续跑" % (k, exc))
+                _dump(os.path.join(cdir, "round.json"), doc)
+                break
+            rec["meas_retry"] = rrow
+            meas = meas2
+            retried = bool(rrow.get("to_base_mm"))
+            if retried:
+                print("  补拍：视点 %s 挪到 (%.2f, %.2f, %.2f) mm（cover %s → "
+                      "一致性 %s）"
+                      % (rrow["pose"], rrow["to_base_mm"][0],
+                         rrow["to_base_mm"][1], rrow["to_base_mm"][2],
+                         rrow["cover_before"],
+                         (meas.get("consistency") or {}).get("reason")))
+            else:
+                print("  补拍跳过：%s" % rrow.get("skipped"))
+            rec["measured"] = meas
         _dump(os.path.join(cdir, "round.json"), doc)
         merged = meas.get("merged") or {}
         print("  测量：top=%s mm  center=%s mm  yaw=%s°  "
@@ -1699,7 +1777,8 @@ def run_round(args):
             stop = "measured_missing"
             break
         if (meas.get("consistency") or {}).get("ok") is not True:
-            stop = "pose_mismatch"
+            stop = ("pose_mismatch_after_retry" if retried
+                    else "pose_mismatch")
             break
         # ---- nudge 组：量完之后**只夹不抬**把块推到目标，退开再量一次。
         # 判分与下一层的表面用**矫正后**的实测；b̂ 记账仍用矫正前那次 ——
@@ -1955,6 +2034,14 @@ def main(argv=None):
                     help="一轮最多矫正几次（含第一次，默认 2）：每次复测仍超门"
                          "就按新实测再来一次")
     ap.add_argument("--terminal-wait-s", type=float, default=10.0)
+    ap.add_argument("--pose-retry", type=int, default=1,
+                    help="两视点 `pose_mismatch` 时补拍几次（默认 1）：把深度"
+                         "完整度最低的视点换位重拍再融合；换位仍不一致就停轮。"
+                         "0 = 直接停（round-01..03 的旧行为）")
+    ap.add_argument("--pose-retry-shift-mm", type=float,
+                    default=pp.STAGE3_RETRY_SHIFT_MM,
+                    help="补拍位沿**原两视点基线的垂直方向**挪多少 mm"
+                         "（默认 20；高度不变）")
     ap.add_argument("--review-ok", action="store_true",
                     help="人眼复核已通过（逐层数值之外必须由人确认）")
     ap.add_argument("--review-note", default=None)

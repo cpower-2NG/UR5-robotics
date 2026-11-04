@@ -745,6 +745,70 @@ def test_depth_face_coverage_empty_mask():
     assert r["n_mask_px"] == 0, r
 
 
+# ------------------------------------------------ 挑坏视点（2026-11-04 补拍，选项 B）
+def _pose(name, covers, found=True):
+    return {"name": name, "fused": {"found": found},
+            "frames": [{"usable": True, "face_cover": c} for c in covers]}
+
+
+@case
+def test_suspect_pose_picks_lowest_coverage():
+    """round-03 L2 现场：坏视点 0.26–0.29、好视点 0.63–0.99 ⇒ 指认坏的那个。"""
+    meas = {"poses": [_pose("pose1", [0.95, 0.94, 0.63]),
+                      _pose("pose2", [0.26, 0.29, 0.28])]}
+    assert m3.suspect_pose_index(meas) == 1, meas
+    # 反过来也一样（不是「总是挑 pose2」）：换序后 pose2 落到下标 0
+    meas["poses"].reverse()
+    assert m3.suspect_pose_index(meas) == 0, meas
+
+
+@case
+def test_suspect_pose_ignores_unusable_frames():
+    """被画幅/尺寸闸门剔掉的帧不进完整度均值 —— 否则剔掉的烂帧会误导补拍。"""
+    meas = {"poses": [{"name": "pose1", "fused": {"found": True},
+                       "frames": [{"usable": False, "face_cover": 0.10},
+                                  {"usable": True, "face_cover": 0.95}]},
+                      _pose("pose2", [0.90])]}
+    assert m3.suspect_pose_index(meas) == 1, meas
+
+
+@case
+def test_suspect_pose_none_without_face_cover():
+    """一帧都没记 face_cover ⇒ None（没依据就不挑，调用方停轮而不是瞎动臂）。"""
+    meas = {"poses": [{"name": "pose1", "fused": {"found": True},
+                       "frames": [{"usable": True}]},
+                      {"name": "pose2", "fused": {"found": True},
+                       "frames": [{"usable": True}]}]}
+    assert m3.suspect_pose_index(meas) is None, meas
+    assert m3.suspect_pose_index({"poses": []}) is None
+
+
+@case
+def test_suspect_pose_from_measure_layer():
+    """``measure_layer`` 必须把每帧 ``face_cover`` 带进 ``poses`` —— 补拍靠它挑人。"""
+    orig = m3.measure_frame
+
+    def fake(d, **kw):
+        low = "bad" in d
+        return {"found": True, "frame": os.path.basename(d), "usable": True,
+                "framing": {"clipped": False, "clear_px": 200.0},
+                "size_ratio": 0.98, "size_ok": True,
+                "face_cover": 0.28 if low else 0.95,
+                "depth_color_xy_mm": 8.8 if low else 3.0,
+                "center_base_mm": [422.0, -115.0], "top_mm": 32.0,
+                "yaw_deg": 0.5, "yaw_color_deg": 0.5, "yaw_trusted": True}
+
+    m3.measure_frame = fake
+    try:
+        rec = m3.measure_layer([("pose1", ["good1"]), ("pose2", ["bad1"])],
+                               window_xy_mm=[422.65, -114.86], layer=2)
+    finally:
+        m3.measure_frame = orig
+    assert m3.suspect_pose_index(rec) == 1, rec["poses"]
+    assert_close(m3.pose_coverage(rec["poses"][1]), 0.28, 1e-9, "坏视点均值")
+    assert rec["poses"][1]["frames"][0]["depth_color_xy_mm"] == 8.8
+
+
 # ---------------------------------------------------------------- 跑
 def main():
     failed = 0

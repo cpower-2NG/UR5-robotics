@@ -756,6 +756,40 @@ def pose_consistency(fused_poses, xy_tol_mm=POSE_XY_TOL_MM,
                 ok_color=bool(ok), reason="ok" if ok else "pose_mismatch")
 
 
+def pose_coverage(pose):
+    """一个视点的深度完整度：**可用帧** ``face_cover`` 的均值；没有记录 ⇒ ``None``。
+
+    只看 ``usable`` 的帧 —— 被画幅/尺寸闸门剔掉的帧本来就不参与融合，
+    拿它们的完整度去挑补拍视点会挑错。
+    """
+    covs = [float(f["face_cover"]) for f in (pose.get("frames") or [])
+            if f.get("usable", True) and f.get("face_cover") is not None]
+    return None if not covs else float(np.mean(covs))
+
+
+def suspect_pose_index(meas):
+    """两视点不一致时该重拍哪一个：可用帧深度完整度最低的那个视点（下标）。
+
+    2026-11-04 round-03 L2 的现场：坏视点 ``face_cover`` 0.26–0.29，好帧
+    0.63–0.99 —— 完整度是当时唯一能在**不换位**的前提下指认坏视点的外部证据。
+    没有依据就别挑：一帧都没记到 ``face_cover`` ⇒ ``None``（调用方停轮，
+    不瞎动臂）。
+
+    同值取**靠前**的视点：第一位姿是计划最后一条航点、臂已停在那里，补拍
+    少一次移动。
+    """
+    best = None
+    for i, p in enumerate(meas.get("poses") or []):
+        if not (p.get("fused") or {}).get("found"):
+            continue           # 没测到的视点没资格比较（一致性也轮不到它）
+        cov = pose_coverage(p)
+        if cov is None:
+            continue
+        if best is None or cov < best[1] - 1e-9:
+            best = (i, cov)
+    return None if best is None else int(best[0])
+
+
 def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,
                   z_bias_mm=0.0, block_h_mm=BLOCK_TRUE_H_MM,
                   radius_mm=TOWER_RADIUS_MM, max_h_mm=MAX_H_MM,
