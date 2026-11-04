@@ -1449,6 +1449,9 @@ def run_round(args):
 
         # ---- eye-in-hand：先走到 carry（`to_slot`），量一次塔顶，改目标再放。
         # 第 1 层没有下层塔顶可量（垫面 2 mm < MIN_H_MM），整层走普通路径。
+        # 第二段从 carry 起跑时**爪里已经夹着块**：执行器的起手夹爪自检要跳过
+        # （close 被块挡住必然判「指令没生效」；就算过了，自检的 open 会松手）。
+        holding_block = False
         if args.group == "eih" and k >= 2:
             cm = None
             if args.go:
@@ -1463,6 +1466,7 @@ def run_round(args):
                     print("!! 第 %d 层走到 carry 判红（rc=%d）—— 块还在爪里，"
                           "停在原地" % (k, rc_c))
                     break
+                holding_block = True          # 块现在在爪里了
                 q_carry = s2.chain_q(board.joints(
                     os.path.join(cdir, "joints-layer%02d-carry" % k)))
                 dirs_c = capture_frames(
@@ -1588,7 +1592,7 @@ def run_round(args):
 
         rc = board.exec_plan(plan_path,
                              os.path.join(cdir, "log-layer%02d.jsonl" % k),
-                             go=True)
+                             go=True, holding_block=holding_block)
         rec["exec_rc"] = rc
         _dump(os.path.join(cdir, "round.json"), doc)
         if rc != 0:

@@ -152,7 +152,7 @@ class Board:
             raise SystemExit("拉回来的帧缺 %s" % miss)
 
     def exec_plan(self, plan_local, log_local, go, upto=None, from_=None,
-                  append=False, reset_remote=False):
+                  append=False, reset_remote=False, holding_block=False):
         """跑一份计划。``upto``/``from_`` 把一条计划切成两段跑（例如抓住块之后
         停一下抓帧看它夹在哪，再继续去槽位）。
 
@@ -170,6 +170,8 @@ class Board:
             args += " --upto %s" % upto
         if from_:
             args += " --from %s" % from_
+        if holding_block:
+            args += " --holding-block"
         args += " --go" if go else " --list"
         # 执行器的 JSONL 写在计划旁边；拉回来另存一份到 cycles/NN/
         remote_log = os.path.splitext(remote_plan)[0] + ".jsonl"
