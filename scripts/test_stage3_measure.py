@@ -668,6 +668,83 @@ def test_measure_layer_dropped_records_size_reason():
                                       "size_ratio": 0.50}], rec["frames_dropped"]
 
 
+# ---------------------------------------------------------------- 一致性门（2026-11-04 收紧）
+@case
+def test_pose_xy_tol_is_5mm():
+    """xy 门 10 → 5 mm：4.9 mm 过、5.2 mm 红。归档 85 层 p95=3.07 mm。
+
+    round-03 L2 的 8.79 mm 假一致就是这么漏过去的 —— 5 mm 会当场停轮。
+    """
+    a = {"found": True, "center_base_mm": [422.0, -115.0], "top_mm": 31.0,
+         "yaw_deg": 0.0, "yaw_color_deg": 1.0}
+    near = dict(a, center_base_mm=[426.9, -115.0])          # 4.9 mm
+    assert m3.pose_consistency([a, near])["ok"] is True
+    far = dict(a, center_base_mm=[427.2, -115.0])           # 5.2 mm
+    r = m3.pose_consistency([a, far])
+    assert r["ok"] is False and r["reason"] == "pose_mismatch", r
+    assert r["tol"]["xy_mm"] == 5.0, r["tol"]
+
+
+@case
+def test_pose_z_tol_is_5mm():
+    """z 门同收到 5 mm（归档 85 层最大 2.48 mm）。"""
+    a = {"found": True, "center_base_mm": [422.0, -115.0], "top_mm": 31.0,
+         "yaw_deg": 0.0, "yaw_color_deg": 1.0}
+    assert m3.pose_consistency([a, dict(a, top_mm=35.9)])["ok"] is True
+    r = m3.pose_consistency([a, dict(a, top_mm=36.2)])
+    assert r["ok"] is False, r
+    assert r["tol"]["z_mm"] == 5.0, r["tol"]
+
+
+# ---------------------------------------------------------------- 深度完整度（只记录）
+def _fake_face(right_depth_m=None):
+    """40×40 深度图，中央 8×8 像素是块顶（0.65 m）；``right_depth_m`` 覆盖右半。"""
+    h = w = 40
+    K = [[1000.0, 0.0, 20.0], [0.0, 1000.0, 20.0], [0.0, 0.0, 1.0]]
+    depth = np.full((h, w), 0.65, dtype=np.float32)
+    depth[:8, :] = 0.0                                  # 背景无效
+    depth[32:, :] = 0.0
+    depth[:, :8] = 0.0
+    depth[:, 32:] = 0.0
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[16:24, 16:24] = 1
+    if right_depth_m is not None:
+        d = np.array(depth, copy=True)
+        d[16:24, 20:24] = float(right_depth_m)
+        depth = d
+    frame = {"depth": depth,
+             "K": np.asarray(K, dtype=np.float64),
+             "R_bc": np.eye(3), "t_bc": np.zeros(3)}
+    return frame, mask
+
+
+@case
+def test_depth_face_coverage_full_and_truncated():
+    """整片顶面都有深度 ⇒ cover≈1；右半深度跳到别的高度 ⇒ cover≈0.5。"""
+    frame, mask = _fake_face()
+    blk_ = {"cx": 0.0, "cy": 0.0, "top": 650.0}
+    full = m3.depth_face_coverage(frame, blk_, mask)
+    assert_close(full["cover"], 1.0, 0.01, "整片")
+    assert full["n_mask_px"] == 64 and full["n_depth_px"] == 64, full
+    assert_close(full["depth_color_xy_mm"], 0.0, 0.5, "彩色中心 == 深度中心")
+
+    frame2, _ = _fake_face(right_depth_m=0.80)          # 高 150 mm，出带
+    cut = m3.depth_face_coverage(frame2, blk_, mask)
+    assert_close(cut["cover"], 0.5, 0.01, "右半出带")
+    assert cut["cover"] < full["cover"], (cut, full)
+
+
+@case
+def test_depth_face_coverage_empty_mask():
+    """掩码空 ⇒ cover=None（不制造一个假的 0）。"""
+    frame, _ = _fake_face()
+    empty = np.zeros(frame["depth"].shape, dtype=np.uint8)
+    r = m3.depth_face_coverage(frame, {"cx": 0.0, "cy": 0.0, "top": 650.0},
+                               empty)
+    assert r["cover"] is None and r["depth_color_xy_mm"] is None, r
+    assert r["n_mask_px"] == 0, r
+
+
 # ---------------------------------------------------------------- 跑
 def main():
     failed = 0

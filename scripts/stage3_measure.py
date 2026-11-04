@@ -65,10 +65,17 @@ MIN_H_MM = 15.0
 #: 三层实测塔顶偏差 0.2–2.6 mm、持块与塔顶相距 74–123 mm，6 mm 两边都够开。
 EXPECTED_TOP_TOL_MM = 6.0
 
-#: 两视点一致性门（沿用阶段 2 的 6° / 10 mm；z 同按 10 mm 算位置）。
-POSE_XY_TOL_MM = 10.0
+#: 两视点一致性门。yaw 用阶段 2 的 6°；**xy / z 于 2026-11-04 从 10 mm 收到 5 mm**。
+#:
+#: 为什么收：全归档 85 层「两视点融合值之差」实测 p50=1.13 / p90=2.76 /
+#: p95=3.07 mm，最大 10.76。10 mm 的门等于「照单全收」，round-03 L2 一个
+#: 8.79 mm 的**假一致**就这么放过（见台账第 239 轮）：那个视点的深度簇被拉成
+#: 24.1×32.6 mm、顶高偏 +1.5 mm、中心偏 −8.4 mm，而同一帧彩色掩码完好
+#: （外接 28.1×27.9、|深度中心−彩色中心|=8.8 mm，全归档 p95 只有 4.5 mm）。
+#: 5 mm 在归档上只拦下 2/85 层，且都出自未通过的轮次；z 的最大偏差是 2.48 mm。
+POSE_XY_TOL_MM = 5.0
 POSE_YAW_TOL_DEG = 6.0
-POSE_Z_TOL_MM = 10.0
+POSE_Z_TOL_MM = 5.0
 
 #: 中心格 —— 塔基（用户拍板）。
 TOWER_CELL_IDX = 4
@@ -504,6 +511,54 @@ def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
     return best, diag
 
 
+#: 顶面高度带的半宽（mm）；与 ``top_face_framing`` 的 ``band_mm`` 同一口径。
+FACE_BAND_MM = 3.0
+
+
+def depth_face_coverage(frame, block, mask, band_mm=FACE_BAND_MM):
+    """彩色掩码那一片顶面上，深度支不支持「这些点就在 ``block['top']``」。
+
+    两个**只记录、不判**的量（2026-11-04 加，给未来的闸门攒数据）：
+
+    · ``cover`` = 掩码像素里「有深度、且高度落在 ``top ± band``」的比例；
+    · ``depth_color_xy_mm`` = 掩码质心投到顶面平面后，与深度簇中心的距离。
+
+    为什么不直接拿它当闸门：全归档 510 帧 ``cover`` p01=0.41 / p05=0.63，
+    round-03 那个坏视点是 0.26 —— 分得开，但没有干净的间隔（0.34 那帧两视点
+    反而一致），阈值要等更多轮数据。现在先记下来，判据留给下一轮决策。
+
+    ``mask`` 是**种子色掩码原样**，不是 ``color_rect_yaw`` 走完「贴块异物救援」
+    之后的那份 ⇒ ``face_n_mask_px`` 与 ``yaw_color_n_px`` 可以不相等（救援过才差），
+    那不是 bug。
+    """
+    vs, us = np.nonzero(mask)
+    n_mask = int(us.size)
+    empty = {"n_mask_px": 0, "n_depth_px": 0,
+             "cover": None, "depth_color_xy_mm": None}
+    if n_mask == 0 or frame.get("K") is None:
+        return empty
+    P, pix = gc.backproject(frame["depth"], frame["K"])
+    if len(pix) == 0:
+        return dict(empty, n_mask_px=n_mask)
+    idx = -np.ones(np.shape(frame["depth"]), dtype=np.int64)
+    idx[pix[:, 1], pix[:, 0]] = np.arange(len(pix))
+    hit = idx[vs, us]
+    hit = hit[hit >= 0]
+    Q = (P @ np.asarray(frame["R_bc"], dtype=np.float64).T
+         + np.asarray(frame["t_bc"], dtype=np.float64)) * 1000.0
+    z = Q[hit, 2] if hit.size else np.zeros(0)
+    in_band = int((np.abs(z - float(block["top"])) <= float(band_mm)).sum())
+    xy = _plane_xy_of_mask(frame, mask, float(block["top"]) / 1000.0)
+    dc = None
+    if xy is not None:
+        c = xy.mean(axis=0) * 1000.0
+        dc = round(float(math.hypot(c[0] - float(block["cx"]),
+                                    c[1] - float(block["cy"]))), 2)
+    return {"n_mask_px": n_mask, "n_depth_px": int(hit.size),
+            "cover": round(in_band / n_mask, 3),
+            "depth_color_xy_mm": dc}
+
+
 def measure_frame(frame_dir, grid=None, window_xy_mm=None,
                   z_bias_mm=0.0, block_h_mm=BLOCK_TRUE_H_MM,
                   radius_mm=TOWER_RADIUS_MM, max_h_mm=MAX_H_MM,
@@ -554,6 +609,11 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
         ratio = min(float(v) for v in ext) / float(block_h_mm)
     size_ok = (None if ratio is None
                else bool(SIZE_RATIO_MIN <= ratio <= SIZE_RATIO_MAX))
+    # 深度完整度：只记录（见 `depth_face_coverage`）。它替我们看见「这个视点的
+    # 深度簇其实不成形」——2026-11-04 round-03 L2 pose1 就是 cover=0.26 却一路
+    # 混到融合里去的。
+    cover = depth_face_coverage(frame, top,
+                                color_face_mask(frame, top["uv"]))
     out.update({
         "framing": framing,
         "usable": (not framing["clipped"]) and (size_ok is not False),
@@ -576,6 +636,11 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
         "size_reason": ("" if size_ok is not False else "size_implausible"),
         "yaw_color_fill": round(float(cyaw["fill"]), 3),
         "yaw_color_n_px": int(cyaw["n_pixels"]),
+        # 深度完整度（2026-11-04）：cover / depth_color_xy_mm 只记录、不判。
+        "face_cover": cover["cover"],
+        "face_n_mask_px": cover["n_mask_px"],
+        "face_n_depth_px": cover["n_depth_px"],
+        "depth_color_xy_mm": cover["depth_color_xy_mm"],
         # 判假后走没走「贴块异物救援」、切掉了多少 —— 只为事后审计，不参与判分。
         "yaw_color_reason": cyaw.get("reason", ""),
         "yaw_color_rescue": cyaw.get("rescue"),
