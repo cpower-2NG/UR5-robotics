@@ -78,6 +78,13 @@ ANCHOR_MM = 12.0
 #: pick-02 那块贴底的块（顶面中心 v=702，离底 18 px）从 9 块减到 8 块，
 #: 动了阶段 2 的归档基准。贴着画幅的记录值本来就不可信，先只切掉确定坏的那圈。
 EDGE_MARGIN_PX = 16
+#: 顶面最小外接边长（mm）。**高度阈值挡不住侧高光**：29.5 mm 的块被侧光打出
+#: 一条亮边，会单独成一簇——2026-11-04 第 2 轮实测那块黄块旁边就有这么一片，
+#: 顶面外接只有 2.2×7.8 mm、752 点，但 h 读成 17.9 mm（> min_h_mm=15）混进块表；
+#: 它离真块 16.5 mm，直接把规划闸门逼成「夹爪全开 95 mm 会碰邻块」整轮 plan_failed。
+#: 同一碎片在上一轮读 14.84 mm，被高度阈值挡掉——**它就在阈值上下翻**，只靠 h 不可靠。
+#: 真块顶面即使被挡掉一半也有 ~15 mm（本轮实测 20.1–30.7 mm），取半块宽。
+MIN_BLOCK_EXT_MM = 15.0
 GRASPNET_ROOT = os.path.expanduser("~/robotics/third_party/graspness_unofficial")
 CKPT = os.path.expanduser("~/robotics/third_party/graspnet-baseline/logs/checkpoint-rs.tar")
 
@@ -666,13 +673,33 @@ def select(blocks, cands, anchor_mm=ANCHOR_MM):
     return per
 
 
+def block_plausible(b, min_h_mm=15.0, min_ext_mm=MIN_BLOCK_EXT_MM):
+    """这一簇够不够格当**积木**（进块表、参与邻块间距/抓取规划）。
+
+    两条都过才算：顶面高 ``h >= min_h_mm``、顶面最小外接边 ``>= min_ext_mm``。
+    只有高度一条不够——侧高光碎片的高度就在 15 mm 上下翻（见
+    ``MIN_BLOCK_EXT_MM`` 的注释），而它的外接边只有 2 mm 量级。
+
+    ``ext`` 缺失时**放行**（fail-open）：缺字段是上游改动，不该表现成「所有块消失」；
+    高度阈值仍在。
+    """
+    if float(b.get("h") or 0.0) < float(min_h_mm):
+        return False
+    ext = b.get("ext")
+    if not ext or len(ext) != 2:
+        return True
+    return min(float(e) for e in ext) >= float(min_ext_mm)
+
+
 def analyse(frame_dir, run_infer=True, anchor_mm=ANCHOR_MM, seeds=(0, 1, 2),
             min_h_mm=15.0, legacy=False):
     """量块 + 推理 + 锚定。
 
     ``min_h_mm=15`` 只用来把**不是积木的东西**（8 mm 平板、木板边缘）挡在外面。
     实测积木高 30–33 mm，平板 8.1 mm —— 间隔够宽，不会误伤；被挡掉的仍留在
-    ``skipped_low`` 里，不是悄悄丢掉。
+    ``skipped_low`` 里，不是悄悄丢掉。另加一条顶面外接判据（``MIN_BLOCK_EXT_MM``）：
+    侧高光碎片的高度在 15 mm 上下翻，只有高度挡不住；被它挡掉的留在
+    ``skipped_tiny``。
 
     ``legacy=True`` 走 2026-10-27 之前的聚类（低处桥接会粘簇、大簇被丢），
     只用于 A3 对照，别用来出新数据。
@@ -680,14 +707,18 @@ def analyse(frame_dir, run_infer=True, anchor_mm=ANCHOR_MM, seeds=(0, 1, 2),
     frame = load_frame(frame_dir)
     P, _ = backproject(frame["depth"], frame["K"])
     all_blocks, table_z = find_blocks(frame, legacy=legacy)
-    blocks = [b for b in all_blocks if b["h"] >= min_h_mm]
+    blocks = [b for b in all_blocks if block_plausible(b, min_h_mm)]
     skipped = [b for b in all_blocks if b["h"] < min_h_mm]
+    # 够高但顶面太窄的（侧高光碎片）：也留着当诊断，别静默丢。
+    skipped_tiny = [b for b in all_blocks
+                    if b["h"] >= min_h_mm and not block_plausible(b, min_h_mm)]
     for i, b in enumerate(blocks):
         b["idx"] = i
     result = {"frame": frame_dir, "table_z_mm": table_z * 1000,
               "camera_base_xyz_mm": [float(v * 1000) for v in frame["t_bc"]],
               "n_points": int(len(P)), "blocks": blocks,
-              "skipped_low": skipped, "min_h_mm": min_h_mm,
+              "skipped_low": skipped, "skipped_tiny": skipped_tiny,
+              "min_h_mm": min_h_mm, "min_ext_mm": MIN_BLOCK_EXT_MM,
               "anchor_mm": anchor_mm, "candidates": [], "per_block": [],
               "chosen": None}
     if not run_infer:

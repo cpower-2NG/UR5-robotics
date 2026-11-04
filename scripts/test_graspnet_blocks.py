@@ -300,6 +300,28 @@ def test_select_keeps_the_whole_near_list():
     assert [c["i"] for c in per[0]["near"]] == [2, 3], per[0]["near"]
 
 
+@case
+def test_side_highlight_fragment_is_not_a_block():
+    """2026-11-04 第 2 轮现场：侧高光碎片 h 读到 17.9 mm，只有外接能认出它不是块。
+
+    真值（round-02/candidates.json）：碎片 ext=[2.2, 7.8]、h=17.89、n=752；
+    同帧真块 ext=[29.6, 30.7]、h=29.80。碎片离真块 16.5 mm，混进块表就会触发
+    「夹爪全开 95 mm 会碰邻块」→ 整轮 plan_failed。
+    """
+    frag = {"h": 17.886, "ext": [2.221, 7.833]}
+    real = {"h": 29.800, "ext": [29.568, 30.654]}
+    assert not gc.block_plausible(frag), '侧高光碎片不该算块'
+    assert gc.block_plausible(real), '正常块必须算块'
+    # 同一碎片上一轮读 14.84 mm —— 高度阈值挡掉它靠的是运气，不是判据
+    assert not gc.block_plausible({"h": 14.839, "ext": [27.2, 39.9]})
+    # 缺 ext：fail-open（高度仍把关），不能因为上游少个字段就把所有块清空
+    assert gc.block_plausible({"h": 30.0})
+    assert gc.block_plausible({"h": 30.0, "ext": []})
+    # 半块宽的边界：15.0 放行，14.9 挡掉
+    assert gc.block_plausible({"h": 30.0, "ext": [15.0, 40.0]})
+    assert not gc.block_plausible({"h": 30.0, "ext": [14.9, 40.0]})
+
+
 # ---------------------------------------------------------------- runner
 def main():
     npass = nfail = 0
