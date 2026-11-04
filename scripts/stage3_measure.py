@@ -49,6 +49,12 @@ import stage2_round as s2                                          # noqa: E402
 
 #: 同一批方块的**真高**（用户多次实测 29.5 mm，2026-10 定）。
 BLOCK_TRUE_H_MM = 29.5
+#: 尺寸合理性闸门：**彩色外接短边 / 真高** 的允许区间（2026-11-04 最终版）。
+#: 324 帧好帧实测 0.874–1.036；只露出一半的掩码 ≈0.50 ⇒ 被拒。
+#: **不用深度外接**：同一批好帧深度比值 0.641–1.064，41% 低于 0.85，
+#: 拿它当闸门会把大量好帧误杀。缺彩色外接 ⇒ 不判（见 `measure_frame`）。
+SIZE_RATIO_MIN = 0.85
+SIZE_RATIO_MAX = 1.10
 #: 塔窗半径：中心格心 / 上一层实测中心 ± 这个值。
 TOWER_RADIUS_MM = 50.0
 #: 找块高度上限：5 层 ≈ 150 mm，留到 220 mm 把整根柱子容进来。
@@ -537,9 +543,20 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
     # 也不让带偏的读数混进中位数。
     framing = top_face_framing(frame, top["cx"], top["cy"], top["top"],
                                clear_px=TOP_FACE_CLEAR_PX)
+    # 尺寸合理性：彩色掩码外接的**短边** / 真高。只露出半块时掩码短边≈14.7 mm
+    # （比值≈0.50），中心/顶高都会被这半块带偏，必须整帧拒掉。
+    # 掩码没量到（``ext`` 缺失 / [0,0]）⇒ ``ratio=None``，不判 —— 那不说明
+    # 块尺寸不合理，深度那一路的中心/顶高仍可用。
+    ext = cyaw.get("ext_mm") or []
+    ratio = None
+    if (len(ext) >= 2 and float(block_h_mm) > 0.0
+            and max(float(v) for v in ext) > 0.0):
+        ratio = min(float(v) for v in ext) / float(block_h_mm)
+    size_ok = (None if ratio is None
+               else bool(SIZE_RATIO_MIN <= ratio <= SIZE_RATIO_MAX))
     out.update({
         "framing": framing,
-        "usable": not framing["clipped"],
+        "usable": (not framing["clipped"]) and (size_ok is not False),
         "center_base_mm": [round(float(top["cx"]), 2),
                            round(float(top["cy"]), 2)],
         # 绝对顶高（base 系）—— 层间增量与稳定性都用它，标定偏差在差分里抵消。
@@ -553,6 +570,10 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
                           else round(float(cyaw["yaw_deg"]), 3)),
         "yaw_color_trusted": bool(cyaw["trusted"]),
         "yaw_color_ext_mm": cyaw["ext_mm"],
+        # 尺寸合理性闸门（2026-11-04）：只报告 + 参与 `usable`，不改 yaw 来源。
+        "size_ratio": None if ratio is None else round(float(ratio), 3),
+        "size_ok": size_ok,
+        "size_reason": ("" if size_ok is not False else "size_implausible"),
         "yaw_color_fill": round(float(cyaw["fill"]), 3),
         "yaw_color_n_px": int(cyaw["n_pixels"]),
         # 判假后走没走「贴块异物救援」、切掉了多少 —— 只为事后审计，不参与判分。
@@ -695,11 +716,17 @@ def measure_layer(pose_frames, grid=None, window_xy_mm=None, layer=None,
                                 min_h_mm=min_h_mm,
                                 expected_top_mm=expected_top_mm,
                                 top_tol_mm=top_tol_mm) for d in dirs]
-        # ``usable=False`` = 顶面贴到画幅边（`TOP_FACE_CLEAR_PX`）：中心会偏
-        # +5~+7 mm，**不进融合**。全被剔掉就按「这一视点没测到」处理。
+        # ``usable=False`` = 顶面贴到画幅边（`TOP_FACE_CLEAR_PX`，中心会偏
+        # +5~+7 mm）或尺寸不合理（彩色外接短边/真高 不在 [0.85,1.10]）：
+        # **不进融合**。全被剔掉就按「这一视点没测到」处理。
         kept = [f for f in frames if f.get("usable", True)]
         dropped += [{"pose": name, "frame": f.get("frame"),
-                     "clear_px": (f.get("framing") or {}).get("clear_px")}
+                     "clear_px": (f.get("framing") or {}).get("clear_px"),
+                     # 两种剔除原因同时成立时记 `framing_clipped`（先发生、更硬）。
+                     "reason": ("framing_clipped"
+                                if (f.get("framing") or {}).get("clipped")
+                                else "size_implausible"),
+                     "size_ratio": f.get("size_ratio")}
                     for f in frames if not f.get("usable", True)]
         poses.append({"name": name, "frames": frames,
                       "n_dropped": len(frames) - len(kept),

@@ -549,6 +549,10 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
                     "gain_yaw": (None if yaw_gain is None
                                  else round(yaw_gain, 2))},
             "delta_xy_mm": round(e0 - e1, 2),
+            # 纯记账：nudge 夹/扭/松把块**自己**带走了多少（after − before）。
+            # 不进 `bias_history` —— b̂ 描述开环放置落哪，拖拽是矫正的副作用，
+            # 混在一起会把补偿器教歪（2026-11-04 用户拍板：不补偿只记账）。
+            "drag_xy_mm": [round(dx, 2), round(dy, 2)],
             "final_ok": ok, "reason": reason,
             "tol": {"xy_mm": float(xy_tol_mm),
                     "yaw_deg": float(yaw_tol_deg)}}
@@ -922,6 +926,22 @@ def nudge_yaw_target(k, prev, plan_yaw_deg):
     return closed_loop_yaw(pm)
 
 
+def nudge_target_for_group(group, k, plan_yaw_deg, prev):
+    """按组选 nudge 朝向目标（2026-11-04 最终版）。
+
+    ``open``（最终版主组）：**每层都用计划绝对朝向** ``plan_yaw_deg``，不跟上一层
+    实测。方块 90° 自对称，实测落在 84–86° 时由 ``nudge_delta`` 的 mod-90 折叠
+    折成 ±6°，``nudge_plan`` 再按离当前 tool0 最近的等价写法试 —— 不会为了
+    「跟上一层」把腕子拧 86°（那是 closed 组 86–90° 异常的来源）。
+
+    ``closed`` / ``eih``（收档对照组）：原 ``nudge_yaw_target`` 语义 ——
+    第 1 层计划、第 2 层起跟上一层实测。保留是为了历史命令还能跑、能做对照。
+    """
+    if str(group) == "open":
+        return float(plan_yaw_deg), "plan"
+    return nudge_yaw_target(k, prev, plan_yaw_deg)
+
+
 # ---------------------------------------------------------------- 放置偏置补偿
 #: 偏置上限（mm）。超过它**不是偏置，是失败**（块掉了 / 没抓住 / 塔被撞了），
 #: 按失败停轮，不用它去推下一层 —— 拿一个 30 mm 的「偏置」补偿下一层，
@@ -987,6 +1007,49 @@ def commanded_target_m(desired_m, bias_hist, mode="adaptive", seed=None):
     t = target_with_bias([float(v) * 1000.0 for v in desired_m],
                          bias_hist, mode, seed=seed)
     return [t[0] / 1000.0, t[1] / 1000.0]
+
+
+# ---------------------------------------------------------------- 防倾覆停轮门
+#: 停轮门的相对 xy 上限（mm）。**5 mm 仍是判分门**；10 mm 只回答
+#: 「这座塔还能不能往上叠」—— 超了不是判红，是不该再加重量。
+STOP_GATE_XY_MM = 10.0
+
+
+def stop_gate_xy(merged, prev_merged, layer, slot_mm, limit_mm=STOP_GATE_XY_MM):
+    """这一层放完后的防倾覆停轮门 —— **只看相对 xy，不看 yaw**。
+
+    返回 ``{"pass": bool|None, "xy_rel_mm": float|None, "ref": 来源,
+    "limit_mm": float, "reason": str}``；判不了时 ``pass=None``（前面的门
+    已经停了，不在这里制造新失败）。
+
+    **参考系**：第 1 层参考格心 ``slot_mm`` —— 这不是给第 1 层判红（第 1 层
+    是 baseline，绝对偏差只报告），而是**放第 2 层之前**的预检：第 2 层目标恒为
+    格心，第 1 层若已偏格心 >10 mm，第 2 层相对第 1 层必然也 >10 mm，没必要
+    先叠上去再发现。第 2 层起参考上一层**矫正后**实测中心 —— 那才是「上块重心
+    相对下块支承面」的直接量。
+
+    **为什么 yaw 不设停轮门**：倾覆判据是上层重心投影是否落在下层支承面内。
+    29.5 mm 正方体对 90° 自对称，yaw 误差只旋转接触正方形、几乎不改变支承
+    多边形与重心投影；把重心推出支承面的是水平相对偏移。yaw 仍按 5° 判分。
+    """
+    m = merged or {}
+    if not m.get("found") or m.get("center_base_mm") is None:
+        return {"pass": None, "xy_rel_mm": None,
+                "limit_mm": float(limit_mm), "ref": None,
+                "reason": "measured_missing"}
+    c = m["center_base_mm"]
+    if int(layer) <= 1:
+        ref, ref_src = slot_mm, "grid_center"
+    else:
+        pm = prev_merged or {}
+        if not pm.get("found") or pm.get("center_base_mm") is None:
+            return {"pass": None, "xy_rel_mm": None,
+                    "limit_mm": float(limit_mm), "ref": "previous_layer",
+                    "reason": "previous_missing"}
+        ref, ref_src = pm["center_base_mm"], "previous_layer"
+    d = math.hypot(float(c[0]) - float(ref[0]), float(c[1]) - float(ref[1]))
+    return {"pass": bool(d <= float(limit_mm)), "xy_rel_mm": round(d, 2),
+            "limit_mm": float(limit_mm), "ref": ref_src, "reason": ""}
 
 
 #: 轮间累积的偏置估计（写在 run 目录下）。下一轮默认拿它当种子 ——
@@ -1355,12 +1418,13 @@ def run_round(args):
                 break
             yaw_place = pyaw
             yaw_place_src = pyaw_src
-        # nudge 的**朝向目标**：第 1 层跟计划，第 2 层往上跟下一层实测
-        # （`nudge_yaw_target`）。在抓帧/发轨迹**之前**就定 —— 下层朝向判不了
-        # 就是这一层不该往上叠，停轮，而不是先叠上去再发现矫正不了。
+        # nudge 的**朝向目标**：open 组每层都用计划绝对朝向（`nudge_target_for_group`），
+        # closed/eih 组第 1 层计划、第 2 层往上跟下一层实测。在抓帧/发轨迹**之前**
+        # 就定 —— 下层朝向判不了就是这一层不该往上叠，停轮，而不是先叠上去再发现矫正不了。
         nudge_yaw = nudge_yaw_src = None
         if nudge_enabled(args):
-            nudge_yaw, nudge_yaw_src = nudge_yaw_target(k, prev, yaw_place)
+            nudge_yaw, nudge_yaw_src = nudge_target_for_group(
+                args.group, k, yaw_place, prev)
             if nudge_yaw is None:
                 stop = "nudge_yaw_%s（第 %d 层，缺可用的下层朝向）" % (
                     nudge_yaw_src, k)
@@ -1694,6 +1758,17 @@ def run_round(args):
               % (bias[0], bias[1],
                  "下一层按历史均值预补偿" if args.bias_comp == "adaptive"
                  else "补偿关闭（--bias-comp none），只记账"))
+        # 防倾覆停轮门：放后**最终**（矫正后）测量，相对 xy >10 mm 就不再加层。
+        # 5 mm 判分门在 stage3_score，这里只回答「还能不能往上叠」。
+        gate = stop_gate_xy(merged, (prev or {}).get("merged"), k, slot_mm)
+        rec["stop_gate"] = gate
+        if gate["pass"] is False:
+            stop = ("xy_rel_gate: %.2f mm > %.1f mm（第 %d 层，相对 %s）"
+                    % (gate["xy_rel_mm"], gate["limit_mm"], k,
+                       "格心" if gate["ref"] == "grid_center" else "上一层"))
+            print("!! " + stop + " —— 停轮，不往上叠")
+            _dump(os.path.join(cdir, "round.json"), doc)
+            break
         prev = {"merged": merged,
                 "surface_est_mm": meas.get("surface_est_mm"),
                 "next_surface_est_mm": meas.get("next_surface_est_mm")}

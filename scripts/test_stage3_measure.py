@@ -462,9 +462,19 @@ SYNTH_K = np.array([[600.0, 0.0, 319.5], [0.0, 600.0, 239.5],
 SYNTH_MM_PER_PX = 400.0 / 600.0
 
 
-def _clip_frame(cx_mm, cy_mm, top_mm=100.0):
+def _clip_frame(cx_mm, cy_mm, top_mm=100.0, block_mm=29.5):
+    # 彩色图上真画一块 29.5 mm 的方块：颜色掩码要从块心生长，若整幅同色，
+    # 它会一直长到 ±`COLOR_HALF_PX` 的窗口边（外接 106 mm），尺寸闸门会
+    # 正当地判「这不是一块 29.5 mm 的块」—— 那测的就不是画幅闸门了。
+    img = np.full((480, 640, 3), 90, dtype=np.uint8)
+    u = 319.5 + float(cx_mm) / SYNTH_MM_PER_PX
+    v = 239.5 - float(cy_mm) / SYNTH_MM_PER_PX
+    r_px = int(round((float(block_mm) / SYNTH_MM_PER_PX) / 2.0))
+    ui, vi = int(round(u)), int(round(v))
+    img[max(0, vi - r_px):vi + r_px,
+        max(0, ui - r_px):ui + r_px] = (60, 60, 180)
     return {"depth": np.full((480, 640), 0.4, dtype=np.float64),
-            "color": np.full((480, 640, 3), 90, dtype=np.uint8),
+            "color": img,
             "K": SYNTH_K, "R_bc": np.diag([1.0, -1.0, -1.0]),
             "t_bc": np.array([0.0, 0.0, 0.5]),
             "_block": _clip_block(cx_mm, cy_mm, top_mm)}
@@ -480,10 +490,10 @@ def _clip_block(cx_mm, cy_mm, top_mm=100.0):
             "ext_rect": [29.5, 29.5], "rect_fill": 0.95}
 
 
-def _measure_synth(cx_mm, cy_mm):
+def _measure_synth(cx_mm, cy_mm, block_mm=29.5):
     """把 ``load_frame`` / ``find_blocks`` 换成合成帧，跑真正产测量入口。"""
     import graspnet_candidates as gc
-    fr = _clip_frame(cx_mm, cy_mm)
+    fr = _clip_frame(cx_mm, cy_mm, block_mm=block_mm)
     ob_lf, ob_fb = gc.load_frame, gc.find_blocks
     gc.load_frame = lambda d, **kw: fr
     gc.find_blocks = lambda f, **kw: ([fr["_block"]], 0.0)
@@ -546,7 +556,9 @@ def test_measure_layer_drops_truncated_frames():
     assert rec["merged"]["center_base_mm"][0] == 422.0, \
         ("贴边帧进了融合", rec["merged"])
     assert rec["frames_dropped"] == [{"pose": "pose2", "frame": "p2",
-                                      "clear_px": 0.0}], rec["frames_dropped"]
+                                      "clear_px": 0.0,
+                                      "reason": "framing_clipped",
+                                      "size_ratio": None}], rec["frames_dropped"]
     assert rec["poses"][1]["n_dropped"] == 1, rec["poses"][1]
 
 
@@ -567,6 +579,93 @@ def test_measure_layer_all_frames_dropped_is_fail_closed():
     assert rec["merged"]["found"] is False, ("全贴边还量出了塔顶", rec["merged"])
     assert rec["consistency"]["ok"] is False, rec["consistency"]
     assert len(rec["frames_dropped"]) == 2, rec["frames_dropped"]
+
+
+# ---------------------------------------------------------------- 尺寸合理性闸门
+@case
+def test_size_gate_rejects_half_block():
+    """彩色掩码只剩半块（短边 14.75 mm）⇒ ratio≈0.50，整帧不可用。
+
+    半块的深度中心/顶高都会被那半块带着走，而两视点会一起错，一致性查不出来。
+    """
+    r = _measure_synth(0.0, 0.0, block_mm=14.75)
+    assert r["found"], r
+    assert r["size_ratio"] is not None and r["size_ratio"] < 0.85, r
+    assert r["size_ok"] is False, r
+    assert r["size_reason"] == "size_implausible", r
+    assert r["usable"] is False, ("半块掩码仍被当成可用帧", r)
+
+
+@case
+def test_size_gate_accepts_good_range():
+    """好帧实测比值 0.874–1.036 必须全放行（闸门只看彩色外接短边）。"""
+    orig = m3.color_rect_yaw
+
+    def with_ext(ratio):
+        def fake(frame, block, **kw):
+            e = m3.BLOCK_TRUE_H_MM * float(ratio)
+            return {"yaw_deg": 0.0, "ext_mm": [e, e], "fill": 1.0,
+                    "n_pixels": 4000, "trusted": True, "reason": ""}
+        return fake
+
+    try:
+        for ratio in (0.874, 1.0, 1.036):
+            m3.color_rect_yaw = with_ext(ratio)
+            r = _measure_synth(0.0, 0.0)
+            assert r["size_ok"] is True, (ratio, r["size_ratio"])
+            assert r["size_reason"] == "", (ratio, r)
+            assert r["usable"] is True, (ratio, r)
+    finally:
+        m3.color_rect_yaw = orig
+
+
+@case
+def test_size_gate_missing_ext_keeps_usable():
+    """彩色掩码没量到（``ext_mm=[0,0]``）⇒ 不判尺寸，不连累 depth 中心。"""
+    orig = m3.color_rect_yaw
+
+    def no_colour(frame, block, **kw):
+        return {"yaw_deg": None, "ext_mm": [0.0, 0.0], "fill": 0.0,
+                "n_pixels": 0, "trusted": False, "reason": "掩码/轮廓太小"}
+
+    m3.color_rect_yaw = no_colour
+    try:
+        r = _measure_synth(0.0, 0.0)
+    finally:
+        m3.color_rect_yaw = orig
+    assert r["size_ratio"] is None, r
+    assert r["size_ok"] is None, r
+    assert r["size_reason"] == "", r
+    assert r["usable"] is True, ("缺彩色外接被当成了尺寸失败", r)
+
+
+@case
+def test_measure_layer_dropped_records_size_reason():
+    """尺寸被拒的帧要在 `frames_dropped` 里留下 reason 与比值。"""
+    orig = m3.measure_frame
+
+    def fake(d, **kw):
+        bad = os.path.basename(d) == "p2"
+        return {"found": True, "frame": os.path.basename(d),
+                "usable": not bad,
+                "framing": {"clipped": False, "clear_px": 200.0},
+                "size_ratio": 0.50 if bad else 0.98,
+                "size_ok": (None if not bad else False),
+                "center_base_mm": [422.0, -115.0] if not bad else [422.0, -115.0],
+                "top_mm": 32.0, "yaw_deg": 0.5, "yaw_color_deg": 0.5,
+                "yaw_trusted": True}
+
+    m3.measure_frame = fake
+    try:
+        rec = m3.measure_layer([("pose1", ["p1"]), ("pose2", ["p2"])],
+                               window_xy_mm=[422.65, -114.86], layer=2)
+    finally:
+        m3.measure_frame = orig
+    assert rec["merged"]["found"] is True, rec["merged"]
+    assert rec["frames_dropped"] == [{"pose": "pose2", "frame": "p2",
+                                      "clear_px": 200.0,
+                                      "reason": "size_implausible",
+                                      "size_ratio": 0.50}], rec["frames_dropped"]
 
 
 # ---------------------------------------------------------------- 跑

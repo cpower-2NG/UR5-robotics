@@ -448,6 +448,122 @@ def test_bias_comp_flag_reaches_the_round():
     assert rc == 2, "非法 --bias-comp 应被 argparse 拒，实得 %r" % (rc,)
 
 
+# ---------------------------------------------------------------- 最终版策略
+@case
+def test_nudge_target_open_uses_plan_yaw_every_layer():
+    """最终版主组：每一层的 nudge 朝向目标都是**计划绝对朝向**。
+
+    open 组的 ``yaw_place`` 是 0.0（geometric 臂），所以目标恒为 0；即便上一层
+    实测 84°，也不许跟 —— 那是 closed 组 86–90° 腕部异常的来源。
+    """
+    prev84 = {"merged": {"found": True, "yaw_color_deg": 84.0}}
+    for k in (1, 2, 3, 5):
+        y, src = s3r.nudge_target_for_group("open", k, 0.0, prev84)
+        assert y == 0.0 and src == "plan", (k, y, src)
+    # 计划朝向不是 0 时也要原样用计划值（不折、不跟上一层）。
+    y, src = s3r.nudge_target_for_group("open", 3, 6.5, prev84)
+    assert y == 6.5 and src == "plan", (y, src)
+
+
+@case
+def test_nudge_target_closed_still_follows_previous():
+    """closed 组语义没被改坏：第 1 层计划，第 2 层起跟上一层实测。"""
+    prev = {"merged": {"found": True, "yaw_color_deg": 84.0,
+                       "yaw_color_trusted": True}}
+    assert s3r.nudge_target_for_group("closed", 1, 0.0, prev) == (0.0, "plan")
+    y, src = s3r.nudge_target_for_group("closed", 2, 0.0, prev)
+    assert y is not None and src == "color", (y, src)
+    # 缺上一层 ⇒ 判不了（停轮），不拿计划值偷偷顶替。
+    y, src = s3r.nudge_target_for_group("closed", 2, 0.0, {"merged": {}})
+    assert y is None and src == "no_prev_layer", (y, src)
+
+
+def _meas(cx, cy, yaw=None):
+    return {"found": True, "center_base_mm": [cx, cy], "yaw_color_deg": yaw}
+
+
+@case
+def test_stop_gate_l1_uses_grid_center():
+    """第 1 层参考**格心**：≤10 mm 过，>10 mm 停（放第 2 层之前的预检）。"""
+    slot = (422.65, -114.86)
+    g = s3r.stop_gate_xy(_meas(slot[0] + 9.9, slot[1]), None, 1, slot)
+    assert g["pass"] is True and g["ref"] == "grid_center", g
+    assert_close(g["xy_rel_mm"], 9.9, 0.01, "xy_rel")
+    g = s3r.stop_gate_xy(_meas(slot[0] + 10.1, slot[1]), None, 1, slot)
+    assert g["pass"] is False and g["ref"] == "grid_center", g
+
+
+@case
+def test_stop_gate_l2_uses_previous_measured_center():
+    """第 2 层起参考**上一层矫正后实测中心**，不是格心。"""
+    slot = (422.65, -114.86)
+    prev = _meas(430.0, -110.0)
+    g = s3r.stop_gate_xy(_meas(430.0, -110.0 + 9.9), prev, 2, slot)
+    assert g["pass"] is True and g["ref"] == "previous_layer", g
+    g = s3r.stop_gate_xy(_meas(430.0, -110.0 + 10.1), prev, 2, slot)
+    assert g["pass"] is False and g["ref"] == "previous_layer", g
+    # 上一层没量到 ⇒ 判不了，不制造新失败（前面的门已经停了）。
+    g = s3r.stop_gate_xy(_meas(430.0, -110.0), {"found": False}, 2, slot)
+    assert g["pass"] is None and g["reason"] == "previous_missing", g
+
+
+@case
+def test_stop_gate_ignores_yaw():
+    """停轮门**只看 xy**：yaw 差 20°、xy 2 mm ⇒ 过（yaw 仍按 5° 判分）。"""
+    slot = (422.65, -114.86)
+    g = s3r.stop_gate_xy(_meas(slot[0] + 2.0, slot[1], yaw=20.0),
+                         None, 1, slot)
+    assert g["pass"] is True, g
+    assert_close(g["xy_rel_mm"], 2.0, 0.01, "xy_rel")
+
+
+@case
+def test_bias_uses_pre_nudge_measurement():
+    """b̂ 必须取**矫正前**的 ``bias_merged`` —— 回归护栏（源码级）。
+
+    2026-11-02 round-10 曾把 nudge 后的 ``merged`` 喂给 ``bias_from_layer``，
+    于是 b̂ 里混进了 nudge 的效果：塔看起来「自己会回正」，下一层反而不补。
+    这条用源码顺序把守：``bias_merged = merged`` 必须在 nudge 之前，
+    且 ``bias_from_layer`` 的实参就是它。
+    """
+    import inspect
+    import re
+    src = inspect.getsource(s3r.run_round)
+    i_alias = src.index("bias_merged = merged")
+    i_nudge = src.index("nudge_after_place(")
+    i_call = src.index("bias_from_layer(")
+    assert i_alias < i_nudge < i_call, (
+        "bias_merged 别名必须早于 nudge、bias_from_layer 必须晚于 nudge",
+        i_alias, i_nudge, i_call)
+    assert re.search(r"bias_from_layer\(\s*bias_merged\.get", src), \
+        "bias_from_layer 的实测值必须来自 bias_merged（矫正前）"
+
+
+@case
+def test_final_run_seed_shifts_command_positive():
+    """最终版首轮种子 (−2.7, −0.5)：命令 = 期望 − b̂ ⇒ 命令朝 **+x/+y** 偏。
+
+    台账 n=21 干净子集的先验；符号写反会把块推得更歪。
+    """
+    desired = (422.65, -114.86)
+    t = s3r.target_with_bias(desired, [], seed=[-2.7, -0.5])
+    assert_close(t[0], 425.35, 1e-9, "命令 x")
+    assert_close(t[1], -114.36, 1e-9, "命令 y")
+
+
+@case
+def test_nudge_row_records_drag_vector():
+    """nudge 拖拽只记账：``drag_xy_mm = after.center − before.center``。"""
+    before = {"center_base_mm": [420.0, -115.0], "yaw_color_deg": 2.0,
+              "yaw_deg": 2.0, "top_mm": 100.0}
+    after = {"center_base_mm": [422.0, -116.5], "yaw_color_deg": 0.5,
+             "yaw_deg": 0.5, "top_mm": 100.0}
+    cmd = {"dx_mm": 3.0, "dy_mm": -1.0, "dyaw_block_deg": -1.5}
+    row = s3r.nudge_row(1, cmd, before, after, [420.0, -115.0],
+                        axes=("yaw",))
+    assert row["drag_xy_mm"] == [2.0, -1.5], row.get("drag_xy_mm")
+
+
 @case
 def test_survey_pose_tracks_tower_top():
     """相机—塔顶距离恒定；塔越高 tool0 越高。"""
