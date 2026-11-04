@@ -988,7 +988,12 @@ def applied_bias(bias_hist, mode="adaptive", seed=None):
     """
     if mode != "adaptive":
         return [0.0, 0.0]
-    vals = ([list(seed)] if seed else []) + list(bias_hist or [])
+    # 两种形状都收：`round.json` 里记的是 {"layer": k, "bias_mm": [...]}（2026-11-04
+    # 首轮第 1 层后就是在这里崩的：旧代码只认 [bx, by]，第 2 层算补偿时 KeyError: 0），
+    # 测试与离线调用则直接给 [bx, by]。
+    vals = ([list(seed)] if seed else [])
+    for h in (bias_hist or []):
+        vals.append(list(h["bias_mm"]) if isinstance(h, dict) else list(h))
     if not vals:
         return [0.0, 0.0]
     n = float(len(vals))

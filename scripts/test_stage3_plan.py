@@ -354,6 +354,29 @@ def test_target_with_bias_cancels_a_repeating_offset():
 
 
 @case
+def test_applied_bias_accepts_round_json_history_entries():
+    """真机的 `bias_history` 是 {"layer", "bias_mm"} 字典，不是 [bx, by]。
+
+    2026-11-04 首轮真机第 1 层放完、nudge 过门后，算第 2 层补偿时
+    `applied_bias` 抛 KeyError: 0 —— 离线预检没触发是因为那段没有实测、
+    `bias_history` 一直是空的。这条测试把两种形状都钉住。
+    """
+    hist = [{"layer": 1, "bias_mm": [-3.0, -2.0]},
+            {"layer": 2, "bias_mm": [-1.0, -4.0]}]
+    b = s3r.applied_bias(hist)
+    assert_close(b[0], -2.0, 1e-9, "字典形状均值 x")
+    assert_close(b[1], -3.0, 1e-9, "字典形状均值 y")
+    # 种子 + 字典混用：均值分母要把种子算进去
+    b2 = s3r.applied_bias(hist[:1], seed=(-2.7, -0.5))
+    assert_close(b2[0], (-2.7 - 3.0) / 2.0, 1e-9, "种子+字典 x")
+    assert_close(b2[1], (-0.5 - 2.0) / 2.0, 1e-9, "种子+字典 y")
+    # 与纯列表形状结果一致
+    b3 = s3r.applied_bias([[-3.0, -2.0], [-1.0, -4.0]])
+    assert_close(b3[0], b[0], 1e-12, "两种形状 x 一致")
+    assert_close(b3[1], b[1], 1e-12, "两种形状 y 一致")
+
+
+@case
 def test_commanded_target_converts_mm_bias_into_metres():
     """接线那一行：期望是米、b̂ 是毫米 —— 换算错了塔会偏 1000 倍。"""
     desired_m = (0.42265, -0.11486)
