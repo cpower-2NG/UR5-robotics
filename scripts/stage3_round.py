@@ -1291,6 +1291,9 @@ def run_round(args):
     grid_yaw = float(grid.get("grid_yaw_base_deg") or 0.0)
     zcal = load_zcal(args.zcal)
     chain = urkin.Chain(args.urdf)
+    # 放置间隙：命令行给的是 mm，计划器吃 m；不给就退回 precision_plan 的缺省。
+    place_clearance_m = (None if args.place_clearance_mm is None
+                         else args.place_clearance_mm / 1000.0)
 
     os.makedirs(args.run_dir, exist_ok=True)
     rdir = args.run_dir
@@ -1405,6 +1408,10 @@ def run_round(args):
         "block_h_mm": m3.BLOCK_TRUE_H_MM,
         "z_bias_mm": zcal,
         "d_mm": round(float(args.d_mm), 2),
+        # 放置那一刻块底离塔顶的高度；没给参数就是 precision_plan 的缺省。
+        "place_clearance_mm": round(
+            (pp.PLACE_CLEARANCE if place_clearance_m is None
+             else place_clearance_m) * 1000.0, 2),
         "scene": {k: scene.get(k) for k in
                   ("pick_zone", "grasp_at", "pick_open_mm", "place_open_mm",
                    "release_dwell_s", "yaw_sign", "finger_axis_delta_deg")},
@@ -1522,7 +1529,8 @@ def run_round(args):
                 survey_tool0=pair[0], carry_z=carry_z, scene=scene,
                 place_open_mm=args.place_open_mm,
                 release_dwell_s=args.release_dwell_s,
-                tower_half_edge=args.tower_half_edge)
+                tower_half_edge=args.tower_half_edge,
+                place_clearance=place_clearance_m)
         except (pp.PlanError, RuntimeError, ValueError) as exc:
             stop = "plan_failed: %s" % exc
             print("!! 第 %d 层计划失败：%s" % (k, exc))
@@ -1670,6 +1678,7 @@ def run_round(args):
                     place_open_mm=args.place_open_mm,
                     release_dwell_s=args.release_dwell_s,
                     tower_half_edge=args.tower_half_edge,
+                    place_clearance=place_clearance_m,
                     # 抓取偏心必须从**抓取那一段**的 meta 来：这里是块心相对
                     # tool0 的偏置，换目标重规划时不能当成 0。
                     grasp_ecc_mm=meta.get("grasp_ecc_mm"))
@@ -2017,6 +2026,10 @@ def main(argv=None):
     ap.add_argument("--tower-half-edge", type=float, default=0.020,
                     help="塔体 box 半边长（m）：块半宽 + 余量")
     ap.add_argument("--place-open-mm", type=float, default=None)
+    ap.add_argument("--place-clearance-mm", type=float, default=None,
+                    help="放置那一刻**块底离塔顶**的悬空高度（mm，缺省用 "
+                         "precision_plan.PLACE_CLEARANCE = 5）。入口②实测 3 mm 组"
+                         "的 Δxy σ 0.80 mm、yaw 重复性也好 2.5 倍（台账第 184 轮）。")
     ap.add_argument("--release-dwell-s", type=float, default=None)
     ap.add_argument("--bias-comp", choices=("adaptive", "none"), default="adaptive",
                     help="轮内自适应放置偏置补偿（默认 adaptive）：每层量完把"

@@ -571,6 +571,27 @@ def test_bias_uses_post_nudge_measurement():
 
 
 @case
+def test_place_clearance_cli_wires_through_to_both_plans():
+    """``--place-clearance-mm`` 要真的影响计划 —— 回归护栏（源码级）。
+
+    2026-11-05 用户拍板第 6 轮降放置间隙 5→3 mm（入口②实测 3 mm 组 Δxy σ 0.80 mm，
+    比 5 mm/停留 0 的 3.40 mm 小 4 倍）。这条堵三处「改了不生效」：
+    参数没定义 / 没换成米 / 只透传给首层计划而漏掉 carry 处重规划那条路。
+    """
+    import inspect
+    import re
+    assert '"--place-clearance-mm"' in inspect.getsource(s3r.main), \
+        "缺 --place-clearance-mm 参数"
+    src = inspect.getsource(s3r.run_round)
+    assert re.search(r"args\.place_clearance_mm\s*/\s*1000", src), \
+        "命令行给的是 mm，计划器吃 m，必须 /1000"
+    assert src.count("place_clearance=place_clearance_m") == 2, \
+        "layer_plan 与 place_plan 两条路都要透传"
+    # 缺省仍是 precision_plan 的 5 mm（不传参数 = 老行为）
+    assert "pp.PLACE_CLEARANCE" in src
+
+
+@case
 def test_final_run_seed_shifts_command_positive():
     """最终版首轮种子 (−2.7, −0.5)：命令 = 期望 − b̂ ⇒ 命令朝 **+x/+y** 偏。
 
