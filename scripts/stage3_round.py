@@ -64,8 +64,9 @@ ARMS = ("geometric", "zero", "graspnet")
 #: 两段，在 carry 处按**期望顶高**量一次塔顶再改目标（2026-11-02 落地；
 #: 入口③ 三层都量得到，见台账第 207 轮）。
 #: ``nudge``（放置后矫正第三对照组）＝放置流程与 ``open`` 完全一样（期望目标
-#: 固定格心、开环放），量完之后**只夹不抬**把块推到目标，再量一次。判分与
-#: 下一层的表面用矫正后的实测；b̂ 记账仍用矫正前那次（见层循环里的注释）。
+#: 固定格心、开环放），量完之后**只夹不抬**把块推到目标，再量一次。判分、
+#: 下一层的表面、b̂ 记账**全部用矫正后**的实测（2026-11-05 用户拍板：拖拽已
+#: 实测为系统性 −x，必须进补偿；见层循环里的注释）。
 IMPLEMENTED_GROUPS = ("open", "closed", "eih", "nudge")
 
 
@@ -549,9 +550,10 @@ def nudge_row(rep, cmd, before, after, target_xy_mm,
                     "gain_yaw": (None if yaw_gain is None
                                  else round(yaw_gain, 2))},
             "delta_xy_mm": round(e0 - e1, 2),
-            # 纯记账：nudge 夹/扭/松把块**自己**带走了多少（after − before）。
-            # 不进 `bias_history` —— b̂ 描述开环放置落哪，拖拽是矫正的副作用，
-            # 混在一起会把补偿器教歪（2026-11-04 用户拍板：不补偿只记账）。
+            # nudge 夹/扭/松把块**自己**带走了多少（after − before）。
+            # 2026-11-05 起**进补偿**：b̂ 吃矫正后实测 = 放置偏置 + 拖拽。
+            # 拖拽 5/5 沿 −x、1.2–4.6 mm，与扭转方向无关，是系统性位移不是噪声
+            # （round-04，台账第 241 轮）；只记账不补偿等于假设它不存在。
             "drag_xy_mm": [round(dx, 2), round(dy, 2)],
             "final_ok": ok, "reason": reason,
             "tol": {"xy_mm": float(xy_tol_mm),
@@ -1061,6 +1063,12 @@ def stop_gate_xy(merged, prev_merged, layer, slot_mm, limit_mm=STOP_GATE_XY_MM):
 #: 不这样做，每轮第 1 层都只能不补，每轮都会重新造一次那个折角。
 BIAS_ESTIMATE_FILE = "bias_estimate.json"
 
+#: 估计的**语义版本**。2026-11-05 把 b̂ 从「矫正前」改成「矫正后（含拖拽）」，
+#: 两种样本不能相加 —— 版本不符的旧文件当没有（回落到 ``--bias-seed``），
+#: 否则新估计会被上一口径的 n=7 拖着走。
+BIAS_ESTIMATE_VERSION = 2
+BIAS_ESTIMATE_MODEL = "constant_post_nudge"
+
 
 def parse_bias_seed(spec):
     """``"bx,by"``（mm，允许中文逗号）→ ``[bx, by]``；空 ⇒ ``None``。"""
@@ -1079,10 +1087,16 @@ def parse_bias_seed(spec):
 
 
 def load_bias_estimate(path):
-    """读轮间估计；坏文件当没有（**不猜**，但也不让一次坏文件炸掉整轮）。"""
+    """读轮间估计；坏文件当没有（**不猜**，但也不让一次坏文件炸掉整轮）。
+
+    版本不符也当没有：旧文件是「矫正前」口径（``version 1``），样本不能和
+    「矫正后（含拖拽）」相加（见 ``BIAS_ESTIMATE_VERSION``）。
+    """
     try:
         doc = json.load(open(path))
     except (OSError, ValueError):
+        return None
+    if doc.get("version") != BIAS_ESTIMATE_VERSION:
         return None
     val = doc.get("bias_mm")
     if not val or len(val) != 2:
@@ -1106,6 +1120,8 @@ def write_bias_estimate(rdir, doc):
         prev = json.load(open(path))
     except (OSError, ValueError):
         prev = None
+    if (prev or {}).get("version") != BIAS_ESTIMATE_VERSION:
+        prev = None            # 旧口径的样本不能并进新口径（见常量注释）
     merged = merge_bias_estimate(prev, hist)
     if merged is None:
         return None
@@ -1129,7 +1145,7 @@ def merge_bias_estimate(prev, new_layers):
     if not vals:
         return None
     n = len(vals)
-    return {"version": 1, "model": "constant",
+    return {"version": BIAS_ESTIMATE_VERSION, "model": BIAS_ESTIMATE_MODEL,
             "bias_mm": [round(sum(v[0] for v in vals) / n, 3),
                         round(sum(v[1] for v in vals) / n, 3)],
             "n": n,
@@ -1781,13 +1797,14 @@ def run_round(args):
                     else "pose_mismatch")
             break
         # ---- nudge 组：量完之后**只夹不抬**把块推到目标，退开再量一次。
-        # 判分与下一层的表面用**矫正后**的实测；b̂ 记账仍用矫正前那次 ——
-        # b̂ 描述的是「开环放置落哪」，拿矫正后的值记会把补偿器教成「我放得
-        # 很准」，下一层不再补，那 4–5 mm 系统偏置会原样回来。这一句以前
-        # 只是注释（代码实际吃了矫正后的 merged），2026-11-02 round-10 的
-        # `bias_history` 与 `nudge.after` 逐层对得上，证实吃错了，这次改到
-        # 真的用矫正前那次。
-        bias_merged = merged
+        # 判分、下一层的表面、b̂ 记账**全部用矫正后**的实测。
+        #
+        # 2026-11-05 用户拍板把 b̂ 从「矫正前」改成「矫正后」。理由：nudge 拖拽
+        # 是**系统性**的（round-04 五层 5/5 沿 −x、1.2–4.6 mm，与扭转方向无关），
+        # 不是噪声 —— 矫正前记账等于假设它不存在，补偿只吃掉放置偏置那一半；
+        # 而判分看的是松手后的**最终落点**。b̂ 改成「放置偏置 + 拖拽」后，
+        # 命令 = 期望 − b̂ 一次抵消两项。（旧口径「矫正前」是 2026-11-02 round-10
+        # 的教训：那一轮拖拽小、b̂ 混进 nudge 效果会把补偿器教歪；现已不适用。）
         if nudge_enabled(args):
             nrow, nstop, after = nudge_after_place(
                 args, board, chain, scene, grid, zcal, cdir, k, round_no,
@@ -1824,10 +1841,11 @@ def run_round(args):
                          "过门" if nrow["final_ok"] else nrow["reason"]))
                 rec["measured"] = after
                 meas, merged = after, after_merged
-        # 这一层落地偏了多少 —— 下一层用它预补偿。超上限按失败停轮，
-        # 不拿一个「块掉了 / 没抓住」的大数去把下一层推得更歪。
+        # 这一层**最终**落地偏了多少（矫正后实测 − 命令）—— 下一层用它预补偿，
+        # 拖拽已经包含在里面。超上限按失败停轮，不拿一个「块掉了 / 没抓住」的
+        # 大数去把下一层推得更歪。
         bias, bwhy = bias_from_layer(
-            bias_merged.get("center_base_mm"),
+            merged.get("center_base_mm"),
             [slot_target[0] * 1000.0, slot_target[1] * 1000.0])
         rec["placement_bias_mm"] = (None if bias is None
                                     else [round(v, 3) for v in bias])
@@ -2002,8 +2020,9 @@ def main(argv=None):
     ap.add_argument("--release-dwell-s", type=float, default=None)
     ap.add_argument("--bias-comp", choices=("adaptive", "none"), default="adaptive",
                     help="轮内自适应放置偏置补偿（默认 adaptive）：每层量完把"
-                         "「实测 − 命令」记进 bias_history，下一层命令目标 = "
-                         "期望目标 − 历史均值。none = 旧的纯开环语义，只记不补。")
+                         "「**矫正后**实测 − 命令」记进 bias_history（含 nudge "
+                         "拖拽），下一层命令目标 = 期望目标 − 历史均值。"
+                         "none = 旧的纯开环语义，只记不补。")
     ap.add_argument("--bias-seed", default=None,
                     help="偏置先验 bx,by（mm），第 1 层也补；不给就吃 "
                          "<run-dir>/bias_estimate.json（上一轮攒下的）")

@@ -457,6 +457,13 @@ def test_bias_seed_parsing_and_round_estimate():
         with open(p, "w") as fh:
             json.dump({"bias_mm": [1.0]}, fh)
         assert s3r.load_bias_estimate(p) is None
+        # 旧语义版本（矫正前口径，version 1）不能当种子 —— 两种样本不能相加。
+        with open(p, "w") as fh:
+            json.dump({"version": 1, "model": "constant",
+                       "bias_mm": [-2.83, -1.19], "n": 7}, fh)
+        assert s3r.load_bias_estimate(p) is None, \
+            "version 1 的旧估计必须被拒（口径已改成矫正后）"
+        assert e2["version"] == s3r.BIAS_ESTIMATE_VERSION, e2
 
 
 @case
@@ -541,25 +548,26 @@ def test_stop_gate_ignores_yaw():
 
 
 @case
-def test_bias_uses_pre_nudge_measurement():
-    """b̂ 必须取**矫正前**的 ``bias_merged`` —— 回归护栏（源码级）。
+def test_bias_uses_post_nudge_measurement():
+    """b̂ 取**矫正后**的 ``merged`` —— 回归护栏（源码级）。
 
-    2026-11-02 round-10 曾把 nudge 后的 ``merged`` 喂给 ``bias_from_layer``，
-    于是 b̂ 里混进了 nudge 的效果：塔看起来「自己会回正」，下一层反而不补。
-    这条用源码顺序把守：``bias_merged = merged`` 必须在 nudge 之前，
-    且 ``bias_from_layer`` 的实参就是它。
+    2026-11-05 用户拍板改口径：round-04 实测 nudge 拖拽 5/5 沿 −x、1.2–4.6 mm，
+    是系统性位移；只记「矫正前」的放置偏置等于假设拖拽不存在，补偿只对一半。
+    现在 b̂ = 放置偏置 + 拖拽，``bias_from_layer`` 必须直接吃矫正后的 ``merged``。
+    这条用源码顺序把守：``nudge_after_place(`` 必须早于 ``bias_from_layer(``，
+    且实参是 ``merged``（不是别的别名），也不许再有 ``bias_merged`` 这个旧别名。
     """
     import inspect
     import re
     src = inspect.getsource(s3r.run_round)
-    i_alias = src.index("bias_merged = merged")
     i_nudge = src.index("nudge_after_place(")
     i_call = src.index("bias_from_layer(")
-    assert i_alias < i_nudge < i_call, (
-        "bias_merged 别名必须早于 nudge、bias_from_layer 必须晚于 nudge",
-        i_alias, i_nudge, i_call)
-    assert re.search(r"bias_from_layer\(\s*bias_merged\.get", src), \
-        "bias_from_layer 的实测值必须来自 bias_merged（矫正前）"
+    assert i_nudge < i_call, (
+        "bias_from_layer 必须在 nudge 之后（要吃矫正后的 merged）",
+        i_nudge, i_call)
+    assert "bias_merged" not in src, "旧口径的 bias_merged 别名必须删掉"
+    assert re.search(r"bias_from_layer\(\s*merged\.get", src), \
+        "bias_from_layer 的实测值必须来自矫正后的 merged"
 
 
 @case
