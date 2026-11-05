@@ -419,6 +419,47 @@ def test_bias_seed_compensates_layer_one():
 
 
 @case
+def test_bias_fixed_ignores_in_round_history():
+    """``--bias-comp fixed``：b̂ 只用先验，本轮实测只记账不改命令。
+
+    2026-11-05 第 6 轮后加：轮内自适应每层换一次 b̂，命令跟着摆
+    （round-06 实测跨层摆幅 x 1.18 / y 1.27 mm，与放置散差同量级）。
+    钉住 b̂ 后，层间误差只剩 ``b̂_k − b̂_{k−1}`` 里真实的那部分。
+    """
+    desired = (422.65, -114.86)
+    seed = [-4.53, -0.91]
+    # 历史再长也不许影响命令 —— 三种长度给出同一个目标。
+    outs = [s3r.target_with_bias(desired, h, "fixed", seed=seed)
+            for h in ([], [[-9.0, 3.0]], [[-9.0, 3.0], [1.0, -8.0]])]
+    for t in outs:
+        assert_close(t[0], desired[0] + 4.53, 1e-9, "fixed x")
+        assert_close(t[1], desired[1] + 0.91, 1e-9, "fixed y")
+    # 没有先验 ⇒ 退回不补（并打印告警），不能悄悄用历史。
+    assert s3r.applied_bias([[-9.0, 3.0]], "fixed") == [0.0, 0.0]
+    # 记账不受影响：历史仍能算出跨轮估计要的值。
+    assert s3r.applied_bias([], "adaptive", seed=seed) == [float(seed[0]),
+                                                          float(seed[1])]
+
+
+@case
+def test_place_target_previous_uses_prev_measured_xy_only():
+    """``--place-target previous`` = xy 跟上一层实测、yaw 仍走计划绝对朝向。
+
+    源码级护栏（跑 run_round 要真机/大件）：必须有一条 ``place_target ==
+    "previous"`` 的分支取 ``prev["merged"]["center_base_mm"]``，且那条分支里
+    **不许** 出现 ``closed_loop_yaw`` —— 那是 closed 组的语义，会引入 86–90° 腕角异常。
+    """
+    import inspect
+    src = inspect.getsource(s3r.run_round)
+    assert '"previous"' in inspect.getsource(s3r.main), "缺 --place-target"
+    i = src.index('args.place_target == "previous"')
+    branch = src[i:i + 600]
+    assert 'center_base_mm' in branch, "previous 目标要取上一层实测中心"
+    assert "closed_loop_yaw" not in branch, \
+        "previous 只跟 xy；跟 yaw 是 closed 组的语义"
+
+
+@case
 def test_bias_seed_parsing_and_round_estimate():
     """``--bias-seed`` 的解析与轮间估计的合并（下一轮第 1 层的先验从这来）。"""
     assert s3r.parse_bias_seed(None) is None

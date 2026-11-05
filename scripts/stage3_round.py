@@ -987,7 +987,19 @@ def applied_bias(bias_hist, mode="adaptive", seed=None):
     本轮历史，不补；第 2 层补满 b̂ ⇒ 第 1↔2 层之间凭空多出一个 ≈|b̂| 的**折角**。
     判分看的是**相对**对中，4 mm 的折角直接把「≤5 mm」吃掉 —— 而物理上
     「相对第 1 层放准第 2 层」本来就要求先知道 b̂，轮内数据给不了，只能给先验。
+
+    ``fixed`` ⇒ **只用种子，轮内不更新**（2026-11-05 第 6 轮后加的）。轮内自适应
+    每层换一次 b̂，命令就跟着摆（round-06 实测跨层摆幅 x 1.18 / y 1.27 mm），
+    而这一项和放置散差是**同一个量级**；把 b̂ 钉住，层间误差只剩
+    ``b̂_k − b̂_{k−1}`` 里真实的那部分，命令项整个消失。历史仍照记，跨轮估计照更新。
+    没给种子时退回 ``[0, 0]`` 并打印告警 —— 那是「以为在补、其实没补」。
     """
+    if mode == "fixed":
+        if seed:
+            return [float(seed[0]), float(seed[1])]
+        print("!! --bias-comp fixed 但没有任何 b̂ 先验（--bias-seed / "
+              "bias_estimate.json）⇒ 这一轮其实没补")
+        return [0.0, 0.0]
     if mode != "adaptive":
         return [0.0, 0.0]
     # 两种形状都收：`round.json` 里记的是 {"layer": k, "bias_mm": [...]}（2026-11-04
@@ -1424,6 +1436,7 @@ def run_round(args):
         "teardown": teardown,
         "layers": [], "terminal": None, "stop_reason": None,
         # 轮内自适应放置偏置补偿：mode=none 时逐字节复现旧的「纯开环」语义。
+        "place_target": args.place_target,
         "bias_comp": {"mode": args.bias_comp, "limit_mm": BIAS_LIMIT_MM,
                       "seed_mm": (None if b_seed is None
                                   else [round(v, 3) for v in b_seed]),
@@ -1469,7 +1482,10 @@ def run_round(args):
             view_xy = prev["merged"]["center_base_mm"]
         else:
             view_xy = slot_mm
-        # 放置目标：主组固定格心；闭环组用上一层实测中心 / yaw。
+        # 放置目标：主组固定格心；闭环组用上一层实测中心 / yaw；
+        # `--place-target previous` 是 2026-11-05 新增的第三条：**xy 跟上一层实测、
+        # yaw 仍走计划绝对朝向**。层间误差 = b̂_k − b̂（常数）⇒ 测量噪声相消、
+        # 方差比固定格心的 √2σ 少一半（round-06 实测：σ 1.6 mm/轴 ⇒ 单对超门 29% → 9%）。
         # **期望目标**（要落到的点，判分与报告看它）与**命令目标**（给臂的点）
         # 从这一层起分开：命令 = 期望 − b̂，b̂ = 先验种子 + 本轮已测各层的均值。
         # b̂ 住「块 ↔ 夹爪」之间，闭环也消不掉，只能这样显式预补偿。
@@ -1491,6 +1507,12 @@ def run_round(args):
                 break
             yaw_place = pyaw
             yaw_place_src = pyaw_src
+        elif (args.place_target == "previous"
+              and prev and prev["merged"].get("found")):
+            # 只跟 xy；yaw 仍用计划绝对朝向（与 closed 组的区别就在这一行）。
+            lm = prev["merged"]
+            desired_target = [lm["center_base_mm"][0] / 1000.0,
+                              lm["center_base_mm"][1] / 1000.0]
         # nudge 的**朝向目标**：open 组每层都用计划绝对朝向（`nudge_target_for_group`），
         # closed/eih 组第 1 层计划、第 2 层往上跟下一层实测。在抓帧/发轨迹**之前**
         # 就定 —— 下层朝向判不了就是这一层不该往上叠，停轮，而不是先叠上去再发现矫正不了。
@@ -2031,7 +2053,13 @@ def main(argv=None):
                          "precision_plan.PLACE_CLEARANCE = 5）。入口②实测 3 mm 组"
                          "的 Δxy σ 0.80 mm、yaw 重复性也好 2.5 倍（台账第 184 轮）。")
     ap.add_argument("--release-dwell-s", type=float, default=None)
-    ap.add_argument("--bias-comp", choices=("adaptive", "none"), default="adaptive",
+    ap.add_argument("--place-target", choices=("grid", "previous"), default="grid",
+                    help="每层放置的**期望** xy：grid = 固定格心（主组原口径）；"
+                         "previous = 上一层实测中心（2026-11-05 起，只跟 xy，"
+                         "yaw 仍走计划绝对朝向）。配合 --bias-comp fixed 用，"
+                         "层间误差才只剩真实散差。")
+    ap.add_argument("--bias-comp", choices=("adaptive", "fixed", "none"),
+                    default="adaptive",
                     help="轮内自适应放置偏置补偿（默认 adaptive）：每层量完把"
                          "「**矫正后**实测 − 命令」记进 bias_history（含 nudge "
                          "拖拽），下一层命令目标 = 期望目标 − 历史均值。"
