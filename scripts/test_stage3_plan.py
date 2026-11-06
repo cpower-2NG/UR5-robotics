@@ -498,12 +498,14 @@ def test_bias_seed_parsing_and_round_estimate():
         with open(p, "w") as fh:
             json.dump({"bias_mm": [1.0]}, fh)
         assert s3r.load_bias_estimate(p) is None
-        # 旧语义版本（矫正前口径，version 1）不能当种子 —— 两种样本不能相加。
-        with open(p, "w") as fh:
-            json.dump({"version": 1, "model": "constant",
-                       "bias_mm": [-2.83, -1.19], "n": 7}, fh)
-        assert s3r.load_bias_estimate(p) is None, \
-            "version 1 的旧估计必须被拒（口径已改成矫正后）"
+        # 旧语义版本不能当种子 —— 口径不同不能相加（v1 旧矫正前、v2 含拖拽，
+        # 现行 v3 = 矫正前，见 BIAS_ESTIMATE_VERSION）。
+        for old in (1, 2):
+            with open(p, "w") as fh:
+                json.dump({"version": old, "model": "constant",
+                           "bias_mm": [-2.83, -1.19], "n": 7}, fh)
+            assert s3r.load_bias_estimate(p) is None, \
+                "version %d 的旧估计必须被拒（口径不同）" % old
         assert e2["version"] == s3r.BIAS_ESTIMATE_VERSION, e2
 
 
@@ -589,14 +591,15 @@ def test_stop_gate_ignores_yaw():
 
 
 @case
-def test_bias_uses_post_nudge_measurement():
-    """b̂ 取**矫正后**的 ``merged`` —— 回归护栏（源码级）。
+def test_bias_uses_pre_nudge_measurement():
+    """b̂ 取**矫正前**的 ``measured_before_nudge`` —— 回归护栏（源码级）。
 
-    2026-11-05 用户拍板改口径：round-04 实测 nudge 拖拽 5/5 沿 −x、1.2–4.6 mm，
-    是系统性位移；只记「矫正前」的放置偏置等于假设拖拽不存在，补偿只对一半。
-    现在 b̂ = 放置偏置 + 拖拽，``bias_from_layer`` 必须直接吃矫正后的 ``merged``。
-    这条用源码顺序把守：``nudge_after_place(`` 必须早于 ``bias_from_layer(``，
-    且实参是 ``merged``（不是别的别名），也不许再有 ``bias_merged`` 这个旧别名。
+    2026-11-06 用户拍板改回「矫正前」（第 8 轮判读，台账第 249 轮）：nudge 拖拽
+    只在真正扭了的层发生（死区层为 0），而下令时不可能知道这层会不会扭 ——
+    混进 b̂ 等于每层猜一次硬币。拖拽不需要补：「目标跟上一层实测」本来就会
+    跟着它走。矫正后的值只留档（``placement_bias_post_nudge_mm``）。
+    这条用源码顺序把守：``nudge_after_place(`` 必须早于 ``bias_from_layer(``
+    （矫正前的记录在 nudge 分支里写），且实测值来自 ``measured_before_nudge``。
     """
     import inspect
     import re
@@ -604,11 +607,15 @@ def test_bias_uses_post_nudge_measurement():
     i_nudge = src.index("nudge_after_place(")
     i_call = src.index("bias_from_layer(")
     assert i_nudge < i_call, (
-        "bias_from_layer 必须在 nudge 之后（要吃矫正后的 merged）",
+        "bias_from_layer 必须在 nudge 之后（要读 measured_before_nudge）",
         i_nudge, i_call)
     assert "bias_merged" not in src, "旧口径的 bias_merged 别名必须删掉"
-    assert re.search(r"bias_from_layer\(\s*merged\.get", src), \
-        "bias_from_layer 的实测值必须来自矫正后的 merged"
+    assert "measured_before_nudge" in src, \
+        "b̂ 的实测值必须来自矫正前的 measured_before_nudge"
+    assert re.search(r"bias_from_layer\(\s*bias_src\.get", src), \
+        "bias_from_layer 的实测值必须来自 bias_src（矫正前优先）"
+    assert re.search(r"placement_bias_post_nudge_mm", src), \
+        "矫正后的 b̂ 必须留档（对账拖拽用）"
 
 
 @case

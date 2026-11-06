@@ -1075,11 +1075,13 @@ def stop_gate_xy(merged, prev_merged, layer, slot_mm, limit_mm=STOP_GATE_XY_MM):
 #: 不这样做，每轮第 1 层都只能不补，每轮都会重新造一次那个折角。
 BIAS_ESTIMATE_FILE = "bias_estimate.json"
 
-#: 估计的**语义版本**。2026-11-05 把 b̂ 从「矫正前」改成「矫正后（含拖拽）」，
-#: 两种样本不能相加 —— 版本不符的旧文件当没有（回落到 ``--bias-seed``），
-#: 否则新估计会被上一口径的 n=7 拖着走。
-BIAS_ESTIMATE_VERSION = 2
-BIAS_ESTIMATE_MODEL = "constant_post_nudge"
+#: 估计的**语义版本**。2026-11-06 把 b̂ 从「矫正后（含拖拽）」改回「矫正前」：
+#: 拖拽只在 nudge 层出现、下令时不可知，混进来是给每层加一次二元跳变
+#: （20 层样本：矫正后 x 离均值最远 5.31 mm，矫正前 3.17 mm）。两种样本不能
+#: 相加 —— 版本不符的旧文件当没有（回落到 ``--bias-seed``）。
+#: v1 = 矫正前（旧）、v2 = 矫正后含拖拽、v3 = 矫正前（现行）。
+BIAS_ESTIMATE_VERSION = 3
+BIAS_ESTIMATE_MODEL = "constant_pre_nudge"
 
 
 def parse_bias_seed(spec):
@@ -1101,8 +1103,8 @@ def parse_bias_seed(spec):
 def load_bias_estimate(path):
     """读轮间估计；坏文件当没有（**不猜**，但也不让一次坏文件炸掉整轮）。
 
-    版本不符也当没有：旧文件是「矫正前」口径（``version 1``），样本不能和
-    「矫正后（含拖拽）」相加（见 ``BIAS_ESTIMATE_VERSION``）。
+    版本不符也当没有：``version 1`` 是旧「矫正前」、``version 2`` 是「矫正后
+    （含拖拽）」，样本口径不同不能相加（见 ``BIAS_ESTIMATE_VERSION``）。
     """
     try:
         doc = json.load(open(path))
@@ -1872,21 +1874,34 @@ def run_round(args):
                          "过门" if nrow["final_ok"] else nrow["reason"]))
                 rec["measured"] = after
                 meas, merged = after, after_merged
-        # 这一层**最终**落地偏了多少（矫正后实测 − 命令）—— 下一层用它预补偿，
-        # 拖拽已经包含在里面。超上限按失败停轮，不拿一个「块掉了 / 没抓住」的
-        # 大数去把下一层推得更歪。
+        # 这一层**矫正前**落地偏了多少（放置实测 − 命令）—— 下一层用它预补偿。
+        # 2026-11-06 改回「矫正前」（第 8 轮判读，台账第 249 轮）：nudge 拖拽
+        # 只在**真正扭了**的层发生（死区层为 0），而下令时不可能知道这层会不会扭
+        # （死区判定在放完测完才做）。把它塞进 b̂ 等于每层猜一次硬币 —— 20 层
+        # 样本里矫正后 x 离均值最远 5.31 mm，矫正前只有 3.17 mm。拖拽也不需要
+        # 补：「目标跟上一层实测」本来就会跟着它走。矫正后的值仍记账（只留档）。
+        # 超上限按失败停轮，不拿一个「块掉了 / 没抓住」的大数去把下一层推得更歪。
+        pre_meas = ((rec.get("measured_before_nudge") or {}).get("merged") or {})
+        bias_src = pre_meas if pre_meas.get("center_base_mm") else merged
         bias, bwhy = bias_from_layer(
-            merged.get("center_base_mm"),
+            bias_src.get("center_base_mm"),
             [slot_target[0] * 1000.0, slot_target[1] * 1000.0])
         rec["placement_bias_mm"] = (None if bias is None
                                     else [round(v, 3) for v in bias])
+        post_bias, _ = bias_from_layer(
+            merged.get("center_base_mm"),
+            [slot_target[0] * 1000.0, slot_target[1] * 1000.0])
+        rec["placement_bias_post_nudge_mm"] = (
+            None if post_bias is None else [round(v, 3) for v in post_bias])
         if bwhy:
             stop = "layer%02d_%s" % (k, bwhy)
             print("!! 第 %d 层：%s" % (k, bwhy))
             _dump(os.path.join(cdir, "round.json"), doc)
             break
-        doc["bias_history"].append({"layer": k,
-                                    "bias_mm": [round(v, 3) for v in bias]})
+        doc["bias_history"].append({
+            "layer": k,
+            "bias_mm": [round(v, 3) for v in bias],
+            "bias_post_nudge_mm": rec["placement_bias_post_nudge_mm"]})
         print("  放置偏置 b̂=(%+.2f, %+.2f) mm —— %s"
               % (bias[0], bias[1],
                  "下一层按历史均值预补偿" if args.bias_comp == "adaptive"
