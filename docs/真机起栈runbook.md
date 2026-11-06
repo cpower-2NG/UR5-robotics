@@ -42,6 +42,10 @@ pkill -f 'ros2 launch yolo_bringup'
 
 **通过**：`pgrep -af 'ros2 launch|controller_stopper'` 输出为空。
 
+> ⚠️ **同名节点必须只剩一个**：`pgrep -cf dashboard_client` —— 拆栈后应为 **0**，新栈起来后应为 **1**。
+> 多于 1 说明有孤儿（实测：整栈重启后 2026-11-05 的旧节点 PPID=1 还活着），两个同名节点抢同一个服务，
+> `programState` 查询会**随机时通时不通**，阶段 3 的前置闸门会因此拒跑（fail-closed，不会误发轨迹）。
+
 > ⚠️ **顺序别反**：拆栈会停掉示教器上的 `ur5ros.urp`。合法次序只有一条：
 > **起栈（驱动先监听）→ 示教器按 PLAY → 连接后把控制器拉回来 → 规划器才起**。
 > 没有驱动监听时按 PLAY，示教器直接「连接被拒绝」，程序停在 STOPPED（实测守 5 分钟也一样）。
@@ -129,3 +133,4 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 | 话题列表是空的 | `ROS_DOMAIN_ID` 没设成 99（查询侧问题） |
 | 候选落到臂够不到的地方、检测却高分 | 相机外参照抄了旧数字 / 用了 `extrinsics-2026-10-03` 那份的 `q`（⛔ 不可用，见当前状态 §3） |
 | 相机没数据、日志 30 秒刷 7 万行 | 有孤儿进程占着相机（`ros2 topic info --verbose` 看 Publishers，别信「话题还在」） |
+| `programState` 时通时不通（`Failed to send request to dashboard server`） | `pgrep -cf dashboard_client` 是不是 >1 —— 孤儿与新节点同名抢服务（2026-11-06 实测） |
