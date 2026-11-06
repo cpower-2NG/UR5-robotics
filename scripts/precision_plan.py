@@ -108,6 +108,10 @@ GRASP_Z_MAX = GRASP_Z_MIN + 0.010      # 上限给 10 mm：块高 30~35 mm，实
 # —— 2026-11-02 拆三层塔：91.34 的块顶被当成块高，绝对 z 277 mm 被截到 224 mm，
 # 指尖落到 20 mm，一抓把三层全带起来。见 `build_pick(block_h_m=...)`。
 MAX_TABLE_BLOCK_TOP_M = 0.050          # 摆在台面上的块，块顶不会高过这个
+# 块底 = 块顶实测 − 块高，两个量都带毫米级噪声（顶面单帧 σ 1.2–2.6 mm）。
+# 贴着台面/垫纸的那块算出来会是小负数 —— 那是噪声，不是「参数给反了」。
+# 2026-11-06 拆第 5 块（塔底，直接坐垫纸上）就因此判红：块底 −0.004 mm。
+BLOCK_BOTTOM_TOL_M = 0.002
 # 腕 2（第 5 关节）离 0 至少这么远。0 就是腕奇异（1、3 轴重合），
 # A/B 两次实测腕 2 = −89.8°，余量极大；这个数只是防止 IK 挑到另一支解。
 WRIST_MIN_RAD = 0.15
@@ -836,9 +840,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     # 下面三行与改动前**逐字节等价**。
     bh = wz if block_h_m is None else float(block_h_m)
     bottom = wz - bh
-    if bottom < -1e-6:
+    if bottom < -BLOCK_BOTTOM_TOL_M:
         raise PlanError("块底算出 %.1f mm（负）—— block_h_m=%.1f 比块顶高 %.1f "
                         "还大，参数给反了" % (bottom * 1000, bh * 1000, wz * 1000))
+    # 容差内的小负数（贴台面那块，噪声把块顶量矮了几百分之一毫米）夹回 0：
+    # 块底就是台面，不能拿负高度去算抓取/放置。
+    bottom = max(bottom, 0.0)
     approach_z = bottom + bh + TOOL0_TO_FINGERTIP + APPROACH_CLEARANCE
     # GRASP_Z_MIN/MAX 是「块底 = 台面」时的 tool0 界限 ⇒ 整段平移到块底。
     grasp_z = bottom + float(np.clip(

@@ -183,6 +183,36 @@ def test_tower_item_without_block_h_is_rejected(chain):
 
 
 @case
+def test_block_bottom_noise_at_table_is_tolerated(chain):
+    """塔底最后一块直接坐垫纸上：块顶实测比名义块高矮一点点 ⇒ 块底算出小负数。
+
+    那是顶面测量噪声（单帧 σ 1.2–2.6 mm），不是「参数给反了」——
+    2026-11-06 拆第 5 块就因块底 −0.004 mm 被判红。容差内夹到 0，
+    抓取深度仍按名义块高；参数真给反（大出几十毫米）照样要拒。
+    """
+    blocks, cand, q0 = scene(chain)
+    bh_mm = 29.5
+    for top_mm in (29.5 - 0.004, 29.5 - 1.8):
+        flat = dict(blocks[0], top=top_mm, h=top_mm)
+        _, _, meta = pp.build_pick(chain, q0, cand, flat, [flat], (0.45, -0.25),
+                                   block_h_m=bh_mm / 1000.0)
+        assert abs(meta["block_bottom_mm"]) < 1e-9, \
+            "块底 %.4f mm 应夹到 0" % meta["block_bottom_mm"]
+        # 指尖锚在块底(0)+名义块高上，不跟块顶噪声走 —— 这是修护栏时唯一
+        # 要求不变的量；抓取深度 = 实测块顶 − 指尖，当然随块顶变。
+        assert abs(meta["fingertip_z_mm"] - 11.0) < 1e-9, meta
+        assert abs(meta["grasp_depth_mm"] - (top_mm - 11.0)) < 0.051, meta
+    tower = dict(blocks[0], top=29.5, h=29.5)
+    try:
+        pp.build_pick(chain, q0, cand, tower, [tower], (0.45, -0.25),
+                      block_h_m=0.091)
+    except pp.PlanError as exc:
+        assert "块底算出" in str(exc), exc
+    else:
+        raise AssertionError("块高 91 mm 比块顶 29.5 mm 大 61 mm，居然过了")
+
+
+@case
 def test_place_target_does_not_trust_grasp_eccentricity(chain):
     """放置目标默认**就是槽位**，不拿抓取偏心去补 —— 但偏心要记下来。
 
