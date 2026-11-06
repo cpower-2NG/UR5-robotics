@@ -71,6 +71,7 @@ JTC 的 ``allow_partial_joints_goal: true`` 让一条轨迹可以只命令部分
 
 import math
 import threading
+import time
 from typing import Callable, List, Optional, Tuple
 
 import rclpy
@@ -195,6 +196,8 @@ class GraspPlanner(Node):
         self.tool0_to_fingertip: float = p["tool0_to_fingertip"]
         self.grasp_clearance: float = p["grasp_clearance"]
         self.approach_clearance: float = p["approach_clearance"]
+        # 下降前的开口（毫米，0 = 不动作，保持全开接近）。见 _select_and_approach。
+        self.approach_opening_mm: float = p["approach_opening_mm"]
         self.lift_height: float = p["lift_height"]
         self.table_min_z: float = p["table_min_z"]
         self.min_score: float = p["min_score"]
@@ -363,6 +366,8 @@ class GraspPlanner(Node):
             f"  目标帧={self.base_frame} IK组={self.ik_group} 末端={self.ik_link}\n"
             f"  指尖偏置={self.tool0_to_fingertip} "
             f"接近余量={self.approach_clearance} 抬起高度={self.lift_height}\n"
+            f"  下降前开口={self.approach_opening_mm:.1f} mm"
+            f"{'（全开接近）' if self.approach_opening_mm <= 0 else ''}\n"
             f"  动作模式={'抓取' if self.carry_objects else '只走位（不夹持）'} "
             f"| 肘高护栏={self.elbow_guard_enabled}"
             f"（台面 {self.table_plane_z:.3f}）"
@@ -463,6 +468,13 @@ class GraspPlanner(Node):
         # `wz` 本身的准确性（那由 perception_3d 的定位方式决定）。
         d("grasp_clearance", 0.01)
         d("approach_clearance", 0.05)   # 接近时在抓取高度之上再抬多少（m）
+        # 下降前把夹爪收到这个**开口宽度**（毫米，两指内侧间距；0 = 不动作）。
+        # 为什么需要：全开 95 mm 时指尖外侧离 tool0 轴 ±(47.5+22)=69.5 mm，
+        # 下降的那一段会把这段扫描带整个扫过台面 —— 邻块只要落在带里就被拖走。
+        # 2026-11-07 仿真实测：夹 block_4 时把 62 mm 外的 block_3 拖了 62 mm，
+        # 被拖的块又推着目标块顶到指尖上，闭合时随机滑向爪内/爪外，同一个命令
+        # 跑出成功和失败两种结果。默认 0（真机保持原行为，改不改要人拍板）。
+        d("approach_opening_mm", 0.0)
         d("lift_height", 0.15)          # 抓取后抬起高度（m）
         # 低于此高度视为已落地物体，跳过（**单位是 base_frame 的 z**，不是世界系！）
         #
@@ -846,8 +858,12 @@ class GraspPlanner(Node):
     # ------------------------------------------------------------------
     def _joint_cb(self, msg: JointState):
         for name, pos in zip(msg.name, msg.position):
-            if name in self.arm_joints:
-                self._current_joints[name] = pos
+            # 记录**所有**关节，不只 arm_joints：臂的当前位姿要用它，夹爪
+            # （以及任何单独发的关节）轨迹的 t=0 起点也要用它 —— 见
+            # _send_trajectory 里「为什么必须带起点」。原来只记 arm_joints，
+            # 于是夹爪那几条轨迹永远拿不到起点，静默退回单点轨迹，正是
+            # 2026-11-07 仿真里「抬升稳、回 HOME 掉」的那条 bug。
+            self._current_joints[name] = pos
 
     def _start_initial_home(self):
         self._home_timer.cancel()
@@ -912,7 +928,30 @@ class GraspPlanner(Node):
         point.time_from_start = Duration(
             sec=int(duration), nanosec=int((duration % 1) * 1e9)
         )
-        traj.points = [point]
+        # ⚠️ **必须带一个 t=0 的起点**，只发终点那一个点是不行的。
+        #
+        # 2026-11-07 仿真实测（同目标、同时序、同夹爪命令，只换轨迹形状）：
+        #   单点轨迹 0/2 成功；加起点后的两点轨迹 16/16 成功。
+        # 失败的形状与整条流水线一模一样：抬升末段方块稳稳跟着（z 六次采样
+        # 全是 0.1574），**回 HOME 途中掉落**。原因是 JTC 对只有终点的轨迹
+        # 不保证按 `time_from_start` 插值——它可以直接以关节速度上限冲过去
+        # （0.025 m 只需 0.25 s），指尖是被"砸"进闭合位的；而两点轨迹把
+        # 3 s 的时长变成真正的插值约束，指尖是慢慢"啃"进去的。夹爪靠位置
+        # 回读判空夹，被砸进去时指尖停在对角顶点上，回读看着像夹住了，
+        # 接触其实是点接触，臂一摆就滑脱。
+        #
+        # 起点取**当前关节位置**：拿不到（还没收到 /joint_states，或这个
+        # 关节不在里面）就退回旧的单点写法——旧行为不因这次的修复而变差。
+        points = []
+        start_positions = [self._current_joints.get(n) for n in joint_names]
+        if all(v is not None for v in start_positions):
+            start_point = JointTrajectoryPoint()
+            start_point.positions = [float(v) for v in start_positions]
+            start_point.velocities = [0.0] * len(start_positions)
+            start_point.time_from_start = Duration(sec=0, nanosec=0)
+            points.append(start_point)
+        points.append(point)
+        traj.points = points
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = traj
@@ -1514,9 +1553,38 @@ class GraspPlanner(Node):
         # -175°（那会变成 350° 的大回转）。
         self._approach_arm = list(arm)
 
-        self._telem.set_state("APPROACH")
-        self._send_arm_trajectory(arm, self.move_duration,
-                                  done_cb=self._on_approach_done)
+        def _start_approach():
+            self._telem.set_state("APPROACH")
+            self._send_arm_trajectory(arm, self.move_duration,
+                                      done_cb=self._on_approach_done)
+
+        if self.approach_opening_mm <= 0.0:
+            _start_approach()
+            return
+
+        # 半开接近：全开 95 mm 的指尖外沿在 tool0 轴两侧各 69.5 mm 处，下降时
+        # 这一段扫描带会扫到邻块（判据/实测见 approach_opening_mm 的声明处）。
+        # 先收到指定开口再动臂 —— 反过来（边降边收）在真机上会让还在闭合的
+        # 手指撞到东西，力方向也不对。
+        self._telem.set_state("PREOPEN")
+
+        def _preopen_done(status, result):
+            if not traj_succeeded(status, result):
+                # 收不拢≠不能抓：全开下降只是有扫到邻块的风险，原地放弃整个
+                # 周期（还要重排一次检测）代价更大。如实报出来，别静默。
+                self.get_logger().warn(
+                    f"预收夹爪到 {self.approach_opening_mm:.1f} mm 未成功"
+                    f"（{traj_status_str(status, result)}）—— 仍按当前开口下降"
+                )
+            _start_approach()
+
+        try:
+            self._gripper.move_to(self.approach_opening_mm, done_cb=_preopen_done)
+        except (NotImplementedError, AttributeError, ValueError) as exc:
+            self.get_logger().warn(
+                f"夹爪后端不支持 approach_opening_mm（{exc}）—— 全开接近"
+            )
+            _start_approach()
 
     # ------------------------------------------------------------------
     # 状态机：接近 → 下降 → 闭合 → 抬起 → HOME → 放置位 → 下降 → 张开 → 抬起 → HOME
@@ -1540,10 +1608,57 @@ class GraspPlanner(Node):
         self._send_arm_trajectory(arm, self.descend_duration,
                                   done_cb=self._on_descend_done)
 
+    def _settle_before_close(self) -> None:
+        """下降轨迹「报完」之后再确认末端**真的停住了**，才去闭合。
+
+        为什么需要：``FollowJointTrajectory`` 的 ``success`` 只保证轨迹时间到了、
+        控制器没报错，**不保证末端已经停在目标上**。2026-11-07 仿真里用全量 trace
+        实测到：JTC 已经报 ``Goal reached`` 之后，tool0 仍持续下沉 1.9 mm
+        （目标 0.2087 → 实际 0.2068），把方块顶起 1.2 mm；随后闭合的回读开口
+        从 35.9 mm 掉到 34.8 mm（小于块的对角宽 37.7 mm），抬升末段方块滑脱。
+        同一目标、同一时序在隔离探针里 13/13 成功，差别就是探针每次测到
+        tool0 精确落在 0.2087 —— 也就是「有没有等它停稳」。
+
+        真机这一条更硬：指尖还在动就闭合，等于在不知道指尖位置的情况下施力。
+        所以这里对所有模式统一等停稳，最多 3 s（等不到就照常往下走并如实告警，
+        不能因为观测不到就把整轮抓取废掉）。
+
+        判据用 **FK 出的 tool0 位置**而不是轨迹目标：要的是末端实际在哪。
+        """
+        wx, wy, wz = self._grasp_target
+        want = wz + self.tool0_to_fingertip + self.grasp_clearance
+        deadline = time.monotonic() + 3.0
+        last = None
+        stable = 0
+        while time.monotonic() < deadline:
+            joints = [self._current_joints.get(n) for n in self.arm_joints]
+            if all(j is not None for j in joints):
+                p = self._call_fk("tool0", joints)
+                if p is not None:
+                    if last is not None and abs(p[2] - last) < 1e-4:
+                        stable += 1
+                        if stable >= 3:
+                            break
+                    else:
+                        stable = 0
+                    last = p[2]
+            time.sleep(0.1)
+
+        if last is None:
+            self.get_logger().warn("闭合前停稳确认：取不到 tool0 位置 —— 照常闭合")
+            return
+        msg = (f"下降后 tool0 z={last:.4f}（目标 {want:.4f}，差 "
+               f"{(last - want) * 1000:+.2f} mm）")
+        if stable >= 3:
+            self.get_logger().info(msg + " —— 已停稳")
+        else:
+            self.get_logger().warn(msg + " —— 3 s 内未停稳，照常闭合")
+
     def _on_descend_done(self, status, result):
         if self._traj_failed("下降轨迹", status, result):
             self._open_and_reset()
             return
+        self._settle_before_close()
         if not self.carry_objects:
             # 只走位模式（第一个真机 demo：夹爪硬件还没接通）：
             # 不闭合、不判空，但**照样走完**抬起 → HOME → 放置位 → 抬起 → HOME，
