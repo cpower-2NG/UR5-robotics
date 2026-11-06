@@ -499,6 +499,45 @@ def test_free_slot_mm_empty_zone_takes_center():
 
 
 @case
+def test_obstacles_for_slot_includes_skipped_tiny():
+    """**回归**：抓不了但挡路的块必须参与选位（2026-11-06 拆塔撞块事故）。
+
+    现场数据（round-10 拆塔帧）：黄块顶面外接 12.3×16.0 mm < min_ext 15 mm，
+    被挡进 ``skipped_tiny``（不在 ``blocks`` 里），于是回位选位把它当空地，
+    把放置点选到它旁边 15.8 mm —— 指尖下探到台面上方 17.7 mm 时撞上它
+    （高约 36 mm），控制箱保护性停止 C153A2。
+    """
+    zone = [0.25, 0.575, 0.17, 0.42]
+    graspable = [blk(i, cx, cy, 30, 29.5) for i, (cx, cy) in enumerate([
+        (296.7, 372.3), (311.6, 289.5), (388.9, 373.1), (411.9, 291.1),
+        (478.4, 239.3), (482.4, 333.6), (560.9, 160.9)])]
+    yellow = blk(7, 380.5, 216.9, 35.89, 35.89)      # 够高 ⇒ 真块，只是面太窄
+    plate = blk(8, 261.8, 207.3, 6.16, 6.16)         # < 15 mm ⇒ 平板碎片
+    analysis = {"blocks": graspable, "skipped_tiny": [yellow],
+                "skipped_low": [plate]}
+
+    # 变异：只喂 blocks（旧行为）—— 选位确实会贴到黄块上，说明 fixture 真复现了事故
+    blind = e.free_slot_mm(graspable, zone)
+    d_blind = ((blind["xy_mm"][0] - yellow["cx"]) ** 2
+               + (blind["xy_mm"][1] - yellow["cy"]) ** 2) ** 0.5
+    assert d_blind < e.PICK_RETURN_GAP_MM, \
+        "旧的选位行为本该贴到黄块（%.1f mm），fixture 没复现事故" % d_blind
+
+    pts, n_extra = e.obstacles_for_slot(analysis)
+    assert n_extra == 1, "skipped_tiny 只该进 1 个，实际 %d" % n_extra
+    assert len(pts) == len(graspable) + 1, "skipped_low 不该并进来"
+
+    spot = e.free_slot_mm(pts, zone)
+    assert spot is not None, "8 个块不该把区占满"
+    x, y = spot["xy_mm"]
+    for b in pts:
+        d = ((x - b["cx"]) ** 2 + (y - b["cy"]) ** 2) ** 0.5
+        assert d >= e.PICK_RETURN_GAP_MM - 1e-6, \
+            "回位点离 idx=%s 只有 %.2f mm" % (b.get("idx"), d)
+    assert spot["gap_mm"] >= e.PICK_RETURN_GAP_MM - 1e-6, spot
+
+
+@case
 def test_tower_block_item_uses_corrected_top():
     """抓塔上那块：h = 顶高 − z 标定 ⇒ 正好是「垫面 + 一块真高」。
 

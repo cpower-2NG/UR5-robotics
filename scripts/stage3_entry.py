@@ -606,6 +606,26 @@ def analyse_pick(frame_dir, extras, cdir):
     return analysis
 
 
+def obstacles_for_slot(analysis):
+    """选回位空位时要避开的点 = 抓取候选 + 「够高但抓不了」的块。
+
+    ``skipped_tiny`` 是被顶面外接判据挡在抓取候选外的**真块**（实测 12.3×16.0 mm）。
+    它抓不起来，但**照样挡得住下降的手指**：2026-11-06 拆塔第 5 块就是只看了
+    ``blocks``，把放置点选到这样一块头旁边 15.8 mm 处，臂下探到指尖 17.7 mm 时
+    撞上它（高约 36 mm），控制箱保护性停止（C153A2），整段 place 作废。
+
+    ``skipped_low``（< 15 mm 的平板 / 台面碎片）不并进来：它们比放置时指尖的
+    最低高度还低，够不成碰撞，并进来只会把本来能放的空位判没。
+
+    返回 ``(points, n_extra)``；``points`` 的形状与 ``analysis["blocks"]`` 一致，
+    可直接喂 ``free_slot_mm``。``n_extra`` 只用于记账，便于发现遮蔽失效又回来了。
+    """
+    blocks = list(analysis.get("blocks") or [])
+    extra = [b for b in (analysis.get("skipped_tiny") or [])
+             if b.get("cx") is not None and b.get("cy") is not None]
+    return blocks + extra, len(extra)
+
+
 def pick_bias_of(analysis, item):
     """拾取侧偏差：被选中那块在帧里的 ``h − 29.5``（与历史复算同口径）。"""
     for b in analysis["blocks"]:
@@ -824,7 +844,8 @@ def return_to_pick_once(args, board, chain, scene, cdir, tag, grid, slot_mm,
     os.makedirs(rdir, exist_ok=True)
     frame_dir, extras = capture_pick(args, board, scene, rdir, tag + "-rp")
     analysis = analyse_pick(frame_dir, extras, rdir)
-    spot = free_slot_mm(analysis["blocks"], scene["pick_zone"])
+    obstacles, n_extra = obstacles_for_slot(analysis)
+    spot = free_slot_mm(obstacles, scene["pick_zone"])
     if spot is None:
         raise EntryStop("拾取区放不下回位的块：没有离块 ≥%.0f mm、离边 ≥%.0f mm "
                         "的空位（先把块挪一挪再续跑）"
@@ -850,6 +871,8 @@ def return_to_pick_once(args, board, chain, scene, cdir, tag, grid, slot_mm,
     rec = {"tag": tag, "kind": "return",
            "spot_mm": spot["xy_mm"], "spot_gap_mm": spot["gap_mm"],
            "spot_edge_mm": spot["edge_mm"],
+           "spot_obstacles": len(obstacles),
+           "spot_obstacles_from_skipped": n_extra,
            "tower_top_mm": merged["top_mm"],
            "tower_center_mm": merged["center_base_mm"],
            "yaw_grasp_deg": item["yaw_grasp_deg"],
