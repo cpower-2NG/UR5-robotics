@@ -349,10 +349,18 @@ class SimGripper(GripperBackend):
         self._command(self._close_pos, self._once(done_cb))
 
     def move_to(self, mm: float, done_cb: Optional[Callable] = None) -> None:
-        if not (self._close_pos <= mm <= self._open_pos):
+        """走到指定**开口宽度**（毫米，两指内侧间距）。
+
+        ⚠️ 单位与 ``open()``/``close()`` **不同**：那两个用的是本后端的原生
+        位置（仿真里是单指半开 q，米），而这里跟 ``Ag95Gripper.move_to``
+        统一成**物理开口毫米**，规划器才不用为每个后端换算。换算关系见
+        URDF：开口 = 2q，q ∈ [0, 0.0475] ⇒ 95 mm 全开。
+        """
+        q = float(mm) / 2000.0
+        if not (self._close_pos <= q <= self._open_pos):
             raise ValueError("开口 %.1f mm 超出 [%.1f, %.1f]"
-                             % (mm, self._close_pos, self._open_pos))
-        self._command(float(mm), self._once(done_cb))
+                             % (mm, self._close_pos * 2000.0, self._open_pos * 2000.0))
+        self._command(q, self._once(done_cb))
 
     def current_position(self) -> Optional[float]:
         return self._pos

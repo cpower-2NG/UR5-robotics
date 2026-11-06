@@ -1,10 +1,11 @@
-# ros2_control configuration for UR5 + gripper in Gazebo Fortress
+# ros2_control configuration for UR5 + AG-95（简化两指）in Gazebo Harmonic
 #
-# Single joint_trajectory_controller manages all 7 joints (arm + gripper).
+# 单个 joint_trajectory_controller 管 6 个臂关节 + 1 个夹爪主关节；
+# 右指不进控制器，由 URDF 的 <mimic> 交给物理引擎跟随（需 bullet-featherstone，见 launch）。
 
-gz_ros2_control:
-  ros__parameters:
-    position_proportional_gain: 10.0
+# ⚠ 死键（2026-11-06 实测）：插件节点的参数不走这个 yaml，
+#   `ros2 param get` 也读不到；实际增益恒为 gz_ros2_control 代码默认 0.1。
+#   position_proportional_gain: 10.0
 
 controller_manager:
   ros__parameters:
@@ -23,9 +24,10 @@ joint_state_broadcaster:
 
 joint_trajectory_controller:
   ros__parameters:
+    # 只留 position：声明 velocity 会让 gz_ros2_control 走速度分支，重力下跟不住
+    # （肩关节稳态差 0.068 rad ≈ 指尖低 3 cm，2026-11-06 实测）。
     command_interfaces:
       - position
-      - velocity
     state_interfaces:
       - position
       - velocity
@@ -36,7 +38,7 @@ joint_trajectory_controller:
       - wrist_1_joint
       - wrist_2_joint
       - wrist_3_joint
-      - robotiq_85_left_knuckle_joint
+      - ag95_left_finger_joint
     constraints:
       stopped_velocity_tolerance: 0.0
       goal_time: 0.0
@@ -58,7 +60,7 @@ joint_trajectory_controller:
       wrist_3_joint:
         trajectory: 0.0
         goal: 0.0
-      robotiq_85_left_knuckle_joint:
+      ag95_left_finger_joint:
         trajectory: 0.0
         goal: 0.0
     state_publish_rate: 50.0

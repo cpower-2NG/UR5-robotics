@@ -8,6 +8,12 @@ install(DIRECTORY launch worlds models config scripts
   DESTINATION share/${PROJECT_NAME}
 )
 
+# ROS 节点脚本必须同时装到 lib/<pkg>，`ros2 run` / launch 的 Node() 才找得到
+install(PROGRAMS
+  scripts/camera_adapter.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 # 说明：抓取规划器不再装在本包里。
 # 参考项目把它作为 scripts/grasp_planner.py 装到 lib/grasp_sim/ 下（ros2 run grasp_sim
 # grasp_planner）。迁入主线后它归 grasp_planner 包，因为那块代码要在仿真与真机之间

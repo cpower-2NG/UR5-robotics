@@ -1,23 +1,26 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/xacro" name="$(arg name)">
   <!--
-    Combined UR5 + Robotiq 2F-85 parallel-jaw gripper URDF.
-    - ur_macro.xacro with generate_ros2_control_tag set to false
-    - Robotiq 2F-85 via official robotiq_description macros
-    - Single unified <ros2_control> tag for all 12 joints (6 arm + 6 gripper)
-      where 5 of the 6 gripper joints are mimic joints synced at the
-      control level by gz_ros2_control (no DART required).
-    - Single <gazebo> plugin for Gazebo Sim ROS 2 control (Harmonic).
+    UR5 + 夹爪 + 腕部相机（阶段 4 仿真底座）。
+
+    坐标系约定（与真机一致，见 docs/calib/extrinsics-2026-10-03-base_link.json）：
+      - 世界系 = UR 的 base_link 系；桌面 z=0，臂座也在 z=0。
+      - tool0 为法兰面，+z 为接近方向。
+      - 相机 link 一律用 RealSense 的 camera_link 约定：x 前（光轴）/ y 左 / z 上。
+        像素光学系（z 前）由 TF 里的 optical frame 派生，别把两者混用。
+
+    夹爪：gripper:=ag95（默认，简化两指）或 robotiq85（旧代理，仅对照）。
   -->
 
   <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
-  <xacro:include filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro"/>
-  <xacro:include filename="$(find robotiq_description)/urdf/ur_to_robotiq_adapter.urdf.xacro"/>
+  <xacro:include filename="$(find arm_grasp_sim)/models/ag95.urdf.xacro"/>
 
-  <!-- ── Arguments (mirror ur.urdf.xacro) ──────────────────── -->
+  <!-- ── Arguments ─────────────────────────────────────────── -->
   <xacro:arg name="name" default="ur5"/>
   <xacro:arg name="ur_type" default="ur5"/>
   <xacro:arg name="tf_prefix" default=""/>
+  <xacro:arg name="gripper" default="ag95"/>
+  <xacro:arg name="with_wrist_camera" default="true"/>
   <xacro:arg name="joint_limit_params"
              default="$(find ur_description)/config/$(arg ur_type)/joint_limits.yaml"/>
   <xacro:arg name="kinematics_params"
@@ -36,33 +39,14 @@
              default="$(find ur_description)/config/initial_positions.yaml"/>
 
   <xacro:property name="initial_positions_file" default="$(arg initial_positions_file)"/>
-
   <xacro:property name="is_sim_ignition" value="$(arg sim_ignition)"/>
   <xacro:property name="is_sim_gazebo" value="$(arg sim_gazebo)"/>
+  <xacro:property name="use_ag95" value="$(arg gripper)"/>
+  <xacro:property name="with_wrist_camera" value="$(arg with_wrist_camera)"/>
 
-  <!-- ── world + ground plane ──────────────────────────────── -->
   <link name="world"/>
 
-  <xacro:if value="${is_sim_ignition or is_sim_gazebo}">
-    <link name="ground_plane">
-      <visual>
-        <origin rpy="0 0 0" xyz="0 0 0"/>
-        <geometry><box size="5 5 0"/></geometry>
-        <material name="ground_white"><color rgba="1 1 1 0.5"/></material>
-      </visual>
-      <collision>
-        <origin rpy="0 0 0" xyz="0 0 0"/>
-        <geometry><box size="5 5 0"/></geometry>
-      </collision>
-    </link>
-    <joint name="ground_plane_joint" type="fixed">
-      <origin xyz="0 0 -0.01" rpy="0 0 0"/>
-      <parent link="world"/>
-      <child link="ground_plane"/>
-    </joint>
-  </xacro:if>
-
-  <!-- ── UR5 arm ───────────────────────────────────────────── -->
+  <!-- ── UR5 arm：臂座直接坐在桌面上（z=0）──────────────────── -->
   <xacro:ur_robot
     name="$(arg name)"
     tf_prefix="$(arg tf_prefix)"
@@ -78,112 +62,168 @@
     sim_gazebo="$(arg sim_gazebo)"
     generate_ros2_control_tag="false"
     initial_positions="${xacro.load_yaml(initial_positions_file)}">
-    <origin xyz="-0.1 0 0.80" rpy="0 0 0"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
   </xacro:ur_robot>
 
-  <!-- ── Robotiq 2F-85 gripper on tool0 ────────────── -->
-  <!-- ur_to_robotiq adapter: tool0 → ur_to_robotiq_link → gripper_mount_link -->
-  <xacro:ur_to_robotiq prefix="" connected_to="tool0"/>
+  <!-- ── 夹爪 ───────────────────────────────────────────────── -->
+  <xacro:if value="${use_ag95 == 'ag95'}">
+    <xacro:ag95_gripper prefix="" parent="tool0">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </xacro:ag95_gripper>
+  </xacro:if>
 
-  <!-- robotiq_gripper macro:
-       include_ros2_control:=false because the official ros2_control xacro
-       hardcodes the Fortress plugin (ign_ros2_control/IgnitionSystem); we
-       declare the 6 robotiq joints in the unified <ros2_control> block below. -->
-  <xacro:robotiq_gripper
-      name="robotiq_gripper" prefix="" parent="gripper_mount_link"
-      sim_ignition="false" sim_isaac="false"
-      use_fake_hardware="false" include_ros2_control="false">
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-  </xacro:robotiq_gripper>
+  <xacro:if value="${use_ag95 == 'robotiq85'}">
+    <xacro:include filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro"/>
+    <xacro:include filename="$(find robotiq_description)/urdf/ur_to_robotiq_adapter.urdf.xacro"/>
+    <xacro:ur_to_robotiq prefix="" connected_to="tool0"/>
+    <xacro:robotiq_gripper
+        name="robotiq_gripper" prefix="" parent="gripper_mount_link"
+        sim_ignition="false" sim_isaac="false"
+        use_fake_hardware="false" include_ros2_control="false">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </xacro:robotiq_gripper>
+  </xacro:if>
 
-  <!-- ── Unified ros2_control (12 joints: 6 arm + 1 main + 5 mimic) ───────────────────── -->
+  <!-- ── 腕部相机（RealSense D435i 代理）───────────────────────
+       外参实测（tool0 ← camera_link，2026 阶段 3 实机帧）：
+         t = (-0.0172, -0.0851, +0.0247) m
+         q = (0.49718, -0.49777, 0.50492, 0.50009)
+       光轴 = tool0 +z（相机装在指侧，看夹持点）。
+       内参实测：1280×720, fx 908.152, fy 908.375, cx 639.435, cy 363.314, D=0
+  -->
+  <xacro:if value="${with_wrist_camera}">
+    <link name="wrist_camera_link">
+      <visual>
+        <origin xyz="0.012 0 0" rpy="0 0 0"/>
+        <geometry><box size="0.026 0.090 0.025"/></geometry>
+        <material name="d435i_body"><color rgba="0.08 0.08 0.09 1.0"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0.012 0 0" rpy="0 0 0"/>
+        <geometry><box size="0.026 0.090 0.025"/></geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0.012 0 0" rpy="0 0 0"/>
+        <mass value="0.072"/>
+        <inertia ixx="0.00005" ixy="0" ixz="0" iyy="0.00005" iyz="0" izz="0.00003"/>
+      </inertial>
+    </link>
+
+    <joint name="wrist_camera_joint" type="fixed">
+      <parent link="tool0"/>
+      <child link="wrist_camera_link"/>
+      <origin xyz="-0.0172 -0.0851 0.0247"
+              rpy="-0.49249984397286012 -1.5593669258974889 2.067532735986044"/>
+    </joint>
+
+    <!-- 光学系：x 右 / y 下 / z 前（像素投影用），由 camera_link 绕 x -90°、再绕 z -90° 得到 -->
+    <link name="wrist_camera_optical_frame"/>
+    <joint name="wrist_camera_optical_joint" type="fixed">
+      <parent link="wrist_camera_link"/>
+      <child link="wrist_camera_optical_frame"/>
+      <origin xyz="0 0 0" rpy="-1.5707963267948966 0 -1.5707963267948966"/>
+    </joint>
+
+    <gazebo reference="wrist_camera_link">
+      <sensor name="wrist_color" type="camera">
+        <update_rate>15</update_rate>
+        <topic>wrist_camera/image</topic>
+        <camera>
+          <!-- 640/908.152 → hfov；fx≈fy 已核对，方形像素 -->
+          <horizontal_fov>1.2269523126593043</horizontal_fov>
+          <image><width>1280</width><height>720</height><format>R8G8B8</format></image>
+          <clip><near>0.05</near><far>5.0</far></clip>
+          <noise><type>gaussian</type><mean>0.0</mean><stddev>0.004</stddev></noise>
+        </camera>
+        <always_on>1</always_on>
+        <visualize>false</visualize>
+      </sensor>
+      <sensor name="wrist_depth" type="depth_camera">
+        <update_rate>15</update_rate>
+        <topic>wrist_camera/depth_image</topic>
+        <camera>
+          <horizontal_fov>1.2269523126593043</horizontal_fov>
+          <image><width>1280</width><height>720</height><format>R_FLOAT32</format></image>
+          <clip><near>0.05</near><far>5.0</far></clip>
+        </camera>
+        <always_on>1</always_on>
+        <visualize>false</visualize>
+      </sensor>
+    </gazebo>
+  </xacro:if>
+
+  <!-- ── 单一 <ros2_control>：6 臂 + 2 指 ───────────────────── -->
   <ros2_control name="$(arg name)" type="system">
     <hardware>
       <plugin>gz_ros2_control/GazeboSimSystem</plugin>
     </hardware>
 
-    <joint name="shoulder_pan_joint">
-      <param name="p_gain">100.0</param>
-      <command_interface name="position"/>
-      <command_interface name="velocity"/>
-      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="shoulder_lift_joint">
-      <param name="p_gain">100.0</param>
-      <command_interface name="position"/>
-      <command_interface name="velocity"/>
-      <state_interface name="position"><param name="initial_value">-1.57</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="elbow_joint">
-      <param name="p_gain">100.0</param>
-      <command_interface name="position"/>
-      <command_interface name="velocity"/>
-      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="wrist_1_joint">
-      <param name="p_gain">100.0</param>
-      <command_interface name="position"/>
-      <command_interface name="velocity"/>
-      <state_interface name="position"><param name="initial_value">-1.57</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="wrist_2_joint">
-      <param name="p_gain">100.0</param>
-      <command_interface name="position"/>
-      <command_interface name="velocity"/>
-      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="wrist_3_joint">
-      <param name="p_gain">100.0</param>
-      <command_interface name="position"/>
-      <command_interface name="velocity"/>
-      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
+    <!-- 只声明 position 命令接口（2026-11-06 实测）：
+         gz_system.cpp 的 write() 是 if(VELOCITY) … else if(POSITION)，
+         两个都声明时永远走速度分支 —— 控制器下发的速度指令在重力下跟不住，
+         误差沿轨迹累积，肩关节稳态差 0.068 rad ≈ 指尖低 3 cm，抓不到块。
+         只留 position 后走位置分支（target_vel = kp·update_rate·(cmd−pos)），
+         是死区极小的位置伺服，重力压不偏。
+         另注：<param name="p_gain"> 是死参数，gz_ros2_control 从不读它；
+         ros2_control.yaml 里的 position_proportional_gain 同样是死键
+         （插件节点的参数没有覆盖通道），实际增益恒为代码默认 0.1 —— 已够用，别再调它。 -->
+    <xacro:macro name="ur_joint" params="jname init">
+      <joint name="${jname}">
+        <command_interface name="position"/>
+        <state_interface name="position"><param name="initial_value">${init}</param></state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+    </xacro:macro>
 
-    <!-- ── Robotiq 2F-85 main driving joint ──────────────────── -->
-    <!-- revolute [0, 0.8] rad, 0=open, 0.8=closed.
-         5 mimic joints below are propagated by gz_ros2_control's
-         MimicJoint controller-level sync (gz_system.cpp:884-911) — no
-         physics-engine mimic constraints needed (ODE doesn't support them). -->
-    <joint name="robotiq_85_left_knuckle_joint">
-      <param name="p_gain">500.0</param>
-      <command_interface name="position"/>
-      <command_interface name="velocity"/>
-      <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
+    <xacro:ur_joint jname="shoulder_pan_joint"  init="0.0"/>
+    <xacro:ur_joint jname="shoulder_lift_joint" init="-1.57"/>
+    <xacro:ur_joint jname="elbow_joint"         init="0.0"/>
+    <xacro:ur_joint jname="wrist_1_joint"       init="-1.57"/>
+    <xacro:ur_joint jname="wrist_2_joint"       init="0.0"/>
+    <xacro:ur_joint jname="wrist_3_joint"       init="0.0"/>
 
-    <!-- 5 mimic joints — gz_ros2_control syncs every tick.
-         Multipliers match /opt/ros/humble/share/robotiq_description/
-         urdf/robotiq_gripper.ros2_control.xacro:50,60,68,77,86 -->
-    <joint name="robotiq_85_right_knuckle_joint">
-      <param name="mimic">robotiq_85_left_knuckle_joint</param>
-      <param name="multiplier">-1</param>
-    </joint>
-    <joint name="robotiq_85_left_inner_knuckle_joint">
-      <param name="mimic">robotiq_85_left_knuckle_joint</param>
-      <param name="multiplier">1</param>
-    </joint>
-    <joint name="robotiq_85_right_inner_knuckle_joint">
-      <param name="mimic">robotiq_85_left_knuckle_joint</param>
-      <param name="multiplier">-1</param>
-    </joint>
-    <joint name="robotiq_85_left_finger_tip_joint">
-      <param name="mimic">robotiq_85_left_knuckle_joint</param>
-      <param name="multiplier">-1</param>
-    </joint>
-    <joint name="robotiq_85_right_finger_tip_joint">
-      <param name="mimic">robotiq_85_left_knuckle_joint</param>
-      <param name="multiplier">1</param>
-    </joint>
+    <xacro:if value="${use_ag95 == 'ag95'}">
+      <joint name="ag95_left_finger_joint">
+        <command_interface name="position"/>
+        <state_interface name="position"><param name="initial_value">0.0475</param></state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+      <!-- 右指**故意不进 ros2_control**：它由 ag95.urdf.xacro 里的 <mimic> 跟随左指，
+           由物理引擎强制（2026-11-06 实测）：
+             - 只有 bullet-featherstone 支持 mimic 约束；DART 会打
+               "does not support mimic constraints ... no constraint will be created"
+               然后**静默不建**，右指变成自由关节（不动也不报错）。
+             - 右指不加状态接口 ⇒ /joint_states 里只有左指，
+               MoveIt 不会看到一个模型里没有的关节。 -->
+      <!-- 右指不在此声明（见上），别加回来。 -->
+    </xacro:if>
+
+    <xacro:if value="${use_ag95 == 'robotiq85'}">
+      <joint name="robotiq_85_left_knuckle_joint">
+        <param name="p_gain">500.0</param>
+        <command_interface name="position"/>
+        <command_interface name="velocity"/>
+        <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
+        <state_interface name="velocity"/>
+      </joint>
+      <joint name="robotiq_85_right_knuckle_joint">
+        <param name="mimic">robotiq_85_left_knuckle_joint</param><param name="multiplier">-1</param>
+      </joint>
+      <joint name="robotiq_85_left_inner_knuckle_joint">
+        <param name="mimic">robotiq_85_left_knuckle_joint</param><param name="multiplier">1</param>
+      </joint>
+      <joint name="robotiq_85_right_inner_knuckle_joint">
+        <param name="mimic">robotiq_85_left_knuckle_joint</param><param name="multiplier">-1</param>
+      </joint>
+      <joint name="robotiq_85_left_finger_tip_joint">
+        <param name="mimic">robotiq_85_left_knuckle_joint</param><param name="multiplier">-1</param>
+      </joint>
+      <joint name="robotiq_85_right_finger_tip_joint">
+        <param name="mimic">robotiq_85_left_knuckle_joint</param><param name="multiplier">1</param>
+      </joint>
+    </xacro:if>
   </ros2_control>
 
-  <!-- ── Gazebo Ignition plugin ────────────────────────────── -->
   <xacro:if value="$(arg sim_ignition)">
     <gazebo>
       <plugin filename="libgz_ros2_control-system.so"

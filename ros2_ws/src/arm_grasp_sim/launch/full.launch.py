@@ -82,6 +82,15 @@ def generate_launch_description():
         description="true = 把仿真世界的桌子发进 MoveIt 规划场景（需与 "
                     "grasp_planner.yaml 的 table_box_* 一致）",
     )
+    # 规划器的参数文件：**仿真用自己的那一份**。
+    # `grasp_planner/config/grasp_planner.yaml` 是真机共用件（几何按现场实测标定），
+    # 而阶段 4 的仿真世界是 base_link 坐在台面上（台面 z=0）、夹爪换成了 AG-95 ——
+    # 几何与夹爪都变了，必须整份换掉。见本仓库 config/grasp_planner_sim.yaml 头注。
+    planner_params_arg = DeclareLaunchArgument(
+        "planner_params_file",
+        default_value=os.path.join(pkg, "config", "grasp_planner_sim.yaml"),
+        description="抓取规划器参数文件；仿真默认用本包的 grasp_planner_sim.yaml",
+    )
 
     # ---- 仿真专属：世界 + 机械臂 + 控制器 + MoveIt ----
     sim = IncludeLaunchDescription(
@@ -106,6 +115,7 @@ def generate_launch_description():
             "skip_planner": LaunchConfiguration("skip_planner"),
             "start_delay": LaunchConfiguration("start_delay"),
             "table_scene_enabled": LaunchConfiguration("table_scene_enabled"),
+            "planner_params_file": LaunchConfiguration("planner_params_file"),
         }.items(),
     )
 
@@ -116,6 +126,7 @@ def generate_launch_description():
         skip_planner_arg,
         start_delay_arg,
         table_scene_arg,
+        planner_params_arg,
         DeclareLaunchArgument("headless", default_value="false"),
         sim,
         pipeline,

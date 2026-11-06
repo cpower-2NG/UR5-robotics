@@ -1,11 +1,17 @@
-"""Launch Gazebo Harmonic + UR5 + ros2_control + RGBD camera + ros_gz_bridge + MoveIt2.
+"""阶段 4 仿真栈：Gazebo Harmonic + UR5 + AG-95 + 双 RGBD + ros2_control + MoveIt2。
 
-从参考项目 grasp_sim 迁入主线（P3-6）。迁移时修掉了 4 个缺陷（D34–D37），
-每条都在代码处以「D3x」标注了原因与修法，详见 docs/RESTRUCTURE_PLAN.md。
+与阶段 2/3 仿真底座的区别（全部按真机实测改）：
+
+- 桌面 z=0（真机 base 系；示教器读数 `基座 z=+3.88 mm`）；
+- 方块 29.5 mm，拾取区 [0.25,0.575]×[0.17,0.42] m；
+- 夹爪换成简化 AG-95（95 mm 行程，tool0→指尖 204.2 mm）；
+- 腕部相机按实测 TF 装到 tool0；俯视相机按实测外参装到 base_link；
+- 场景由 `scripts/gen_scene.py` 用固定种子生成（S0–S4，各 5 布局）。
 
 用法：
-  ros2 launch arm_grasp_sim sim.launch.py
-  ros2 launch arm_grasp_sim sim.launch.py headless:=true     # 无 GUI（CI/远程）
+  ros2 launch arm_grasp_sim sim.launch.py                      # S0#0 + GUI
+  ros2 launch arm_grasp_sim sim.launch.py headless:=true scene:=S4:2
+  ros2 launch arm_grasp_sim sim.launch.py world:=/path/to/x.sdf
 """
 import os
 import subprocess
@@ -31,198 +37,170 @@ URDF_PATH = "/tmp/ur5.urdf"
 SRDF_PATH = "/tmp/ur5.srdf"
 COMBINED_XACRO = "models/ur5_with_gripper.urdf.xacro"
 
-# ── 仿真相机的真实位姿（取自 worlds/grasp_world.sdf 的 overhead_camera）──────
-# <pose>0.5 0.0 1.145 0 1.57 0</pose>
-#
-# 旋转部分不是「rpy(0,1.57,0) 直接转四元数」——那只是 Gazebo 的**视觉模型**
-# 朝向。图像像素 (u,v)+深度 Z 走的是**光学约定**（x 右、y 下、z 向前），
-# 两者之间差一个固定的轴重排。把该重排与模型朝向合成后，结果是一个
-# **合法旋转**（det=+1），四元数为 (x=0.7071, y=-0.7071, z=0, w=0)：
-#
-#     光心 x+ → world -y      光心 y+ → world -x      光心 z+ → world -z
-#
-# 已用实跑数据反证：相机(0.5,0,1.145) + R·(0.119,0.007,0.695) = (0.493,-0.119,0.450)，
-# 与 grasp_planner 日志里那条成功抓取的世界坐标**精确吻合**。
-# 参考项目把它写成硬编码常量、并注释称「无法用纯旋转表示」——那句注释是错的。
-CAMERA_FRAME = "overhead_camera/camera_link/color_camera"
-CAMERA_QX, CAMERA_QY, CAMERA_QZ, CAMERA_QW = 0.7071067811865476, -0.7071067811865476, 0.0, 0.0
+# ── 俯视相机外参（真机实测）─────────────────────────────────────────────
+# 来源 docs/calib/extrinsics-2026-10-03-base_link.json：
+#   parent base_link, child camera_link；camera_link 用 RealSense 约定
+#   （x 前 = 光轴 / y 左 / z 上）。光轴 54.27° 下俯，落在台面 (0.374, 0.406)。
+TOPCAM_XYZ = (0.34694477757210807, 0.8693043936314018, 0.6454397556505314)
+TOPCAM_Q = (0.32913450910630487, 0.31637465543060517,
+            -0.61852813688270547, 0.63953146615387635)
+# 内参：分辨率/焦距按真机实测（1280×720，fx≈917.6），主点用**仿真实际渲染值**。
+# ⚠️ Gazebo 的主点固定在图像正中心 (W/2, H/2)，无法配置偏移；真机 D435 的
+#    cx/cy = (649.55, 344.91)。若照抄真机主点，整条链会带 ~10 px ≈ 1 cm 的系统偏差
+#    （2026-11-06 实测：块顶面反投影偏 +11 mm）。所以仿真必须发布自己真实的内参，
+#    否则「算法在仿真里对、上真机偏」会被误判成外参问题。
+TOPCAM_W, TOPCAM_H = 1280, 720
+TOPCAM_FX, TOPCAM_FY = 917.62046813964844, 917.62052536010742  # Gazebo 实测（hfov 由真机 fx 反算）
+TOPCAM_CX, TOPCAM_CY = TOPCAM_W / 2.0, TOPCAM_H / 2.0
+
+# ── 腕部相机内参 ────────────────────────────────────────────────────────
+# 真机实测 1280×720, fx 908.152 / fy 908.375 / cx 639.435 / cy 363.314, D=0；
+# 仿真渲染实测 fx=fy=908.9544、主点 (640,360)（见上面俯视相机的说明）。
+WRIST_W, WRIST_H = 1280, 720
+WRIST_FX, WRIST_FY = 908.95439147949219, 908.95437240600586
+WRIST_CX, WRIST_CY = WRIST_W / 2.0, WRIST_H / 2.0
 
 
-def _run_xacro(argv):
-    """同步执行 xacro 并返回 stdout。
-
-    D34 修法：参考项目把 URDF/SRDF 的**生成**放在 ExecuteProcess（运行期），
-    却在 generate_launch_description() 里用 open() **构造期**读取，于是
-    「首次冷启动必然失败」——文件那一刻还不存在。参考项目的 LAB.md §9.5
-    也警告过该现象。
-    这里改为在**解析 launch 文件时同步执行** xacro：生成完成才返回，
-    后续的 open()/写文件天然安全，竞态从根上消失，也不再需要
-    ExecuteProcess 与 TimerAction 去猜时序。
-    """
+def _run(argv):
     result = subprocess.run(argv, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(
-            f"xacro 执行失败（{result.returncode}）：{' '.join(argv)}\n"
-            f"stderr:\n{result.stderr}"
-        )
+            f"命令失败（{result.returncode}）：{' '.join(argv)}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
     return result.stdout
 
 
 def generate_launch_description():
     pkg = get_package_share_directory("arm_grasp_sim")
-    # 用**源码路径**取 xacro：改了 xacro 不用重新 colcon build 就能生效
-    # get_package_share_directory 返回 .../install/arm_grasp_sim/share/arm_grasp_sim
+    # 用源码路径取 xacro / 生成器：改了不用 colcon build 就生效
     ws_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(pkg))))
     src_pkg = os.path.join(ws_root, "src", "arm_grasp_sim")
 
-    world_path = os.path.join(pkg, "worlds", "grasp_world.sdf")
     bridge_yaml = os.path.join(pkg, "config", "gz_bridge.yaml")
     ros2_control_yaml = os.path.join(pkg, "config", "ros2_control.yaml")
     combined_xacro_path = os.path.join(src_pkg, COMBINED_XACRO)
     srdf_xacro_path = os.path.join(src_pkg, "config", "ur5_gripper.srdf.xacro")
+    gen_scene = os.path.join(src_pkg, "scripts", "gen_scene.py")
+    adapter_py = os.path.join(src_pkg, "scripts", "camera_adapter.py")
 
     headless = LaunchConfiguration("headless")
+    scene = LaunchConfiguration("scene")
+    gripper = LaunchConfiguration("gripper")
+    world_override = LaunchConfiguration("world")
+    # 物理引擎见下方 physics 参数声明处的实测说明。
+    physics = LaunchConfiguration("physics")
 
-    # Add ROS share dirs to Gazebo resource path so mesh model:// URIs resolve
-    ros_share = "/opt/ros/humble/share"
-    existing_gz_path = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
-    gz_resource_path = f"{ros_share}" + (f":{existing_gz_path}" if existing_gz_path else "")
-    set_gz_path = SetEnvironmentVariable("GZ_SIM_RESOURCE_PATH", gz_resource_path)
+    # ── 场景：解析期用固定种子生成，产出 world + 真值 ────────────────
+    # scene 形如 "S4:2"；world:= 直接指定现成 SDF 时优先。
+    # （launch 的 LaunchConfiguration 在解析期取不到值，这里直接读 argv。）
+    argv = {a.split(":=", 1)[0]: a.split(":=", 1)[1]
+            for a in os.sys.argv if ":=" in a and a.split(":=", 1)[0] in
+            ("scene", "world", "gripper", "headless")}
+    explicit_world = argv.get("world", "")
+    if explicit_world:
+        world_path = explicit_world
+        truth_path = os.environ.get("SCENE_TRUTH", "")
+    else:
+        scene_str = argv.get("scene", "S0:0")
+        try:
+            batch, index = scene_str.split(":")
+            index = int(index)
+        except ValueError:
+            raise RuntimeError(f"scene 参数应为 '<batch>:<index>'，收到 {scene_str!r}")
+        scene_dir = f"/tmp/grasp_scene_{batch}_{index}"
+        _run(["python3", gen_scene, "--batch", batch, "--index", str(index),
+              "--out-dir", scene_dir])
+        world_path = os.path.join(scene_dir, "grasp_world.sdf")
+        truth_path = os.path.join(scene_dir, "scene_truth.json")
 
+    # ── URDF / SRDF：解析期同步生成 ─────────────────────────────────
     xacro_common = [
         "name:=ur5", "ur_type:=ur5", "safety_limits:=false",
         "sim_ignition:=true", "sim_gazebo:=false",
+        f"gripper:={argv.get('gripper', 'ag95')}", "with_wrist_camera:=true",
         f"simulation_controllers:={ros2_control_yaml}",
     ]
-
-    # ── D34：解析期同步生成，消除「构造期读运行期文件」的竞态 ──────────
-    urdf_contents = _run_xacro(["xacro", combined_xacro_path] + xacro_common)
-    srdf_contents = _run_xacro(["xacro", srdf_xacro_path, "name:=ur5"])
-    # 写盘供 ros_gz_sim create -file 使用（它只吃文件路径，不吃字符串）
+    urdf_contents = _run(["xacro", combined_xacro_path] + xacro_common)
+    srdf_contents = _run(["xacro", srdf_xacro_path, "name:=ur5"])
     with open(URDF_PATH, "w") as f:
         f.write(urdf_contents)
     with open(SRDF_PATH, "w") as f:
         f.write(srdf_contents)
 
-    # Gazebo Sim（headless 时加 -s，只跑物理不起 GUI）
-    #
-    # D38：原写法把 gz_ros2_control 的路径硬编码成
-    #   <本 ws>/install/gz_ros2_control/lib
-    # 一旦它不在本 ws（例如作为独立第三方 ws 叠加上来），这个目录并不存在，
-    # GZ_SIM_SYSTEM_PLUGIN_PATH / LD_LIBRARY_PATH 就指向空目录，Gazebo 加载
-    # libgz_ros2_control-system.so 失败——而报错只在 Gazebo 侧，离原因很远。
-    # 改为**问 ament 要**：谁提供 gz_ros2_control 都能找到。
-    #
-    # 注意：不能用 apt 的 ros-humble-gz-ros2-control——它依赖 libignition-*
-    # （Fortress / gz-sim6），而本项目跑的是 Harmonic（gz-sim8），两者 ABI 不通。
-    # 必须用 GZ_VERSION=harmonic 源码编译的版本。
+    # ── Gazebo ─────────────────────────────────────────────────────
+    ros_share = "/opt/ros/humble/share"
+    existing_gz_path = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
+    gz_resource_path = f"{ros_share}" + (f":{existing_gz_path}" if existing_gz_path else "")
+    set_gz_path = SetEnvironmentVariable("GZ_SIM_RESOURCE_PATH", gz_resource_path)
+
     ros2_lib = "/opt/ros/humble/lib"
     try:
-        gz_ros2_control_lib = os.path.join(
-            get_package_prefix("gz_ros2_control"), "lib"
-        )
+        gz_ros2_control_lib = os.path.join(get_package_prefix("gz_ros2_control"), "lib")
     except PackageNotFoundError:
         raise RuntimeError(
-            "找不到 gz_ros2_control。Gazebo 加载 ros2_control 插件需要它，且必须是\n"
-            "用 GZ_VERSION=harmonic 源码编译的版本（apt 的 ros-humble-gz-ros2-control\n"
-            "依赖 Fortress/gz-sim6，与本项目的 Harmonic/gz-sim8 不兼容）。\n"
-            "  git clone -b humble https://github.com/ros-controls/gz_ros2_control\n"
-            "  export GZ_VERSION=harmonic && colcon build --packages-up-to gz_ros2_control\n"
-            "若它建在别的 ws，把那个 ws 的 install/setup.bash 先 source 再 source 本 ws。"
-        )
-    ws_lib = gz_ros2_control_lib
-    gz_plugin_path = f"{ws_lib}:{ros2_lib}"
-    # D39：**不能**写成 Node(package="ros_gz_sim", executable="gz_sim")。
-    # 本机装的是 Harmonic 变体 ros-humble-ros-gzharmonic-sim，它的
-    # /opt/ros/humble/lib/ros_gz_sim/ 下只有 create 和 test_stopwatch，
-    # **没有 gz_sim 这个可执行文件**，用 Node 会在解析期直接报
-    #   executable 'gz_sim' not found on the libexec directory ...
-    # 且 ros2 launch 任何包都起不来。
-    #
-    # `gz sim` 是 Gazebo 自己的 CLI（来自 gz-tools2，在 PATH 上），不是
-    # ros_gz_sim 的节点，所以只能用 ExecuteProcess 起。
-    # 这也是原参考项目 grasp_sim 的做法（本文件在迁移时曾误改成 Node，已改回）。
+            "找不到 gz_ros2_control（必须是用 GZ_VERSION=harmonic 源码编译的版本；"
+            "apt 的 ros-humble-gz-ros2-control 依赖 Fortress/gz-sim6，ABI 不通）。")
+    gz_plugin_path = f"{gz_ros2_control_lib}:{ros2_lib}"
     gz_env = {
         "GZ_SIM_RESOURCE_PATH": gz_resource_path,
         "GZ_SIM_SYSTEM_PLUGIN_PATH": gz_plugin_path,
-        "LD_LIBRARY_PATH": f"{ws_lib}:{ros2_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}",
+        "LD_LIBRARY_PATH": f"{gz_ros2_control_lib}:{ros2_lib}:{os.environ.get('LD_LIBRARY_PATH', '')}",
     }
     gz_sim = ExecuteProcess(
-        cmd=["gz", "sim", "-r", world_path],
-        name="gz_sim",
-        output="screen",
-        additional_env=gz_env,
+        cmd=["gz", "sim", "-r", "--render-engine", "ogre2",
+             "--physics-engine", physics, world_path],
+        name="gz_sim", output="screen", additional_env=gz_env,
         condition=UnlessCondition(headless),
     )
     gz_sim_headless = ExecuteProcess(
-        cmd=["gz", "sim", "-r", "-s", world_path],
-        name="gz_sim",
-        output="screen",
-        additional_env=gz_env,
+        cmd=["gz", "sim", "-r", "-s", "--render-engine", "ogre2",
+             "--physics-engine", physics, world_path],
+        name="gz_sim", output="screen", additional_env=gz_env,
         condition=IfCondition(headless),
     )
 
     robot_state_pub = Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        name="robot_state_publisher",
-        output="screen",
+        package="robot_state_publisher", executable="robot_state_publisher",
+        name="robot_state_publisher", output="screen",
         parameters=[{"robot_description": urdf_contents, "use_sim_time": True}],
     )
 
     spawn_ur5 = Node(
-        package="ros_gz_sim",
-        executable="create",
-        name="spawn_ur5",
-        output="screen",
-        arguments=[
-            "-world", "grasp_world", "-name", "ur5", "-file", URDF_PATH,
-            "-x", "0.0", "-y", "0.0", "-z", "0.0",
-        ],
+        package="ros_gz_sim", executable="create", name="spawn_ur5", output="screen",
+        arguments=["-world", "grasp_world", "-name", "ur5", "-file", URDF_PATH,
+                   "-x", "0.0", "-y", "0.0", "-z", "0.0"],
     )
 
-    # ── 相机 TF（仿真侧的地面真值）─────────────────────────────────
-    # perception_3d 靠 TF 把像素投影到 base_link，所以相机帧**必须**在 TF 树里。
-    # 参考项目从不发布它：把相机位姿硬编码在抓取节点里，另发一个自称
-    # 「approximate、无法用纯旋转表示」的假 TF 供可视化——那条 TF 与真实
-    # 投影用的变换并不一致。迁入主线后统一由这里发布。
-    #
-    # 真机侧：同一接口改由**手眼标定结果**提供（静态 TF）；若相机是
-    # 眼在手上（eye-in-hand），则必须来自机器人 URDF/TF 而非静态发布。
-    camera_tf = Node(
-        package="tf2_ros",
-        executable="static_transform_publisher",
-        name="camera_tf_publisher",
-        output="screen",
-        arguments=[
-            "--x", "0.5", "--y", "0.0", "--z", "1.145",
-            "--qx", str(CAMERA_QX), "--qy", str(CAMERA_QY),
-            "--qz", str(CAMERA_QZ), "--qw", str(CAMERA_QW),
-            "--frame-id", "world",
-            "--child-frame-id", CAMERA_FRAME,
-        ],
+    # ── 俯视相机 TF（真机外参；不是随手编的近似值）──────────────────
+    topcam_link = Node(
+        package="tf2_ros", executable="static_transform_publisher",
+        name="topcam_link_tf", output="screen",
+        arguments=["--x", str(TOPCAM_XYZ[0]), "--y", str(TOPCAM_XYZ[1]),
+                   "--z", str(TOPCAM_XYZ[2]),
+                   "--qx", str(TOPCAM_Q[0]), "--qy", str(TOPCAM_Q[1]),
+                   "--qz", str(TOPCAM_Q[2]), "--qw", str(TOPCAM_Q[3]),
+                   "--frame-id", "base_link", "--child-frame-id", "topcam_camera_link"],
+        parameters=[{"use_sim_time": True}],
+    )
+    topcam_optical = Node(
+        package="tf2_ros", executable="static_transform_publisher",
+        name="topcam_optical_tf", output="screen",
+        arguments=["--roll", "-1.5707963267948966", "--pitch", "0",
+                   "--yaw", "-1.5707963267948966",
+                   "--frame-id", "topcam_camera_link",
+                   "--child-frame-id", "topcam_optical_frame"],
         parameters=[{"use_sim_time": True}],
     )
 
-    # ── MoveIt2 move_group ───────────────────────────────────────
+    # ── MoveIt2 ────────────────────────────────────────────────────
     kinematics_params = os.path.join(pkg, "config", "kinematics.yaml")
     joint_limits_yaml = load_yaml("ur_moveit_config", "config/joint_limits.yaml")
     ompl_yaml = load_yaml("ur_moveit_config", "config/ompl_planning.yaml")
     controllers_yaml = load_yaml("ur_moveit_config", "config/controllers.yaml")
-    # 仿真跑的是 joint_trajectory_controller，真机官方默认跑 scaled_joint_trajectory_controller。
-    # ⚠️ 只 pop 掉它的详情块**不够**：官方那份 yaml 顶层还有一条
-    #    `controller_names: [scaled_..., joint_...]` 的清单，详情块没了但名字
-    #    还留在清单里，moveit_simple_controller_manager 会照着清单挨个查
-    #    `moveit_simple_controller_manager.<name>.action_ns` —— 查不到就报
-    #    「No action namespace specified for controller `scaled_joint_trajectory_controller`」。
-    #    所以名字也必须从 controller_names 里摘掉。
-    #    今天不发作是因为 planner_node 直接发 JTC 的 action，从不走 /move_action；
-    #    但任何人试着用 move_group 规划就会踩到。
     controllers_yaml.pop("scaled_joint_trajectory_controller", None)
     controllers_yaml["controller_names"] = [
         n for n in controllers_yaml.get("controller_names", [])
-        if n != "scaled_joint_trajectory_controller"
-    ]
+        if n != "scaled_joint_trajectory_controller"]
     controllers_yaml["joint_trajectory_controller"]["default"] = True
 
     ompl_config = {
@@ -237,9 +215,7 @@ def generate_launch_description():
     ompl_config.update(ompl_yaml)
 
     move_group = Node(
-        package="moveit_ros_move_group",
-        executable="move_group",
-        name="move_group",
+        package="moveit_ros_move_group", executable="move_group", name="move_group",
         output="screen",
         parameters=[
             {"robot_description": urdf_contents},
@@ -248,91 +224,100 @@ def generate_launch_description():
             kinematics_params,
             {"robot_description_planning": joint_limits_yaml},
             {"move_group": ompl_config},
-            {
-                "moveit_simple_controller_manager": controllers_yaml,
-                "moveit_controller_manager": "moveit_simple_controller_manager/MoveItSimpleControllerManager",
-            },
-            {
-                "moveit_manage_controllers": False,
-                "trajectory_execution.allowed_execution_duration_scaling": 1.2,
-                "trajectory_execution.allowed_goal_duration_margin": 0.5,
-                "trajectory_execution.allowed_start_tolerance": 0.01,
-                "trajectory_execution.execution_duration_monitoring": False,
-            },
-            {
-                "publish_planning_scene": True,
-                "publish_geometry_updates": True,
-                "publish_state_updates": True,
-                "publish_transforms_updates": True,
-            },
+            {"moveit_simple_controller_manager": controllers_yaml,
+             "moveit_controller_manager": "moveit_simple_controller_manager/MoveItSimpleControllerManager"},
+            {"moveit_manage_controllers": False,
+             "trajectory_execution.allowed_execution_duration_scaling": 1.2,
+             "trajectory_execution.allowed_goal_duration_margin": 0.5,
+             "trajectory_execution.allowed_start_tolerance": 0.01,
+             "trajectory_execution.execution_duration_monitoring": False},
+            {"publish_planning_scene": True, "publish_geometry_updates": True,
+             "publish_state_updates": True, "publish_transforms_updates": True},
             {"use_sim_time": True},
         ],
     )
 
-    # ── 控制器 spawner ───────────────────────────────────────────
-    # JTC 管全部 7 个关节（6 臂 + 夹爪）
-    #
-    # D35：参考项目在两条 spawner 命令后都加了 `|| true`，于是**控制器加载失败
-    # 会被吞掉**——launch 照样「成功」，直到后面规划失败才暴露，且现象与真实
-    # 原因相距极远。这里去掉 `|| true`，让失败真的失败。
-    #
-    # D37：参考项目在 spawner 之后又调了一次 switch_controller 来「激活」控制器。
-    # 但 spawner 默认已经激活（它自己就会 configure+activate），这次重复调用
-    # 只会产生两条误导性的 `Could not activate controller ...` WARN，
-    # 而响应其实是 ok=True。纯噪音，删掉。
     spawn_controllers = Node(
-        package="controller_manager",
-        executable="spawner",
-        name="spawn_controllers",
+        package="controller_manager", executable="spawner", name="spawn_controllers",
         output="screen",
-        arguments=[
-            "joint_state_broadcaster",
-            "joint_trajectory_controller",
-            "--controller-manager-timeout", "30",
-            "--ros-args", "-p", "use_sim_time:=true",
-        ],
+        arguments=["joint_state_broadcaster", "joint_trajectory_controller",
+                   "--controller-manager-timeout", "30",
+                   "--ros-args", "-p", "use_sim_time:=true"],
     )
 
     gz_bridge = Node(
-        package="ros_gz_bridge",
-        executable="parameter_bridge",
-        name="gz_bridge",
+        package="ros_gz_bridge", executable="parameter_bridge", name="gz_bridge",
         output="screen",
         parameters=[{"config_file": bridge_yaml, "use_sim_time": True}],
     )
 
-    # ── D36：删掉了 set_p_gain ────────────────────────────────────
-    # 参考项目用一个 `sleep 2 && ros2 param set /gz_ros2_control
-    # position_proportional_gain 5.0` 想把增益设成 5.0，实测**必然失败**
-    # （sleep 2 时节点还不存在 → `Node not found` → exit 1）。
-    #
-    # 但更关键的是：**这个增益根本没法这样设**。查 gz_ros2_control 源码：
-    #   - gz_ros2_control_plugin.cpp:357 用自己的 node options 建节点
-    #     `rclcpp::Node::make_shared("gz_ros2_control", ns)`，**不接收参数覆盖**；
-    #   - URDF 的 `<ros><parameter>` 与 yaml 的 `--params-file` 是在之后
-    #     （:381–396）注入**全局 context** 的，只对随后创建的 controller_manager
-    #     生效 —— 这就是为什么 yaml 里 `controller_manager:` 段有效
-    #     （实测 update_rate=100、allow_partial_joints_goal=True），
-    #     而 `gz_ros2_control:` 段完全无效。
-    #   - gz_system.cpp:273 在 configure 时读一次进成员变量，之后再没重读，
-    #     所以**事后 `ros2 param set` 也不会改变行为**。
-    # 结论：该参数恒为库默认 **0.1**（gz_system.cpp:270 `default_gain = 0.1`），
-    # 实测日志 `The position_proportional_gain has been set to: 0.1` 与之一致。
-    # URDF 里那个 100.0 与 yaml 里那个 10.0 **从来没有生效过** —— 所有成功的
-    # 仿真抓取都是在 0.1 下完成的。故此处删除该进程，并保留本段说明以免
-    # 后来者再去「修」一个不存在的问题。若确需调大增益，得改 gz_ros2_control 源码。
+    # ── 相机适配：编码/frame_id/内参 全部按真机契约 ──────────────────
+    wrist_adapter = Node(
+        package="arm_grasp_sim", executable="camera_adapter.py", name="wrist_camera_adapter",
+        output="screen",
+        parameters=[{
+            "camera_name": "wrist",
+            "wrist_in_color": "/sim/wrist/color",
+            "wrist_in_depth": "/sim/wrist/depth",
+            "wrist_in_info": "",
+            # ⚠️ 腕部相机**不能**占用 /camera/*：主线 pipeline（检测器、投影器）
+            #    认的 /camera 是**俯视**那一路（`realsense_camera.yaml` 钉的是俯视
+            #    SDK 序列号，projector 的 54° 斜视注释也指它）。2026-11-07 之前这里
+            #    把腕部发到 /camera、俯视发到 /topcam，于是 `pipeline.launch.py`
+            #    在仿真里默认读的 /camera/depth 其实是**腕部**视角 —— 典型症状是
+            #    「仿真能跑、真机不跑」。现在按真机契约：/camera = 俯视，
+            #    腕部另立 /wrist（真机若接腕部相机也照这个名字）。
+            "wrist_out_color": "/wrist/color/image_raw",
+            "wrist_out_depth": "/wrist/depth/image_raw",
+            "wrist_out_info": "/wrist/color/camera_info",
+            "wrist_optical_frame": "wrist_camera_optical_frame",
+            "wrist_width": WRIST_W, "wrist_height": WRIST_H,
+            "wrist_fx": WRIST_FX, "wrist_fy": WRIST_FY,
+            "wrist_cx": WRIST_CX, "wrist_cy": WRIST_CY,
+            "wrist_publish_info": True,
+        }],
+    )
+    topcam_adapter = Node(
+        package="arm_grasp_sim", executable="camera_adapter.py", name="topcam_camera_adapter",
+        output="screen",
+        parameters=[{
+            "camera_name": "topcam",
+            "topcam_in_color": "/sim/topcam/color",
+            "topcam_in_depth": "/sim/topcam/depth",
+            "topcam_in_info": "",
+            # 俯视 = 主线契约里的 /camera/*（理由见上面 wrist_adapter 的注释）
+            "topcam_out_color": "/camera/color/image_raw",
+            "topcam_out_depth": "/camera/depth/image_raw",
+            "topcam_out_info": "/camera/color/camera_info",
+            "topcam_optical_frame": "topcam_optical_frame",
+            "topcam_width": TOPCAM_W, "topcam_height": TOPCAM_H,
+            "topcam_fx": TOPCAM_FX, "topcam_fy": TOPCAM_FY,
+            "topcam_cx": TOPCAM_CX, "topcam_cy": TOPCAM_CY,
+            "topcam_publish_info": True,
+        }],
+    )
 
     return LaunchDescription([
+        DeclareLaunchArgument("headless", default_value="false"),
+        DeclareLaunchArgument("scene", default_value="S0:0",
+                              description="场景批次:布局，如 S0:0 / S4:2"),
+        DeclareLaunchArgument("gripper", default_value="ag95"),
+        # 2026-11-06 实测：DART 下夹爪的**移动副**关节收不到 JointVelocityCmd ——
+        # gz_ros2_control 位置分支每步算出 -0.275 m/s 写进组件，手指纹丝不动
+        # （转动副的手臂正常）。换 bullet-featherstone 后同一条命令 1 s 内到位。
+        # 另有：DART 也不支持 <mimic> 约束（Physics.cc 报错后静默不建），
+        # bullet-featherstone 支持 —— 右指靠 URDF mimic 由物理层跟随左指。
         DeclareLaunchArgument(
-            "headless", default_value="false",
-            description="true = 只跑物理不起 Gazebo GUI（-s）",
-        ),
+            "physics", default_value="gz-physics-bullet-featherstone-plugin",
+            description="gz 物理引擎插件；DART 驱动不了移动副 + 不支持 mimic"),
+        DeclareLaunchArgument("world", default_value="",
+                              description="直接指定 SDF（优先于 scene）"),
         set_gz_path,
-        TimerAction(period=2.0, actions=[gz_sim, gz_sim_headless]),        # t=2
-        TimerAction(period=4.0, actions=[robot_state_pub]),               # t=4
-        TimerAction(period=5.0, actions=[spawn_ur5]),                     # t=5
-        TimerAction(period=6.0, actions=[camera_tf]),                     # t=6
-        TimerAction(period=8.0, actions=[move_group]),                    # t=8 (MoveIt2 IK)
-        TimerAction(period=10.0, actions=[spawn_controllers]),            # t=10
-        TimerAction(period=12.0, actions=[gz_bridge]),                    # t=12
+        TimerAction(period=2.0, actions=[gz_sim, gz_sim_headless]),
+        TimerAction(period=4.0, actions=[robot_state_pub]),
+        TimerAction(period=5.0, actions=[spawn_ur5]),
+        TimerAction(period=6.0, actions=[topcam_link, topcam_optical]),
+        TimerAction(period=8.0, actions=[move_group]),
+        TimerAction(period=10.0, actions=[spawn_controllers]),
+        TimerAction(period=12.0, actions=[gz_bridge, wrist_adapter, topcam_adapter]),
     ])

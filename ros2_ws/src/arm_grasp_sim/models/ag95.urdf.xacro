@@ -1,0 +1,125 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/xacro">
+
+  <!--
+    简化 AG-95 两指平行夹爪（仿真代理）。
+
+    与真机一致的部分：
+      - 行程 95 mm（单指各 47.5 mm，对称开合）
+      - tool0 → 指尖外沿 204.2 mm（memory: ag95-finger-outer-vs-inner）
+      - 两指内侧平面平行、沿 tool0 x 方向开合
+
+    与真机**不一致**、结论要打折的部分：
+      - 指尖内侧有机械结构，可伸入深度小于「指长 − 塔高」，这里建模为光滑直板
+      - 没建 AG-95 的齿条/导轨/外壳细节与真实质量分布
+      - 夹持力/电流监控在仿真里没有对应量
+
+    坐标系：tool0 为夹爪安装面，+z 为接近方向（指向工件）。
+  -->
+
+  <xacro:macro name="ag95_gripper" params="prefix parent *origin">
+
+    <!-- ── 参数 ──────────────────────────────────────────────── -->
+    <xacro:property name="body_x"       value="0.100"/>
+    <xacro:property name="body_y"       value="0.075"/>
+    <xacro:property name="body_z"       value="0.060"/>
+    <xacro:property name="finger_x"     value="0.022"/>
+    <xacro:property name="finger_y"     value="0.030"/>
+    <xacro:property name="stroke_half"  value="0.0475"/>   <!-- 95 mm / 2 -->
+    <xacro:property name="tip_z"        value="0.2042"/>   <!-- tool0 → 指尖外沿 -->
+
+    <!-- 指尖从本体下沿伸出 -->
+    <xacro:property name="finger_z"     value="${tip_z - body_z}"/>
+    <xacro:property name="finger_cz"    value="${body_z + finger_z/2}"/>
+
+    <!-- ── 本体 ──────────────────────────────────────────────── -->
+    <link name="${prefix}ag95_base_link">
+      <visual>
+        <origin xyz="0 0 ${body_z/2}" rpy="0 0 0"/>
+        <geometry><box size="${body_x} ${body_y} ${body_z}"/></geometry>
+        <material name="ag95_dark"><color rgba="0.15 0.15 0.17 1.0"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${body_z/2}" rpy="0 0 0"/>
+        <geometry><box size="${body_x} ${body_y} ${body_z}"/></geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 ${body_z/2}" rpy="0 0 0"/>
+        <mass value="0.90"/>
+        <inertia ixx="0.0011" ixy="0" ixz="0" iyy="0.0014" iyz="0" izz="0.0014"/>
+      </inertial>
+    </link>
+
+    <joint name="${prefix}ag95_mount_joint" type="fixed">
+      <xacro:insert_block name="origin"/>
+      <parent link="${parent}"/>
+      <child link="${prefix}ag95_base_link"/>
+    </joint>
+
+    <!-- ── 左指（主驱动）────────────────────────────────────── -->
+    <link name="${prefix}ag95_left_finger_link">
+      <visual>
+        <geometry><box size="${finger_x} ${finger_y} ${finger_z}"/></geometry>
+        <material name="ag95_steel"><color rgba="0.72 0.73 0.75 1.0"/></material>
+      </visual>
+      <collision>
+        <geometry><box size="${finger_x} ${finger_y} ${finger_z}"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.12"/>
+        <inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00007" iyz="0" izz="0.00007"/>
+      </inertial>
+    </link>
+
+    <!-- 关节原点在「闭合时左指中心」：内侧面贴 x=0，中心 x=finger_x/2 -->
+    <joint name="${prefix}ag95_left_finger_joint" type="prismatic">
+      <parent link="${prefix}ag95_base_link"/>
+      <child link="${prefix}ag95_left_finger_link"/>
+      <origin xyz="${finger_x/2} 0 ${finger_cz}" rpy="0 0 0"/>
+      <axis xyz="1 0 0"/>
+      <!-- effort = **夹持力上限**，2026-11-07 实测校准：
+             120 N 时闭合过程把块横向挤走 13 mm（yz 楔角 × 大正压力 ⇒ 侧向分量
+             远超桌面摩擦 0.9×0.03 kg×g ≈ 0.26 N），块是「挤进去卡住」而不是「夹住」。
+             AG-95 真机 50% 力度约 30 N，取这个量级即可：块重 0.29 N，指面摩擦 2.0
+             ⇒ 30 N 的夹持力富余百倍；侧向楔分力降到 ~1.2 N，位移量级收敛。 -->
+      <limit lower="0" upper="${stroke_half}" effort="30" velocity="0.10"/>
+      <dynamics damping="2.0" friction="1.0"/>
+    </joint>
+
+    <!-- ── 右指（mimic，multiplier=-1）───────────────────────── -->
+    <link name="${prefix}ag95_right_finger_link">
+      <visual>
+        <geometry><box size="${finger_x} ${finger_y} ${finger_z}"/></geometry>
+        <material name="ag95_steel"><color rgba="0.72 0.73 0.75 1.0"/></material>
+      </visual>
+      <collision>
+        <geometry><box size="${finger_x} ${finger_y} ${finger_z}"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.12"/>
+        <inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00007" iyz="0" izz="0.00007"/>
+      </inertial>
+    </link>
+
+    <joint name="${prefix}ag95_right_finger_joint" type="prismatic">
+      <parent link="${prefix}ag95_base_link"/>
+      <child link="${prefix}ag95_right_finger_link"/>
+      <origin xyz="${-finger_x/2} 0 ${finger_cz}" rpy="0 0 0"/>
+      <axis xyz="1 0 0"/>
+      <limit lower="${-stroke_half}" upper="0" effort="30" velocity="0.10"/>
+      <dynamics damping="2.0" friction="1.0"/>
+      <mimic joint="${prefix}ag95_left_finger_joint" multiplier="-1" offset="0"/>
+    </joint>
+
+    <!-- ── 仿真接触参数：指尖摩擦必须够大，否则一抬就滑 ────── -->
+    <gazebo reference="${prefix}ag95_left_finger_link">
+      <mu1>2.0</mu1><mu2>2.0</mu2>
+      <kp>1000000</kp><kd>100</kd>
+    </gazebo>
+    <gazebo reference="${prefix}ag95_right_finger_link">
+      <mu1>2.0</mu1><mu2>2.0</mu2>
+      <kp>1000000</kp><kd>100</kd>
+    </gazebo>
+
+  </xacro:macro>
+</robot>

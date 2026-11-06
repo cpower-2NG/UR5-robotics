@@ -1,37 +1,38 @@
-# ros_gz_bridge config: YAML list of bridge entries
-# Syntax: ros_topic_name + gz_topic_name for remapping, or topic_name for pass-through
+# ros_gz_bridge 配置：Gazebo 话题 → ROS 中间话题。
+#
+# 只桥**原始图像**，不桥 camera_info：
+#   Gazebo 的彩色/深度两路 sensor 会把各自的 info 挤到同一个话题上
+#   （实测 camera_info 的帧数是图像的两倍），下游拿到的是混着的。
+#   内参一律由 camera_adapter.py 用真机实测值重新发布。
+#
+# 中间名带 /sim/ 前缀，与真机话题名（/camera/...）分开，
+# 这样适配节点的「输入 = 输出」永远不会自激。
 
-- ros_topic_name: "/camera/color/image_raw"
-  gz_topic_name: "/rgbd_camera/image"
+- ros_topic_name: "/sim/wrist/color"
+  gz_topic_name: "/wrist_camera/image"
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "gz.msgs.Image"
   direction: "GZ_TO_ROS"
 
-- ros_topic_name: "/camera/depth/image_raw"
-  gz_topic_name: "/rgbd_camera/depth_image"
+- ros_topic_name: "/sim/wrist/depth"
+  gz_topic_name: "/wrist_camera/depth_image"
   ros_type_name: "sensor_msgs/msg/Image"
   gz_type_name: "gz.msgs.Image"
   direction: "GZ_TO_ROS"
 
-- ros_topic_name: "/camera/color/camera_info"
-  gz_topic_name: "/rgbd_camera/camera_info"
-  ros_type_name: "sensor_msgs/msg/CameraInfo"
-  gz_type_name: "gz.msgs.CameraInfo"
+- ros_topic_name: "/sim/topcam/color"
+  gz_topic_name: "/topcam/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
   direction: "GZ_TO_ROS"
 
-- ros_topic_name: "/camera/depth/points"
-  gz_topic_name: "/rgbd_camera/depth_image/points"
-  ros_type_name: "sensor_msgs/msg/PointCloud2"
-  gz_type_name: "gz.msgs.PointCloudPacked"
+- ros_topic_name: "/sim/topcam/depth"
+  gz_topic_name: "/topcam/depth_image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
   direction: "GZ_TO_ROS"
 
 - topic_name: "/clock"
   ros_type_name: "rosgraph_msgs/msg/Clock"
   gz_type_name: "gz.msgs.Clock"
   direction: "GZ_TO_ROS"
-
-- ros_topic_name: "/world/grasp_world/set_pose"
-  gz_topic_name: "/world/grasp_world/set_pose"
-  ros_type_name: "geometry_msgs/msg/Pose"
-  gz_type_name: "gz.msgs.Pose"
-  direction: "ROS_TO_GZ"

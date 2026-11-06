@@ -143,7 +143,11 @@ REAL_TRAJECTORY_ACTION = '/scaled_joint_trajectory_controller/follow_joint_traje
 # ⚠️ 取大一档是**保守侧**：法兰被放得更高，失手是「夹空」而不是「压桌面」。
 #    真机首抓若老是夹不到，回退成 `0.172`（= 不加那 4 mm）。
 # ⚠️ 这个参数**含方块高**（28.5 mm，现场视觉标定）—— 换方块要重算。
-SIM_TOOL0_TO_FINGERTIP = '0.13'
+# 阶段 4 起仿真侧也换成 **AG-95**（`arm_grasp_sim/models/ag95.urdf.xacro`，
+# 指尖外沿 204.2 mm，与真机同一个数），方块是 **29.5 mm**：
+#       SIM = 0.2042 − 0.0295 = **0.1747**
+# 下面那串 0.13 是旧仿真（Robotiq 2F-85 + 40 mm 方块）的值，留作推导旁证。
+SIM_TOOL0_TO_FINGERTIP = '0.1747'
 REAL_TOOL0_TO_FINGERTIP = '0.1757'
 # 放置下降时额外留的高度（m）= 「闭合 − 张开」的指尖落差。**同样是后端属性**：
 # 平爪**闭合**时指尖会往下走一截，所以放置那一段（爪是闭合的）比抓取那一段
@@ -151,6 +155,10 @@ REAL_TOOL0_TO_FINGERTIP = '0.1757'
 # 整段注释都在讲这件事。仿真：2F-85 闭合 0.170 − 张开 0.160 = 0.010，正是那个 0.01。
 # 真机：AG-95 = 200.2 − 184.6 = **0.0156**。
 # ⚠️ 两个值都**尚未现场验收**，且都随夹爪开合行程变。
+# ⚠️ 阶段 4 的仿真 AG-95 是指尖**刚性平板**的代理模型，开合不改变最低点，
+#    所以「闭合 − 张开」在仿真里其实是 0；这里仍取 0.01 —— 节点对它有
+#    `> 0` 的启动检查（`planner_node.py` 的 `place_release_lift` 检查），
+#    顺带给放置留 10 mm 空程。
 SIM_PLACE_RELEASE_LIFT = '0.01'
 REAL_PLACE_RELEASE_LIFT = '0.0156'
 
@@ -310,6 +318,25 @@ def generate_launch_description():
     camera_source_arg = DeclareLaunchArgument(
         'camera_source', default_value='sim',
         description='sim | realsense | external — who provides /camera/* topics'
+    )
+    # use_sim_time：**默认跟着 camera_source 走**（sim ⇒ true），理由与
+    # depth_topic / gripper_backend 同源 —— 它同样是「仿真与真机名字不同」的
+    # 那一类，只是这里的「名字」是**时钟本身**。
+    #
+    # 为什么必须开（2026-11-07 实测，组件测试 B）：Gazebo 给相机帧盖的是
+    # `/clock` 的**仿真时间**戳，而 ROS 节点默认用墙钟。两边一起跑时，
+    # `projector_node` 的 `_nearest_depth` 会算出一个上亿秒的时间差，
+    # 超过 `max_sync_dt` 后**静默丢弃每一批检测** —— 症状是「/targets_3d
+    # 一条都没有」，看着像检测器或投影坏了。把探针加 `-p use_sim_time:=true`
+    # 之后立刻通过（5 个块 ≤5 mm）。所以这不是优化项，是仿真能跑的前提。
+    # 另外规划器的 close_settle / idle_finish_timeout 也是按这个时钟算的：
+    # 仿真 RTF≈0.14，用墙钟会让「等 0.5 s」实际只过了 0.07 仿真秒。
+    use_sim_time_default = PythonExpression([
+        "'true' if '", LaunchConfiguration('camera_source'), "' == 'sim' else 'false'",
+    ])
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time', default_value=use_sim_time_default,
+        description='true = 节点时钟跟随 /clock（仿真必须开；真机保持 false）'
     )
     # ── 相机认亲：钉死是哪一台 D435i ─────────────────────────────────────
     # ⚠️ 序列号**不在这个文件里传**，在 `config/realsense_camera.yaml` ——
@@ -633,6 +660,7 @@ def generate_launch_description():
             'model': LaunchConfiguration('model'),
             'confidence_threshold': LaunchConfiguration('confidence_threshold'),
             'device': LaunchConfiguration('device'),
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
         }],
     )
 
@@ -662,6 +690,7 @@ def generate_launch_description():
             'depth_buffer_len': LaunchConfiguration('depth_buffer_len'),
             'camera_info_topic': LaunchConfiguration('camera_info_topic'),
             'detections_topic': LaunchConfiguration('detections_topic'),
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
         }],
     )
 
@@ -692,6 +721,9 @@ def generate_launch_description():
             # 只走位演示：规划器不闭合夹爪，但仍走完「接近→下降→抬起→HOME→
             # 放置位→下降→抬起→HOME」的完整动作序列。
             'carry_objects': LaunchConfiguration('carry_objects'),
+            # 规划器的所有 Timer（close_settle / idle_finish_timeout）与轨迹
+            # 时间戳都走节点的时钟；仿真 RTF≈0.14，用墙钟会整体快 ~7 倍。
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
         },
     ]
     planner = Node(
@@ -709,6 +741,7 @@ def generate_launch_description():
         device_arg,
         target_frame_arg,
         camera_source_arg,
+        use_sim_time_arg,
         realsense_params_arg,
         depth_topic_arg,
         tf_required_arg,

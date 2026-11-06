@@ -1,0 +1,141 @@
+# grasp_planner 的**仿真专用**参数（阶段 4 新世界：AG-95 + base_link 就是台面）。
+#
+# 为什么另开一份、而不是改 `grasp_planner/config/grasp_planner.yaml`：
+#   那份是**真机共用**的（真机几何按现场实测标定）。仿真世界的几何与夹爪与真机
+#   完全不同，改共用文件会把真机一起改坏。入口是 `yolo_bringup/pipeline.launch.py`
+#   的 launch 参数 `planner_params_file`，由 `arm_grasp_sim/full.launch.py` 指到这里。
+#
+# ⚠️ **本文件不是唯一的一份**：launch 会在本文件之后**再叠一个字典**（后一份赢），
+#    所以下面这几个键写在这里**不生效**，必须走 launch 参数：
+#      gripper_backend / table_scene_enabled / ik_group / trajectory_action /
+#      tool0_to_fingertip / place_release_lift / carry_objects
+#   其中 `tool0_to_fingertip`、`place_release_lift` 的**仿真值**在
+#   pipeline.launch.py 的 SIM_* 常量里（已按 AG-95 改过）。
+#    另：本文件里**没写**的键会落到 planner_node.py 的硬编码默认值（那套默认值
+#    与真机 yaml 逐条相同），所以"少写"不等于"随便"——改动前先确认默认值是什么。
+#
+# 世界几何（出自 `arm_grasp_sim/scripts/gen_scene.py`，坐标 = base_link 系）：
+#   台面顶面 z = 0；方块 29.5 mm，静止时中心 z=0.01475、顶面 z=0.0295
+#   放置垫：中心 (0.4242, -0.11224)、0.30×0.30、厚 2.88 mm ⇒ 垫面 z=0.00288
+#   拾取区 ZONE = x[0.25, 0.575] y[0.17, 0.42]
+# 夹爪：AG-95 代理，单指行程 47.5 mm（开口 95 mm），topic 关节 `ag95_left_finger_joint`
+
+grasp_planner:
+  ros__parameters:
+    # ---- 接口 ----
+    targets_topic: /targets_3d
+    ik_service: /compute_ik
+    base_frame: base_link
+    ik_group: ur5_manipulator
+    ik_link: tool0
+    ik_timeout: 2.0
+
+    arm_joint_names:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+
+    # 工具朝下：绕 base x 转 180° ⇒ tool0 +z（接近方向）指向 -base z，
+    # 指沿 base x 开合。与 scripts 里的探针一致（2026-11-07 实测抓取成功）。
+    grasp_rpy: [3.141592653589793, 0.0, 0.0]
+
+    # 折叠位姿：tool0 在 z≈1.00，臂收在工作台上方，与拾取区的方块无干涉。
+    # （实测：这个 HOME 下 FK 的 tool0 z = 1.0011，JTC 到位误差 < 1e-4 rad。）
+    home_joints: [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
+
+    # 前伸 IK 种子：**必须固定**。用当前位置当种子会在回到 HOME 后解出极端肩角。
+    # 这组值在拾取区 x≈0.53 y≈0.17 处实测能解出肘朝上的支。
+    ik_seed: [0.0, -1.2, 1.3, -1.6, -1.57, 0.0]
+
+    # ---- 几何 ----
+    # 语义：`tool0_to_fingertip` = 闭合时 法兰→指尖 − 方块高（**含方块高**）。
+    # 这里写的是 AG-95 仿真值；实际生效的是 pipeline.launch.py 的
+    # SIM_TOOL0_TO_FINGERTIP（launch 字典覆盖本文件），这里同步写一份只为可读。
+    tool0_to_fingertip: 0.1747      # = 0.2042 − 0.0295
+    grasp_clearance: 0.010          # 下降再抬 10 mm：指尖落在台面上方 10 mm
+    approach_clearance: 0.05
+    lift_height: 0.15
+
+    # 下降前先把夹爪收到 50 mm 开口。全开 95 mm 时指尖外沿在 tool0 轴两侧
+    # 各 69.5 mm，下降那一段会把整条扫描带扫过台面：本场景的块间距最小 77 mm
+    # （block_3 ↔ block_4），全开必然蹭到邻块。2026-11-07 实测全开时 block_3
+    # 被拖走 62 mm、再推着目标块顶到指尖上，随后闭合结果不确定（同一条命令
+    # 一次夹住、一次滑掉）。半开 50 mm 时扫描带外沿只剩 47 mm，闭合前的块
+    # 位姿与真值逐位一致（0.462078, 0.190610, 0.014750）。
+    # 50 mm > 本场景最宽的块投影宽度 37.7 mm（29.5 mm 块转 160.5°），仍能罩住。
+    approach_opening_mm: 50.0
+
+    # 台面上方也算「地上」的判据。base_link 就在台面 ⇒ 台上的块顶 ≈ 0.03，
+    # 掉到地上的块顶 ≈ -0.72。取 -0.2 干净分开两者。
+    table_min_z: -0.2
+
+    # 拾取区：XY 用 gen_scene 的 ZONE，Z 取「台面 0 到块顶上方一点」。
+    pick_zone: [0.25, 0.575, 0.17, 0.42, 0.0, 0.06]
+
+    # ---- 放置槽位（扁平 x,y,...，按顺序消费）----
+    # 6 格 = 2 排 × 3 列，间距 0.13 m（> AG-95 开口 0.095 m，否则张开的指会压到
+    # 相邻格已放好的块）。全部落在放置垫 0.30×0.30 的范围内，且 y<0.17 ⇒ 在
+    # pick_zone 之外（这就是「放好即不再是候选」的终止机制）。
+    # 注意：垫面上的白色宫格是 60 mm 间距的**装饰**，与这 6 个槽位不对齐 ——
+    # 60 mm 太密，真放 6 个张开的指会互相压到，所以槽位不按宫格摆。
+    place_slots: [
+      0.2942, -0.17724,   0.4242, -0.17724,   0.5542, -0.17724,
+      0.2942, -0.04724,   0.4242, -0.04724,   0.5542, -0.04724,
+    ]
+    place_slot_classes: []
+    # 放置参考高度 = 垫面 + 方块高（**方块静止时的可见顶面**，不是中心）
+    place_z: 0.0324                 # = 0.00288 + 0.0295
+    # 必须 > 0（节点启动检查）。AG-95 仿真指尖是刚性平板，开合不改变最低点，
+    # 这里取 0.01 纯作余量：放置时指尖落在垫面上方约 10 mm。
+    place_release_lift: 0.01
+
+    max_attempts_without_place: 10
+    idle_finish_timeout: 20.0
+
+    # ---- 时序 ----
+    # 仿真 RTF ≈ 0.14（bullet-featherstone，本机实测），时间都是**仿真时间**，
+    # 所以这些值不能按壁钟感觉调小。
+    move_duration: 2.0
+    descend_duration: 1.5
+    goal_time_tolerance: 2.0
+    gripper_duration: 3.0
+    close_settle: 0.5
+    retry_delay: 0.5
+
+    min_score: 0.3
+
+    # ---- 姿态安全：肘高护栏 ----
+    # 臂坐在台面上（base_link z=0 ⇒ 台面也是 0），所以 table_plane_z 就是 0.0。
+    elbow_guard_enabled: true
+    fk_service: /compute_fk
+    guard_links: [forearm_link, wrist_1_link]
+    table_plane_z: 0.0
+    guard_margin: 0.02
+    guard_path_samples: 8
+    max_joint_jump: 1.0
+
+    # ---- 把桌子放进 MoveIt 规划场景 ----
+    # 与 gen_scene.py 的 `table` 模型一致（1.15×1.10×0.04 @ (0.225,0.10,-0.02)）。
+    table_scene_enabled: true
+    table_box_size: [1.15, 1.10, 0.04]
+    table_box_pose: [0.225, 0.10, -0.02, 0.0, 0.0, 0.0]
+    table_retry_period: 2.0
+
+    # ---- 夹爪（AG-95 代理，走 JTC 的第 7 个关节）----
+    # open 大 / close 小，与真机 Robotiq 的 0.0 / 0.8 方向**相反**：
+    #   AG-95 的左指关节 q∈[0, 0.0475]，q 越大开口越大，0 = 全闭。
+    sim_gripper_joint: ag95_left_finger_joint
+    sim_gripper_open: 0.0475
+    # ⚠️ close 必须下到 **0.0**（而不是块半宽 0.01475）。gz_ros2_control 的位置
+    #   分支是**速度伺服**：target_vel = -0.1·(state−cmd)·100。命令停在块半宽时
+    #   残余误差只有零点几毫米 ⇒ 指令速度 ~6 mm/s ⇒ 夹持力可忽略，块一抬就掉
+    #   （2026-11-06 实测：块升 −0.3 mm）。下到 0 才能让误差恒定、持续施力。
+    sim_gripper_close: 0.0
+    # 空夹判据（`is_empty`）：pos ≥ empty_threshold 或 pos ≤ barely_moved ⇒ 空。
+    # 反解出来「夹住」的窗口是 (0.004, 0.030) 即开口 8–60 mm，29.5 mm 的块正好落
+    # 在中段（实测夹住时 q≈0.014–0.022）；空夹会一路走到 ~0.0。
+    sim_gripper_empty_threshold: 0.030
+    sim_gripper_barely_moved: 0.004
