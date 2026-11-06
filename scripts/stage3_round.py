@@ -980,6 +980,20 @@ def bias_from_layer(measured_mm, commanded_mm, limit_mm=BIAS_LIMIT_MM):
     return [bx, by], None
 
 
+def bias_note(mode):
+    """`--bias-comp` 三种模式在逐层日志里各说各的（别把 fixed 说成「补偿关闭」）。
+
+    2026-11-06 第 13 轮现场：`--bias-comp fixed` 明明在补（命令 = 期望 − b̂，
+    逐层可验），日志却打印「补偿关闭（--bias-comp none）」——只看模式三分支，
+    别再用「不是 adaptive 就是 none」这种二选一。
+    """
+    return {
+        "adaptive": "下一层按历史均值预补偿",
+        "fixed": "整轮固定先验补偿（--bias-comp fixed）",
+        "none": "补偿关闭（--bias-comp none），只记账",
+    }.get(mode, "未知模式 %r，按不补偿处理" % (mode,))
+
+
 def applied_bias(bias_hist, mode="adaptive", seed=None):
     """这一层要用的 b̂（mm）：``种子 + 本轮已测各层`` 的均值。
 
@@ -1903,9 +1917,7 @@ def run_round(args):
             "bias_mm": [round(v, 3) for v in bias],
             "bias_post_nudge_mm": rec["placement_bias_post_nudge_mm"]})
         print("  放置偏置 b̂=(%+.2f, %+.2f) mm —— %s"
-              % (bias[0], bias[1],
-                 "下一层按历史均值预补偿" if args.bias_comp == "adaptive"
-                 else "补偿关闭（--bias-comp none），只记账"))
+              % (bias[0], bias[1], bias_note(args.bias_comp)))
         # 防倾覆停轮门：放后**最终**（矫正后）测量，相对 xy >10 mm 就不再加层。
         # 5 mm 判分门在 stage3_score，这里只回答「还能不能往上叠」。
         gate = stop_gate_xy(merged, (prev or {}).get("merged"), k, slot_mm)

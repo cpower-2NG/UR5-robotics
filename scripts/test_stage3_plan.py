@@ -419,6 +419,24 @@ def test_bias_seed_compensates_layer_one():
 
 
 @case
+def test_bias_note_distinguishes_fixed_from_none():
+    """逐层日志按模式说话：`fixed` 在补，不许打印成「补偿关闭」。
+
+    2026-11-06 第 13 轮现场：`--bias-comp fixed` 命令 = 期望 − b̂（逐层可验），
+    日志却写「补偿关闭（--bias-comp none）」——旧代码用
+    「不是 adaptive 就是 none」的二选一，把 fixed 漏了。
+    """
+    fixed = s3r.bias_note("fixed")
+    none = s3r.bias_note("none")
+    adaptive = s3r.bias_note("adaptive")
+    assert fixed != none, "fixed 与 none 的日志文案必须不同"
+    assert "fixed" in fixed and "关闭" not in fixed, fixed
+    assert "关闭" in none, none
+    assert "均值" in adaptive, adaptive
+    assert "fixed" not in adaptive, adaptive
+
+
+@case
 def test_bias_fixed_ignores_in_round_history():
     """``--bias-comp fixed``：b̂ 只用先验，本轮实测只记账不改命令。
 
