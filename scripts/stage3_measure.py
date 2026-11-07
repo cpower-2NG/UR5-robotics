@@ -64,6 +64,10 @@ MIN_H_MM = 15.0
 #: 按高度认塔顶的容差（mm）。入口③ 用它把「手里那块」和「塔顶」分开，
 #: 三层实测塔顶偏差 0.2–2.6 mm、持块与塔顶相距 74–123 mm，6 mm 两边都够开。
 EXPECTED_TOP_TOL_MM = 6.0
+#: 按**同帧相对高度**选簇的容差（mm）。E4a 悬停时手指在块顶上方 50–80 mm，
+#: 相对高度差 = hover（≥50 mm），10 mm 的窗把两者分得很开；相对量同帧测得，
+#: 深度沿光轴的偏差在两边抵消。方块真高 29.5 mm（见上）。
+SELECT_H_TOL_MM = 10.0
 
 #: 两视点一致性门。yaw 用阶段 2 的 6°；**xy / z 于 2026-11-04 从 10 mm 收到 5 mm**。
 #:
@@ -473,7 +477,8 @@ def top_face_framing(frame, cx_mm, cy_mm, ztop_mm, radius_mm=25.0,
 
 def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
                    min_h_mm=MIN_H_MM, expected_top_mm=None,
-                   top_tol_mm=EXPECTED_TOP_TOL_MM):
+                   top_tol_mm=EXPECTED_TOP_TOL_MM, select_h_mm=None,
+                   select_h_tol_mm=SELECT_H_TOL_MM):
     """塔窗内取**最高**的合格簇；返回 ``(block|None, diag)``。
 
     只认 ``low=False`` 且高度 ≥``min_h_mm`` 的簇 —— 低处的连接件/台面噪声
@@ -483,6 +488,12 @@ def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
     ``|top − expected_top| ≤ top_tol_mm`` 的簇。eye-in-hand 在 carry 处抓帧时
     必须给 —— 那时手里还夹着块，它的顶面比塔顶高 74–120 mm，按「最高簇」取
     会量到手里那块（入口③ 的旧记录正是这么错的）。
+
+    ``select_h_mm``（可选）＝**按同帧相对高度选簇**：只保留
+    ``|h − select_h_mm| ≤ select_h_tol_mm`` 的簇，再取最接近这个高度的一个。
+    悬停（E4a）必须给：夹爪手指就在块顶正上方 ``hover`` 毫米处，
+    ``h`` ≈ 块高 + hover，而块顶 ``h`` ≈ 块高；用**相对台面**的高度选，
+    俯视/腕部深度沿光轴的偏差在两边同量抵消，不依赖绝对顶高。
     """
     wx, wy = float(window_xy_mm[0]), float(window_xy_mm[1])
     cands = []
@@ -493,6 +504,10 @@ def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
                 and abs(float(b.get("top", 0.0)) - float(expected_top_mm))
                 > float(top_tol_mm)):
             continue
+        if (select_h_mm is not None
+                and abs(float(b.get("h", 0.0)) - float(select_h_mm))
+                > float(select_h_tol_mm)):
+            continue
         d = math.hypot(b["cx"] - wx, b["cy"] - wy)
         if d <= radius_mm:
             cands.append(dict(b, _dist_mm=round(d, 2)))
@@ -500,14 +515,24 @@ def pick_tower_top(blocks, window_xy_mm, radius_mm=TOWER_RADIUS_MM,
             "expected_top_mm": (None if expected_top_mm is None
                                 else round(float(expected_top_mm), 2)),
             "top_tol_mm": float(top_tol_mm),
+            "select_h_mm": (None if select_h_mm is None
+                            else round(float(select_h_mm), 2)),
+            "select_h_tol_mm": float(select_h_tol_mm),
             "window_xy_mm": [round(wx, 2), round(wy, 2)],
             "radius_mm": float(radius_mm),
             "candidates": [{"idx": b["idx"], "cx": round(b["cx"], 2),
                             "cy": round(b["cy"], 2), "top": round(b["top"], 2),
+                            "h": round(float(b.get("h", 0.0)), 2),
                             "dist_mm": b["_dist_mm"]} for b in cands]}
     if not cands:
         return None, diag
-    best = max(cands, key=lambda b: b["top"])
+    if select_h_mm is not None:
+        # 最接近目标相对高度的那簇；同距取更高者（确定性）。
+        best = min(cands, key=lambda b: (abs(float(b.get("h", 0.0))
+                                             - float(select_h_mm)),
+                                         -float(b.get("top", 0.0))))
+    else:
+        best = max(cands, key=lambda b: b["top"])
     return best, diag
 
 
@@ -563,10 +588,13 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
                   z_bias_mm=0.0, block_h_mm=BLOCK_TRUE_H_MM,
                   radius_mm=TOWER_RADIUS_MM, max_h_mm=MAX_H_MM,
                   min_h_mm=MIN_H_MM, frame=None, expected_top_mm=None,
-                  top_tol_mm=EXPECTED_TOP_TOL_MM):
+                  top_tol_mm=EXPECTED_TOP_TOL_MM, select_h_mm=None,
+                  select_h_tol_mm=SELECT_H_TOL_MM):
     """一帧 → 塔顶观测。
 
     ``grid`` / ``window_xy_mm``：至少给一个；都没给就报错（塔窗不能靠猜）。
+    ``select_h_mm``：按同帧相对高度选簇（悬停时排除夹爪手指，见
+    ``pick_tower_top``）。
     返回的 ``surface_est_mm`` 已扣 ``z_bias_mm``，是**本层放置面**的估计。
     """
     if window_xy_mm is None:
@@ -580,7 +608,9 @@ def measure_frame(frame_dir, grid=None, window_xy_mm=None,
     top, diag = pick_tower_top(blocks, window_xy_mm, radius_mm=radius_mm,
                                min_h_mm=min_h_mm,
                                expected_top_mm=expected_top_mm,
-                               top_tol_mm=top_tol_mm)
+                               top_tol_mm=top_tol_mm,
+                               select_h_mm=select_h_mm,
+                               select_h_tol_mm=select_h_tol_mm)
     out = {"frame": os.path.basename(os.path.abspath(frame_dir)),
            "found": top is not None,
            "window_xy_mm": [round(float(window_xy_mm[0]), 2),

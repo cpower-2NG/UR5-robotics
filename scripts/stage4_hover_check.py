@@ -16,6 +16,12 @@
 帧目录两种形态都认：``--burst 1`` 的单帧（``color.png``）与 ``--burst N`` 的
 批量帧（``color_000.png`` …）。后者不要求先拆目录。
 
+**选簇按同帧相对高度**（``select_h_mm`` = 块高，默认 29.5，可用
+``--block-h-mm`` 改）：悬停时夹爪手指就在块顶正上方 hover 毫米处，相对台面的
+高度 ≈ 块高 + hover；若沿用「取窗口内最高簇」，量到的会是手指 —— 手指相对相机
+静止，中心/yaw 极差恒为 0，会把 E4a 判成败假绿。相对高度在同一帧里测得，
+腕部深度沿光轴的偏差在块与台面两边同量抵消。
+
 退出码：0 = 三个高度全过；1 = 有高度不过；2 = 数据缺失/坏。
 """
 
@@ -100,6 +106,8 @@ def summarize(samples, block_xy_mm=None, block_top_mm=None, hover_mm=None):
             if s.get('yaw_color_trusted') is True and s.get('yaw_color_deg') is not None]
     covers = [float(s['face_cover']) for s in usable
               if s.get('face_cover') is not None]
+    tops = [float(s['top_mm']) for s in usable
+            if s.get('top_mm') is not None]
 
     span_x, span_y = _span(xs), _span(ys)
     half = (max(span_x, span_y) / 2.0
@@ -129,6 +137,15 @@ def summarize(samples, block_xy_mm=None, block_top_mm=None, hover_mm=None):
         out['tool0_z_mm'] = round(float(block_top_mm)
                                   + TOOL0_TO_BARE_FINGERTIP_M * 1000.0
                                   + float(hover_mm), 2)
+    # 命令高度是按「俯视测的块顶」算的；俯视深度历来读远 ~1.9%，真实余量未必
+    # 等于 hover。腕部这一路自己量的块顶（同帧相对高度选簇）给出**实际余量**，
+    # 只记录、不改判据 —— 报告里必须能看出「说 50 mm 实际是多少」。
+    if tops:
+        out['measured_top_mm'] = round(_median(tops), 2)
+        if out.get('tool0_z_mm') is not None:
+            out['actual_hover_mm'] = round(
+                out['tool0_z_mm'] - TOOL0_TO_BARE_FINGERTIP_M * 1000.0
+                - out['measured_top_mm'], 2)
 
     if n == 0:
         out['reasons'].append('没有帧')
@@ -168,12 +185,17 @@ def check_height(capture_dir, hover_mm, block_xy_mm, block_top_mm=None,
     if not os.path.isdir(capture_dir):
         raise ValueError('帧目录不存在：%s' % capture_dir)
     idxs = list_indices(capture_dir)
+    # 悬停时夹爪手指在块顶正上方 hover 毫米处，相对台面的高度 ≈ 块高 + hover。
+    # 不按这个相对高度选簇，pick_tower_top 的「取最高簇」会量到手指本身 ——
+    # 手指相对相机静止，中心/yaw 极差都会是 0，E4a 会拿夹爪自己判成满分。
+    select_h = (float(block_h_mm) if block_h_mm is not None
+                else float(sm.BLOCK_TRUE_H_MM))
     samples, records = [], []
     for idx in idxs:
         try:
             frame = load_indexed_frame(capture_dir, idx)
             kw = {'window_xy_mm': tuple(block_xy_mm), 'z_bias_mm': z_bias_mm,
-                  'frame': frame}
+                  'frame': frame, 'select_h_mm': select_h}
             if block_h_mm is not None:
                 kw['block_h_mm'] = block_h_mm
             res = sm.measure_frame(capture_dir, **kw)
@@ -187,7 +209,7 @@ def check_height(capture_dir, hover_mm, block_xy_mm, block_top_mm=None,
     summary = summarize(samples, block_xy_mm=block_xy_mm,
                         block_top_mm=block_top_mm, hover_mm=hover_mm)
     summary.update({'hover_mm': float(hover_mm), 'capture': capture_dir,
-                    'frames': records})
+                    'select_h_mm': select_h, 'frames': records})
     return summary
 
 

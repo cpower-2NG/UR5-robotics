@@ -115,6 +115,35 @@ def test_pick_tower_top_can_gate_by_expected_height():
     assert top3 is None and diag3["n_window"] == 0, diag3
 
 
+@case
+def test_pick_tower_top_can_select_by_relative_height():
+    """E4a 悬停：夹爪手指在块顶正上方 hover 毫米处，按**同帧相对高度**选块。
+
+    实测几何：块高 29.5 mm，悬停 50–80 mm ⇒ 手指簇的 h ≈ 79.5–109.5 mm，
+    块顶串 h ≈ 29.5 mm。不选高度时「取最高簇」量到的是手指 —— 手指相对相机
+    静止，中心/yaw 极差恒为 0，E4a 会把夹爪自己判成满分（假绿）。
+    这里同时钉住旧行为（取到手指）和新行为（取到块），证明闸门不是空转。
+    """
+    blocks = [blk(1, 422.0, -114.0, 400.0, 29.5),    # 块顶
+              blk(2, 424.0, -112.0, 459.5, 89.5)]    # 夹爪手指（hover=60）
+    top, _ = m3.pick_tower_top(blocks, [422.0, -114.0])
+    assert top["idx"] == 2, "不给高度时旧行为会量到手指（这就是待修的假绿）"
+    top2, diag2 = m3.pick_tower_top(blocks, [422.0, -114.0],
+                                    select_h_mm=29.5)
+    assert top2 is not None and top2["idx"] == 1, top2
+    assert_close(diag2["select_h_mm"], 29.5, 1e-9)
+    assert_close(diag2["select_h_tol_mm"], m3.SELECT_H_TOL_MM, 1e-9)
+    assert diag2["n_window"] == 1, diag2
+    # 容差严格分开两者：给一个谁都不沾的目标高度 ⇒ 一簇都不选（fail-closed）
+    top3, diag3 = m3.pick_tower_top(blocks, [422.0, -114.0],
+                                    select_h_mm=59.5)
+    assert top3 is None and diag3["n_window"] == 0, diag3
+    # 变异：把容差放到 40 mm，同一条数据必须把手指也收进来（闸门真在查）
+    top4, diag4 = m3.pick_tower_top(blocks, [422.0, -114.0],
+                                    select_h_mm=59.5, select_h_tol_mm=40.0)
+    assert top4 is not None and diag4["n_window"] == 2, diag4
+
+
 # ---------------------------------------------------------------- 融合
 @case
 def test_fuse_frames_median_and_yaw():

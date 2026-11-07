@@ -38,12 +38,16 @@ def check(name, cond, detail=''):
         print('  FAIL  %s%s' % (name, ('\n        ' + detail) if detail else ''))
 
 
-def sample(usable=True, x=0.0, y=0.0, yaw=10.0, trusted=True, cover=0.5):
+def sample(usable=True, x=0.0, y=0.0, yaw=10.0, trusted=True, cover=0.5,
+           top=None):
     if not usable:
         return {'usable': False, 'found': False}
-    return {'usable': True, 'found': True, 'center_base_mm': [x, y],
-            'yaw_color_deg': yaw, 'yaw_color_trusted': trusted,
-            'face_cover': cover}
+    out = {'usable': True, 'found': True, 'center_base_mm': [x, y],
+           'yaw_color_deg': yaw, 'yaw_color_trusted': trusted,
+           'face_cover': cover}
+    if top is not None:
+        out['top_mm'] = top
+    return out
 
 
 def grid(n=15, dx=1.0, dy=0.0, dyaw=0.5):
@@ -98,6 +102,21 @@ check('tool0_z = 100 + 204.2 + 50', abs(base['tool0_z_mm'] - 354.2) < 1e-6,
       repr(base.get('tool0_z_mm')))
 check('offset_from_block 记中位数', base['offset_from_block_mm'] == [0.7, 0.0],
       repr(base.get('offset_from_block_mm')))
+
+# 实际余量：命令高度按俯视块顶算，腕部实测块顶给出真值（俯视读远 ~1.9%）
+with_top = hc.summarize([sample(x=0.0, y=0.0, top=100.0) for _ in range(15)],
+                        block_xy_mm=[0.0, 0.0], block_top_mm=120.0,
+                        hover_mm=50.0)
+check('记录腕部实测块顶 100 mm', abs(with_top['measured_top_mm'] - 100.0) < 1e-9,
+      repr(with_top.get('measured_top_mm')))
+check('命令 50 mm、实际余量 70 mm（俯视读低 20 mm 看得见）',
+      abs(with_top['actual_hover_mm'] - 70.0) < 1e-9,
+      repr(with_top.get('actual_hover_mm')))
+no_top = hc.summarize(good_set(dx=0.1, dyaw=0.1), block_top_mm=120.0,
+                      hover_mm=50.0)
+check('没有 top_mm ⇒ 不编造实际余量',
+      no_top.get('measured_top_mm') is None and
+      'actual_hover_mm' not in no_top, repr(no_top.get('actual_hover_mm')))
 
 small = hc.summarize(good_set(n_usable=15, dx=0.1, dyaw=0.1))
 check('小跨度 → ok', small['ok'] and small['yaw_color_span_deg'] <= 2.0,
@@ -207,12 +226,14 @@ with tempfile.TemporaryDirectory() as td:
 
     _li, _mf = hc.load_indexed_frame, hc.sm.measure_frame
     calls = []
+    kw_seen = []
 
     def fake_load(d, idx):
         calls.append(idx)
         return {'fake_index': idx}
 
     def fake_measure(frame_dir, **kw):
+        kw_seen.append(dict(kw))
         i = kw['frame']['fake_index']
         if i in (1, 2, 3):
             raise RuntimeError('坏帧')
@@ -229,6 +250,29 @@ with tempfile.TemporaryDirectory() as td:
     check('坏帧在 frames 里留 error', res['frames'][1].get('error') and
           not res['frames'][1]['usable'], repr(res['frames'][1]))
     check('3/6 可用 < 60% ⇒ 判红', not res['ok'], repr(res['reasons']))
+    # 悬停必须按「同帧相对高度」选簇，否则会量到夹爪手指（见 test_stage3_measure）
+    check('每帧都传 select_h_mm=块高（默认 29.5）',
+          kw_seen and all(abs(k.get('select_h_mm', -1) - 29.5) < 1e-9
+                          for k in kw_seen), repr([k.get('select_h_mm')
+                                                   for k in kw_seen]))
+    check('报告里记下 select_h_mm', abs(res.get('select_h_mm', -1) - 29.5) < 1e-9,
+          repr(res.get('select_h_mm')))
+    check('没有拿绝对 expected_top_mm 顶着用（那会引入俯视深度偏差）',
+          all('expected_top_mm' not in k for k in kw_seen))
+
+    # --block-h-mm 给值 ⇒ 用给的值选（换了别的尺寸的块时要用）
+    kw_seen.clear()
+    _li2, _mf2 = hc.load_indexed_frame, hc.sm.measure_frame
+    hc.load_indexed_frame = lambda d, idx: {'fake_index': idx}
+    hc.sm.measure_frame = fake_measure
+    try:
+        hc.check_height(td, 50.0, [0.0, 0.0], block_h_mm=35.0)
+    finally:
+        hc.load_indexed_frame, hc.sm.measure_frame = _li2, _mf2
+    check('--block-h-mm 35 ⇒ select_h_mm=35',
+          kw_seen and all(abs(k.get('select_h_mm', -1) - 35.0) < 1e-9
+                          for k in kw_seen), repr([k.get('select_h_mm')
+                                                   for k in kw_seen]))
 
 # 目录不存在 ⇒ ValueError（main 会转成退出码 2）
 try:
