@@ -45,6 +45,7 @@
 """
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -59,6 +60,20 @@ import numpy as np                                                # noqa: E402
 R_LINK_TO_OPTICAL = np.array([[0.0, 0.0, 1.0],
                               [-1.0, 0.0, 0.0],
                               [0.0, -1.0, 0.0]])
+
+#: 理想旋转只是**兜底**。驱动实测的同一条链（从帧的 tf.json 取）与之差约 15 mm，
+#: 所以真机上一律用 ``--tf-json``，别让理想值参与联合标定。
+WRIST_LINK_TO_OPTICAL_KEYS = (
+    'camera_link:camera_color_frame',
+    'camera_color_frame:camera_color_optical_frame')
+TOPCAM_LINK_TO_OPTICAL_KEYS = (
+    'topcam_link:topcam_color_frame',
+    'topcam_color_frame:topcam_color_optical_frame')
+
+WRIST_LINK = 'camera_link'
+TOPCAM_LINK = 'topcam_link'
+OPTICAL_FRAMES = ('camera_color_optical_frame', 'camera_optical_frame',
+                  'topcam_color_optical_frame', 'topcam_optical_frame')
 
 
 def quat_to_matrix(q):
@@ -165,29 +180,67 @@ def detect_board(image_path, board_meta, K, dist):
             np.asarray(tvec, dtype=float).reshape(3)), int(n), float(np.sqrt((err ** 2).mean()))
 
 
-def base_from_camera(doc):
-    """外参文件 → ``base←camera_link`` 的 ``(R, t)``。
+def chain_from_tf(doc, keys):
+    """``tf.json`` → 整条链的 ``(R, t)``。
 
-    接受两种 `frame_child`：已是光学系（原样用），或 `camera_link`（左乘固定旋转）。
+    ``keys`` 按 ``父:子`` 的顺序给；结果 = 第一段 ∘ 第二段 ∘ …（即父←末端）。
+    缺任何一段就停 —— 少存一段时宁可不标，不拿理想值顶替。
+    """
+    ok = (doc or {}).get('ok') or {}
+    acc = (np.eye(3), np.zeros(3))
+    for key in keys:
+        if key not in ok:
+            raise SystemExit('tf.json 缺 %s（有的键：%s）'
+                             % (key, ', '.join(sorted(ok)) or '无'))
+        e = ok[key]
+        tr, ro = e['translation'], e['rotation']
+        acc = compose(acc, (quat_to_matrix([ro['x'], ro['y'], ro['z'], ro['w']]),
+                            np.array([tr['x'], tr['y'], tr['z']],
+                                     dtype=float)))
+    return acc
+
+
+def _link_to_optical(tf_doc, keys):
+    """有 tf.json 就用驱动实测链，没有才退回理想旋转（并在调用处标明来源）。"""
+    if tf_doc is None:
+        return (R_LINK_TO_OPTICAL.copy(), np.zeros(3))
+    return chain_from_tf(tf_doc, keys)
+
+
+def base_from_camera(doc, link_to_optical=None):
+    """外参文件 → ``base←相机光学系`` 的 ``(R, t)``。
+
+    接受两种 `frame_child`：已是光学系（原样用），或 ``*_link``（左乘
+    link←optical）。``link_to_optical`` 给定时用它（驱动实测），否则用理想旋转。
     其它帧名一律拒绝 —— 猜帧关系是这一类错误里最难查的一种。
     """
     child = str(doc.get('frame_child') or doc.get('camera_frame') or '')
     R = (np.array(doc['R'], dtype=float) if 'R' in doc
          else quat_to_matrix(doc['q'] if 'q' in doc else doc['rotation']))
     t = np.array([float(v) for v in (doc.get('t') or doc['translation'])], dtype=float)
-    if child in ('camera_color_optical_frame', 'camera_optical_frame'):
+    if child in OPTICAL_FRAMES:
         return (R, t)
-    if child == 'camera_link':
-        return (R @ R_LINK_TO_OPTICAL, t)
-    raise SystemExit(f'不认识的 frame_child={child!r}：只认 camera_link 与光学系（拒绝猜）')
+    if child in (WRIST_LINK, TOPCAM_LINK):
+        return compose((R, t), link_to_optical or
+                       (R_LINK_TO_OPTICAL, np.zeros(3)))
+    raise SystemExit(f'不认识的 frame_child={child!r}：只认 '
+                     f'{" / ".join((WRIST_LINK, TOPCAM_LINK) + OPTICAL_FRAMES)}'
+                     f'（拒绝猜）')
 
 
-def fmt_launch(R, t):
+def fmt_launch(R, t, prefix='camera'):
+    """``base_link←相机 link`` → launch 静态 TF 的那一串启动参数。
+
+    ``prefix='camera'`` 是腕部那条（``publish_camera_tf``），``'topcam'``
+    是俯视那条（``topcam_publish_tf``）。注意传进来的必须是 **link** 系，
+    不是光学系——驱动自己再发 link→optical。
+    """
     q = matrix_to_quat(R)
-    return ('publish_camera_tf:=true \\\n'
-            f'  camera_x:={t[0]:.6f}  camera_y:={t[1]:.6f}  camera_z:={t[2]:.6f} \\\n'
-            f'  camera_qx:={q[0]:.6f} camera_qy:={q[1]:.6f} '
-            f'camera_qz:={q[2]:.6f} camera_qw:={q[3]:.6f}')
+    return (f'publish_{prefix}_tf:=true \\\n'
+            f'  {prefix}_x:={t[0]:.6f}  {prefix}_y:={t[1]:.6f}  '
+            f'{prefix}_z:={t[2]:.6f} \\\n'
+            f'  {prefix}_qx:={q[0]:.6f} {prefix}_qy:={q[1]:.6f} '
+            f'{prefix}_qz:={q[2]:.6f} {prefix}_qw:={q[3]:.6f}')
 
 
 def main():
@@ -200,6 +253,13 @@ def main():
                    help='由存下的板位姿重算 base←cam，并打印启动参数')
     ap.add_argument('--image', required=True)
     ap.add_argument('--info', required=True, help='同一次采集的 info.json（内参）')
+    ap.add_argument('--tf-json', default=None,
+                    help='同一次采集的 tf.json：用驱动实测的 link→optical 链'
+                         '（理想旋转与实测差约 15 mm，真机必须给）')
+    ap.add_argument('--prefix', choices=('camera', 'topcam'), default=None,
+                    help='启动参数前缀；默认按 --tf-json 的键 / 外参 frame_child 推断')
+    ap.add_argument('--out', default=None,
+                    help='--solve 时把结果写成 JSON（E3b 逐轮比较用）')
     ap.add_argument('--board', default='docs/calib/charuco_A4_30mm_5x5.json',
                     help='板参数 JSON（make_charuco_board.py 产出）')
     ap.add_argument('--extrinsics', help='--init 用：当前可信的外参文件')
@@ -215,6 +275,25 @@ def main():
         board_meta['square_mm'] = a.square_mm
     if a.marker_mm:
         board_meta['marker_mm'] = a.marker_mm
+    tf_doc = None
+    if a.tf_json:
+        tf_doc = json.load(open(a.tf_json, encoding='utf-8'))
+    ext_doc = (json.load(open(a.extrinsics, encoding='utf-8'))
+               if a.extrinsics else None)
+
+    # 前缀：显式给了就照办；没给就按镜头来源推断（topcam 前缀会打出
+    # topcam_x..qw 那组参数——前缀打错不报错，只是静态 TF 永远不生效）。
+    prefix = a.prefix
+    if prefix is None:
+        child = str((ext_doc or {}).get('frame_child') or '')
+        top_keys = (tf_doc or {}).get('ok') or {}
+        prefix = ('topcam' if child.startswith('topcam')
+                  or any(k.startswith(TOPCAM_LINK + ':') for k in top_keys)
+                  else 'camera')
+    link_keys = (TOPCAM_LINK_TO_OPTICAL_KEYS if prefix == 'topcam'
+                 else WRIST_LINK_TO_OPTICAL_KEYS)
+    link_to_optical = _link_to_optical(tf_doc, link_keys)
+
     K, dist, (w, h) = load_camera(a.info)
     det = detect_board(a.image, board_meta, K, dist)
     if det is None:
@@ -230,7 +309,7 @@ def main():
         if not a.extrinsics:
             print('!! --init 必须给 --extrinsics：它是这条链的**基准**')
             return 2
-        base_from_cam = base_from_camera(json.load(open(a.extrinsics, encoding='utf-8')))
+        base_from_cam = base_from_camera(ext_doc, link_to_optical)
         base_from_board = compose(base_from_cam, cam_from_board)
         Rb, tb = base_from_board
         data = {'board': a.board,
@@ -238,8 +317,10 @@ def main():
                 'marker_mm': board_meta['marker_mm'],
                 'dictionary': board_meta['dictionary'],
                 'base_from_board_R': Rb.tolist(), 'base_from_board_t': tb.tolist(),
-                'from_extrinsics': a.extrinsics, 'reproj_rms_px': rms,
-                'n_corners': n_pts}
+                'from_extrinsics': a.extrinsics,
+                'link_to_optical_source': ('tf-json:%s' % a.tf_json
+                                           if tf_doc is not None else 'ideal'),
+                'reproj_rms_px': rms, 'n_corners': n_pts}
         with open(a.store, 'w', encoding='utf-8') as fh:
             json.dump(data, fh, ensure_ascii=False, indent=1)
         print(f'板在 base 系里的位置 = {np.round(tb, 4).tolist()} m')
@@ -256,17 +337,44 @@ def main():
                        np.array(data['base_from_board_t'], dtype=float))
     base_from_cam = compose(base_from_board, invert(cam_from_board))
     Rc, tc = base_from_cam
-    print(f'相机光心在 base_link = {np.round(tc, 4).tolist()} m'
+    base_from_link = compose(base_from_cam, invert(link_to_optical))
+    Rl, tl = base_from_link
+    print(f'相机光心（光学系原点）在 base_link = {np.round(tc, 4).tolist()} m'
           f'（离基座水平 {math.hypot(tc[0], tc[1]):.3f} m，高 {tc[2]:.3f} m）')
+    print('link→optical 链来源：%s'
+          % ('tf.json 驱动实测' if tf_doc is not None
+             else '理想旋转（真机上这会让联合标定偏约 15 mm）'))
     if 'from_extrinsics' in data:
-        prev = base_from_camera(json.load(open(data['from_extrinsics'], encoding='utf-8')))
+        prev_doc = json.load(open(data['from_extrinsics'], encoding='utf-8'))
+        prev = base_from_camera(prev_doc, link_to_optical)
         d = float(np.linalg.norm(tc - prev[1]))
         ang = math.degrees(math.acos(min(1.0, max(-1.0,
             (np.trace(Rc.T @ prev[0]) - 1.0) / 2.0))))
         print(f'与 --init 那次相比：位移 {d * 1000:.1f} mm，转角 {ang:.3f}°'
               f'（这就是这段时间相机漂掉的量）')
-    print('\n启动参数：')
-    print(fmt_launch(Rc, tc))
+    print('\n启动参数（%s 前缀，base_link←%s_link）：' % (prefix, 'topcam' if prefix == 'topcam' else 'camera'))
+    print(fmt_launch(Rl, tl, prefix=prefix))
+
+    if a.out:
+        out_doc = {
+            'version': 1, 'kind': 'camera-extrinsics',
+            'frame_parent': 'base_link',
+            'frame_child': ('topcam_color_optical_frame' if prefix == 'topcam'
+                            else 'camera_color_optical_frame'),
+            'R': Rc.tolist(), 't': tc.tolist(),
+            'q': matrix_to_quat(Rc).tolist(),
+            'R_link': Rl.tolist(), 't_link': tl.tolist(),
+            'link_to_optical_source': ('tf-json:%s' % a.tf_json
+                                       if tf_doc is not None else 'ideal'),
+            'reproj_rms_px': rms, 'n_corners': n_pts,
+            'image': a.image, 'store': a.store, 'board': a.board,
+            'square_mm': board_meta['square_mm'],
+            'marker_mm': board_meta['marker_mm'],
+            'created': datetime.datetime.now().isoformat(timespec='seconds'),
+        }
+        with open(a.out, 'w', encoding='utf-8') as fh:
+            json.dump(out_doc, fh, ensure_ascii=False, indent=1)
+        print('写入 %s' % a.out)
     return 0
 
 

@@ -23,6 +23,17 @@
   3. `base_link → camera_link` 静态 TF —— 手眼标定的落地处
   4. `pipeline.launch.py`（`camera_source:=realsense`）
 
+第二路俯视相机（阶段 4，E2）
+============================
+`topcam_enable:=true` 时再起**一台** `realsense2_camera`，话题在 `/topcam/...`、
+TF 是 `base_link → topcam_link`。三点必须记住：
+  · 帧名只能用 `topcam_link`，**不能**再发一个 `camera_link` 父节点 —— 腕部手眼
+    TF（`tool0→camera_link`）由板上独立脚本发布，多一个父节点 TF 树就坏了；
+  · 两个参数文件的 `serial_no` **必须不同**（`_guard_topcam_params` 当场拦）：
+    相同 = 两个节点抢同一台相机，联合标定会变成「自己跟自己比」的 0 mm 假绿；
+  · 俯视外参**无声过期**（实测一天漂 0.945°）—— 这里发出的只是启动时填的值，
+    当轮能不能用由 E3b 的垫 PnP 门回答，见 `docs/阶段/阶段4-杂乱指定抓取/`。
+
 ⚠️ 机械臂动作、控制器切换、真机抓取属于**高风险操作**：未经当次明确授权且
 急停就绪，不要启动真实运动。本文件只做「起节点」这件事，不改任何安全设置，
 所有保护（示教器速度滑条、URControl 自己的安全/负载配置、急停）都在机器人侧。
@@ -42,6 +53,8 @@
 """
 
 import os
+import re
+import sys
 
 from ament_index_python.packages import (
     PackageNotFoundError,
@@ -103,6 +116,179 @@ INITIAL_JOINT_CONTROLLER = "scaled_joint_trajectory_controller"
 # moveit: ur_moveit.launch.py:71,74,77,80,87），所以一个参数就能把两边同时钉住。
 # 细节与「怎么重新抓标定」见 ros2_ws/src/yolo_ur_description/README.md。
 DESCRIPTION_PACKAGE = "yolo_ur_description"
+
+# ── 俯视第二路相机的名字（**不是** launch 参数，别改成可调旋钮）──────────
+# 话题前缀、节点名、`camera_name`、TF 帧 `topcam_link` 四者必须一致，而 remap
+# 的目标是**字面量**：一旦名字可调，remap 就会静默失配（话题变成
+# `/foo/foo/color/...`，下游订阅 `/topcam/...` 一帧都收不到，且不报错）。
+# 本仓库所有脚本也按 `/topcam` 写死，所以这里钉成一个常量。
+TOPCAM = "topcam"
+TOPCAM_LINK = TOPCAM + "_link"
+
+# 与 pipeline.launch.py 的 REALSENSE_REMAPS 同理：驱动发
+# `<camera_namespace>/<camera_name>/...`，这里收回单层 `/topcam/...`。
+# 若驱动的实现改成「用节点名当前缀」，这些 remap 只是不命中，话题名仍然对 ——
+# 两种驱动行为下 `/topcam/color/image_raw` 都成立。
+TOPCAM_REMAPS = [
+    ("/%s/%s/color/image_raw" % (TOPCAM, TOPCAM),
+     "/%s/color/image_raw" % TOPCAM),
+    ("/%s/%s/aligned_depth_to_color/image_raw" % (TOPCAM, TOPCAM),
+     "/%s/aligned_depth_to_color/image_raw" % TOPCAM),
+    ("/%s/%s/color/camera_info" % (TOPCAM, TOPCAM),
+     "/%s/color/camera_info" % TOPCAM),
+]
+
+# 与 pipeline.launch.py 的 SERIAL_PLACEHOLDERS 一致（测试钉着两边相等）。
+SERIAL_PLACEHOLDERS = ("<topcam-serial>", "<wristcam-serial>")
+
+USER_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config",
+                               "ur5-vision-grasp")
+USER_REALSENSE_PARAMS = os.path.join(USER_CONFIG_DIR, "realsense_camera.yaml")
+USER_TOPCAM_PARAMS = os.path.join(USER_CONFIG_DIR, "realsense_top_truth.yaml")
+
+
+def _package_config(filename):
+    """包内模板路径；包没编出来时返回空串（不是错误：用户文件可能已就位）。"""
+    try:
+        return os.path.join(
+            get_package_share_directory("yolo_bringup"), "config", filename
+        )
+    except PackageNotFoundError:
+        return ""
+
+
+def _default_topcam_params_file():
+    """俯视参数文件：`UR5_TOPCAM_PARAMS` → 本机未跟踪文件 → 包内模板。
+
+    顺序与 pipeline.launch.py 的 `_default_realsense_params_file` 相同。
+    """
+    env = os.environ.get("UR5_TOPCAM_PARAMS")
+    if env:
+        if os.path.exists(env):
+            return env
+        print("[real.launch.py] 警告: UR5_TOPCAM_PARAMS 指向的 %s 不存在，"
+              "继续往下找。" % env, file=sys.stderr)
+    if os.path.exists(USER_TOPCAM_PARAMS):
+        return USER_TOPCAM_PARAMS
+    return _package_config("realsense_topcam.yaml")
+
+
+def _wrist_params_file(context):
+    """**腕部/`/camera`** 那份参数文件（用来比序列号）。
+
+    解析顺序必须与 pipeline.launch.py 一致 —— 它是真正传给 `/camera` 节点的路径：
+    `realsense_params_file`（显式/命令行）→ `UR5_REALSENSE_PARAMS` →
+    `~/.config/ur5-vision-grasp/realsense_camera.yaml` → 包内模板。
+    """
+    explicit = context.launch_configurations.get("realsense_params_file", "")
+    if explicit:
+        return explicit
+    env = os.environ.get("UR5_REALSENSE_PARAMS")
+    if env and os.path.exists(env):
+        return env
+    if os.path.exists(USER_REALSENSE_PARAMS):
+        return USER_REALSENSE_PARAMS
+    return _package_config("realsense_camera.yaml")
+
+
+def _read_serial_no(path):
+    """从 realsense 参数文件里抠 `serial_no`；读不到/没写返回 None。
+
+    只认一行 `serial_no: "..."`（文件里只有这一项是我们要的），**不用** YAML
+    解析：那些文件用 `/**` 通配 key，形状不是普通 dict。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(r"^\s*serial_no\s*:\s*[\"']?([^\"'\s#]+)", text, re.M)
+    return m.group(1) if m else None
+
+
+def _guard_topcam_params(context, path):
+    """起 launch 时检查俯视参数文件；**不满足就当场抛错**。
+
+    `path` 由调用方先解析好（`topcam_params_file` 或 `_default_topcam_params_file()`）——
+    检查与「用哪份文件」必须是同一个值，否则会检查 A 起 B。
+
+    四件都必须拦：
+      · 文件不在 —— 驱动每 6 秒重试、永不退出（「进程都在、没有图像」）；
+      · 俯视序列号还是占位符 —— 同上；
+      · 腕部文件不在/还是占位符 —— 比不出「是不是同一台」，**不能查不到就放行**；
+      · 两路序列号相同 —— 两个节点抢同一台相机，而联合标定会给出一个
+        看起来很完美的 **0 mm**。这是最坏的一种失败：它最像成功。
+    """
+    if context.launch_configurations.get("topcam_enable", "false") != "true":
+        return []
+
+    if not path or not os.path.exists(path):
+        raise RuntimeError(
+            "topcam_enable:=true，但俯视参数文件不存在：%r\n"
+            "  驱动对「找不到设备」的反应是**每 6 秒重试一次、永不退出**，\n"
+            "  表现为「进程都在、就是没有 /topcam 图像」。\n"
+            "  二选一：\n"
+            "    · 建 %s（写入外壳标签上的 SDK 号，引号要留着）；\n"
+            "    · 或 topcam_params_file:=/path/to/your.yaml / 设 UR5_TOPCAM_PARAMS。\n"
+            % (path, USER_TOPCAM_PARAMS)
+        )
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            top_text = f.read()
+    except OSError as exc:
+        raise RuntimeError("读不了俯视参数文件 %s：%s" % (path, exc))
+
+    for ph in SERIAL_PLACEHOLDERS:
+        if ph in top_text:
+            raise RuntimeError(
+                "俯视参数文件的 serial_no 还是占位符 %s（%s）。\n"
+                "  用外壳标签上的 **SDK 号**（不是 /sys/bus/usb 的 ASIC 号）填上，"
+                "**引号要留着**。" % (ph, path)
+            )
+
+    wrist_path = _wrist_params_file(context)
+    if not wrist_path or not os.path.exists(wrist_path):
+        raise RuntimeError(
+            "topcam_enable:=true，但找不到 `/camera`（腕部）那份参数文件：%r\n"
+            "  不知道腕部钉的是哪台相机，就无法保证两路不是同一台 —— 这种检查\n"
+            "  不能「查不到就放行」。先按 pipeline.launch.py 的说明把它就位。"
+            % (wrist_path,)
+        )
+
+    try:
+        with open(wrist_path, "r", encoding="utf-8") as f:
+            wrist_text = f.read()
+    except OSError as exc:
+        raise RuntimeError("读不了腕部参数文件 %s：%s" % (wrist_path, exc))
+    for ph in SERIAL_PLACEHOLDERS:
+        if ph in wrist_text:
+            raise RuntimeError(
+                "腕部（`/camera`）参数文件的 serial_no 还是占位符 %s（%s）。\n"
+                "  这时无法判断两路是不是同一台相机 —— 不能放行。\n"
+                "  真机上它应该是钉腕部那台的 `wrist_camera.yaml`；\n"
+                "  如果你从没配过，先设 UR5_REALSENSE_PARAMS 指向它。"
+                % (ph, wrist_path)
+            )
+
+    top_serial = _read_serial_no(path)
+    wrist_serial = _read_serial_no(wrist_path)
+    if not top_serial or not wrist_serial:
+        raise RuntimeError(
+            "参数文件里读不到 serial_no（俯视 %r / 腕部 %r）。\n"
+            "  没钉序列号时驱动取「枚举到的第一台」，插着两台相机就是随机认一台 ——\n"
+            "  两个节点可能同时打开同一台，联合标定会给出 0 mm 的假绿。"
+            % (top_serial, wrist_serial)
+        )
+    if top_serial == wrist_serial:
+        raise RuntimeError(
+            "俯视与 `/camera` 的参数文件钉了**同一个序列号**（%s）。\n"
+            "  两个 realsense 节点会抢同一台相机（或其中一个静默取到另一台），\n"
+            "  联合标定看到的是「自己跟自己」，会给出一个看起来很完美的 0 mm。\n"
+            "  俯视文件：%s\n  腕部文件：%s"
+            % (top_serial, path, wrist_path)
+        )
+    return []
 
 
 def _package_launch(pkg: str, filename: str, *, why: str) -> str:
@@ -171,6 +357,23 @@ def _check(context):
                 "    · 确知相机与基座重合时显式传单位四元数 "
                 "camera_qw:=1.0（一般不是你要的）。"
             )
+
+    # 俯视相机同一个判据（不是抄一遍：腕部与俯视是**两套独立外参**，
+    # 只拦一个等于给另一条留了同一个坑）。
+    if context.launch_configurations.get("topcam_publish_tf", "false") == "true":
+        quat = [
+            context.launch_configurations.get(k, "0.0")
+            for k in ("topcam_qx", "topcam_qy", "topcam_qz", "topcam_qw")
+        ]
+        if all(_is_zero(v) for v in quat):
+            raise RuntimeError(
+                "topcam_publish_tf:=true 但俯视外参的四元数还是默认的全零。\n"
+                "  俯视外参由 E2 联合标定给出（`scripts/stage4_joint_calib.py`），\n"
+                "  并且**必须**先过 E3b 的外参门 —— 它无声过期（实测一天漂 0.945°），\n"
+                "  镜头看起来一样、数据照样流，只是坐标全歪。\n"
+                "  第 1 轮标定之前先 topcam_publish_tf:=false。"
+            )
+
     return []
 
 
@@ -273,6 +476,71 @@ def _moveit(context):
     ]
 
 
+def _topcam(context):
+    """俯视第二路相机（阶段 4，E2）。`topcam_enable:=false` 时什么都不做。
+
+    必须在**执行期**解析参数文件路径并跑守卫：路径取决于环境变量与本机未跟踪
+    文件，而节点是否启动由 IfCondition 在执行期决定 —— 在构造期算路径会出现
+    「检查了 A 起的是 B」。
+    """
+    if context.launch_configurations.get("topcam_enable", "false") != "true":
+        return []
+
+    path = context.launch_configurations.get("topcam_params_file", "").strip()
+    if not path:
+        path = _default_topcam_params_file()
+    _guard_topcam_params(context, path)
+
+    # ---- 驱动 ----
+    # ⚠️ 话题前缀来自**参数** `camera_namespace`/`camera_name`，不是节点的
+    #    namespace/name（板端实测：两个参数默认都是 `camera`，于是 `/camera/camera/...`；
+    #    节点 namespace 不影响话题前缀）。所以这里两个参数都显式给 `topcam`，
+    #    remap 才有确定的落点。节点名也给 `topcam`：与参数同名，日志里一眼能认，
+    #    且不会与 `/camera` 那个节点重名。
+    #    TF 帧前缀同样由 `camera_name` 决定 ⇒ `topcam_link` / `topcam_color_frame` /
+    #    `topcam_color_optical_frame`，与腕部的 `camera_link` 那棵树互不相干。
+    driver = Node(
+        package="realsense2_camera",
+        executable="realsense2_camera_node",
+        name=TOPCAM,
+        output="screen",
+        parameters=[
+            # 文件在前、覆盖项在后（与 pipeline.launch.py 同一种写法）。
+            # `serial_no` **只**在文件里（带引号才传得过去），别加到下面的 dict。
+            path,
+            {
+                "camera_namespace": TOPCAM,
+                "camera_name": TOPCAM,
+                "align_depth.enable": True,
+            },
+        ],
+        remappings=TOPCAM_REMAPS,
+    )
+
+    # ---- 外参 ----
+    # 与腕部 camera_tf 同一套判据：子帧用**驱动的根帧** `topcam_link`，
+    # 不能直接发到 topcam_color_optical_frame（那会给它两个父节点，树坏掉）。
+    topcam_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="topcam_tf_publisher",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("topcam_publish_tf")),
+        arguments=[
+            "--x", LaunchConfiguration("topcam_x"),
+            "--y", LaunchConfiguration("topcam_y"),
+            "--z", LaunchConfiguration("topcam_z"),
+            "--qx", LaunchConfiguration("topcam_qx"),
+            "--qy", LaunchConfiguration("topcam_qy"),
+            "--qz", LaunchConfiguration("topcam_qz"),
+            "--qw", LaunchConfiguration("topcam_qw"),
+            "--frame-id", "base_link",
+            "--child-frame-id", TOPCAM_LINK,
+        ],
+    )
+    return [driver, topcam_tf]
+
+
 def generate_launch_description():
     pkg_dir = get_package_share_directory("yolo_bringup")
 
@@ -321,6 +589,32 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_qy", default_value="0.0"),
         DeclareLaunchArgument("camera_qz", default_value="0.0"),
         DeclareLaunchArgument("camera_qw", default_value="0.0"),
+        # ---- 俯视第二路相机（阶段 4，E2）----
+        DeclareLaunchArgument(
+            "topcam_enable", default_value="false",
+            description="true = 再起一台 realsense 当俯视相机，话题 /topcam/*，"
+                        "TF 帧 topcam_link。真机上 `/camera` 仍是腕部那台，"
+                        "两路参数文件的 serial_no 必须不同（否则当场报错）",
+        ),
+        DeclareLaunchArgument(
+            "topcam_params_file", default_value="",
+            description="俯视相机参数文件。留空 = 按 UR5_TOPCAM_PARAMS → "
+                        "~/.config/ur5-vision-grasp/realsense_top_truth.yaml → "
+                        "包内模板 的顺序解析。序列号是占位符/不存在都会当场报错",
+        ),
+        DeclareLaunchArgument(
+            "topcam_publish_tf", default_value="false",
+            description="true = 发布 base_link→topcam_link 静态 TF。"
+                        "需同时给 topcam_x..topcam_qw（E2 联合标定结果），"
+                        "否则报错退出。第 1 轮标定前必须为 false",
+        ),
+        DeclareLaunchArgument("topcam_x", default_value="0.0"),
+        DeclareLaunchArgument("topcam_y", default_value="0.0"),
+        DeclareLaunchArgument("topcam_z", default_value="0.0"),
+        DeclareLaunchArgument("topcam_qx", default_value="0.0"),
+        DeclareLaunchArgument("topcam_qy", default_value="0.0"),
+        DeclareLaunchArgument("topcam_qz", default_value="0.0"),
+        DeclareLaunchArgument("topcam_qw", default_value="0.0"),
         # ---- 透传给感知/抓取 ----
         DeclareLaunchArgument("model", default_value="block_best.pt"),
         DeclareLaunchArgument("device", default_value="cuda:0"),
@@ -415,5 +709,9 @@ def generate_launch_description():
         OpaqueFunction(function=_driver),
         OpaqueFunction(function=_moveit),
         camera_tf,
+        # 俯视第二路：守卫在**执行期**跑（要读参数文件/环境变量），
+        # 而且必须在任何相机节点起来之前 —— 两路钉同一台相机是最坏的一种
+        # 失败（联合标定给 0 mm），不能等到标定才发现。
+        OpaqueFunction(function=_topcam),
         pipeline,
     ])

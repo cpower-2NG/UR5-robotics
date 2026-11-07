@@ -66,6 +66,11 @@ REAL_ONLY_ARGS = [
     "publish_camera_tf",
     "camera_x", "camera_y", "camera_z",
     "camera_qx", "camera_qy", "camera_qz", "camera_qw",
+    # 俯视第二路（阶段 4 E2）：仿真里没有第二台 realsense 节点，这些参数
+    # 只能在 real.launch.py 里声明（D64 同一条理由）。
+    "topcam_enable", "topcam_params_file", "topcam_publish_tf",
+    "topcam_x", "topcam_y", "topcam_z",
+    "topcam_qx", "topcam_qy", "topcam_qz", "topcam_qw",
 ]
 
 
@@ -856,15 +861,21 @@ def main():
         # 控制器会报 SUCCEEDED。唯一的征兆是「夹爪撞桌子」。
         #
         # 而且它**不能靠改 `grasp_planner.yaml` 来修**：那份 yaml 是仿真与
-        # 真机**共用**的（仿真用 Robotiq 2F-85 = 0.13，真机用 AG-95 = 0.1757），
-        # 改它等于把仿真一起改坏。所以必须走 launch 侧的后端分支。
+        # 真机**共用**的，改它等于两边一起改（yaml 里留的 0.13 是旧仿真的
+        # 2F-85 值，只作推导旁证）。所以必须走 launch 侧的后端分支。
         check("pipeline.launch.py 声明了 tool0_to_fingertip",
               "tool0_to_fingertip" in p_names)
         t_subs = _raw_default(pipeline, "tool0_to_fingertip")
         sim_v = _resolve_default_in(t_subs, camera_source="sim")
         real_v = _resolve_default_in(t_subs, camera_source="realsense")
-        check("仿真默认仍是 2F-85 的 0.13（动它就会把仿真弄坏）", sim_v == "0.13",
-              f"got {sim_v!r}")
+        # 阶段 4 起仿真侧也换成 **AG-95**（arm_grasp_sim/models/ag95.urdf.xacro，
+        # 指尖外沿 204.2 mm，与真机同一个数），仿真方块 29.5 mm：
+        #     SIM = 0.2042 − 0.0295 = 0.1747
+        # 旧仿真（Robotiq 2F-85 + 40 mm 方块）的 0.13 已退役。
+        # 这条断言钉的是「仿真的指尖也真的是 204.2」—— 换回旧值、或只改方块高
+        # 不改指尖，都会让它红。
+        check("仿真默认是 AG-95 的 0.1747（tool0→闭合指尖 204.2 − 方块 29.5）",
+              sim_v == "0.1747", f"got {sim_v!r}")
         # 真机值的来历（2026-10-02 **按 204 定案**，取代更早的 0.172）：
         #   大寰官方 184.6（张开）/ 200.2（闭合）的基准面是 Ø67 法兰板**底面**；
         #   但 `tool0` 与那块底面之间**还夹着腕部相机的外挂件 4 mm**
@@ -877,13 +888,13 @@ def main():
         # 早先的 0.172 / 0.174 / 0.176 都是手工读数，已全部降级。
         check("真机默认是 AG-95 的 0.1757（tool0→闭合指尖 204.2 − 方块 28.5）",
               real_v == "0.1757", f"got {real_v!r}")
-        # 这条是**意图**的断言：差的不是零头，是「指尖扎进台面」那个量级。
-        # ⚠️ 别再把这里钉成一个精确值 —— 真机方块高换一次，这个差就跟着变。
-        # 要钉的是「两个后端真的差了几十毫米」，那才是 D44 说的那一截。
+        # 两个后端现在用**同一支** AG-95，所以差的只剩方块高（29.5 vs 28.5）。
+        # 这条仍值得断言：它同时保证「仿真的指尖真的换成了 204.2」（否则差值
+        # 会回到 40+ mm 那个量级），也保证两边的方块高没有被谁单独改掉。
         _delta = abs(float(real_v) - float(sim_v))
-        check("两者差 ≥ 30 mm（正是 D44 说的那一截，不是零头）",
-              _delta >= 0.030,
-              f"差 {_delta * 1e3:.1f} mm")
+        check("两者只差方块高（≈1 mm），指尖已是同一个 204.2",
+              abs(_delta - 0.001) <= 5e-4,
+              f"差 {_delta * 1e3:.1f} mm（旧仿真 Robotiq 2F-85 时是 45 mm）")
 
         # 关键：光声明没用，得**真的传进 grasp_planner 的参数字典**。
         # `planner_params` 是 [yaml路径, {覆盖项}] 两项 —— 覆盖项落在第二项里
@@ -1278,6 +1289,250 @@ def main():
                 check("守卫 OpaqueFunction 排在节点之前",
                       names.index("OpaqueFunction") < names.index("TimerAction"),
                       f"顺序: {names}")
+
+    # ---------------------------------------------------------- 俯视第二路（E2）
+    # 这一段测的是**一个错误比别的都贵**的地方：两路相机钉同一台时，E2 的
+    # 联合标定会给出 0 mm 的假绿 —— 它看起来最完美，而且没有任何一环会报错。
+    print("\n--- 俯视第二路（阶段 4 E2）：守卫、节点结构与默认值 ---")
+    if real is None:
+        skip("俯视第二路", "real.launch.py 不存在")
+    else:
+        tmpdir2 = tempfile.mkdtemp(prefix="topcam_guard_")
+        top_ph = os.path.join(tmpdir2, "top_ph.yaml")
+        top_ok = os.path.join(tmpdir2, "top_ok.yaml")
+        wrist_ph = os.path.join(tmpdir2, "wrist_ph.yaml")
+        wrist_ok = os.path.join(tmpdir2, "wrist_ok.yaml")
+        wrist_same = os.path.join(tmpdir2, "wrist_same.yaml")
+        with open(top_ph, "w", encoding="utf-8") as fh:
+            fh.write('serial_no: "<topcam-serial>"\n')
+        with open(top_ok, "w", encoding="utf-8") as fh:
+            fh.write('serial_no: "111111111111"\n')
+        with open(wrist_ph, "w", encoding="utf-8") as fh:
+            fh.write('serial_no: "<wristcam-serial>"\n')
+        with open(wrist_ok, "w", encoding="utf-8") as fh:
+            fh.write('serial_no: "222222222222"\n')
+        with open(wrist_same, "w", encoding="utf-8") as fh:
+            fh.write('serial_no: "111111111111"\n')
+
+        guard = getattr(real, "_guard_topcam_params", None)
+        build = getattr(real, "_topcam", None)
+        check("real.launch.py 定义了俯视参数守卫", callable(guard))
+        check("real.launch.py 定义了俯视节点构造 _topcam", callable(build))
+        check("俯视 TF 根帧是 topcam_link（不是 camera_link —— 腕部手眼 TF 的"
+              "唯一父节点在别处，发第二个会把树弄坏）",
+              getattr(real, "TOPCAM_LINK", None) == "topcam_link",
+              f"got {getattr(real, 'TOPCAM_LINK', None)!r}")
+
+        # 模板 yaml 的占位符必须与常量同步（同 pipeline 那条理由）。
+        t_tmpl = (PROJECT_ROOT / "ros2_ws" / "src" / "yolo_bringup"
+                  / "config" / "realsense_topcam.yaml")
+        phs = getattr(real, "SERIAL_PLACEHOLDERS", ())
+        if not t_tmpl.exists():
+            check("俯视模板 yaml 存在", False, f"{t_tmpl} 不存在")
+        else:
+            val = ""
+            for line in t_tmpl.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s.startswith("serial_no:"):
+                    val = s.split(":", 1)[1].strip().strip('"').strip("'")
+                    break
+            check("俯视模板 yaml 的 serial_no 是已知占位符",
+                  bool(phs) and val in tuple(phs),
+                  f"serial_no={val!r}，常量={phs!r}")
+
+        if not callable(guard) or not callable(build) or not phs:
+            skip("俯视守卫的行为", "上面已报缺失")
+        else:
+            # ① 关着的时候什么都不做（不能让 E1/旧会话被它拦死）。
+            check("topcam_enable 默认是 false",
+                  dict(declared_names(real)).get("topcam_enable") == "false")
+            check("topcam_publish_tf 默认是 false（第 1 轮标定前不发 TF）",
+                  dict(declared_names(real)).get("topcam_publish_tf") == "false")
+            check("topcam_params_file 默认空串（= 按顺序解析）",
+                  dict(declared_names(real)).get("topcam_params_file") == "")
+            check("关闭时 _topcam 不造任何节点",
+                  build(ctx(topcam_enable="false")) == [])
+
+            # ② 打开但文件不在 → 必须抛（驱动会每 6 秒重试、永不退出）。
+            check("打开 + 参数文件不存在 → 抛异常",
+                  _raises(lambda: build(ctx(
+                      topcam_enable="true",
+                      topcam_params_file=os.path.join(tmpdir2, "nope.yaml"),
+                      realsense_params_file=wrist_ok)), RuntimeError))
+
+            # ③ 占位符 → 必须抛。
+            check("打开 + 俯视序列号仍是占位符 → 抛异常",
+                  _raises(lambda: build(ctx(
+                      topcam_enable="true", topcam_params_file=top_ph,
+                      realsense_params_file=wrist_ok)), RuntimeError))
+            check("打开 + 腕部序列号仍是占位符 → 抛异常（比不出「是不是同一台」"
+                  "就不能放行）",
+                  _raises(lambda: build(ctx(
+                      topcam_enable="true", topcam_params_file=top_ok,
+                      realsense_params_file=wrist_ph)), RuntimeError))
+
+            # ④ 两路同一个序列号 → 必须抛。这是本段最贵的一条：
+            #    放行的话联合标定会给出一个「自己跟自己」的 0 mm 假绿。
+            err = ""
+            try:
+                build(ctx(topcam_enable="true", topcam_params_file=top_ok,
+                          realsense_params_file=wrist_same))
+            except RuntimeError as exc:
+                err = str(exc)
+            check("打开 + 两路序列号相同 → 抛异常",
+                  bool(err), "放行的话 E2 会得到 0 mm 的假绿")
+            check("报错点明「抢同一台 / 0 mm 假绿」这个后果",
+                  ("0 mm" in err) and ("同一台" in err),
+                  f"got {err[:80]!r}")
+
+            # ⑤ 两个不同序列号 → 出两个节点：驱动 + 静态 TF。
+            nodes = build(ctx(topcam_enable="true", topcam_params_file=top_ok,
+                              realsense_params_file=wrist_ok))
+            check("两个不同序列号 → 造出 2 个实体（驱动 + TF）",
+                  len(nodes) == 2, f"got {len(nodes)}")
+
+            # launch 的内部表示要解一层：参数 key 是**替换对象元组**、值是
+            # `yaml.dump(...)` 的文本（`'topcam\n...\n'` —— YAML 对裸标量加的
+            # 文档结束符，运行时 rcl 再 yaml.load 回 `topcam`）、remap 是
+            # `((from…), (to…))` 两层元组、参数文件是 `ParameterFile`。
+            # 直接跟字符串比会永远不等 —— 那会让本段变成一整片假红。
+            import yaml as _yaml
+            from launch import LaunchContext
+            from launch.utilities import perform_substitutions
+
+            _lc = LaunchContext()
+
+            def _txt(subs):
+                try:
+                    return perform_substitutions(_lc, subs)
+                except Exception:
+                    return repr(subs)
+
+            def _val(raw):
+                """把归一化后的参数值还原成 Python 值（字符串走 yaml.load）。"""
+                if isinstance(raw, tuple):
+                    try:
+                        return _yaml.safe_load(_txt(raw))
+                    except Exception:
+                        return _txt(raw)
+                return raw
+
+            drv = None
+            for e in nodes:
+                if getattr(e, "_Node__node_name", None) == "topcam":
+                    drv = e
+            check("驱动的节点名是 topcam", drv is not None)
+            if drv is not None:
+                params = getattr(drv, "_Node__parameters", None) or []
+                merged = {}
+                for item in params:
+                    if isinstance(item, dict):
+                        for k, v in item.items():
+                            merged[_txt(k)] = _val(v)
+                # 话题/帧前缀来自**参数**，不是节点 namespace（板端实测）。
+                # 给错的话话题落在 /topcam/camera/...，remap 静默失配。
+                check("驱动参数里 camera_name=topcam（TF 帧前缀靠它）",
+                      merged.get("camera_name") == "topcam", f"got {merged!r}")
+                check("驱动参数里 camera_namespace=topcam（话题前缀靠它）",
+                      merged.get("camera_namespace") == "topcam")
+                check("驱动参数里 align_depth.enable=True（没有对齐深度就没法投影）",
+                      merged.get("align_depth.enable") is True)
+                first = params[0] if params else None
+                check("驱动参数**第一项**是参数文件路径（顺序：文件在前、覆盖在后）",
+                      first is not None
+                      and _txt(getattr(first, "param_file", ())) == top_ok,
+                      f"got {first!r}")
+
+                remaps = getattr(drv, "_Node__remappings", None) or []
+                froms = [_txt(p[0]) for p in remaps]
+                tos = [_txt(p[1]) for p in remaps]
+                check("remap 把 /topcam/topcam/color/image_raw 收回单层",
+                      "/topcam/topcam/color/image_raw" in froms
+                      and "/topcam/color/image_raw" in tos,
+                      f"got {list(zip(froms, tos))}")
+                check("remap 覆盖对齐深度与 camera_info（否则下游拿不到）",
+                      any("aligned_depth_to_color" in s for s in froms)
+                      and any("camera_info" in s for s in froms),
+                      f"got {froms}")
+
+            # ⑥ 外参守卫：topcam_publish_tf 打开时四元数全零必须抛（与腕部同判据）。
+            #    注意要 start_ur_driver=false：否则先撞上「robot_ip 必填」那条。
+            check("topcam_publish_tf=true + 四元数全零 → 抛异常",
+                  _raises(lambda: real._check(ctx(
+                      start_ur_driver="false",
+                      topcam_publish_tf="true")), RuntimeError))
+            check("topcam_publish_tf=true + 合法四元数 → 放行",
+                  real._check(ctx(start_ur_driver="false",
+                                  topcam_publish_tf="true",
+                                  topcam_qw="1.0")) == [])
+            check("腕部与俯视是两个独立判据（只给腕部四元数不顶用）",
+                  _raises(lambda: real._check(ctx(
+                      start_ur_driver="false",
+                      publish_camera_tf="true", camera_qw="1.0",
+                      topcam_publish_tf="true")), RuntimeError))
+
+            # ⑦ 默认解析顺序：env → 本机未跟踪文件 → 包内模板。
+            saved = (getattr(real, "USER_TOPCAM_PARAMS", None),
+                     os.environ.get("UR5_TOPCAM_PARAMS"))
+            try:
+                env_ok = os.path.join(tmpdir2, "env.yaml")
+                with open(env_ok, "w", encoding="utf-8") as fh:
+                    fh.write('serial_no: "333333333333"\n')
+                real.USER_TOPCAM_PARAMS = wrist_ok  # 假装本机文件就位
+                os.environ["UR5_TOPCAM_PARAMS"] = env_ok
+                check("解析顺序：环境变量最优先",
+                      real._default_topcam_params_file() == env_ok)
+                del os.environ["UR5_TOPCAM_PARAMS"]
+                check("其次用本机未跟踪文件",
+                      real._default_topcam_params_file() == wrist_ok)
+                real.USER_TOPCAM_PARAMS = os.path.join(tmpdir2, "no_user.yaml")
+                check("最后回落到包内模板",
+                      real._default_topcam_params_file().endswith(
+                          "realsense_topcam.yaml"))
+            finally:
+                real.USER_TOPCAM_PARAMS, old_env = saved
+                if old_env is None:
+                    os.environ.pop("UR5_TOPCAM_PARAMS", None)
+                else:
+                    os.environ["UR5_TOPCAM_PARAMS"] = old_env
+
+            # ⑧ 变异：清空占位符常量后③不再拦 —— 证明③不是碰巧抛在别处。
+            saved_ph = real.SERIAL_PLACEHOLDERS
+            try:
+                real.SERIAL_PLACEHOLDERS = ()
+                check("变异（清空占位符常量）后占位符不再被拦 —— 证明③不是假绿",
+                      len(build(ctx(topcam_enable="true",
+                                    topcam_params_file=top_ph,
+                                    realsense_params_file=wrist_ok))) == 2)
+            finally:
+                real.SERIAL_PLACEHOLDERS = saved_ph
+
+            # ⑨ 结构：负责起俯视的 OpaqueFunction 必须**和 pipeline 同级**，
+            #    且排在 pipeline 之前（否则感知节点先起来了）。
+            ents = list(real.generate_launch_description().entities)
+            idx = [i for i, e in enumerate(ents)
+                   if getattr(getattr(e, "_OpaqueFunction__function", None),
+                              "__name__", "") == "_topcam"]
+            check("generate_launch_description 里挂了 _topcam", bool(idx),
+                  f"实体: {[type(e).__name__ for e in ents]}")
+            if idx:
+                # 它必须在 **pipeline 那条 include 之前**：感知节点先起来了、
+                # 相机才开始守序列号，就等于没守。
+                inc = []
+                for i, e in enumerate(ents):
+                    src = getattr(
+                        e, "_IncludeLaunchDescription__launch_description_source",
+                        None)
+                    # ⚠️ 读私有字段 `__location`（替换对象元组）而不是公开的
+                    #    `.location`：后者在执行前返回的是 `str(TextSubstitution)`
+                    #    —— `'<launch.substitutions… object at 0x…>'`，里面没有路径。
+                    loc = getattr(
+                        src, "_LaunchDescriptionSource__location", ()) if src else ()
+                    if "pipeline.launch.py" in _txt(loc):
+                        inc.append(i)
+                check("_topcam 排在 pipeline include 之前",
+                      bool(inc) and idx[0] < inc[0],
+                      f"_topcam@{idx[0]}，pipeline@{inc or '—'}")
 
     # ------------------------------------------------------------------ 收尾
     print("\n" + "=" * 56)

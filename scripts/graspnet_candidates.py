@@ -62,6 +62,19 @@ CHAIN = (
 )
 TIP = "camera_color_optical_frame"
 
+# ── 俯视第二路（阶段 4）──────────────────────────────────────────────
+# 俯视相机不挂在臂上，链是**纯静态的四段**、不经过 tool0。名字必须与
+# real.launch.py 的 `TOPCAM_LINK`、precision_capture 的 `TOPCAM_CHAIN` 一致。
+# ⚠️ `base_link → topcam_link` 只在标定出外参之后才存在；第 1 轮之前抓的
+#    俯视帧**没有**这一段，用它算 base 系坐标会直接 KeyError（这是有意的：
+#    宁可报错，也不要拿一个不存在的 TF 算出「看起来正常」的坐标）。
+TOPCAM_CHAIN = (
+    ("base_link", "topcam_link"),
+    ("topcam_link", "topcam_color_frame"),
+    ("topcam_color_frame", "topcam_color_optical_frame"),
+)
+TOPCAM_TIP = "topcam_color_optical_frame"
+
 VOXEL = 0.005
 NUM_POINTS = 20000
 MIN_SCORE = 0.20
@@ -109,20 +122,30 @@ def _tf_entry(tf, parent, child):
     return M
 
 
-def cam_pose(frame_dir):
-    """base_link ← camera_color_optical_frame。老帧可能直接存了合成结果。"""
-    tf = json.load(open(os.path.join(frame_dir, "tf.json")))["ok"]
-    direct = "base_link:%s" % TIP
-    if direct in tf:
-        T = _tf_entry(tf, "base_link", TIP)
+def cam_pose_tf(tf_ok, tip=TIP, chain=CHAIN):
+    """同 ``cam_pose``，但直接吃 ``tf.json`` 的 ``ok`` 段（合帧/批量帧用）。"""
+    direct = "base_link:%s" % tip
+    if direct in tf_ok:
+        T = _tf_entry(tf_ok, "base_link", tip)
         return T[:3, :3], T[:3, 3]
     T = np.eye(4)
     cur = "base_link"
-    while cur != TIP:
-        nxt = next(b for a, b in CHAIN if a == cur)
-        T = T @ _tf_entry(tf, cur, nxt)
+    while cur != tip:
+        nxt = next(b for a, b in chain if a == cur)
+        T = T @ _tf_entry(tf_ok, cur, nxt)
         cur = nxt
     return T[:3, :3], T[:3, 3]
+
+
+def cam_pose(frame_dir, tip=TIP, chain=CHAIN):
+    """base_link ← 指定相机光心（默认腕部 `camera_color_optical_frame`）。
+
+    `tip`/`chain` 的默认值保持旧行为（阶段 1–3 的所有调用点不用改）。俯视帧传
+    `tip=TOPCAM_TIP, chain=TOPCAM_CHAIN` —— 那条链是**纯静态四段**，不经过臂。
+    老帧可能直接存了合成结果（`base_link:<tip>` 一条），先认它。
+    """
+    tf = json.load(open(os.path.join(frame_dir, "tf.json")))["ok"]
+    return cam_pose_tf(tf, tip=tip, chain=chain)
 
 
 def camera_k(frame_dir):
@@ -133,11 +156,11 @@ def camera_k(frame_dir):
     return np.array(m["camera_info"]["K"], float).reshape(3, 3)
 
 
-def load_frame(frame_dir):
+def load_frame(frame_dir, tip=TIP, chain=CHAIN):
     depth = np.array(Image.open(os.path.join(frame_dir, "depth.png")),
                      dtype=np.float64) / 1000.0
     color = np.array(Image.open(os.path.join(frame_dir, "color.png")).convert("RGB"))
-    R, t = cam_pose(frame_dir)
+    R, t = cam_pose(frame_dir, tip=tip, chain=chain)
     js_path = os.path.join(frame_dir, "joint_states.json")
     joints = json.load(open(js_path)) if os.path.exists(js_path) else None
     return {"dir": frame_dir, "depth": depth, "color": color,

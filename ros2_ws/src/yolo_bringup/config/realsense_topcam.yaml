@@ -1,0 +1,51 @@
+# 俯视（第二路）RealSense D435i 的参数文件 —— **模板**。
+#
+# ⚠️ 仓库里这份是模板，序列号是占位符。**直接用会让你没有 /topcam 图像，
+#    而且不报错**（驱动每 6 秒重试一次、永不退出）。上真机前先填一份自己的。
+#
+# 起它的方式（real.launch.py）：
+#     ros2 launch yolo_bringup real.launch.py robot_ip:=<...> \
+#         topcam_enable:=true topcam_publish_tf:=false
+#
+# ── 怎么填 ──────────────────────────────────────────────────────────────
+# 与 realsense_camera.yaml 同规矩（那份文件头写了「为什么 serial_no 只能走
+# 带引号的 yaml」的完整实测），要点只有两条：
+#
+#   1. 把下面 serial_no 换成**外壳标签上的 SDK 号**，**引号要留着**。
+#      ⚠️ 别用 /sys/bus/usb/devices/*/serial 里的 ASIC 号 —— 用错不报错退出，
+#         而是「进程都在、永远没有图像」。
+#   2. 放进本机未跟踪位置（推荐，序列号不会被误提交）：
+#        mkdir -p ~/.config/ur5-vision-grasp
+#        cp <这个文件> ~/.config/ur5-vision-grasp/realsense_top_truth.yaml
+#      文件名沿用历史名 `realsense_top_truth.yaml`（真值采集那条线留下的）。
+#      或另存一份并用 topcam_params_file:=/path/to/your.yaml 显式指定，
+#      也可以设环境变量 UR5_TOPCAM_PARAMS=/path/to/your.yaml。
+#
+# ⚠️ 这两份参数文件（这份 + 腕部 `wrist_camera.yaml`）的 serial_no **必须不同**。
+#    real.launch.py 会当场比对，相同就报错退出 —— 相同意味着两个节点抢同一台
+#    相机，而 E2 的联合标定会得到一个「自己跟自己」的 0 mm，看起来最完美。
+#
+# ── 分辨率为什么是 1280x720 ────────────────────────────────────────────
+# ChArUco 检测需要每块码有足够像素：640x480 下每块码约 14 px，检测器只认出
+# 1/12 个码；1280x720 下 16/16 内角点全中（2026-10-25 实测）。E2/E3b 都要
+# 用俯视帧做 PnP，所以这一档是判据的前提，不是画质偏好。
+#
+# ── 为什么显式钉序列号 ────────────────────────────────────────────────
+# 不传 serial_no 时驱动取「枚举到的第一台」，而枚举顺序随插拔变化 ——
+# 今天起俯视、明天可能起腕部，而且不报错。插着两台相机时这一条尤其致命。
+#
+# 通配用 `/**` 而不是具体节点名：这个文件**只**传给俯视那个节点，
+# 通配跟着节点走，不会因为改名而静默失去作用。
+
+/**:
+  ros__parameters:
+    # ↓↓ 引号是**功能性的**，不是风格。 ↓↓
+    # ↓↓ 换成俯视相机外壳标签上的号，否则没有图像且不报错。 ↓↓
+    serial_no: "<topcam-serial>"
+    # 相机掉电/重插后先复位一次，避免偶发的「序列号认到了但流起不来」。
+    initial_reset: true
+    rgb_camera.color_profile: "1280x720x30"
+    depth_module.depth_profile: "848x480x30"
+    # 对齐深度到彩色：投影/测量用彩色内参，不开它就没有
+    # /topcam/aligned_depth_to_color/image_raw（launch 里也会再开一次）。
+    align_depth.enable: true

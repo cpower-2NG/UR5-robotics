@@ -41,6 +41,7 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gripper_action as ga                                       # noqa: E402
+import real_motion_authorize as rma                               # noqa: E402
 
 
 def resolve_port(explicit=None):
@@ -134,7 +135,27 @@ def main():
                          "自检里的 open 会把块从半空松开")
     ap.add_argument("--grasp-planner-src", default=None,
                     help="grasp_planner 源码目录（没 source ROS 环境时才需要）")
+    ap.add_argument("--require-auth", default=None,
+                    help="真机运动令牌（real_motion_authorize.py 的 STOP→PLAY "
+                         "两步握手产出）；--go 时必须给，10 分钟过期")
     args = ap.parse_args()
+
+    # 真机运动逐次授权（AGENTS 红线 6）：--go 没有当次握手令牌就一条轨迹都不发。
+    # 令牌只来自两次现场观测（Dashboard 只读查询到 STOPPED、再看到 PLAYING），
+    # 不来自任务描述/环境变量/记忆。
+    if args.go:
+        if not args.require_auth:
+            print("!! --go 必须带 --require-auth <token>：真机运动逐次授权")
+            print("   先跑 real_motion_authorize.py --step stop，再 --step play")
+            return 2
+        ok, why, age = rma.check_token(args.require_auth)
+        if not ok:
+            print("!! 运动授权不成立：%s" % why)
+            print("   ⇒ 不做任何动作（fail-closed）")
+            return 2
+        print("  运动授权：STOP→PLAY 握手在 %.0f 秒前完成" % age)
+    elif args.require_auth:
+        print("（--require-auth 只在 --go 时校验：本次是预演/只查闸门）")
 
     plan = json.load(open(args.plan))
     names = [w["name"] for w in plan["waypoints"]]

@@ -21,6 +21,14 @@
 说明页 B 真的歪了/偏了；直接把名义坐标喂给联合 PnP，会把这点拼贴误差摊到
 整个垫系上。先测出来、再搬过去，才叫「视觉实测，不假设对齐」。
 
+E2 用法（阶段 4，俯视那一路）
+────────────────────────────
+``--camera topcam`` 换成俯视帧的 TF 链与光学系 tip；再加 ``--cam-identity``
+就把 ``R_bc=I, t_bc=0`` 传给 ``solve_pad``，于是结果的语义**不再是 base←pad，
+而是 topcam_color_optical←pad**（相机系里解垫）。E2 要的正是后者：腕部帧给
+base←pad，俯视帧给 cam←pad，两者相除才得到 base←topcam。屏幕会大字标出来，
+默认输出文件名也换成 ``T_cam_pad.json``——**不要**把它当 grid.json 用。
+
 退出码：0 = 判据全过；1 = 解出来了但有判据不过；2 = 数据缺失/坏。
 """
 
@@ -263,7 +271,13 @@ def main(argv=None):
         description='阶段 2：survey 帧 → 垫系 → grid.json（只读，不动臂）')
     ap.add_argument('--frame', required=True, help='帧目录（color.png/tf.json/meta.json）')
     ap.add_argument('--mat', required=True, help='stage2-mat.json（sidecar）')
-    ap.add_argument('--out', default=None, help='默认 <frame>/grid.json')
+    ap.add_argument('--out', default=None,
+                    help='默认 <frame>/grid.json；--cam-identity 时默认 <frame>/T_cam_pad.json')
+    ap.add_argument('--camera', choices=('wrist', 'topcam'), default='wrist',
+                    help='用哪一路的 TF 链解（topcam 帧须由 '
+                         'precision_capture.py --camera topcam 抓）')
+    ap.add_argument('--cam-identity', action='store_true',
+                    help='R_bc=I, t_bc=0 ⇒ 输出语义变成 cam←pad（E2 俯视那一路用）')
     ap.add_argument('--max-rms-px', type=float, default=MAX_RMS_PX)
     ap.add_argument('--min-markers', type=int, default=MIN_MARKERS)
     args = ap.parse_args(argv)
@@ -273,13 +287,18 @@ def main(argv=None):
     except (OSError, ValueError) as exc:
         print('读不到垫子 sidecar %s：%s' % (args.mat, exc))
         return 2
+    chain = gc.CHAIN if args.camera == 'wrist' else gc.TOPCAM_CHAIN
+    tip = gc.TIP if args.camera == 'wrist' else gc.TOPCAM_TIP
     try:
-        frame = gc.load_frame(args.frame)
+        frame = gc.load_frame(args.frame, tip=tip, chain=chain)
     except (OSError, ValueError, KeyError) as exc:
         print('读不到帧 %s：%s' % (args.frame, exc))
         return 2
 
-    res = solve_pad(frame['color'], frame['K'], frame['R_bc'], frame['t_bc'],
+    R_bc, t_bc = frame['R_bc'], frame['t_bc']
+    if args.cam_identity:
+        R_bc, t_bc = np.eye(3), np.zeros(3)
+    res = solve_pad(frame['color'], frame['K'], R_bc, t_bc,
                     meta, max_rms_px=args.max_rms_px,
                     min_markers=args.min_markers)
     c = res['checks']
@@ -296,6 +315,36 @@ def main(argv=None):
     if res['T_base_pad'] is None:
         print('判红：%s' % c.get('reason', '未知'))
         return 1
+
+    if args.cam_identity:
+        out = args.out or os.path.join(args.frame, 'T_cam_pad.json')
+        T = np.asarray(res['T_base_pad'], dtype=np.float64)
+        delta = _pose_delta(T)
+        doc = {
+            'version': 1, 'kind': 'stage2-cam-pad',
+            'camera': args.camera, 'frame': 'cam', 'chain_tip': tip,
+            'T_cam_pad': [[float(v) for v in row] for row in T],
+            'pad_pose_in_cam': delta,
+            'rms_adopted_px': c['rms_adopted_px'], 'adopted': res['adopted'],
+            'T_A_B': res['T_A_B'], 'checks': c,
+            'note': 'T_cam_pad 是 %s←pad，不是 base←pad；别当 grid.json 用'
+                    % tip,
+        }
+        with open(out, 'w') as f:
+            json.dump(doc, f, ensure_ascii=False, indent=1)
+        bar = '=' * 68
+        print(bar)
+        print('!!  --cam-identity：以下数字是  %s←pad  （相机系！）' % tip)
+        print('!!  不是 base←pad，不能直接当 grid.json 用')
+        print(bar)
+        print('垫心在该相机系：(%+.1f, %+.1f, %+.1f) mm，yaw %+.2f°，tilt %.2f°'
+              % (*delta['translation_mm'], delta['yaw_deg'], delta['tilt_deg']))
+        print('采用 %s 解，RMS %.2f px' % (res['adopted'], c['rms_adopted_px']))
+        print('写入 %s' % out)
+        if not res['ok']:
+            print('判红：%s' % c.get('reason', '未知'))
+            return 1
+        return 0
 
     out = args.out or os.path.join(args.frame, 'grid.json')
     grid = build_grid(meta, res['T_base_pad'], c, T_A_B=res['T_A_B'])
