@@ -291,7 +291,7 @@ def joint_check(extrinsic_path, wrist_frame, topcam_frame, mat,
                 max_trans_mm=2.0, max_rot_deg=0.5, out_path=None):
     ns = argparse.Namespace(
         wrist_frame=wrist_frame, topcam_frame=topcam_frame, mat=mat,
-        base_topcam_link=extrinsic_path,
+        base_topcam_link=extrinsic_path, derive_extrinsic=False,
         max_trans_mm=max_trans_mm, max_rot_deg=max_rot_deg,
         max_rms_px=1.5, min_markers=4, margin_px=20.0,
         pick_zone=list(jc.PICK_ZONE), table_z_mm=jc.TABLE_Z_MM,

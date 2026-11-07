@@ -308,7 +308,14 @@ def run(args):
     if not t_idx:
         reasons.append('俯视帧目录里没有帧：%s' % args.topcam_frame)
 
+    # 逐帧解 → 只留解的出来的帧。**单帧解失败不得把整串 burst 判死**：
+    # 20–40 帧是同一个静止场景，某一帧被机械臂挡住一角很正常；拿最后一帧
+    # 的结果当整串的结论，会把 28/40 帧都成功的 round-05 直接丢掉
+    # （2026-11-07 实测：round-05 最后一帧页 B 只有 3 个标记 ⇒ 整轮 0 帧；
+    # 实际 28 帧可解，两路 0.73 mm / 0.31°）。每帧自己的 RMS/标记数门槛
+    # 仍由 sp.solve_pad 逐帧把守，这里只决定「这一帧算不算数」。
     w_ok, t_ok = [], []
+    w_all, t_all = [], []
     wres = tres = None
     for i in w_idx or []:
         wframe = gc.load_frame(args.wrist_frame, idx=i)   # 腕部链完整，照旧
@@ -316,7 +323,7 @@ def run(args):
                          wframe['t_bc'], meta,
                          max_rms_px=args.max_rms_px,
                          min_markers=args.min_markers)
-        wres = r
+        w_all.append(r)
         if r['T_base_pad'] is not None:
             w_ok.append(r['T_base_pad'])
     for i in t_idx or []:
@@ -325,23 +332,27 @@ def run(args):
                          np.zeros(3), meta,
                          max_rms_px=args.max_rms_px,
                          min_markers=args.min_markers)
-        tres = r
+        t_all.append(r)
         if r['T_base_pad'] is not None:
             t_ok.append(r['T_base_pad'])
+    # 对外报告用的代表帧：优先第一帧解出来的（标记数只用来描述布场，
+    # 不再当作整串的判决）；全都解不出来时退回最后一帧，好把失败原因说清楚。
+    wres = next((r for r in w_all if r['T_base_pad'] is not None),
+                w_all[-1] if w_all else None)
+    tres = next((r for r in t_all if r['T_base_pad'] is not None),
+                t_all[-1] if t_all else None)
 
     tframe = load_camera_frame(args.topcam_frame, idx=t_idx[-1]) if t_idx else None
     tf_doc = load_tf(args.topcam_frame, idx=t_idx[-1]) if t_idx else None
 
-    for name, res in (('腕部', wres), ('俯视', tres)):
-        if res is None:
-            continue
-        if res['T_base_pad'] is None:
-            reasons.append('%s PnP 失败：%s'
-                           % (name, res['checks'].get('reason', '未知')))
     if w_idx and not w_ok:
-        reasons.append('腕部 %d 帧没有一帧解出来' % len(w_idx))
+        reasons.append('腕部 %d 帧没有一帧解出来：%s'
+                       % (len(w_idx), (wres or {}).get('checks', {})
+                          .get('reason', '未知')))
     if t_idx and not t_ok:
-        reasons.append('俯视 %d 帧没有一帧解出来' % len(t_idx))
+        reasons.append('俯视 %d 帧没有一帧解出来：%s'
+                       % (len(t_idx), (tres or {}).get('checks', {})
+                          .get('reason', '未知')))
 
     # link→optical：必须用驱动实测的那条链
     try:
@@ -364,14 +375,26 @@ def run(args):
     T_base_pad_w = mean_pose(w_ok)
     T_cam_pad = mean_pose(t_ok)
     frames = {}
-    for name, P in (('wrist', w_ok), ('topcam', t_ok)):
+    for name, P, allr in (('wrist', w_ok, w_all), ('topcam', t_ok, t_all)):
         m = mean_pose(P)
         spread_mm = max(float(np.linalg.norm(np.asarray(T)[:3, 3] - m[:3, 3]))
                         * 1000.0 for T in P)
         spread_deg = max(_rel_delta(m, np.asarray(T, dtype=np.float64))
                          ['angle_deg'] for T in P)
-        frames[name] = {'n_frames': len(P), 'spread_mm': round(spread_mm, 3),
+        # 每页标记数的分布：俯视看垫子常被机械臂挡掉几个，这组数就是
+        # 「这一轮的靶几何有多弱」的唯一现场证据，必须逐轮留档。
+        pages = {}
+        for page in ('page_a', 'page_b'):
+            ns = [int(((r['checks'].get(page) or {}).get('n_markers')) or 0)
+                  for r in allr]
+            if ns:
+                pages[page + '_min'] = min(ns)
+                pages[page + '_median'] = float(np.median(ns))
+        frames[name] = {'n_frames': len(P), 'n_attempted': len(allr),
+                        'n_failed': len(allr) - len(P),
+                        'spread_mm': round(spread_mm, 3),
                         'spread_deg': round(spread_deg, 3)}
+        frames[name].update(pages)
 
     # base←topcam_link：优先已发布的（独立检验）；第 1 轮没有就得自己解
     T_pub_link = None
@@ -380,6 +403,12 @@ def run(args):
         with open(args.base_topcam_link, encoding='utf-8') as fh:
             T_pub_link = _extrinsic_link_from_doc(json.load(fh))
         pub_source = 'file:%s' % args.base_topcam_link
+    elif args.derive_extrinsic:
+        # 第 1 轮：**忽略**帧里已发布的 TF，强制两路相除。
+        # 不加这个开关的话，只要 launch 发过 TF，下面 _published_link 一定会命中，
+        # 导出支永远走不到 —— 导出的「derived」文件其实是已发布值原样抄回
+        # （2026-11-07 实测：R_link/t_link 与 launch 参数逐位相同）。
+        pub_source = 'ignored(--derive-extrinsic)'
     else:
         T_pub_link = _published_link(tf_doc)
         if T_pub_link is not None:
@@ -511,6 +540,11 @@ def main(argv=None):
     ap.add_argument('--base-topcam-link', default=None,
                     help='已发布的 base_link←topcam_link JSON；不给则从帧 tf.json 找，'
                          '再没有就按第 1 轮相除导出')
+    ap.add_argument('--derive-extrinsic', action='store_true',
+                    help='★ 强制走「两路相除导出」，忽略帧 tf.json 里的 '
+                         'base_link→topcam_link（E2 第 1 轮用）。'
+                         '没有它时，只要 launch 发过 TF 导出支就永远走不到，'
+                         '导出的文件其实是把已发布值原样抄回。')
     ap.add_argument('--max-trans-mm', type=float, default=2.0)
     ap.add_argument('--max-rot-deg', type=float, default=0.5)
     ap.add_argument('--max-rms-px', type=float, default=sp.MAX_RMS_PX)

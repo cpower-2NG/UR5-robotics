@@ -268,7 +268,8 @@ with open(_MAT, 'w') as fh:
 def make_args(**kw):
     a = argparse.Namespace(
         wrist_frame='/tmp/wrist', topcam_frame='/tmp/topcam', mat=_MAT,
-        base_topcam_link=None, max_trans_mm=2.0, max_rot_deg=0.5,
+        base_topcam_link=None, derive_extrinsic=False,
+        max_trans_mm=2.0, max_rot_deg=0.5,
         max_rms_px=1.5, min_markers=4,
         margin_px=20.0, pick_zone=list(jc.PICK_ZONE),
         table_z_mm=jc.TABLE_Z_MM, block_mm=29.5, hover_mm=80.0)
@@ -356,6 +357,85 @@ check('  转角 ≈5°', abs(r_rot['two_way']['angle_deg'] - 5.0) < 0.05,
 r_nochain = run_case({'ok': {}})
 check('tf.json 缺 link→optical ⇒ fatal（不拿理想值顶替）',
       r_nochain.get('fatal') is True, str(r_nochain.get('reasons')))
+
+
+def run_burst(wrist_n, topcam_fail, page_b_counts=None):
+    """burst：俯视第 ``topcam_fail`` 里的帧解不出来（模拟被机械臂挡住）。
+
+    2026-11-07 真机：round-05 最后一帧页 B 只有 3 个标记，旧逻辑拿
+    「最后一帧」当整串结论 ⇒ 28/40 帧可解的整轮被判死。这个用例钉住
+    「单帧失败不得丢整串」，同时钉住「全帧失败仍然致命」。
+    """
+    orig = (jc.gc.load_frame, jc.gc.list_frame_indices, jc.load_camera_frame,
+            jc.load_tf, jc.sp.solve_pad)
+    top_n = len(page_b_counts or []) or (max(topcam_fail) + 1)
+
+    def stub_solve(color, K_, R_bc, t_bc, meta, **kws):
+        is_top = (np.allclose(np.asarray(R_bc), np.eye(3))
+                  and np.allclose(np.asarray(t_bc), 0.0))
+        if not is_top:
+            T_w, nb = T_BASE_PAD, 10
+        else:
+            i = stub_solve.top_i
+            stub_solve.top_i += 1
+            nb = page_b_counts[i] if page_b_counts else 10
+            if i in topcam_fail:
+                return {'ok': False, 'adopted': None, 'T_A_B': None,
+                        'T_base_pad': None,
+                        'checks': {'reason': '页 B 标记不够',
+                                   'page_a': {'n_markers': 10,
+                                              'ids': list(range(10)),
+                                              'missing_ids': []},
+                                   'page_b': {'n_markers': nb,
+                                              'ids': list(range(nb)),
+                                              'missing_ids': []}}}
+            T_w = T_CAM_PAD_TRUE
+        return {'ok': True, 'adopted': 'joint', 'T_A_B': None,
+                'T_base_pad': T_w,
+                'checks': {'rms_adopted_px': 0.5, 'adopted': 'joint',
+                           'page_a': {'n_markers': 10,
+                                      'ids': list(range(10)),
+                                      'missing_ids': []},
+                           'page_b': {'n_markers': nb,
+                                      'ids': list(range(nb)),
+                                      'missing_ids': []}}}
+
+    stub_solve.top_i = 0
+    jc.gc.load_frame = lambda *a, **k: {
+        'color': np.zeros((720, 1280, 3), dtype=np.uint8), 'K': K,
+        'R_bc': T_BASE_PAD[:3, :3], 't_bc': T_BASE_PAD[:3, 3]}
+    jc.load_camera_frame = lambda *a, **k: {
+        'color': np.zeros((720, 1280, 3), dtype=np.uint8), 'K': K,
+        'dist': DIST, 'width': 1280, 'height': 720, 'meta': META}
+    jc.gc.list_frame_indices = lambda path, *a, **k: (
+        list(range(wrist_n)) if 'wrist' in str(path)
+        else list(range(top_n)))
+    jc.load_tf = lambda *a, **k: _tf_with_published(T_BASE_LINK_TRUE)
+    jc.sp.solve_pad = stub_solve
+    try:
+        return jc.run(make_args(wrist_frame='/tmp/wrist',
+                                topcam_frame='/tmp/topcam'))
+    finally:
+        (jc.gc.load_frame, jc.gc.list_frame_indices, jc.load_camera_frame,
+         jc.load_tf, jc.sp.solve_pad) = orig
+
+
+rb = run_burst(3, {4}, page_b_counts=[10, 9, 8, 10, 3])
+check('burst：最后一帧解不出 ⇒ 整轮仍用其余帧判绿（旧逻辑会整轮判死）',
+      rb.get('ok') is True and not rb.get('fatal'), str(rb.get('reasons')))
+check('  且记下 5 帧里坏了 1 帧',
+      rb['frames']['topcam']['n_attempted'] == 5
+      and rb['frames']['topcam']['n_frames'] == 4
+      and rb['frames']['topcam']['n_failed'] == 1,
+      str(rb['frames']['topcam']))
+check('  页 B 标记数分布留档（min 取全部尝试帧，不只是解出来的）',
+      rb['frames']['topcam']['page_b_min'] == 3
+      and rb['frames']['topcam']['page_b_median'] == 9.0,
+      str(rb['frames']['topcam']))
+
+rb_all = run_burst(2, {0, 1, 2, 3})
+check('burst：俯视一帧都解不出 ⇒ 仍然 fatal（fail-closed 没被放水）',
+      rb_all.get('fatal') is True, str(rb_all.get('reasons')))
 
 os.unlink(_MAT)
 
