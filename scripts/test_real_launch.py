@@ -1450,6 +1450,13 @@ def main():
                       "/topcam/topcam/color/image_raw" in froms
                       and "/topcam/color/image_raw" in tos,
                       f"got {list(zip(froms, tos))}")
+                # 2026-11-07 板端实测：`camera_namespace` 参数改不动，驱动实际发
+                # `/camera/topcam/...`；漏了这条 remap 会让 /topcam 一帧都没有，
+                # 而且不报错（下游静默空转）。必须同时钉住实测前缀。
+                check("remap 也认实测前缀 /camera/topcam/...（camera_namespace 改不动）",
+                      "/camera/topcam/color/image_raw" in froms
+                      and "/topcam/color/image_raw" in tos,
+                      f"got {list(zip(froms, tos))}")
                 check("remap 覆盖对齐深度与 camera_info（否则下游拿不到）",
                       any("aligned_depth_to_color" in s for s in froms)
                       and any("camera_info" in s for s in froms),

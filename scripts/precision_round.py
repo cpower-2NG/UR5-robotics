@@ -60,8 +60,14 @@ from grasp_planner.slot_routing import pick_slot                # noqa: E402
 PY_SELF = sys.executable
 PY_GRASPNET = os.path.expanduser("~/robotics/venvs/graspnet/bin/python")
 BOARD_DIR = "~/precision"
+#: 板上 STOP→PLAY 两步握手的产物（real_motion_authorize.py 写，600 秒过期）。
+AUTH_TOKEN_FILE = "~/.config/ur5-vision-grasp/motion-auth.json"
 BOARD_SCRATCH = "/tmp/precision"
+#: ``real_motion_authorize.py`` 也必须推：板上的 ``precision_exec.py --go`` 会
+#: import 它核令牌，缺了就 import 失败 —— 那是"一条轨迹都不发"，但日志读起来
+#: 更像环境坏了。
 BOARD_PY_FILES = ("precision_capture.py", "precision_exec.py",
+                  "real_motion_authorize.py",
                   "gripper_action.py", "precision_grip_check.py")
 RUN_SH = """#!/bin/bash
 # 板上入口：把所有 ROS 环境一次性装好。ROS_DOMAIN_ID=99 是现场值。
@@ -95,6 +101,40 @@ def sh(cmd, quiet=False, check=True):
         if check:
             raise SystemExit("命令失败（%d）：%s" % (r.returncode, " ".join(cmd)))
     return r
+
+
+def board_motion_token(board):
+    """读板上**当次**握手写下的令牌；没有/已过期 ⇒ 抛错，一条轨迹都不发（fail-closed）。
+
+    令牌只由 ``real_motion_authorize.py`` 在两次现场只读观测（先看到 STOPPED、
+    再看到 PLAYING）之后写进板上 ``~/.config/ur5-vision-grasp/motion-auth.json``，
+    板上执行器拿同一份文件核对。所以这里"读文件"不是"授权来自数据"：
+    那个文件无法用文字伪造，600 秒就过期，而两次观测只能是人在示教器上按出来的。
+
+    过期用**板上时钟**算（同一条 ssh 里取 ``date +%s``）：开发机与板子时差
+    几分钟时，拿本机时间判会把有效令牌误判成过期（或反过来把过期的放过）。
+    """
+    r = board.ssh("cat " + AUTH_TOKEN_FILE + " 2>/dev/null; echo ---; date +%s",
+                  quiet=True, check=False)
+    doc_s, _, now_s = r.stdout.partition('---')
+    try:
+        doc = json.loads(doc_s.strip())
+        now = float(now_s.strip())
+    except (ValueError, TypeError):
+        doc, now = None, None
+    tok = (doc or {}).get('token')
+    if not tok or now is None:
+        raise SystemExit('板上没有运动授权令牌（%s）：先做 STOP→PLAY 两步握手\n'
+                         '  >>> 人在示教器按 STOP，脚本看到 STOPPED 后再按 PLAY'
+                         % AUTH_TOKEN_FILE)
+    remain = float(doc.get('expires') or 0) - now
+    if remain <= 0:
+        raise SystemExit('运动授权令牌已过期 %.0f 秒（%s）：重新做 STOP→PLAY 两步握手'
+                         % (-remain, AUTH_TOKEN_FILE))
+    if not doc.get('stop_at') or not doc.get('play_at'):
+        raise SystemExit('授权令牌缺少 STOP/PLAY 两步记录：重做握手（fail-closed）')
+    print('  运动授权：令牌有效，按板上时钟还剩 %.0f 秒' % remain)
+    return tok
 
 
 class Board:
@@ -138,15 +178,24 @@ class Board:
             dest_local + "/"], quiet=True)
         return json.load(open(os.path.join(dest_local, "joint_states.json")))
 
-    def capture(self, dest_local, name, timeout=40):
-        """板子上抓一帧，拉回 dest_local。板上路径固定，不把开发机的路径传过去。"""
+    def capture(self, dest_local, name, timeout=40, camera="wrist"):
+        """板子上抓一帧，拉回 dest_local。板上路径固定，不把开发机的路径传过去。
+
+        ``camera="topcam"`` 走俯视那一路（E2 要同一时刻的两帧：先腕部、后俯视，
+        臂静止，两帧之间的位姿差可以忽略）。
+        """
         remote = "%s/frames/%s" % (BOARD_SCRATCH, name)
         self.ssh("mkdir -p %s" % remote, quiet=True)
-        self.ssh("%s/run.sh %s/precision_capture.py %s --timeout %s"
-                 % (BOARD_DIR, BOARD_DIR, remote, timeout))
+        self.ssh("%s/run.sh %s/precision_capture.py %s --timeout %s --camera %s"
+                 % (BOARD_DIR, BOARD_DIR, remote, timeout, camera))
         os.makedirs(dest_local, exist_ok=True)
         sh(["scp", "-q", "%s:%s/*" % (self.alias, remote), dest_local + "/"], quiet=True)
-        need = ("color.png", "depth.png", "meta.json", "tf.json", "joint_states.json")
+        need = ["color.png", "depth.png", "meta.json", "tf.json"]
+        if camera == "wrist":
+            # 俯视相机与臂无关，抓帧本来就不写关节角（`precision_capture.py`
+            # 对 topcam 不要求 /joint_states）—— 在这里要求它，会把一次成功的
+            # 俯视抓帧判成「缺件」。
+            need.append("joint_states.json")
         miss = [f for f in need if not os.path.exists(os.path.join(dest_local, f))]
         if miss:
             raise SystemExit("拉回来的帧缺 %s" % miss)
@@ -172,7 +221,13 @@ class Board:
             args += " --from %s" % from_
         if holding_block:
             args += " --holding-block"
-        args += " --go" if go else " --list"
+        if go:
+            # 真机运动逐次授权（AGENTS 红线 6）：令牌从板上握手文件读，
+            # 读不到就一条轨迹都不发 —— 这里 fail-closed，别让执行器自己
+            # 撞门（那样日志里会留下一条"被拒"，容易被误读成闸门问题）。
+            args += " --go --require-auth %s" % shlex.quote(board_motion_token(self))
+        else:
+            args += " --list"
         # 执行器的 JSONL 写在计划旁边；拉回来另存一份到 cycles/NN/
         remote_log = os.path.splitext(remote_plan)[0] + ".jsonl"
         if not append or reset_remote:

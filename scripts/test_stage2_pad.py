@@ -188,6 +188,41 @@ def test_bad_corner_is_red():
 
 
 @case
+def test_duplicate_ids_from_foreign_board_are_disambiguated():
+    """同 ID 的「别的板子」混进来时，必须按版式挑回垫子那一簇（顺序无关）。
+
+    2026-11-07 真机俯视实测：ChArUco 板也用 DICT_4X4_50、ID 与页 A 撞车，
+    旧写法「后到的检出覆盖先到的」让 id 6/9 被抢走，PnP 解出 2437 px 的
+    重投影误差。这里造一组同 ID、但**各向异性拉伸**过的假检出（拉伸不是
+    相似变换，平面 PnP 吸收不掉），无论放在检出列表前面还是后面，都必须
+    只留下垫子那 10 条。
+    """
+    meta = _meta()
+    view, _ = _view(meta, _compose_mat(meta))
+    gray = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
+    corners, ids = sa.detect_markers(gray, meta['pages']['a']['dictionary'])
+    assert ids is not None and len(ids) >= 10, '合成视图里页 A 的标记没检全'
+
+    allc = np.vstack([np.asarray(c, dtype=np.float64) for c in corners])
+    ctr = allc.mean(axis=0)
+    decoy = [((np.asarray(c, dtype=np.float64) - ctr) * np.array([1.6, 1.0])
+              + ctr + np.array([300.0, 0.0])) for c in corners]
+    want = {int(i): np.asarray(c, dtype=np.float64)
+            for c, i in zip(corners, ids)}
+
+    for order in ('decoy_last', 'decoy_first'):
+        cc = list(corners) + decoy if order == 'decoy_last' else decoy + list(corners)
+        ii = list(ids) + list(ids)
+        got = sp._consistent_markers(meta, 'a', cc, np.asarray(ii),
+                                     tm._camera_matrix())
+        assert sorted(got) == sorted(want), '%s 挑错簇：留下 %s' % (order, sorted(got))
+        for mid in want:
+            err = np.abs(got[mid] - want[mid]).max()
+            assert err < 0.01, '%s：id %d 的角点不是垫子那条（差 %.2f px）' % (
+                order, mid, err)
+
+
+@case
 def test_rms_limit_is_not_vacuous():
     """把 max_rms 压到 1e-4 → 同一条合格视图必须判红（阈值真的在参与）。"""
     meta = _meta()

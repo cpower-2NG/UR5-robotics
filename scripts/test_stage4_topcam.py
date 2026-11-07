@@ -206,11 +206,31 @@ cov_small = jc.coverage(META, T_BASE_PAD, T_CAM_BASE, K, DIST, 200, 200)
 check('画幅缩到 200×200 ⇒ 宫格跑出画面，判红',
       not cov_small['grid_corners']['in_frame'] and not cov_small['ok'])
 
+check('垫定义里没有标记几何 ⇒ pad_markers 记 None（判不了，不当成通过）',
+      cov['pad_markers']['in_frame'] is None)
+
 cov_miss = jc.coverage(META, T_BASE_PAD, T_CAM_BASE, K, DIST, 1280, 720,
                        detected={'a': [0, 1, 2, 3], 'b': [0, 1, 2, 3],
                                  'a_missing': [4], 'b_missing': []})
-check('页 A 缺一个标记 ⇒ 判红（两页必须全检出）',
-      not cov_miss['markers']['all_detected'] and not cov_miss['ok'])
+check('检出缺标记只作诊断：all_detected False 但覆盖不因此判红',
+      cov_miss['markers']['all_detected'] is False and cov_miss['ok'])
+# 为什么改：远端那页的码在 1.45 m 外只有 ~12 px，1920×1080 下也只有 5/10，
+# 是分辨率的物理上限（2026-11-07 实测）。硬门改成「两页标记角点几何上都在
+# 画幅内」——与能否解码无关，测下面这条。
+META_MK = dict(META, pages={
+    'a': {'markers': [{'corners_pad_mm': [[x0, y0], [x0 + 28, y0],
+                                          [x0 + 28, y0 + 28], [x0, y0 + 28]]}
+                      for x0, y0 in ((-170, 54), (-108, 54), (-170, 82))]},
+    'b': {'markers': [{'corners_pad_mm': [[x0, y0], [x0 + 28, y0],
+                                          [x0 + 28, y0 + 28], [x0, y0 + 28]]}
+                      for x0, y0 in ((122, 54), (184, 54), (122, 82))]}})
+cov_mk = jc.coverage(META_MK, T_BASE_PAD, T_CAM_BASE, K, DIST, 1280, 720)
+check('两页 6 个标记全在画幅内 ⇒ 几何判过，记 n_markers=6',
+      cov_mk['pad_markers']['in_frame'] and
+      cov_mk['pad_markers']['n_markers'] == 6, json.dumps(cov_mk['pad_markers']))
+check('几何门真的在查：把画幅收到标记之外 ⇒ 判红',
+      not jc.coverage(META_MK, T_BASE_PAD, T_CAM_BASE, K, DIST,
+                      60, 40)['pad_markers']['in_frame'])
 
 # =====================================================================
 print('\n--- E. 端到端合成：第 1 轮 derived / 第 2 轮 published ---')
@@ -259,8 +279,8 @@ def make_args(**kw):
 
 def run_case(tf_doc, **kw):
     """打桩掉帧 I/O 与 PnP，只让 joint_calib 的代数跑。"""
-    orig = (jc.gc.load_frame, jc.load_camera_frame, jc.load_tf,
-            jc.sp.solve_pad)
+    orig = (jc.gc.load_frame, jc.gc.list_frame_indices, jc.load_camera_frame,
+            jc.load_tf, jc.sp.solve_pad)
     calls = {'n': 0}
 
     def stub_solve(color, K_, R_bc, t_bc, meta, **kws):
@@ -283,13 +303,14 @@ def run_case(tf_doc, **kw):
     jc.load_camera_frame = lambda *a, **k: {
         'color': np.zeros((720, 1280, 3), dtype=np.uint8), 'K': K,
         'dist': DIST, 'width': 1280, 'height': 720, 'meta': META}
+    jc.gc.list_frame_indices = lambda *a, **k: [None]
     jc.load_tf = lambda *a, **k: tf_doc
     jc.sp.solve_pad = stub_solve
     try:
         return jc.run(make_args(**kw))
     finally:
-        (jc.gc.load_frame, jc.load_camera_frame, jc.load_tf,
-         jc.sp.solve_pad) = orig
+        (jc.gc.load_frame, jc.gc.list_frame_indices, jc.load_camera_frame,
+         jc.load_tf, jc.sp.solve_pad) = orig
 
 
 r1 = run_case(_tf_with_published(None))
@@ -574,6 +595,66 @@ check('缺端到端两路复核 ⇒ 不算通过（fail-closed）',
 rep, code = gate_run(drift_rc=None, prev_extrinsics=None, joint_ok=False,
                      wrist_frame='/tmp/w', topcam_frame='/tmp/t')
 check('端到端两路复核不过 ⇒ 判红', code == 1)
+
+# ---------------------------------------------------------------- burst 融合
+check('mean_pose：平移取均值，旋转回到真值',
+      np.allclose(jc.mean_pose([T_BASE_PAD,
+                                T(T_BASE_PAD[:3, :3], T_BASE_PAD[:3, 3] + [0.001, 0, 0]),
+                                T(T_BASE_PAD[:3, :3], T_BASE_PAD[:3, 3] - [0.001, 0, 0])])[:3, 3],
+                 T_BASE_PAD[:3, 3], atol=1e-9),
+      str(jc.mean_pose([T_BASE_PAD])[:3, 3]))
+
+
+def run_case_burst(n=5, **kw):
+    """burst：每侧 n 帧，逐帧故意抖 ±0.5 mm，融合后应回到真值附近。"""
+    orig = (jc.gc.load_frame, jc.gc.list_frame_indices, jc.load_camera_frame,
+            jc.load_tf, jc.sp.solve_pad)
+    calls = {'w': 0, 't': 0}
+
+    def stub_solve(color, K_, R_bc, t_bc, meta, **kws):
+        is_top = np.allclose(np.asarray(R_bc), np.eye(3)) and \
+            np.allclose(np.asarray(t_bc), 0.0)
+        if is_top:
+            calls['t'] += 1
+            k = calls['t'] - (n + 1) // 2
+            off = np.array([0.0, 0.0005 * k, 0.0])
+            Tw = T(T_CAM_PAD_TRUE[:3, :3], T_CAM_PAD_TRUE[:3, 3] + off)
+        else:
+            calls['w'] += 1
+            k = calls['w'] - (n + 1) // 2
+            off = np.array([0.0005 * k, 0.0, 0.0])
+            Tw = T(T_BASE_PAD[:3, :3], T_BASE_PAD[:3, 3] + off)
+        return {'ok': True, 'adopted': 'joint', 'T_A_B': None,
+                'T_base_pad': Tw,
+                'checks': {'rms_adopted_px': 0.5, 'adopted': 'joint',
+                           'page_a': {'ids': list(range(10)), 'missing_ids': []},
+                           'page_b': {'ids': list(range(10)), 'missing_ids': []}}}
+
+    jc.gc.load_frame = lambda *a, **k: {
+        'color': np.zeros((720, 1280, 3), dtype=np.uint8), 'K': K,
+        'R_bc': T_BASE_PAD[:3, :3], 't_bc': T_BASE_PAD[:3, 3]}
+    jc.gc.list_frame_indices = lambda *a, **k: list(range(n))
+    jc.load_camera_frame = lambda *a, **k: {
+        'color': np.zeros((720, 1280, 3), dtype=np.uint8), 'K': K,
+        'dist': DIST, 'width': 1280, 'height': 720, 'meta': META}
+    jc.load_tf = lambda *a, **k: _tf_with_published(T_BASE_LINK_TRUE)
+    jc.sp.solve_pad = stub_solve
+    try:
+        return jc.run(make_args(**kw))
+    finally:
+        (jc.gc.load_frame, jc.gc.list_frame_indices, jc.load_camera_frame,
+         jc.load_tf, jc.sp.solve_pad) = orig
+
+
+with open(_MAT, 'w') as fh:          # 前面的用例 unlink 过它，重新写一份
+    json.dump(META, fh)
+rb = run_case_burst(5, base_topcam_link=None)
+check('burst 5 帧：两侧都记了 n_frames=5',
+      rb['frames']['wrist']['n_frames'] == 5
+      and rb['frames']['topcam']['n_frames'] == 5, str(rb.get('frames')))
+check('burst 5 帧：逐帧抖动被融合压掉（两路差 <0.1 mm）',
+      rb['two_way']['translation_mm'] < 0.1, str(rb['two_way']))
+check('burst 5 帧：整体 ok', rb['ok'], str(rb['reasons']))
 
 os.unlink(_STORE)
 os.unlink(_BOARD)

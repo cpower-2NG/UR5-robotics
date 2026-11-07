@@ -20,8 +20,10 @@
 
 import argparse
 import datetime
+import glob
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -113,8 +115,8 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def solve_extrinsic(image, info_path, board_path, store_path, tf_doc,
-                    max_rms_px=1.0, anchor=None):
+def _check_store(board_path, store_path, anchor):
+    """载入板模型与板位姿存盘，并核「板位姿锚定在哪份外参上」。"""
     if not os.path.exists(store_path):
         raise GateData('没有板位姿存盘 %s：先跑一次 '
                        'topcam_marker_calib.py --init' % store_path)
@@ -139,6 +141,17 @@ def solve_extrinsic(image, info_path, board_path, store_path, tf_doc,
                            % anchor)
         anchor_info = {'path': anchor, 'sha256': a_sha,
                        'store_from': src}
+    # 存盘自己的身份也要进报告：单帧 --init 与多帧融合 --init 解出来的板位姿
+    # 差在 0.1 mm 量级，光看 round-NN.json 分不出这一轮用的是哪一份
+    # （2026-11-07 实测：同一 burst，单帧锚 1.43 mm、融合锚 0.08 mm）。
+    store_info = {'path': os.path.abspath(store_path),
+                  'sha256': _sha256(store_path),
+                  'n_frames': store.get('n_frames')}
+    return board_meta, store, anchor_info, store_info
+
+
+def _solve_one(image, info_path, board_meta, store, tf_doc, max_rms_px):
+    """单帧：ChArUco PnP → ``base←topcam_optical``。"""
     K, dist, (w, h) = tmc.load_camera(info_path)
     det = tmc.detect_board(image, board_meta, K, dist)
     if det is None:
@@ -159,7 +172,59 @@ def solve_extrinsic(image, info_path, board_path, store_path, tf_doc,
         'rms_px': float(rms), 'n_corners': int(n_pts),
         'link_to_optical_source': lo_source,
         'image': image, 'info': info_path,
+    }
+
+
+def solve_extrinsic(image, info_path, board_path, store_path, tf_doc,
+                    max_rms_px=1.0, anchor=None):
+    board_meta, store, anchor_info, store_info = _check_store(
+        board_path, store_path, anchor)
+    sol = _solve_one(image, info_path, board_meta, store, tf_doc, max_rms_px)
+    sol['store_anchor'] = anchor_info
+    sol['store'] = store_info
+    return sol
+
+
+def solve_extrinsic_burst(frames, board_path, store_path, max_rms_px=1.0,
+                          anchor=None):
+    """多帧（同一静止场景的 burst）→ SE(3) 平均后的 ``base←optical``。
+
+    单帧 ChArUco 在 1.45 m 处的实测散布：10 帧极差 5.1 mm / 0.30°
+    （2026-11-07 round-05 burst）—— 比逐轮门的 1 mm / 0.2° 还大。所以
+    「单帧解一次就比门限」必然误报重解，门的第 2 步也必须多帧融合。
+    ``frames`` = ``[(image, info_path, tf_doc), ...]``。
+    """
+    board_meta, store, anchor_info, store_info = _check_store(
+        board_path, store_path, anchor)
+    sols = [_solve_one(img, info, board_meta, store, tf_doc, max_rms_px)
+            for img, info, tf_doc in frames]
+    T_mean = jc.mean_pose([s['T_optical'] for s in sols])
+    spread = []
+    for s in sols:
+        t_mm, ang = _diff(T_mean, s['T_optical'])
+        spread.append((t_mm, ang))
+    (R_lo, t_lo), lo_source = _link_to_optical(frames[0][2])
+    T_bl = T_mean @ np.linalg.inv(_T(R_lo, t_lo))
+    return {
+        'T_optical': T_mean,
+        'R': T_mean[:3, :3], 't': T_mean[:3, 3],
+        'R_link': T_bl[:3, :3], 't_link': T_bl[:3, 3],
+        'rms_px': max(s['rms_px'] for s in sols),
+        'n_corners': min(s['n_corners'] for s in sols),
+        'link_to_optical_source': lo_source,
+        'image': os.path.dirname(os.path.abspath(frames[0][0])),
+        'info': frames[0][1],
         'store_anchor': anchor_info,
+        'store': store_info,
+        'frames': {
+            'n_frames': len(sols),
+            'spread_mm': round(max(t for t, _ in spread), 3),
+            'spread_deg': round(max(a for _, a in spread), 3),
+            'per_frame': [
+                {'image': os.path.basename(s['image']),
+                 'rms_px': round(s['rms_px'], 3),
+                 'n_corners': s['n_corners']} for s in sols],
+        },
     }
 
 
@@ -184,6 +249,44 @@ def write_extrinsic(path, sol):
 
 
 # ---------------------------------------------------------------- 4. 端到端
+def _frame_triples(image, info, tf_json):
+    """``--image`` 可以是单帧，也可以是 burst 帧目录。
+
+    目录写法认 ``precision_capture --burst`` 的产物：
+    ``color_000.png`` + ``meta_000.json`` + ``tf_000.json``。任何一帧缺内参/
+    tf 就报错（不跳过 —— 跳过就等于悄悄少用几帧）。
+    """
+    if not os.path.isdir(image):
+        if not info:
+            raise GateData('单帧模式必须给 --info（内参）')
+        tf_doc = None
+        if tf_json:
+            with open(tf_json, encoding='utf-8') as fh:
+                tf_doc = json.load(fh)
+        return [(image, info, tf_doc)]
+    names = sorted(glob.glob(os.path.join(image, 'color_*.png')))
+    if not names:
+        raise GateData('帧目录里没有 color_*.png：%s' % image)
+    out = []
+    for p in names:
+        m = re.search(r'color_(\d+)\.png$', p)
+        if not m:
+            continue
+        idx = m.group(1)
+        info_p = os.path.join(image, 'meta_%s.json' % idx)
+        tf_p = os.path.join(image, 'tf_%s.json' % idx)
+        if not os.path.exists(info_p):
+            raise GateData('缺内参 %s（burst 帧不齐）' % info_p)
+        tf_doc = None
+        if os.path.exists(tf_p):
+            with open(tf_p, encoding='utf-8') as fh:
+                tf_doc = json.load(fh)
+        elif tf_json:
+            with open(tf_json, encoding='utf-8') as fh:
+                tf_doc = json.load(fh)
+        out.append((p, info_p, tf_doc))
+    return out
+
 def joint_check(extrinsic_path, wrist_frame, topcam_frame, mat,
                 max_trans_mm=2.0, max_rot_deg=0.5, out_path=None):
     ns = argparse.Namespace(
@@ -203,13 +306,16 @@ def joint_check(extrinsic_path, wrist_frame, topcam_frame, mat,
 
 # ---------------------------------------------------------------- 主流程
 def run(args):
-    out_dir = args.out_dir or os.path.join(
-        os.path.dirname(os.path.abspath(args.image)), 'extrinsic-gate')
+    base = os.path.dirname(os.path.abspath(args.image))
+    out_dir = args.out_dir or os.path.join(base, 'extrinsic-gate')
     os.makedirs(out_dir, exist_ok=True)
     tag = 'round-%02d' % args.round if args.round else 'round'
     ext_path = os.path.join(out_dir, tag + '-extrinsics.json')
     joint_path = os.path.join(out_dir, tag + '-joint-calib.json')
     gate_path = os.path.join(out_dir, tag + '.json')
+
+    frames = _frame_triples(args.image, args.info, args.tf_json)
+    new_image = args.new_image or (frames[0][0] if len(frames) > 1 else None)
 
     report = {'version': 1, 'kind': 'stage4-extrinsic-gate',
               'round': args.round,
@@ -217,8 +323,8 @@ def run(args):
               'reasons': [], 'ok': False}
 
     # ---- 1. drift（只报警，不放行）
-    if args.prev_image and args.new_image:
-        drift = run_drift(args.prev_image, args.new_image, args.info)
+    if args.prev_image and new_image:
+        drift = run_drift(args.prev_image, new_image, frames[0][1])
         report['drift'] = drift
         if drift['rc'] not in (1, 2):
             report['reasons'].append(
@@ -232,18 +338,24 @@ def run(args):
                            'reason': '没有上次标定的图 / 没给 --new-image：'
                                      '第 1 轮无法 drift，只凭 PnP（记录在案）'}
 
-    # ---- 2. PnP
-    tf_doc = None
-    if args.tf_json:
-        with open(args.tf_json, encoding='utf-8') as fh:
-            tf_doc = json.load(fh)
-    sol = solve_extrinsic(args.image, args.info, args.board, args.store,
-                          tf_doc, max_rms_px=args.max_rms_px,
-                          anchor=getattr(args, 'anchor', None))
+    # ---- 2. PnP（单帧或多帧融合）
+    def _solve(images_info_tf):
+        if len(images_info_tf) == 1:
+            img, info_p, tf_doc = images_info_tf[0]
+            return solve_extrinsic(img, info_p, args.board, args.store,
+                                   tf_doc, max_rms_px=args.max_rms_px,
+                                   anchor=getattr(args, 'anchor', None))
+        return solve_extrinsic_burst(images_info_tf, args.board, args.store,
+                                     max_rms_px=args.max_rms_px,
+                                     anchor=getattr(args, 'anchor', None))
+
+    sol = _solve(frames)
     report['pnp'] = {'image': args.image, 'rms_px': sol['rms_px'],
                      'n_corners': sol['n_corners'],
                      'link_to_optical_source': sol['link_to_optical_source'],
                      'store_anchor': sol.get('store_anchor'),
+                     'store': sol.get('store'),
+                     'frames': sol.get('frames'),
                      'ok': True}
     doc = write_extrinsic(ext_path, sol)
     T_new = sol['T_optical']
@@ -253,7 +365,7 @@ def run(args):
     if args.prev_extrinsics:
         with open(args.prev_extrinsics, encoding='utf-8') as fh:
             prev_doc = json.load(fh)
-        link_pair, _ = _link_to_optical(tf_doc)
+        link_pair, _ = _link_to_optical(frames[0][2])
         T_prev = optical_from_doc(prev_doc, link_pair)
         t_mm, ang = _diff(T_prev, T_new)
         cmp.update(t_mm=round(t_mm, 3), angle_deg=round(ang, 4),
@@ -268,10 +380,10 @@ def run(args):
                     '与存盘外参差 %.2f mm / %.3f°，超限且没给 --reimage 重拍'
                     % (t_mm, ang))
             else:
-                sol2 = solve_extrinsic(args.reimage, args.reinfo or args.info,
-                                       args.board, args.store, tf_doc,
-                                       max_rms_px=args.max_rms_px,
-                                       anchor=getattr(args, 'anchor', None))
+                reframes = _frame_triples(args.reimage,
+                                          args.reinfo or args.info,
+                                          args.tf_json)
+                sol2 = _solve(reframes)
                 doc = write_extrinsic(ext_path, sol2)
                 T_new = sol2['T_optical']
                 t2, ang2 = _diff(T_prev, T_new)
@@ -280,6 +392,7 @@ def run(args):
                            resolved=(t2 <= args.max_drift_mm
                                      and ang2 <= args.max_drift_deg))
                 report['pnp']['reimage_rms_px'] = sol2['rms_px']
+                report['pnp']['reimage_frames'] = sol2.get('frames')
                 if not cmp['resolved']:
                     report['reasons'].append(
                         '重解后仍差 %.2f mm / %.3f°（上限 %.2f mm / %.2f°）'
@@ -344,8 +457,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description='阶段 4 E3b：俯视外参门（只读，不动臂）')
     ap.add_argument('--round', type=int, default=None)
-    ap.add_argument('--image', required=True, help='本轮俯视帧（color.png）')
-    ap.add_argument('--info', required=True, help='同一次采集的 info.json')
+    ap.add_argument('--image', required=True,
+                    help='本轮俯视帧（color.png），或 precision_capture --burst '
+                         '的帧目录（color_000.png…）')
+    ap.add_argument('--info', default=None,
+                    help='单帧模式必给：同一次采集的 meta.json/info.json；'
+                         '帧目录模式可省（逐帧读 meta_NNN.json）')
     ap.add_argument('--prev-image', default=None, help='上次标定用的图（drift 用）')
     ap.add_argument('--new-image', default=None, help='本轮刚拍的图（drift 用）')
     ap.add_argument('--board', default='docs/calib/charuco_A4_30mm_5x5.json')

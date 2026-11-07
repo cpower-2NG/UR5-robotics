@@ -58,13 +58,14 @@ CHAIN_KEYS = (
 TIP = "camera_color_optical_frame"
 
 # ── 俯视第二路（阶段 4，E2）────────────────────────────────────────────
-# 与腕部那条链的**根本差别**：俯视相机不挂在臂上，所以它的链是**纯静态**的
-# 四段，不经过 tool0、也不经过任何转动的关节。
-# ⚠️ `base_link → topcam_link` 这一段**只在标定出外参之后才存在**（launch 里
-#    `topcam_publish_tf:=true`）。第 1 轮标定之前它故意不发 —— 那个量正是要
-#    解出来的东西，拿旧值反喂就是自证。
+# 与腕部那条链的**根本差别**：俯视相机不挂在臂上，所以它的链是**纯静态**的，
+# 不经过 tool0、也不经过任何转动的关节。
+# ⚠️ 这里只列**驱动自己发**的那两段。`base_link → topcam_link` **不进就绪门**：
+#    它只在标定出外参之后才存在（launch 里 `topcam_publish_tf:=true`），而第 1
+#    轮标定之前它故意不发 —— 那个量正是要解出来的东西，拿旧值反喂就是自证。
+#    把它写进就绪门 = 第 1 轮永远抓不到俯视帧（等到超时）。需要 base 系坐标的
+#    下游（`graspnet_candidates.TOPCAM_CHAIN`）仍然要求它，缺了当场报错。
 TOPCAM_CHAIN = (
-    "base_link:topcam_link",
     "topcam_link:topcam_color_frame",
     "topcam_color_frame:topcam_color_optical_frame",
 )

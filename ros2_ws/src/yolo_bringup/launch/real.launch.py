@@ -127,15 +127,21 @@ TOPCAM_LINK = TOPCAM + "_link"
 
 # 与 pipeline.launch.py 的 REALSENSE_REMAPS 同理：驱动发
 # `<camera_namespace>/<camera_name>/...`，这里收回单层 `/topcam/...`。
-# 若驱动的实现改成「用节点名当前缀」，这些 remap 只是不命中，话题名仍然对 ——
-# 两种驱动行为下 `/topcam/color/image_raw` 都成立。
+#
+# ⚠️ 2026-11-07 板端实测：`camera_namespace` **参数改不动**（与
+# pipeline.launch.py:75 的记录一致）—— 传 `topcam` 被接受、节点参数也读到了
+# `topcam`，但话题前缀仍是默认的 `/camera`，于是实际发的是
+# `/camera/topcam/color/...`。所以这里**三种前缀都挂上**：
+#   · `/camera/topcam/...` —— 当前驱动实测行为（camera_namespace 默认 camera）
+#   · `/topcam/topcam/...` —— 若某天 camera_namespace 真的生效
+#   · `/topcam/...`        —— 若驱动改成直接用 camera_name 当前缀（不需要 remap）
+# 不命中的 remap 只是个空规则，不会静默改坏别的话题；漏掉命中的那个才会
+# 让下游一帧都收不到且不报错。
 TOPCAM_REMAPS = [
-    ("/%s/%s/color/image_raw" % (TOPCAM, TOPCAM),
-     "/%s/color/image_raw" % TOPCAM),
-    ("/%s/%s/aligned_depth_to_color/image_raw" % (TOPCAM, TOPCAM),
-     "/%s/aligned_depth_to_color/image_raw" % TOPCAM),
-    ("/%s/%s/color/camera_info" % (TOPCAM, TOPCAM),
-     "/%s/color/camera_info" % TOPCAM),
+    ("/%s/%s/%s" % (prefix, TOPCAM, leaf), "/%s/%s" % (TOPCAM, leaf))
+    for prefix in ("camera", TOPCAM)
+    for leaf in ("color/image_raw", "aligned_depth_to_color/image_raw",
+                 "color/camera_info")
 ]
 
 # 与 pipeline.launch.py 的 SERIAL_PLACEHOLDERS 一致（测试钉着两边相等）。
@@ -492,12 +498,12 @@ def _topcam(context):
     _guard_topcam_params(context, path)
 
     # ---- 驱动 ----
-    # ⚠️ 话题前缀来自**参数** `camera_namespace`/`camera_name`，不是节点的
-    #    namespace/name（板端实测：两个参数默认都是 `camera`，于是 `/camera/camera/...`；
-    #    节点 namespace 不影响话题前缀）。所以这里两个参数都显式给 `topcam`，
-    #    remap 才有确定的落点。节点名也给 `topcam`：与参数同名，日志里一眼能认，
-    #    且不会与 `/camera` 那个节点重名。
-    #    TF 帧前缀同样由 `camera_name` 决定 ⇒ `topcam_link` / `topcam_color_frame` /
+    # ⚠️ 话题前缀来自**参数** `camera_namespace`/`camera_name`。2026-11-07 板端
+    #    实测：`camera_name` 能改（`/camera/topcam/...` 里的 topcam 就是它），
+    #    但 `camera_namespace` **改不动**（与 pipeline.launch.py:75 一致）——
+    #    remap 因此按实测前缀 `/camera/topcam/...` 写（见 TOPCAM_REMAPS）。
+    #    节点名也给 `topcam`：与参数同名，日志里一眼能认。
+    #    TF 帧前缀由 `camera_name` 决定 ⇒ `topcam_link` / `topcam_color_frame` /
     #    `topcam_color_optical_frame`，与腕部的 `camera_link` 那棵树互不相干。
     driver = Node(
         package="realsense2_camera",

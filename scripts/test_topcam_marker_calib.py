@@ -142,6 +142,80 @@ check('  位移不受纯转动漂移影响（相机光心没动）',
 check('★ 反过来：板若被写错（把 cam←板 当成 base←板），闭环就崩 —— 值得显式记',
       not np.allclose(compose(A, invert(B))[0], compose(A, invert(A))[0]))
 
+print('\n--- E. ★ 同 ID 撞车：按板版式挑回自己那一簇（真机 2026-11-07 实测缺陷） ---')
+# 背景：垫子页 A 与 ChArUco 板都用 DICT_4X4_50，id 0–9 重合。真机上两张靶
+# 同时进俯视画面，旧写法按下标取用 ⇒ 板 PnP 混进垫子的角点，同一条命令
+# 一帧 RMS 0.28 px、另一帧 53 px（见 topcam_marker_calib._consistent_board_markers
+# 的 docstring）。这里造一块**同 id、不同版式**的外来靶（标记间距/行列都不同，
+# 所以它不可能是自板平面的某个单应），钉住两件事：
+#   · 无论外来靶排在检出列表前面还是后面，只能留下自板那一簇；
+#   · 无撞车时函数**原样**返回，不偷偷改单张标定的行为。
+import cv2                                                    # noqa: E402
+import cv2.aruco as aruco                                     # noqa: E402
+import topcam_marker_calib as tmc                             # noqa: E402
+
+
+def _mk_charuco():
+    d = aruco.Dictionary_get(aruco.DICT_4X4_50)
+    return aruco.CharucoBoard_create(5, 5, 0.03, 0.022, d), d
+
+
+def _proj(H, xy):
+    p = np.hstack([np.asarray(xy, dtype=float),
+                   np.ones((len(xy), 1))]) @ np.asarray(H, float).T
+    return p[:, :2] / p[:, 2:3]
+
+
+board_e, dict_e = _mk_charuco()
+ids_true = [int(v) for v in np.asarray(board_e.ids).ravel()]
+H_true = np.array([[900.0, 25.0, 720.0], [-18.0, 890.0, 430.0], [0.0, 0.0, 1.0]])
+rng = np.random.default_rng(7)
+true_c = []
+for i in range(len(board_e.objPoints)):
+    xy = np.asarray(board_e.objPoints[i], float).reshape(4, 3)[:, :2]
+    true_c.append((_proj(H_true, xy)
+                   + rng.normal(0.0, 0.12, (4, 2))).astype(np.float32))
+# 外来靶：只用 id 0–9，版式 2×5 / 42 mm（自板是 5×5 / 30 mm），投影到另一处
+n_decoy = min(10, len(ids_true))
+decoy_ids = ids_true[:n_decoy]
+H_dec = np.array([[1100.0, -40.0, 300.0], [30.0, 1050.0, 900.0], [0.0, 0.0, 1.0]])
+decoy_c = []
+for k in range(n_decoy):
+    cx, cy = (k % 5) * 0.042, (k // 5) * 0.042
+    o = np.array([[cx, cy], [cx + 0.03, cy], [cx + 0.03, cy + 0.03],
+                  [cx, cy + 0.03]])
+    decoy_c.append((_proj(H_dec, o)
+                    + rng.normal(0.0, 0.12, (4, 2))).astype(np.float32))
+K_e = np.array([[800.0, 0.0, 640.0], [0.0, 800.0, 360.0], [0.0, 0.0, 1.0]])
+
+
+def _check_cluster(order):
+    if order == 'decoy_last':
+        cc = list(true_c) + list(decoy_c)
+        ii = np.array(ids_true + decoy_ids).reshape(-1, 1)
+    else:
+        cc = list(decoy_c) + list(true_c)
+        ii = np.array(decoy_ids + ids_true).reshape(-1, 1)
+    gc, gi = tmc._consistent_board_markers(board_e, cc, ii, K_e)
+    got = {int(i): np.asarray(c, float).reshape(4, 2) for c, i in zip(gc, gi)}
+    want = {mid: np.asarray(true_c[ids_true.index(mid)], float).reshape(4, 2)
+            for mid in ids_true}
+    kept = sorted(got) == sorted(want)
+    err = (max(np.abs(got[m] - want[m]).max() for m in want) if kept else 9.99)
+    check('%s：只留下自板 %d 个标记（留下 %d 个）'
+          % (order, len(ids_true), len(got)), kept)
+    check('%s：留下的角点就是自板的（最大差 %.1e px）' % (order, err),
+          kept and err < 1e-6)
+
+
+_check_cluster('decoy_last')
+_check_cluster('decoy_first')
+gc, gi = tmc._consistent_board_markers(
+    board_e, list(true_c[:5]), np.array(ids_true[:5]).reshape(-1, 1), K_e)
+check('  无撞车时原样返回（5 个标记，角点不变）',
+      len(gc) == 5 and np.allclose(np.asarray(gc[0], float),
+                                   np.asarray(true_c[0], float), atol=1e-9))
+
 print('\n通过 %d，失败 %d' % (N_PASS, N_FAIL))
 if FAILS:
     print('失败项：')

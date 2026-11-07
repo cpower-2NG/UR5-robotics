@@ -31,9 +31,11 @@ GraspNet 的分数是「这个点像不像可抓」，不是「这是哪一块�
 推理权重默认 ``~/robotics/third_party/graspnet-baseline/logs/checkpoint-rs.tar``。
 """
 import argparse
+import glob
 import json
 import math
 import os
+import re
 import sys
 
 sys.dont_write_bytecode = True
@@ -137,34 +139,59 @@ def cam_pose_tf(tf_ok, tip=TIP, chain=CHAIN):
     return T[:3, :3], T[:3, 3]
 
 
-def cam_pose(frame_dir, tip=TIP, chain=CHAIN):
+_INDEX_RE = re.compile(r"color_(\d+)\.png$")
+
+
+def list_frame_indices(frame_dir):
+    """帧目录 → 帧序号列表；单帧形态（``color.png``）返回 ``[None]``。
+
+    ``precision_capture.py --burst N`` 写 ``color_000.png`` 这种带序号的名字
+    （E4a 的 20 帧、E2 的多帧融合都靠它）；单帧版本仍叫 ``color.png``。
+    """
+    hits = sorted(glob.glob(os.path.join(frame_dir, "color_*.png")))
+    if hits:
+        return sorted(int(_INDEX_RE.search(h).group(1)) for h in hits)
+    if os.path.exists(os.path.join(frame_dir, "color.png")):
+        return [None]
+    return []
+
+
+def _frame_path(frame_dir, name, ext, idx):
+    base = name if idx is None else "%s_%03d" % (name, idx)
+    return os.path.join(frame_dir, base + ext)
+
+
+def cam_pose(frame_dir, tip=TIP, chain=CHAIN, idx=None):
     """base_link ← 指定相机光心（默认腕部 `camera_color_optical_frame`）。
 
     `tip`/`chain` 的默认值保持旧行为（阶段 1–3 的所有调用点不用改）。俯视帧传
     `tip=TOPCAM_TIP, chain=TOPCAM_CHAIN` —— 那条链是**纯静态四段**，不经过臂。
     老帧可能直接存了合成结果（`base_link:<tip>` 一条），先认它。
+    ``idx`` 给定时读 burst 帧（``tf_000.json`` 这种）。
     """
-    tf = json.load(open(os.path.join(frame_dir, "tf.json")))["ok"]
+    tf = json.load(open(_frame_path(frame_dir, "tf", ".json", idx)))["ok"]
     return cam_pose_tf(tf, tip=tip, chain=chain)
 
 
-def camera_k(frame_dir):
-    p = os.path.join(frame_dir, "camera_info.json")
+def camera_k(frame_dir, idx=None):
+    p = _frame_path(frame_dir, "camera_info", ".json", idx)
     if os.path.exists(p):
         return np.array(json.load(open(p))["K"], float).reshape(3, 3)
-    m = json.load(open(os.path.join(frame_dir, "meta.json")))
+    m = json.load(open(_frame_path(frame_dir, "meta", ".json", idx)))
     return np.array(m["camera_info"]["K"], float).reshape(3, 3)
 
 
-def load_frame(frame_dir, tip=TIP, chain=CHAIN):
-    depth = np.array(Image.open(os.path.join(frame_dir, "depth.png")),
+def load_frame(frame_dir, tip=TIP, chain=CHAIN, idx=None):
+    depth = np.array(Image.open(_frame_path(frame_dir, "depth", ".png", idx)),
                      dtype=np.float64) / 1000.0
-    color = np.array(Image.open(os.path.join(frame_dir, "color.png")).convert("RGB"))
-    R, t = cam_pose(frame_dir, tip=tip, chain=chain)
-    js_path = os.path.join(frame_dir, "joint_states.json")
+    color = np.array(Image.open(
+        _frame_path(frame_dir, "color", ".png", idx)).convert("RGB"))
+    R, t = cam_pose(frame_dir, tip=tip, chain=chain, idx=idx)
+    js_path = _frame_path(frame_dir, "joint_states", ".json", idx)
     joints = json.load(open(js_path)) if os.path.exists(js_path) else None
     return {"dir": frame_dir, "depth": depth, "color": color,
-            "K": camera_k(frame_dir), "R_bc": R, "t_bc": t, "joints": joints}
+            "K": camera_k(frame_dir, idx=idx), "R_bc": R, "t_bc": t,
+            "joints": joints}
 
 
 def backproject(depth, K):

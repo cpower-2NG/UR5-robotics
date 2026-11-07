@@ -3,7 +3,8 @@
 
 做三件事
 ────────
-1. 同时检测两页标记（第 1 页 ``DICT_4X4_50``、第 2 页 ``DICT_5X5_50``，各 ID 0–9）；
+1. 同时检测两页标记（第 1 页 ``DICT_4X4_50``、第 2 页 ``DICT_5X5_50``，各 ID 0–9），
+   并**按版式一致性**把同 ID 的别的板子（E3b 的 ChArUco 板也是 4×4、ID 撞车）剔掉；
 2. 用 sidecar ``stage2-mat.json`` 里每个标记的**垫系**角点做 PnP；
    两页分开解一次，得到页 B 相对页 A 的**实测**位移 ``T_A_B``（不假设拼贴对齐）；
 3. 用 ``T_A_B`` 把页 B 的角点搬到页 A 系，做联合 PnP（只在重投影不比单页差时才采用），
@@ -88,13 +89,78 @@ def _pose_delta(T):
 
 
 # ---------------------------------------------------------------- 检测
-def detect_pages(gray, meta):
-    """按页分别检测；返回 ``{'a': {id: corners(4,2)}, 'b': {...}}``。"""
+def _consistent_markers(meta, key, corners, ids, K, inlier_px=3.0):
+    """一页的全部检出里，只留与垫子**版式**几何一致的那些（每个 ID 一条）。
+
+    场景里不止有垫子：E3b 的 ChArUco 板也用 ``DICT_4X4_50``，ID 与页 A 撞车。
+    旧写法 ``{id: corners}`` 让「检测顺序里后到的那条」静默覆盖先到的——碰巧
+    全落在垫子上就解对，混进一块板子上的标记就会解出 2000+ px 的重投影误差
+    （2026-11-07 俯视连拍第 0 帧实测：id 6/9 被 ChArUco 板抢走，RMS 2437 px）。
+    这里拿 sidecar 的物点做 RANSAC：两条不同 ID 的检出起假设，重投影
+    ≤``inlier_px`` 的算内点，取内点最多（并列取 RMS 小）的那一簇。
+    """
+    idx = _marker_index(meta, key)
+    dets = []
+    for c, i in zip(corners, ids):
+        mid = int(i)
+        if mid not in idx:
+            continue
+        dets.append({'id': mid,
+                     'img': np.asarray(c, dtype=np.float64).reshape(4, 2),
+                     'obj': np.asarray(idx[mid]['corners_pad_mm'],
+                                       dtype=np.float64).reshape(4, 2) / 1000.0})
+    if len(dets) < 2:
+        return {d['id']: d['img'] for d in dets}
+    # 没有重复 ID ⇒ 没有歧义可消。保持旧行为（每个检出都进 PnP），这样
+    # 「一个角点画错 5 mm」仍然照旧判红，而不是被当成外点悄悄剔掉。
+    if len({d['id'] for d in dets}) == len(dets):
+        return {d['id']: d['img'] for d in dets}
+
+    best = None
+    for i in range(len(dets)):
+        for j in range(i + 1, len(dets)):
+            if dets[i]['id'] == dets[j]['id']:
+                continue
+            obj = np.vstack([dets[i]['obj'], dets[j]['obj']])
+            img = np.vstack([dets[i]['img'], dets[j]['img']])
+            try:
+                rvec, tvec, _ = sa.solve_plane_pnp(obj, img, K)
+            except (ValueError, cv2.error):
+                continue
+            inl = []
+            for d in dets:
+                uv = sa.project_points(d['obj'], rvec, tvec, K)
+                err = float(np.sqrt(np.mean(np.sum((uv - d['img']) ** 2,
+                                                   axis=1))))
+                if err <= inlier_px:
+                    inl.append((d, err))
+            if len(inl) < 2:
+                continue
+            rms = float(np.sqrt(np.mean([e * e for _, e in inl])))
+            score = (len(inl), -rms)
+            if best is None or score > best[0]:
+                best = (score, inl)
+    if best is None:
+        # 一组都拟合不上：原样交出去，让上层按重投影判红（fail-closed）。
+        return {d['id']: d['img'] for d in dets}
+
+    out = {}
+    for d, err in best[1]:
+        if d['id'] not in out or err < out[d['id']][1]:
+            out[d['id']] = (d['img'], err)
+    return {mid: v[0] for mid, v in out.items()}
+
+
+def detect_pages(gray, meta, K):
+    """按页分别检测；返回 ``{'a': {id: corners(4,2)}, 'b': {...}}``。
+
+    ``K`` 只用来在多簇同 ID 检出里判版式一致性（见 ``_consistent_markers``）。
+    """
     out = {}
     for key in ('a', 'b'):
         dict_name = meta['pages'][key]['dictionary']
         corners, ids = sa.detect_markers(gray, dict_name)
-        out[key] = ({int(i): c for c, i in zip(corners, ids)}
+        out[key] = (_consistent_markers(meta, key, corners, ids, K)
                     if ids is not None else {})
     return out
 
@@ -145,7 +211,7 @@ def solve_pad(color, K, R_bc, t_bc, meta,
     """
     K = np.asarray(K, dtype=np.float64).reshape(3, 3)
     gray = cv2.cvtColor(np.asarray(color), cv2.COLOR_RGB2GRAY)
-    det = detect_pages(gray, meta)
+    det = detect_pages(gray, meta, K)
     pairs = {}
     checks = {'max_rms_px': float(max_rms_px),
               'min_markers_per_page': int(min_markers)}

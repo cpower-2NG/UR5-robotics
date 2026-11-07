@@ -96,28 +96,53 @@ def _in_frame(uv, w, h, margin):
 
 
 # ---------------------------------------------------------------- 帧 I/O
-def load_camera_frame(frame_dir):
+def _p(frame_dir, name, ext, idx):
+    base = name if idx is None else '%s_%03d' % (name, idx)
+    return os.path.join(frame_dir, base + ext)
+
+
+def load_camera_frame(frame_dir, idx=None):
     """只读 color + 内参（**不碰 TF**）。
 
     俯视第 1 轮还没有 ``base_link→topcam_link``，``gc.load_frame`` 会在算
     base←cam 时直接 KeyError —— 这里是刻意的逃生门：E2 要的恰恰是解出那段
     TF，所以只取图上量得到的东西（像素 + 内参 + ``tf.json`` 里的固定链）。
+    ``idx`` 给定时读 burst 帧（``color_000.png``）。
     """
-    meta_path = os.path.join(frame_dir, 'meta.json')
-    with open(meta_path, encoding='utf-8') as fh:
+    with open(_p(frame_dir, 'meta', '.json', idx), encoding='utf-8') as fh:
         meta = json.load(fh)
     info = meta['camera_info']
     K = np.array(info['K'], dtype=np.float64).reshape(3, 3)
     dist = np.array(info.get('D') or [0.0] * 5, dtype=np.float64).reshape(-1, 1)
-    color = np.array(Image.open(os.path.join(frame_dir, 'color.png')).convert('RGB'))
+    color = np.array(Image.open(_p(frame_dir, 'color', '.png', idx)).convert('RGB'))
     return {'color': color, 'K': K, 'dist': dist,
             'width': int(info['width']), 'height': int(info['height']),
             'meta': meta}
 
 
-def load_tf(frame_dir):
-    with open(os.path.join(frame_dir, 'tf.json'), encoding='utf-8') as fh:
+def load_tf(frame_dir, idx=None):
+    with open(_p(frame_dir, 'tf', '.json', idx), encoding='utf-8') as fh:
         return json.load(fh)
+
+
+def mean_pose(Ts):
+    """一组 4×4 的 SE(3) 平均：平移取均值，旋转取弦距离最小（SVD 投影）。
+
+    多帧融合用它压噪声——单帧俯视垫位姿在 1.45 m 处的重复性只有
+    ~0.4 mm / 0.18°（1σ），但逐帧会抖；融合后两路差才回到判据以内
+    （2026-11-07 实测，见台账）。
+    """
+    Ts = [np.asarray(T, dtype=np.float64) for T in Ts]
+    t = np.mean([T[:3, 3] for T in Ts], axis=0)
+    U, _, Vt = np.linalg.svd(np.sum([T[:3, :3] for T in Ts], axis=0))
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        U[:, -1] *= -1
+        R = U @ Vt
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
 
 
 # ---------------------------------------------------------------- 外参入口
@@ -158,6 +183,15 @@ def _grid_corners_pad_mm(meta):
     return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
 
 
+def _marker_corners_pad_mm(meta):
+    """两页垫**所有**标记的角点（垫系，mm）。只取几何，不管检出与否。"""
+    pts = []
+    for page in (meta.get('pages') or {}).values():
+        for mk in page.get('markers') or []:
+            pts.extend(mk.get('corners_pad_mm') or [])
+    return pts
+
+
 def _hover_points_base_m(zone, table_z_m, block_m, hover_m):
     """5 个悬停点：拾取区四角 + 中心，z = 台面 + 块高 + 悬停高度。"""
     x0, x1, y0, y1 = zone
@@ -171,7 +205,14 @@ def coverage(meta, T_base_pad, T_cam_base, K, dist, w, h,
              zone=PICK_ZONE, table_z_m=TABLE_Z_MM / 1000.0,
              block_m=0.0295, hover_m=0.080, margin=20.0,
              detected=None):
-    """把台面矩形 / 宫格四角 / 悬停点投到俯视画幅，算边距；同时报标记检出。"""
+    """把台面矩形 / 宫格四角 / 悬停点（以及两页垫的全部标记角点）投到俯视画幅。
+
+    **标记的硬门是几何**（两页每个角点都在画幅内），不是「每个码都解码成功」：
+    实测（2026-11-07）俯视在 base y=+1.08 m、离垫 1.45 m，远端那页的码只有
+    ~12 px，1920×1080 下也只认出 5/10（1208×720 时更少，参数放到最松也只多 1 个）。
+    那是分辨率的物理上限，不是布场错。`detected` 里的检出数仍然全量记录，但只作
+    诊断：垫位姿能不能解，由 `solve_pad` 自己的「每页 ≥4 个 + RMS ≤1.5 px」把守。
+    """
     def _proj_base(pts_m):
         P = np.asarray(pts_m, dtype=np.float64).reshape(-1, 3)
         Ph = np.column_stack([P, np.ones(len(P))])
@@ -199,6 +240,25 @@ def coverage(meta, T_base_pad, T_cam_base, K, dist, w, h,
                 'in_front': front,
                 'in_frame': bool(front) and _in_frame(uv, w, h, margin)}
 
+    # 两页垫的每个标记角点都必须落在画幅内（几何可见性，与能否解码无关）
+    mk_pad = _marker_corners_pad_mm(meta)
+    if mk_pad:
+        mk_base = [(T_bp @ np.array([x / 1000.0, y / 1000.0, 0.0, 1.0]))[:3]
+                   for x, y in mk_pad]
+        uv_mk, front_mk = _proj_base(mk_base)
+        uv_arr = np.asarray(uv_mk, dtype=np.float64)
+        pad_markers = {
+            'n_markers': len(mk_pad) // 4,
+            'in_frame': bool(front_mk) and _in_frame(uv_mk, w, h, margin),
+            'uv_bbox_px': [[round(float(uv_arr[:, 0].min()), 2),
+                            round(float(uv_arr[:, 1].min()), 2)],
+                           [round(float(uv_arr[:, 0].max()), 2),
+                            round(float(uv_arr[:, 1].max()), 2)]]}
+    else:
+        # 垫定义里没有标记几何 ⇒ 这一条判不了。写成 None 而不是 True：
+        # 下游能看出「没判」，不会把它当成通过。
+        pad_markers = {'n_markers': 0, 'in_frame': None}
+
     markers = None
     if detected is not None:
         markers = {
@@ -207,6 +267,9 @@ def coverage(meta, T_base_pad, T_cam_base, K, dist, w, h,
             'page_b': {'n': len(detected.get('b', [])),
                        'missing_ids': detected.get('b_missing', [])},
         }
+        # 只作诊断：远端那页的码在 1.45 m 外只有 ~12 px，解不出来是分辨率的
+        # 物理上限（证据见函数头）。硬门看上面的 pad_markers 几何 + solve_pad
+        # 自己的「每页 ≥4 个、RMS ≤1.5 px」。
         markers['all_detected'] = bool(
             not markers['page_a']['missing_ids']
             and not markers['page_b']['missing_ids'])
@@ -218,13 +281,14 @@ def coverage(meta, T_base_pad, T_cam_base, K, dist, w, h,
         'pick_zone': _block(uv_pick, front_pick),
         'grid_corners': _block(uv_grid, front_grid),
         'hover_points': _block(uv_hover, front_hover),
+        'pad_markers': pad_markers,
     }
     if markers is not None:
         res['markers'] = markers
     ok = bool(res['pick_zone']['in_frame'] and res['grid_corners']['in_frame']
               and res['hover_points']['in_frame'])
-    if markers is not None:
-        ok = ok and markers['all_detected']
+    if pad_markers['in_frame'] is not None:
+        ok = ok and pad_markers['in_frame']
     res['ok'] = ok
     return res
 
@@ -234,23 +298,50 @@ def run(args):
     with open(args.mat, encoding='utf-8') as fh:
         meta = json.load(fh)
 
-    wframe = gc.load_frame(args.wrist_frame)          # 腕部链完整，照旧
-    wres = sp.solve_pad(wframe['color'], wframe['K'], wframe['R_bc'],
-                        wframe['t_bc'], meta,
-                        max_rms_px=args.max_rms_px,
-                        min_markers=args.min_markers)
-    tframe = load_camera_frame(args.topcam_frame)
-    tf_doc = load_tf(args.topcam_frame)
-    tres = sp.solve_pad(tframe['color'], tframe['K'], np.eye(3),
-                        np.zeros(3), meta,
-                        max_rms_px=args.max_rms_px,
-                        min_markers=args.min_markers)
-
+    # 帧目录可以是单帧（color.png）也可以是 burst（color_000.png …）：
+    # 逐帧解垫位姿，再融合。单帧时 n=1，行为与旧版完全一致。
+    w_idx = gc.list_frame_indices(args.wrist_frame)
+    t_idx = gc.list_frame_indices(args.topcam_frame)
     reasons = []
+    if not w_idx:
+        reasons.append('腕部帧目录里没有帧：%s' % args.wrist_frame)
+    if not t_idx:
+        reasons.append('俯视帧目录里没有帧：%s' % args.topcam_frame)
+
+    w_ok, t_ok = [], []
+    wres = tres = None
+    for i in w_idx or []:
+        wframe = gc.load_frame(args.wrist_frame, idx=i)   # 腕部链完整，照旧
+        r = sp.solve_pad(wframe['color'], wframe['K'], wframe['R_bc'],
+                         wframe['t_bc'], meta,
+                         max_rms_px=args.max_rms_px,
+                         min_markers=args.min_markers)
+        wres = r
+        if r['T_base_pad'] is not None:
+            w_ok.append(r['T_base_pad'])
+    for i in t_idx or []:
+        tframe_i = load_camera_frame(args.topcam_frame, idx=i)
+        r = sp.solve_pad(tframe_i['color'], tframe_i['K'], np.eye(3),
+                         np.zeros(3), meta,
+                         max_rms_px=args.max_rms_px,
+                         min_markers=args.min_markers)
+        tres = r
+        if r['T_base_pad'] is not None:
+            t_ok.append(r['T_base_pad'])
+
+    tframe = load_camera_frame(args.topcam_frame, idx=t_idx[-1]) if t_idx else None
+    tf_doc = load_tf(args.topcam_frame, idx=t_idx[-1]) if t_idx else None
+
     for name, res in (('腕部', wres), ('俯视', tres)):
+        if res is None:
+            continue
         if res['T_base_pad'] is None:
             reasons.append('%s PnP 失败：%s'
                            % (name, res['checks'].get('reason', '未知')))
+    if w_idx and not w_ok:
+        reasons.append('腕部 %d 帧没有一帧解出来' % len(w_idx))
+    if t_idx and not t_ok:
+        reasons.append('俯视 %d 帧没有一帧解出来' % len(t_idx))
 
     # link→optical：必须用驱动实测的那条链
     try:
@@ -264,12 +355,23 @@ def run(args):
 
     if reasons:
         return {'ok': False, 'fatal': True, 'reasons': reasons,
-                'wrist': {'ok': bool(wres['ok']), 'checks': wres['checks']},
-                'topcam': {'ok': bool(tres['ok']), 'checks': tres['checks']},
+                'wrist': ({'ok': bool(wres['ok']), 'checks': wres['checks']}
+                          if wres else None),
+                'topcam': ({'ok': bool(tres['ok']), 'checks': tres['checks']}
+                           if tres else None),
                 'link_to_optical': {'source': lo_source}}
 
-    T_base_pad_w = np.asarray(wres['T_base_pad'], dtype=np.float64)
-    T_cam_pad = np.asarray(tres['T_base_pad'], dtype=np.float64)
+    T_base_pad_w = mean_pose(w_ok)
+    T_cam_pad = mean_pose(t_ok)
+    frames = {}
+    for name, P in (('wrist', w_ok), ('topcam', t_ok)):
+        m = mean_pose(P)
+        spread_mm = max(float(np.linalg.norm(np.asarray(T)[:3, 3] - m[:3, 3]))
+                        * 1000.0 for T in P)
+        spread_deg = max(_rel_delta(m, np.asarray(T, dtype=np.float64))
+                         ['angle_deg'] for T in P)
+        frames[name] = {'n_frames': len(P), 'spread_mm': round(spread_mm, 3),
+                        'spread_deg': round(spread_deg, 3)}
 
     # base←topcam_link：优先已发布的（独立检验）；第 1 轮没有就得自己解
     T_pub_link = None
@@ -315,20 +417,20 @@ def run(args):
 
     T_base_link = _compose(T_base_cam, _inv(T_link_optical))
 
-    ok = bool(wres['ok'] and tres['ok'] and two_way['ok'] and cov['ok'])
-    if not wres['ok']:
+    # 单帧时 wres/tres 就是那唯一一帧；burst 时用的是「解出来的那些帧」的
+    # 融合位姿，逐帧是否全过已经由 sp.solve_pad 的 RMS/标记数把关。
+    ok = bool(w_ok and t_ok and two_way['ok'] and cov['ok'])
+    if wres['ok'] is False and len(w_idx) == 1:
         reasons.append('腕部判据不过：%s' % wres['checks'].get('reason', ''))
-    if not tres['ok']:
+    if tres['ok'] is False and len(t_idx) == 1:
         reasons.append('俯视判据不过：%s' % tres['checks'].get('reason', ''))
     if not two_way['ok']:
         reasons.append('两路不一致：%.2f mm / %.3f°（上限 %.2f mm / %.2f°）'
                        % (two_way['translation_mm'], two_way['angle_deg'],
                           args.max_trans_mm, args.max_rot_deg))
     if not cov['ok']:
-        bad = [k for k in ('pick_zone', 'grid_corners', 'hover_points')
-               if not cov[k]['in_frame']]
-        if cov.get('markers', {}).get('all_detected') is False:
-            bad.append('markers')
+        bad = [k for k in ('pick_zone', 'grid_corners', 'hover_points',
+                           'pad_markers') if cov[k]['in_frame'] is False]
         reasons.append('覆盖不过：%s' % (', '.join(bad) or '未知'))
 
     return {
@@ -341,6 +443,7 @@ def run(args):
         'topcam': {'ok': bool(tres['ok']), 'checks': tres['checks'],
                    'T_cam_pad': T_cam_pad.tolist(),
                    'T_base_pad_from_cam': T_base_pad_t.tolist()},
+        'frames': frames,
         'link_to_optical': {'source': lo_source,
                             'R': R_lo.tolist(), 't': t_lo.tolist()},
         'extrinsic': {'source': ext_source,
@@ -382,6 +485,14 @@ def extrinsics_doc(res, joint_path, created=None):
         'created': (created or
                     datetime.datetime.now().isoformat(timespec='seconds')),
     }
+
+
+def _frames_note(frames, side):
+    fr = (frames or {}).get(side)
+    if not fr or fr['n_frames'] <= 1:
+        return ''
+    return '，%d 帧融合（逐帧散布 %.2f mm / %.3f°）' % (
+        fr['n_frames'], fr['spread_mm'], fr['spread_deg'])
 
 
 def main(argv=None):
@@ -444,22 +555,27 @@ def main(argv=None):
 
     tw = res['two_way']
     cov = res['coverage']
-    print('腕部：RMS %.2f px（%s）'
+    fr = res.get('frames') or {}
+    print('腕部：RMS %.2f px（%s）%s'
           % (res['wrist']['checks'].get('rms_adopted_px', float('nan')),
-             res['wrist']['checks'].get('adopted')))
-    print('俯视：RMS %.2f px（%s）'
+             res['wrist']['checks'].get('adopted'), _frames_note(fr, 'wrist')))
+    print('俯视：RMS %.2f px（%s）%s'
           % (res['topcam']['checks'].get('rms_adopted_px', float('nan')),
-             res['topcam']['checks'].get('adopted')))
+             res['topcam']['checks'].get('adopted'), _frames_note(fr, 'topcam')))
     print('外参来源：%s（link→optical：%s）'
           % (res['extrinsic']['source'], res['link_to_optical']['source']))
     print('两路差：%.2f mm / %.3f°（yaw %+.3f°，tilt %.3f°）%s'
           % (tw['translation_mm'], tw['angle_deg'], tw['yaw_deg'],
              tw['tilt_deg'], '' if tw['ok'] else '  ← 超限'))
-    print('覆盖：拾取区 %s、宫格 %s、悬停点 %s、标记 %s → %s'
+    print('覆盖：拾取区 %s、宫格 %s、悬停点 %s、两页垫标记几何 %s → %s'
           % (cov['pick_zone']['in_frame'], cov['grid_corners']['in_frame'],
-             cov['hover_points']['in_frame'],
-             cov.get('markers', {}).get('all_detected', 'n/a'),
+             cov['hover_points']['in_frame'], cov['pad_markers']['in_frame'],
              'OK' if cov['ok'] else 'FAIL'))
+    if cov.get('markers'):
+        mk = cov['markers']
+        print('  （诊断，不判分）标记检出：页A %d 缺 %s；页B %d 缺 %s'
+              % (mk['page_a']['n'], mk['page_a']['missing_ids'] or '无',
+                 mk['page_b']['n'], mk['page_b']['missing_ids'] or '无'))
     if res['note']:
         print('注：%s' % res['note'])
     print('写入 %s' % out)
