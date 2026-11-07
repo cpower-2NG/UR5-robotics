@@ -46,6 +46,15 @@ PICK_ZONE = [0.25, 0.575, 0.17, 0.42]
 #: 台面在 base 系的 z（mm，2026-10-02 实测 +3.88，≈0）。
 TABLE_Z_MM = 3.88
 
+#: 判据 B（2026-11-07 用户拍板，台账第二百七十二 / 二百七十三轮）：俯视外参按**自洽性**
+#: 判 —— 主判据是刚性 ChArUco 板路线的自复现性 + E3a 漂移门；这里的两路垫 PnP 降为
+#: **交叉核对**，平移门 2 mm 不变、角度门由 0.5° 放到 1.2°（= 这条路线自己的复现性）。
+#: 依据：8 个可评轮次的角度 0.31–0.89° 全部压在腕部链条 ~1° 的姿态倾角误差上，
+#: 两条互相独立的外参路线给出同样的数 ⇒ 0.5° 在这套硬件上不可达。
+#: **这是唯一的口径源**；``topcam_extrinsic_gate.py`` 从这里取，别在两处各写一份。
+PAD_CROSS_TRANS_MM = 2.0
+PAD_CROSS_ROT_DEG = 1.2
+
 
 # ---------------------------------------------------------------- 几何
 def _T(R, t):
@@ -545,8 +554,11 @@ def main(argv=None):
                          'base_link→topcam_link（E2 第 1 轮用）。'
                          '没有它时，只要 launch 发过 TF 导出支就永远走不到，'
                          '导出的文件其实是把已发布值原样抄回。')
-    ap.add_argument('--max-trans-mm', type=float, default=2.0)
-    ap.add_argument('--max-rot-deg', type=float, default=0.5)
+    ap.add_argument('--max-trans-mm', type=float, default=PAD_CROSS_TRANS_MM)
+    ap.add_argument('--max-rot-deg', type=float, default=PAD_CROSS_ROT_DEG,
+                    help='两路差的角度门。默认 1.2° = 判据 B（2026-11-07 用户拍板）：'
+                         '俯视外参按自洽性判，垫只做交叉核对；0.5° 是旧判据 A，'
+                         '压在腕部链条 ~1° 的姿态倾角地板上，需用户另行拍板才用')
     ap.add_argument('--max-rms-px', type=float, default=sp.MAX_RMS_PX)
     ap.add_argument('--min-markers', type=int, default=sp.MIN_MARKERS)
     ap.add_argument('--margin-px', type=float, default=20.0)

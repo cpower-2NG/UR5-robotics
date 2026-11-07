@@ -11,8 +11,11 @@
    ``base←topcam_optical``；板没检出 / RMS 超限 ⇒ 退出 2。
 3. **增量门**：与存盘外参比，平移 >1 mm 或转角 >0.2° ⇒ 必须**重解**（给
    ``--reimage`` 再拍一帧）；重解后仍超 ⇒ 退出 1，停车。
-4. **端到端复核**：把新外参交给 ``stage4_joint_calib``（``--base-topcam-link``）
-   跑两路垫 PnP，要求 ≤2 mm / 0.5°；不过 ⇒ 退出 1。
+4. **端到端交叉核对**：把新外参交给 ``stage4_joint_calib``（``--base-topcam-link``）
+   跑两路垫 PnP。**判据 B（2026-11-07 用户拍板）**：平移门仍是 2 mm，角度门放到
+   1.2°（= 这条路线自己的复现性）—— 因为 8 个可评轮次的 0.31–0.89° 全部压在腕部
+   链条 ~1° 的姿态倾角地板上，0.5° 在这套硬件上不可达。**主判据是第 3 步的板路线
+   自复现性 + E3a 漂移门**；垫只做增量交叉核对，超限 ⇒ 退出 1（仍然 fail-closed）。
    通过后本门的输出就是外参的**事实源**（``site.yaml`` 只是启动参数副本）。
 
 退出码：0 = 全过；1 = 判据不过（停车）；2 = 数据缺失/坏（停车）。
@@ -37,6 +40,25 @@ import stage4_joint_calib as jc                                   # noqa: E402
 import topcam_marker_calib as tmc                                 # noqa: E402
 
 DRIFT_SCRIPT = os.path.join(HERE, 'topcam_drift_check.py')
+
+# 判据 B（2026-11-07 用户拍板，台账第二百七十二 / 二百七十三轮）：
+# 俯视外参按**自洽性**判，而不是拿第二路相机做绝对仲裁 ——
+#   主判据：刚性 ChArUco 板路线的自复现性（第 3 步增量门 ≤1 mm / 0.2°）+ E3a 漂移门；
+#   交叉核对：垫 PnP 的平移门 2 mm 不变，角度门由 0.5° 改为 1.2°（= 这条路线自己的
+#   复现性），仍 fail-closed。
+# 依据：8 个可评轮次的角度 0.31–0.89° 全部压在腕部链条 ~1° 的姿态倾角误差上，
+# 两条互相独立的外参路线给出同样的数 ⇒ 0.5° 在这套硬件上不可达，不是垫或俯视的锅。
+CRITERION = {
+    'name': 'self-consistency-B',
+    'approved': 'user 2026-11-07',
+    'primary': '板路线自复现性（增量门 1 mm / 0.2°）+ E3a 漂移门',
+    'pad_cross_check': {'translation_mm': jc.PAD_CROSS_TRANS_MM,
+                        'angle_deg': jc.PAD_CROSS_ROT_DEG},
+    'changed_from': {'translation_mm': 2.0, 'angle_deg': 0.5},
+    'why': '腕部链条 ~1° 姿态倾角地板；两条独立外参路线同数 ⇒ 0.5° 不可达',
+}
+PAD_CROSS_ROT_DEG = CRITERION['pad_cross_check']['angle_deg']
+PAD_CROSS_TRANS_MM = CRITERION['pad_cross_check']['translation_mm']
 
 
 class GateData(Exception):
@@ -320,6 +342,10 @@ def run(args):
     report = {'version': 1, 'kind': 'stage4-extrinsic-gate',
               'round': args.round,
               'created': datetime.datetime.now().isoformat(timespec='seconds'),
+              'criterion': dict(CRITERION,
+                                applied={'pad_cross_check': {
+                                    'translation_mm': args.max_trans_mm,
+                                    'angle_deg': args.max_rot_deg}}),
               'reasons': [], 'ok': False}
 
     # ---- 1. drift（只报警，不放行）
@@ -424,10 +450,13 @@ def run(args):
                 'file': joint_path,
                 'two_way': jr.get('two_way'),
                 'extrinsic_source': jr.get('extrinsic', {}).get('source'),
+                'thresholds': {'translation_mm': args.max_trans_mm,
+                               'angle_deg': args.max_rot_deg},
+                'role': '交叉核对（判据 B：主判据是板路线自复现性）',
                 'reasons': jr.get('reasons', []),
             }
             if not jr.get('ok'):
-                report['reasons'].append('端到端两路复核不过：%s'
+                report['reasons'].append('垫交叉核对不过：%s'
                                          % '；'.join(jr.get('reasons') or ['未知']))
         except GateData:
             raise
@@ -449,8 +478,10 @@ def _write(path, report):
 def _add_thresholds(ap):
     ap.add_argument('--max-drift-mm', type=float, default=1.0)
     ap.add_argument('--max-drift-deg', type=float, default=0.2)
-    ap.add_argument('--max-trans-mm', type=float, default=2.0)
-    ap.add_argument('--max-rot-deg', type=float, default=0.5)
+    ap.add_argument('--max-trans-mm', type=float, default=PAD_CROSS_TRANS_MM)
+    ap.add_argument('--max-rot-deg', type=float, default=PAD_CROSS_ROT_DEG,
+                    help='垫交叉核对的角度门。默认 1.2° = 判据 B 的自复现性；'
+                         '传 0.5 就是判据 A（需要用户另行拍板）')
 
 
 def main(argv=None):

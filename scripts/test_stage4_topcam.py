@@ -591,7 +591,7 @@ def gate_args(**kw):
 
 
 def gate_run(drift_rc=None, sol_shift=None, sol_shifts=None, joint_ok=True,
-             **kw):
+             capture=None, **kw):
     orig = (gate.run_drift, gate.solve_extrinsic, gate.joint_check)
     gate.run_drift = lambda *a, **k: {
         'ran': True, 'rc': drift_rc, 'verdict': '打桩', 'tail': []}
@@ -610,10 +610,12 @@ def gate_run(drift_rc=None, sol_shift=None, sol_shifts=None, joint_ok=True,
                 'image': 'x'}
 
     gate.solve_extrinsic = stub_solve
-    gate.joint_check = lambda *a, **k: {
-        'ok': joint_ok, 'two_way': {'translation_mm': 0.2, 'angle_deg': 0.01},
-        'extrinsic': {'source': 'published-tf'},
-        'reasons': [] if joint_ok else ['打桩不过']}
+    gate.joint_check = lambda *a, **k: (
+        capture.update(k) if capture is not None else None,
+        {'ok': joint_ok,
+         'two_way': {'translation_mm': 0.2, 'angle_deg': 0.01},
+         'extrinsic': {'source': 'published-tf'},
+         'reasons': [] if joint_ok else ['打桩不过']})[1]
     try:
         return gate.run(gate_args(**kw))
     finally:
@@ -640,6 +642,44 @@ check('给了 --prev-image/--new-image ⇒ drift 真的跑了',
 rep, code = gate_run(drift_rc=None)
 check('第 1 轮无上次图 ⇒ drift 明确记 skipped（不假装做过）',
       rep['drift']['ran'] is False and '第 1 轮' in rep['drift']['reason'])
+
+# ---- 判据 B（2026-11-07 用户拍板）：垫只做交叉核对，角度门 1.2°
+_seen = {}
+rep, code = gate_run(drift_rc=None, wrist_frame='/tmp/w', topcam_frame='/tmp/t',
+                     capture=_seen,
+                     max_trans_mm=gate.PAD_CROSS_TRANS_MM,
+                     max_rot_deg=gate.PAD_CROSS_ROT_DEG)
+check('判据 B：垫交叉核对按 2 mm / 1.2° 判（不是 0.5°）',
+      _seen.get('max_rot_deg') == 1.2 and _seen.get('max_trans_mm') == 2.0,
+      str(_seen))
+check('判据 B 写进报告：名字 / 拍板人 / 改前改后都在',
+      rep['criterion']['name'] == 'self-consistency-B'
+      and rep['criterion']['approved'] == 'user 2026-11-07'
+      and rep['criterion']['changed_from']['angle_deg'] == 0.5,
+      str(rep.get('criterion')))
+check('  applied 记下本次实际用的门', rep['criterion']['applied']
+      ['pad_cross_check'] == {'translation_mm': 2.0, 'angle_deg': 1.2},
+      str(rep['criterion'].get('applied')))
+check('  joint 里标了角色是交叉核对',
+      '交叉核对' in (rep.get('joint', {}).get('role') or ''), str(rep.get('joint')))
+
+_seen2 = {}
+gate_run(drift_rc=None, wrist_frame='/tmp/w', topcam_frame='/tmp/t',
+         capture=_seen2, max_rot_deg=0.5)
+check('传 --max-rot-deg 0.5 仍可用（想回到判据 A 不必改代码）',
+      _seen2.get('max_rot_deg') == 0.5, str(_seen2))
+
+# 变异检查：上面的用例都是「显式传参」，必须再验**缺省值**本身，
+# 否则把 default 改回 0.5 也照样全绿。
+_p = argparse.ArgumentParser()
+gate._add_thresholds(_p)
+_ns = _p.parse_args([])
+check('判据 B 落在 CLI 缺省上：--max-rot-deg 不给参数 = 1.2°',
+      _ns.max_rot_deg == 1.2 and _ns.max_trans_mm == 2.0, str(_ns))
+check('  两个脚本共用同一口径源（gate 的常数就是 jc 的常数）',
+      (gate.PAD_CROSS_ROT_DEG, gate.PAD_CROSS_TRANS_MM)
+      == (jc.PAD_CROSS_ROT_DEG, jc.PAD_CROSS_TRANS_MM) == (1.2, 2.0),
+      str((gate.PAD_CROSS_ROT_DEG, jc.PAD_CROSS_ROT_DEG)))
 
 PREV = os.path.join(_ARGS_TMP, 'prev.json')
 with open(PREV, 'w') as fh:
