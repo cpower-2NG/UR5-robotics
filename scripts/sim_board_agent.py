@@ -58,6 +58,10 @@ class SimClient:
     def joints(self):
         return self.call(op="joints")
 
+    def state(self):
+        # 带 age（秒）：不重试、不阻塞，用来看仿真是不是还活着
+        return self.call(op="state")
+
     def move(self, names, points, timeout=180.0):
         # 统一成 {positions, secs}：协议那头按 dict 解析
         norm = [p if isinstance(p, dict) else _norm(p) for p in points]
@@ -95,6 +99,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping")
     sub.add_parser("joints")
+    sub.add_parser("state")
     sub.add_parser("home")
     g = sub.add_parser("gripper")
     g.add_argument("--mm", type=float, required=True)
@@ -111,6 +116,8 @@ def main():
         r = c.ping()
     elif args.cmd == "joints":
         r = c.joints()
+    elif args.cmd == "state":
+        r = c.state()
     elif args.cmd == "home":
         r = c.home()
     elif args.cmd == "gripper":
@@ -120,7 +127,8 @@ def main():
             plan = json.load(open(args.plan))
             names, points = plan["names"], plan["points"]
         else:
-            names = args.names.split(",")
+            # 不给 --names 时默认六轴（2026-11-07 踩过：省略直接 AttributeError）
+            names = args.names.split(",") if args.names else list(ARM_JOINTS)
             points = parse_points(args.points)
         r = c.move(names, points, args.timeout)
     print(json.dumps(r, ensure_ascii=False, indent=2))

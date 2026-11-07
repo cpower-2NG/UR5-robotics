@@ -162,8 +162,15 @@ class SimBridge(Node):
     def dispatch(self, req):
         op = req.get("op")
         if op == "ping":
+            # ⚠️ 只看 action_ready 会假绿灯：仿真进程被杀后，rclpy 的图缓存
+            #    仍可能报 true（2026-11-07 实测：gz 已退出，ping 依旧 true）。
+            #    判活必须以 /joint_states 的新鲜度为准。
+            _, stamp = self.joints()
+            age = round(time.time() - stamp, 3) if stamp else None
             return {"ok": True, "host": "dev-sim", "action": self._action_name,
-                    "action_ready": self._ac.server_is_ready()}
+                    "action_ready": self._ac.server_is_ready(),
+                    "joints_age": age,
+                    "sim_live": bool(age is not None and age < 2.0)}
         if op == "state":
             j, stamp = self.joints()
             return {"ok": True, "joints": j, "age": round(time.time() - stamp, 3)

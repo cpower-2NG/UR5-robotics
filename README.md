@@ -111,9 +111,10 @@ ros2 launch yolo_bringup bringup.launch.py camera_source:=sim
 scripts/sim_board_link.sh
 
 # 板子上：发命令（另一个终端）
-python3 ~/simlink/sim_board_agent.py ping
+python3 ~/simlink/sim_board_agent.py ping     # 认 sim_live:true，别认 action_ready
+python3 ~/simlink/sim_board_agent.py state    # 关节 + age(秒)
 python3 ~/simlink/sim_board_agent.py joints
-python3 ~/simlink/sim_board_agent.py move --names shoulder_pan_joint,shoulder_lift_joint,elbow_joint,wrist_1_joint,wrist_2_joint,wrist_3_joint --points '[[0.4,-1.3,0.3,-1.5,0.2,0.1],4.0]'
+python3 ~/simlink/sim_board_agent.py move --points '[[0.4,-1.3,0.3,-1.5,0.2,0.1],4.0]'   # 省略 --names = 六轴
 python3 ~/simlink/sim_board_agent.py gripper --mm 50
 python3 ~/simlink/sim_board_agent.py home
 ```
@@ -125,6 +126,9 @@ python3 ~/simlink/sim_board_agent.py home
 
 判据：`gz topic -e -t /world/grasp_world/dynamic_pose/info -n 1` 里
 `wrist_3_link` 的位姿随板上命令改变（不要只看 bridge 自报的关节角）。
+链路活着与否只看 `ping` 的 `sim_live`：仿真进程被杀后 rclpy 的 action 图缓存
+仍会报 `action_ready:true`（2026-11-07 实测），`sim_live` 按 `/joint_states`
+新鲜度（<2 s）判。
 
 ### `gz_ros2_control` 前置（仿真必需，真机不需要）
 
