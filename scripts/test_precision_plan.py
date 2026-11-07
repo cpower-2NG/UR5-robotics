@@ -1030,15 +1030,22 @@ def test_resume_run_command_shape():
         return subprocess.run(["true"], capture_output=True)
 
     orig_sh, orig_ssh = pr.sh, pr.Board.ssh
+    orig_token = pr.board_motion_token
     pr.sh = fake_sh
     pr.Board.ssh = lambda self, cmd, **kw: (
         seen.append(cmd),
         types.SimpleNamespace(returncode=0, stdout=""))[1]
+    # 令牌闸门**不在这条用例的把守范围**：它测的是续跑命令行写没写对。真去读板上
+    # 令牌会让它在开发机上（没握手、没令牌）抛 SystemExit —— 而 SystemExit 不是
+    # Exception，主循环接不住，**整个文件后面的用例会被静默跳过**。
+    # 闸门本身由 test_exec_plan_refuses_without_token 单独把守。
+    pr.board_motion_token = lambda board: "test-token"
     try:
         b.exec_plan(plan, log, True, from_="to_slot_split1", append=True,
                     reset_remote=True)
     finally:
         pr.sh, pr.Board.ssh = orig_sh, orig_ssh
+        pr.board_motion_token = orig_token
 
     run = [c for c in seen if "precision_exec.py" in c]
     assert len(run) == 1, "续跑只发一条执行命令，实际 %r" % (seen,)
@@ -1048,6 +1055,47 @@ def test_resume_run_command_shape():
     got = open(log).read()
     assert got.count("\n") == 2, "续跑后本地应有两行（第一段 + 第二段），实际 %r" % got
     assert "to_slot_split1" in got, "第二段没并进本地日志：%r" % got
+
+
+@case
+def test_exec_plan_refuses_without_token():
+    """没有 / 过期 / 缺两步记录的令牌都必须**一条轨迹都不发**（fail-closed）。
+
+    闸门读的是板上文件，所以这条用例用假 Board 喂三种坏文件；它把守的是
+    「闸门还在、还认这三件事」，不是「板上有授权」。
+    """
+    import types
+    import precision_round as pr
+
+    b = pr.Board.__new__(pr.Board)
+    now = 1700000000
+
+    def fake(stdout):
+        b.ssh = lambda cmd, **kw: types.SimpleNamespace(returncode=0,
+                                                        stdout=stdout)
+
+    cases = [
+        ("没有令牌文件", "\n---\n%d" % now, "没有运动授权令牌"),
+        ("令牌过期",
+         '{"token": "t", "expires": %d, "stop_at": 1, "play_at": 2}\n---\n%d'
+         % (now - 1, now), "已过期"),
+        ("缺 STOP/PLAY 记录",
+         '{"token": "t", "expires": %d, "stop_at": 0, "play_at": 0}\n---\n%d'
+         % (now + 600, now), "缺少 STOP/PLAY"),
+    ]
+    for label, stdout, want in cases:
+        fake(stdout)
+        try:
+            pr.board_motion_token(b)
+        except SystemExit as e:
+            assert want in str(e), "%s：拒绝理由不对：%r" % (label, str(e))
+        else:
+            raise AssertionError("%s 竟然放行了" % label)
+
+    # 正例：两步齐全、未过期 ⇒ 必须放行（否则闸门变成永远拒绝，同样是坏的）
+    fake('{"token": "t", "expires": %d, "stop_at": 1, "play_at": 2}\n---\n%d'
+         % (now + 600, now))
+    assert pr.board_motion_token(b) == "t"
 
 
 @case
@@ -1185,6 +1233,74 @@ def test_finish_pose_guard(chain):
         pass
     else:
         raise AssertionError("位姿差了 11.5° 还放行 —— 会写出假的放置误差")
+
+
+@case
+def test_move_quat_replaces_down_rotation():
+    """`--move-quat` 给定时朝向**完全取代**「竖直朝下 + yaw」；不给时一个数值都不变。
+
+    阶段 4 E4a 的 B 案靠这条：腕部相机光轴不在 tool0 轴上，悬停要把 tool0
+    转 19–21°。若哪天 `quat` 被悄悄忽略，倾斜悬停会退化成竖直悬停 —— 块又贴到
+    画幅下缘，而计划本身仍然「预检全过」。
+    """
+    from scipy.spatial.transform import Rotation as Rot
+
+    xyz = (0.5, -0.2, 0.4)
+    T0 = pp.target_matrix(xyz)
+    assert np.allclose(T0[:3, :3], pp.down_rotation(0.0)), "缺省朝向变了"
+    assert np.allclose(pp.target_matrix(xyz, 30.0)[:3, :3],
+                       pp.down_rotation(30.0)), "yaw 路径变了"
+
+    q = Rot.from_euler("y", 20.0, degrees=True).as_quat()
+    T1 = pp.target_matrix(xyz, quat=q)
+    assert np.allclose(T1[:3, :3], Rot.from_quat(q).as_matrix()), "quat 没生效"
+    assert not np.allclose(T1[:3, :3], T0[:3, :3]), "20° 倾斜与竖直朝向判成一样"
+    assert np.allclose(T1[:3, 3], xyz), "位移被 quat 改掉了"
+
+    try:
+        pp.target_matrix(xyz, quat=(0.0, 0.0, 0.0, 0.0))
+    except pp.PlanError:
+        pass
+    else:
+        raise AssertionError("全零四元数竟然被当成合法朝向")
+
+
+@case
+def test_build_move_quat_and_transit(chain):
+    """带倾斜 + 抬脚点的平动计划：两个航点、朝向真是倾斜的、FK 对得上。
+
+    「抬脚点」不是锦上添花：JTC 在**关节空间**插值，从上一个悬停位直接飞过去，
+    末端实际走的是一道弧，中途离台面和别的块多近没人算过。同 xy、抬高 100 mm
+    先停一下，把横移关在竖直面里。
+    """
+    from scipy.spatial.transform import Rotation as Rot
+
+    q0 = [-0.6395, -1.5421, 1.2431, -1.2710, -1.5684, -2.2124]
+    xyz = (0.5637, 0.2633, 0.28562)
+    # 与 B 案同构：**在竖直朝下姿态上**绕一条水平轴倾 20°（不是把 20° 加在单位阵上，
+    # 那样离竖直朝向差了 160°，测的就不是「悬停时倾斜多少」）
+    R = Rot.from_rotvec(np.radians(20.0) * np.array([1.0, 0.0, 0.0])).as_matrix() \
+        @ pp.down_rotation(0.0)
+    quat = Rot.from_matrix(R).as_quat()
+
+    wps, checks, meta = pp.build_move(chain, q0, xyz, quat=quat,
+                                      transit_dz=0.10)
+    assert [w["name"] for w in wps] == ["move_transit", "move"], \
+        "航点名/顺序不对：%r" % [w["name"] for w in wps]
+    assert len(checks) == 2, "两个航点必须两条预检记录"
+    assert meta["tool0_quat_xyzw"] == [float(v) for v in quat]
+
+    Tt = pp.target_matrix(xyz, quat=quat)
+    T = chain.fk(wps[-1]["q"])
+    assert np.linalg.norm(T[:3, 3] - np.array(xyz)) * 1000 < 0.1, "位置没对上"
+    re = np.degrees(np.linalg.norm(
+        Rot.from_matrix(Tt[:3, :3].T @ T[:3, :3]).as_rotvec()))
+    assert re < 0.05, "姿态残差 %.3f°" % re
+    ang = np.degrees(np.linalg.norm(
+        Rot.from_matrix(pp.down_rotation(0.0).T @ T[:3, :3]).as_rotvec()))
+    assert abs(ang - 20.0) < 0.05, "航点实际只转了 %.2f°（应为 20°）" % ang
+    assert abs(chain.fk(wps[0]["q"])[2, 3] - (xyz[2] + 0.10)) < 1e-6, \
+        "抬脚点不在目标正上方 +100 mm"
 
 
 # ---------------------------------------------------------------- runner

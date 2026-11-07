@@ -212,9 +212,23 @@ def down_rotation(yaw_deg=0.0):
         Rot.from_euler("x", 180.0, degrees=True).as_matrix()
 
 
-def target_matrix(xyz, yaw_deg=0.0):
+def target_matrix(xyz, yaw_deg=0.0, quat=None):
+    """tool0 目标位姿。``quat``（xyzw）给定时**完全取代**「竖直朝下 + yaw」。
+
+    任意朝向是给阶段 4 的 E4a B 案用的：腕部相机光轴与 tool0 z 平行、但本体横偏
+    91 mm，悬停时要把 tool0 转 19–21° 才能让画面框住块顶（姿态见
+    ``runs/<run>/e4a/bcase-plan.json``）。其余调用方都不传 ``quat``，走的还是
+    原来那条 ``down_rotation`` 路径，一个数值都不变。
+    """
     T = np.eye(4)
-    T[:3, :3] = down_rotation(yaw_deg)
+    if quat is None:
+        T[:3, :3] = down_rotation(yaw_deg)
+    else:
+        q = np.asarray(quat, float)
+        n = float(np.linalg.norm(q))
+        if n < 1e-9:
+            raise PlanError("目标朝向的四元数全零")
+        T[:3, :3] = Rot.from_quat(q / n).as_matrix()
     T[:3, 3] = xyz
     return T
 
@@ -371,8 +385,8 @@ def stage3_survey_retry_tool0(pose_xyz, pair, shift_mm=STAGE3_RETRY_SHIFT_MM):
             float(pose_xyz[2]))
 
 
-def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200):
-    T = target_matrix(xyz, yaw_deg)
+def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200, quat=None):
+    T = target_matrix(xyz, yaw_deg, quat=quat)
     q, pe, re, nfev = chain.ik(T, seed, max_iter=max_iter)
     # 数值 IK 可能收敛到「同一个位姿、差 2π」的那一支；折回离种子最近的
     # 字面值，否则执行器会照字面整圈转过去（见 unwrap_near 的注释）。
@@ -380,10 +394,10 @@ def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200):
     return q, pe, re, nfev
 
 
-def pose_residual(chain, q, xyz, yaw_deg=0.0):
+def pose_residual(chain, q, xyz, yaw_deg=0.0, quat=None):
     """已有 q 相对目标位姿的残差：位置 mm、姿态 deg。"""
     T = chain.fk(q)
-    Tt = target_matrix(xyz, yaw_deg)
+    Tt = target_matrix(xyz, yaw_deg, quat=quat)
     pe = float(np.linalg.norm(T[:3, 3] - Tt[:3, 3])) * 1000
     re = float(np.degrees(np.linalg.norm(
         Rot.from_matrix(Tt[:3, :3].T @ T[:3, :3]).as_rotvec())))
@@ -581,16 +595,18 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
 
 
 def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
-             duration=None, before=None, after=None, q=None, guard=None):
+             duration=None, before=None, after=None, q=None, guard=None,
+             quat=None):
     """解一个航点并跑单点预检，追加到 waypoints。返回该点的 q。
 
     ``q`` 已经解好（来自 `solve_path`）时直接用，只复核残差与各项预检。
+    ``quat``（xyzw）给定时用它取代「竖直朝下 + yaw」，见 `target_matrix`。
     """
     if q is None:
-        q, pe, re, nfev = solve_waypoint(chain, xyz, yaw_deg, q_seed)
+        q, pe, re, nfev = solve_waypoint(chain, xyz, yaw_deg, q_seed, quat=quat)
     else:
         q = np.asarray(q, float)
-        pe, re = pose_residual(chain, q, xyz, yaw_deg)
+        pe, re = pose_residual(chain, q, xyz, yaw_deg, quat=quat)
         nfev = 0
     if pe > 0.1 or re > 0.05:
         raise PlanError("航点 %s IK 没解出来：位置残差 %.3f mm、姿态残差 %.4f° "
@@ -698,11 +714,29 @@ def build_survey(chain, q_start, which):
     return wps, checks, {"kind": "survey", "which": which, "tool0": list(xyz)}
 
 
-def build_move(chain, q_start, xyz, name="move"):
+def build_move(chain, q_start, xyz, name="move", quat=None, transit_dz=None):
+    """一（或两）个航点的平动计划。
+
+    ``quat``：tool0 目标朝向（xyzw）；缺省 = 竖直朝下、yaw 0（老行为）。
+    ``transit_dz``：给定且 >0 时，先在**同一 xy、同一朝向**、z 抬高 ``transit_dz``
+    的中间点停一个航点再下去。横移到悬停位时用它 —— 直接一条直线过去，JTC 在
+    关节空间插值，末端实际会划一道弧，中途离台面/别的块有多近没人算过。
+    """
     wps, checks = [], []
-    q, c = add_move(wps, chain, name, xyz, q_start, 0.0, TABLE_PLANE_Z)
+    q = q_start
+    if transit_dz:
+        qy = (xyz[0], xyz[1], xyz[2] + float(transit_dz))
+        q, c = add_move(wps, chain, name + "_transit", qy, q, 0.0,
+                        TABLE_PLANE_Z, quat=quat)
+        checks.append(c)
+    q, c = add_move(wps, chain, name, xyz, q, 0.0, TABLE_PLANE_Z, quat=quat)
     checks.append(c)
-    return wps, checks, {"kind": "move", "tool0": list(xyz)}
+    meta = {"kind": "move", "tool0": list(xyz)}
+    if quat is not None:
+        meta["tool0_quat_xyzw"] = [float(v) for v in quat]
+    if transit_dz:
+        meta["transit_dz_m"] = float(transit_dz)
+    return wps, checks, meta
 
 
 def place_heights(block_h_m, grasp_depth_m, table_z=TABLE_PLANE_Z,
@@ -1338,6 +1372,10 @@ def main():
     grp = ap.add_mutually_exclusive_group(required=True)
     grp.add_argument("--survey", choices=sorted(SURVEY_TOOL0))
     grp.add_argument("--move", help="tool0 目标 x,y,z（米）")
+    ap.add_argument("--move-quat", default=None,
+                    help="配合 --move：tool0 目标朝向 x,y,z,w；缺省 = 竖直朝下")
+    ap.add_argument("--move-transit-dz", type=float, default=None,
+                    help="配合 --move：先在同一 xy、同一朝向上方 dz 米处停一航点")
     grp.add_argument("--pick", action="store_true")
     ap.add_argument("--candidates", default=None)
     ap.add_argument("--block", type=int, default=None)
@@ -1377,7 +1415,10 @@ def main():
             wps, checks, meta = build_survey(chain, q_start, args.survey)
         elif args.move:
             xyz = tuple(float(v) for v in args.move.split(","))
-            wps, checks, meta = build_move(chain, q_start, xyz)
+            quat = (tuple(float(v) for v in args.move_quat.split(","))
+                    if args.move_quat else None)
+            wps, checks, meta = build_move(chain, q_start, xyz, quat=quat,
+                                           transit_dz=args.move_transit_dz)
         else:
             if not (args.candidates and args.slot) or args.block is None:
                 ap.error("--pick 要同时给 --candidates / --block / --slot")
