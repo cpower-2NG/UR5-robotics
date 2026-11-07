@@ -100,6 +100,32 @@ ros2 launch yolo_bringup bringup.launch.py camera_source:=sim
 ... camera_source:=sim model:=其他.pt device:=cpu
 ```
 
+### 板子控制仿真（板子是控制方）
+
+板子与开发机**不同网段**：开发机能 SSH 到板子，板子回不来（2026-11-07 实测
+板子 ping 不通开发机）。跨机器 DDS 要双向 ⇒ 不可用，改走**开发机发起、板子
+回程**的 SSH 反向隧道：
+
+```bash
+# 开发机：起 bridge + 推客户端到板上 + 守护 ssh -R（前台，Ctrl-C 退出）
+scripts/sim_board_link.sh
+
+# 板子上：发命令（另一个终端）
+python3 ~/simlink/sim_board_agent.py ping
+python3 ~/simlink/sim_board_agent.py joints
+python3 ~/simlink/sim_board_agent.py move --names shoulder_pan_joint,shoulder_lift_joint,elbow_joint,wrist_1_joint,wrist_2_joint,wrist_3_joint --points '[[0.4,-1.3,0.3,-1.5,0.2,0.1],4.0]'
+python3 ~/simlink/sim_board_agent.py gripper --mm 50
+python3 ~/simlink/sim_board_agent.py home
+```
+
+轨迹点由板子给出，`scripts/sim_bridge.py` 只补 t=0 起点并转交
+`/joint_trajectory_controller/follow_joint_trajectory`，**不做规划**。
+板子别名自动探测（`jetson` / `jetson-hotspot`），也可 `BOARD_ALIAS=<别名>`
+指定；检查两端状态用 `scripts/sim_board_link.sh --check`。
+
+判据：`gz topic -e -t /world/grasp_world/dynamic_pose/info -n 1` 里
+`wrist_3_link` 的位姿随板上命令改变（不要只看 bridge 自报的关节角）。
+
 ### `gz_ros2_control` 前置（仿真必需，真机不需要）
 
 apt 上的 `ros-humble-gz-ros2-control` **依赖 Fortress（gz-sim6）**，与 Harmonic
