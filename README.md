@@ -100,6 +100,10 @@ ros2 launch yolo_bringup bringup.launch.py camera_source:=sim
 ... camera_source:=sim model:=其他.pt device:=cpu
 ```
 
+⚠️ `model` 默认是相对名 `block_best.pt`（在 CWD 及父目录里找）。仓库根下不存在
+这个文件，`detector_node` 会直接 `FileNotFoundError` 退出。用绝对路径，例如
+`model:=$HOME/robotics/models/block_best_7cls.pt`（`~` 在 launch 参数里不展开）。
+
 ### 板子控制仿真（板子是控制方）
 
 板子与开发机**不同网段**：开发机能 SSH 到板子，板子回不来（2026-11-07 实测

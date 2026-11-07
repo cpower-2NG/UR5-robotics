@@ -220,11 +220,16 @@ def serve(node: SimBridge, host: str, port: int):
                 line = line.strip()
                 if not line:
                     continue
+                # ⚠️ req 必须先绑定：json.loads 抛异常时若 req 还没赋值，
+                #    record(req, …) 会抛 UnboundLocalError，客户端线程直接死、
+                #    连错误回包都发不出去（2026-11-07 C7 验收打到）。
+                req = None
                 try:
                     req = json.loads(line)
                     rep = node.dispatch(req)
                 except Exception as e:  # 单条命令出错不能打断链路
                     rep = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+                    rep["raw"] = line.decode("utf-8", "replace")[:200]
                 node.record(req, rep)
                 f.write((json.dumps(rep, ensure_ascii=False) + "\n").encode())
                 f.flush()
