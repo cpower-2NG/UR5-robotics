@@ -410,6 +410,67 @@ check('  板没检出 ⇒ GateData（退出 2）',
 check('  link→optical 来源标成 ideal（没给 tf.json）',
       sol['link_to_optical_source'] == 'ideal')
 
+# -- 板位姿的基准（anchor）：必须由 E2 那份外参 --init 出来，不许旧路线反推
+_ANCHOR_A = tempfile.mktemp(suffix='-anchor-a.json')
+_ANCHOR_B = tempfile.mktemp(suffix='-anchor-b.json')
+_STORE_A = tempfile.mktemp(suffix='-store-a.json')
+with open(_ANCHOR_A, 'w') as fh:
+    json.dump({'kind': 'camera-extrinsics', 'tag': 'A'}, fh)
+with open(_ANCHOR_B, 'w') as fh:
+    json.dump({'kind': 'camera-extrinsics', 'tag': 'B'}, fh)
+with open(_STORE_A, 'w') as fh:
+    json.dump({'base_from_board_R': T_BB[:3, :3].tolist(),
+               'base_from_board_t': T_BB[:3, 3].tolist(),
+               'from_extrinsics': _ANCHOR_A}, fh)
+
+
+def _with_detect2(fn, store=_STORE_A, anchor=None):
+    orig = (gate.tmc.load_camera, gate.tmc.detect_board)
+    gate.tmc.load_camera = lambda p: (K, np.zeros((5, 1)), (1280, 720))
+    gate.tmc.detect_board = fn
+    try:
+        return gate.solve_extrinsic('x.png', _INFO, _BOARD, store, None,
+                                    anchor=anchor)
+    finally:
+        gate.tmc.load_camera, gate.tmc.detect_board = orig
+
+
+_sol_a = _with_detect2(lambda *a, **k: ((R_cb, t_cb), 16, 0.4),
+                       anchor=_ANCHOR_A)
+check('anchor 一致 ⇒ 通过并记下 sha256',
+      _sol_a['store_anchor']['sha256'] == gate._sha256(_ANCHOR_A),
+      repr(_sol_a.get('store_anchor')))
+check('anchor 不一致 ⇒ GateData（不拿旧板位姿假绿）',
+      isinstance(safe(_with_detect2, lambda *a, **k: ((R_cb, t_cb), 16, 0.4),
+                      anchor=_ANCHOR_B), str))
+check('store 里没有 from_extrinsics ⇒ GateData',
+      isinstance(safe(_with_detect2, lambda *a, **k: ((R_cb, t_cb), 16, 0.4),
+                      store=_STORE, anchor=_ANCHOR_A), str))
+check('anchor 文件不存在 ⇒ GateData',
+      isinstance(safe(_with_detect2, lambda *a, **k: ((R_cb, t_cb), 16, 0.4),
+                      anchor='/no/such/anchor.json'), str))
+
+# -- joint-calib → camera-extrinsics：能直接被 base_from_camera 吃下
+_ext_res = {
+    'extrinsic': {'source': 'derived-this-round',
+                  'R': T_BASE_CAM[:3, :3].tolist(),
+                  't': T_BASE_CAM[:3, 3].tolist(),
+                  'q': tmc.matrix_to_quat(T_BASE_CAM[:3, :3]).tolist()},
+    'extrinsic_link': {'R_link': T_BASE_LINK_TRUE[:3, :3].tolist(),
+                       't_link': T_BASE_LINK_TRUE[:3, 3].tolist()},
+    'link_to_optical': {'source': 'tf-json:/tmp/tf.json'},
+}
+_edoc = jc.extrinsics_doc(_ext_res, '/tmp/joint-calib.json', created='X')
+check('extrinsics_doc：frame_child 是光学系（--init 才认）',
+      _edoc['frame_child'] == 'topcam_color_optical_frame',
+      repr(_edoc['frame_child']))
+check('extrinsics_doc：base_from_camera 还原出同一个 base←光学系',
+      np.allclose(T(*tmc.base_from_camera(_edoc)), T_BASE_CAM, atol=1e-9))
+check('extrinsics_doc：带上 link 系参数与来源',
+      _edoc['R_link'] and _edoc['source'] ==
+      'stage4-joint-calib:derived-this-round' and
+      _edoc['joint_calib'] == '/tmp/joint-calib.json', repr(_edoc.get('source')))
+
 # -- run() 编排：用打桩的 solve / joint / drift
 _ARGS_TMP = tempfile.mkdtemp(prefix='gate-test-')
 

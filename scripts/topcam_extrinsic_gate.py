@@ -104,8 +104,17 @@ def run_drift(old_image, new_image, info_path=None, timeout=120):
 
 
 # ---------------------------------------------------------------- 2. PnP
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def solve_extrinsic(image, info_path, board_path, store_path, tf_doc,
-                    max_rms_px=1.0):
+                    max_rms_px=1.0, anchor=None):
     if not os.path.exists(store_path):
         raise GateData('没有板位姿存盘 %s：先跑一次 '
                        'topcam_marker_calib.py --init' % store_path)
@@ -113,6 +122,23 @@ def solve_extrinsic(image, info_path, board_path, store_path, tf_doc,
         board_meta = json.load(fh)
     with open(store_path, encoding='utf-8') as fh:
         store = json.load(fh)
+    # 板位姿必须**锚定在本轮可信的外参**上（E2 的腕部链解），不能是旧路线
+    # 用旧外参反推出来的那份 —— 否则每轮 PnP 只是在跟它自己比，永远 0 mm。
+    anchor_info = None
+    if anchor:
+        if not os.path.exists(anchor):
+            raise GateData('基准外参不存在：%s' % anchor)
+        src = store.get('from_extrinsics')
+        if not src or not os.path.exists(src):
+            raise GateData('板位姿存盘没有可核的基准（from_extrinsics=%r）：'
+                           '用 --init --extrinsics %s 重建' % (src, anchor))
+        a_sha, s_sha = _sha256(anchor), _sha256(src)
+        if a_sha != s_sha:
+            raise GateData('板位姿存盘不是由基准外参 %s 算出来的'
+                           '（--init 的 from_extrinsics 内容不同）⇒ 重建'
+                           % anchor)
+        anchor_info = {'path': anchor, 'sha256': a_sha,
+                       'store_from': src}
     K, dist, (w, h) = tmc.load_camera(info_path)
     det = tmc.detect_board(image, board_meta, K, dist)
     if det is None:
@@ -133,6 +159,7 @@ def solve_extrinsic(image, info_path, board_path, store_path, tf_doc,
         'rms_px': float(rms), 'n_corners': int(n_pts),
         'link_to_optical_source': lo_source,
         'image': image, 'info': info_path,
+        'store_anchor': anchor_info,
     }
 
 
@@ -211,10 +238,12 @@ def run(args):
         with open(args.tf_json, encoding='utf-8') as fh:
             tf_doc = json.load(fh)
     sol = solve_extrinsic(args.image, args.info, args.board, args.store,
-                          tf_doc, max_rms_px=args.max_rms_px)
+                          tf_doc, max_rms_px=args.max_rms_px,
+                          anchor=getattr(args, 'anchor', None))
     report['pnp'] = {'image': args.image, 'rms_px': sol['rms_px'],
                      'n_corners': sol['n_corners'],
                      'link_to_optical_source': sol['link_to_optical_source'],
+                     'store_anchor': sol.get('store_anchor'),
                      'ok': True}
     doc = write_extrinsic(ext_path, sol)
     T_new = sol['T_optical']
@@ -241,7 +270,8 @@ def run(args):
             else:
                 sol2 = solve_extrinsic(args.reimage, args.reinfo or args.info,
                                        args.board, args.store, tf_doc,
-                                       max_rms_px=args.max_rms_px)
+                                       max_rms_px=args.max_rms_px,
+                                       anchor=getattr(args, 'anchor', None))
                 doc = write_extrinsic(ext_path, sol2)
                 T_new = sol2['T_optical']
                 t2, ang2 = _diff(T_prev, T_new)
@@ -320,6 +350,10 @@ def main(argv=None):
     ap.add_argument('--new-image', default=None, help='本轮刚拍的图（drift 用）')
     ap.add_argument('--board', default='docs/calib/charuco_A4_30mm_5x5.json')
     ap.add_argument('--store', default=os.path.expanduser('~/topcam_marker.json'))
+    ap.add_argument('--anchor', default=None,
+                    help='建立 --store 时用的基准外参（E2 第 1 轮 joint-calib 的 '
+                         '--extrinsics-out）；给了就核 store.from_extrinsics 的 '
+                         'sha256，不一致 ⇒ 退出 2（不拿旧路线的板位姿假绿）')
     ap.add_argument('--tf-json', default=None,
                     help='本轮俯视帧的 tf.json（用实测 link→optical 链）')
     ap.add_argument('--prev-extrinsics', default=None,

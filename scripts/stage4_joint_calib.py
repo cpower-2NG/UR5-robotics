@@ -362,6 +362,28 @@ def run(args):
     }
 
 
+def extrinsics_doc(res, joint_path, created=None):
+    """joint-calib 结果 → ``camera-extrinsics`` 文档（光学系 R/t + link 系 R/t）。
+
+    ``frame_child`` 写成**光学系**：``topcam_marker_calib.base_from_camera``
+    只认光学系或 ``*_link``，写成 ``a→b`` 这种会直接被拒。
+    """
+    ext, lk = res['extrinsic'], res['extrinsic_link']
+    return {
+        'version': 1, 'kind': 'camera-extrinsics',
+        'frame_parent': 'base_link',
+        'frame_child': gc.TOPCAM_TIP,
+        'R': ext['R'], 't': ext['t'], 'q': ext['q'],
+        'R_link': lk['R_link'], 't_link': lk['t_link'],
+        'source': 'stage4-joint-calib:%s' % ext['source'],
+        'joint_calib': joint_path,
+        'inputs': res.get('inputs'),
+        'link_to_optical_source': res['link_to_optical']['source'],
+        'created': (created or
+                    datetime.datetime.now().isoformat(timespec='seconds')),
+    }
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description='阶段 4 E2：双相机联合标定（只读，不动臂）')
@@ -371,6 +393,10 @@ def main(argv=None):
                     help='垫子 sidecar stage2-mat.json（仓外）')
     ap.add_argument('--out', default=None,
                     help='默认 <wrist-frame>/../joint-calib.json')
+    ap.add_argument('--extrinsics-out', default=None,
+                    help='通过时再写一份 camera-extrinsics（可直接喂 '
+                         'topcam_marker_calib --init --extrinsics 与 '
+                         'topcam_extrinsic_gate --prev-extrinsics）')
     ap.add_argument('--base-topcam-link', default=None,
                     help='已发布的 base_link←topcam_link JSON；不给则从帧 tf.json 找，'
                          '再没有就按第 1 轮相除导出')
@@ -403,6 +429,18 @@ def main(argv=None):
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     with open(out, 'w', encoding='utf-8') as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1)
+
+    if args.extrinsics_out:
+        if res['ok']:
+            edoc = extrinsics_doc(res, out)
+            os.makedirs(os.path.dirname(os.path.abspath(args.extrinsics_out)),
+                        exist_ok=True)
+            with open(args.extrinsics_out, 'w', encoding='utf-8') as fh:
+                json.dump(edoc, fh, ensure_ascii=False, indent=1)
+            print('写外参 %s（可直接喂 --init --extrinsics）'
+                  % args.extrinsics_out)
+        else:
+            print('判红：不写 --extrinsics-out（坏外参不许进链）')
 
     tw = res['two_way']
     cov = res['coverage']
