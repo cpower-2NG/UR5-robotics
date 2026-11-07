@@ -220,6 +220,7 @@ def serve(node: SimBridge, host: str, port: int):
                 line = line.strip()
                 if not line:
                     continue
+                req = None  # 解析失败时 req 未绑定，record 会抛 UnboundLocalError
                 try:
                     req = json.loads(line)
                     rep = node.dispatch(req)
