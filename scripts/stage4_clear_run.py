@@ -21,6 +21,11 @@
 ``min_block_gap=0.0``，并在 manifest 里写 ``gap_check: probe_verified``。
 **没有探针判决的调用方不许这样放宽。**
 
+跑后核验（``--verify``）另读两份输入：跑后深度真值 json，和（可选的）跑后
+俯视 burst 目录。目标块「落在指定格」用**彩色顶面质心**量 —— 垫面在俯视深度
+里分辨不出 29.5 mm 台阶（2026-11-08 实测，见 ``measure_target_colour``）；
+其余判据仍用深度真值。仍不 import ROS。
+
 指令顺序（每条都在 manifest 里可见）
 ------------------------------------
 1. 先按探针给的顺序执行清障步骤（``clearing_steps``：谁 → 从哪 → 到哪）；
@@ -49,8 +54,13 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import numpy as np                                                # noqa: E402
+from PIL import Image                                             # noqa: E402
+
+import graspnet_candidates as gc                                  # noqa: E402
 import precision_plan as pp                                       # noqa: E402
 import stage4_clear_model as cm                                   # noqa: E402
+import stage4_truth_from_frame as tf                              # noqa: E402
 import urkin                                                      # noqa: E402
 
 #: 收尾巡检位（base 系，m）。用阶段 4 工作区上方的空位，不用阶段 2 的
@@ -271,25 +281,257 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
     return plans, layout, q
 
 
+def _match_blocks(exp, post):
+    """两份真值按**三维最近位置**一一配对，返回 ``(match, missing, extra)``。
+
+    **不能按 id 配对**：id 只是同一份真值内部的序号，两份真值各自按位置重排
+    （2026-11-08 实测：跑后真值的 id 顺序和计划里的 ``final_layout`` 完全不同，
+    按 id 对齐会把紫塔的块配到橙塔上、报出 240 mm 的假位移）。
+    配对之后也不比颜色 —— 塔底块的颜色取自塔顶面，真值里写着塔顶的颜色。
+    """
+    pairs = []
+    for ei, e in exp.items():
+        for pi, p in post.items():
+            d = math.sqrt((float(p["x"]) - float(e["x"])) ** 2
+                          + (float(p["y"]) - float(e["y"])) ** 2
+                          + (float(p["z"]) - float(e["z"])) ** 2) * 1000.0
+            pairs.append((d, ei, pi))
+    pairs.sort()
+    used_e, used_p, match = set(), set(), {}
+    for d, ei, pi in pairs:            # 全局按距离贪心，一对一
+        if ei in used_e or pi in used_p:
+            continue
+        used_e.add(ei)
+        used_p.add(pi)
+        match[ei] = (pi, d)
+    return (match, sorted(set(exp) - used_e, key=lambda s: (len(s), s)),
+            sorted(set(post) - used_p, key=lambda s: (len(s), s)))
+
+
+# ------------------------------------------------------------ 目标块彩色量具
+#: 彩色门限：白垫 s≈0、黑标记 v≈0，都被这两条排除。
+COLOUR_S_MIN, COLOUR_V_MIN = 90.0, 60.0
+#: 顶面取「窗内最亮的一批」：顶面比侧面亮，取最亮 40% 让质心落在顶面，
+#: 不被侧面的透视拉伸拖偏（2026-11-08 实测 10 帧极差 ≤7 mm）。
+COLOUR_TOP_PCT = 40.0
+#: 一帧至少要这么多个色彩像素才算「看见目标块」。29.5 mm 的块在垫面约 16×16 px
+#: ⇒ 顶面 250 px 量级；150 只在远/斜视时触发。
+COLOUR_MIN_PX = 150
+
+
+def hsv_of(img):
+    """RGB uint8 图像 → ``(h 度 0–360, s 0–255, v 0–255)``。"""
+    a = np.asarray(img).astype(np.float32) / 255.0
+    mx, mn = a.max(2), a.min(2)
+    d = mx - mn
+    h = np.zeros_like(mx)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    m = d > 1e-6
+    i = m & (mx == r)
+    h[i] = (60.0 * ((g[i] - b[i]) / d[i])) % 360.0
+    i = m & (mx == g)
+    h[i] = 60.0 * ((b[i] - r[i]) / d[i]) + 120.0
+    i = m & (mx == b)
+    h[i] = 60.0 * ((r[i] - g[i]) / d[i]) + 240.0
+    s = np.where(mx > 1e-6, d / np.maximum(mx, 1e-6), 0.0) * 255.0
+    return h, s, mx * 255.0
+
+
+def _hue_peak(h, step=15.0):
+    """主色相簇 → ``(簇中心角, 落在峰 ±1 bin 内的掩码)``。
+
+    只取峰附近、不取「窗口里所有彩色像素」：窗口里万一还有别的颜色的东西
+    （邻塔、反光），按整窗平均会把两样东西的颜色混成一个不存在的色。
+
+    簇中心用**保留像素的圆均值**、不用 bin 中心：一个窄色簇全落在同一 bin
+    时，bin 中心最多差半步（实测偏 15°），而且环形平滑会让相邻 bin 打平。
+    """
+    n = int(round(360.0 / step))
+    idx = (np.mod(h, 360.0) / step).astype(int) % n
+    cnt = np.bincount(idx, minlength=n).astype(int)
+    p = int(np.argmax(cnt))
+    keep = np.zeros(n, bool)
+    keep[(p - 1) % n] = keep[p] = keep[(p + 1) % n] = True
+    m = keep[idx]
+    ang = np.radians(h[m])
+    mean = math.degrees(math.atan2(float(np.sin(ang).mean()),
+                                  float(np.cos(ang).mean()))) % 360.0
+    return mean, m
+
+
+def colour_blob_uv(img, uv0, half_px, min_px=COLOUR_MIN_PX):
+    """窗口里「一坨有颜色的东西」的**顶面质心**像素坐标；看不见 ⇒ ``None``。
+
+    ``uv0`` = 窗口中心（计划宫格在块顶高的投影），``half_px`` = 半窗宽。
+    返回 ``{"uv", "n_px", "n_top", "hue_deg"}``。
+
+    **看不见就返回 None，不猜**：调用方必须把 None 判红，不许拿计划位当量值。
+    """
+    h, s, v = hsv_of(img)
+    H, W = h.shape
+    r = int(round(float(half_px)))
+    u0, v0 = int(round(float(uv0[0]))), int(round(float(uv0[1])))
+    ua, ub = max(0, u0 - r), min(W, u0 + r + 1)
+    va, vb = max(0, v0 - r), min(H, v0 + r + 1)
+    if ub - ua < 5 or vb - va < 5:
+        return None
+    sh, ss, sv = h[va:vb, ua:ub], s[va:vb, ua:ub], v[va:vb, ua:ub]
+    m = (ss >= COLOUR_S_MIN) & (sv >= COLOUR_V_MIN)
+    if int(m.sum()) < min_px:
+        return None
+    peak, keep = _hue_peak(sh[m])
+    mm = np.zeros_like(m)
+    mm[m] = keep
+    if int(mm.sum()) < min_px:
+        return None
+    ys, xs = np.nonzero(mm)
+    vv = sv[ys, xs]
+    # 最亮 40%（分位取 100−40）：平坦面（整块同色）分位就等于该值 ⇒ 全取，
+    # 不会被阈值空掉；真实块上这就是顶面，侧面更暗、被排除。
+    top = vv >= np.percentile(vv, 100.0 - COLOUR_TOP_PCT)
+    if int(top.sum()) < 20:
+        return None
+    return {"uv": (ua + float(xs[top].mean()), va + float(ys[top].mean())),
+            "n_px": int(mm.sum()), "n_top": int(top.sum()),
+            "hue_deg": round(peak, 1)}
+
+
+def _base_to_uv(p, K, R, t):
+    """base 系一点 → 俯视像素（``ray_plane_xy`` 的逆）。在相机后方 ⇒ None。"""
+    pc = np.asarray(R, float).T @ (np.asarray(p, float) - np.asarray(t, float))
+    if pc[2] <= 1e-6:
+        return None
+    uv = np.asarray(K, float) @ pc
+    return (float(uv[0] / uv[2]), float(uv[1] / uv[2]))
+
+
+def _window_half_px(xy, z, half_mm, K, R, t):
+    """以 (x, y, z) 为心、边长 2·half_mm 的正方形投影到像面的半窗宽（px）。"""
+    uv0 = _base_to_uv((xy[0], xy[1], z), K, R, t)
+    if uv0 is None:
+        return None
+    h = half_mm * 0.001
+    cors = [_base_to_uv((xy[0] + dx * h, xy[1] + dy * h, z), K, R, t)
+            for dx in (-1.0, 1.0) for dy in (-1.0, 1.0)]
+    cors = [c for c in cors if c is not None]
+    if not cors:
+        return None
+    return max(8.0, max(max(abs(c[0] - uv0[0]), abs(c[1] - uv0[1]))
+                        for c in cors))
+
+
+def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=60.0,
+                          max_frames=10, min_frames=5):
+    """跑后俯视 burst → 目标块顶面质心（台面 mm，中位）与可复现性。
+
+    **为什么目标块要换彩色量**（2026-11-08 用户拍板）：垫面在俯视深度里
+    分辨不出 29.5 mm 的台阶 —— 实测 10 帧只有 3 帧有真台阶，跑前同一带本来
+    就有 15–30 mm 的幻影穹顶，``find_blocks`` 把块并进 48×46 mm 的一坨、
+    质心被拉偏 33 mm（场景 2 因此被深度判成「没落格」，实际落在格内）。
+    同一块在彩色里清清楚楚。**其余判据仍用深度真值**：块数、旁观块、终态、
+    清空块都在台面上，深度是准的。
+
+    每帧：窗内取色彩像素 → 主色相簇 → 最亮 40%（顶面）质心 → 射线 ∩
+    块顶水平面。跨帧取中位；``ok`` 要求至少 ``min_frames`` 帧看见。
+
+    返回 ``{"ok", "xy_mm", "hue_deg", "n_frames", "n_missed", "miss_reasons",
+    "per_frame", "search_mm", "top_z"}``。漏帧不静默：每一帧漏的原因都写下来
+    （缺静态 TF / 窗内没看见 / 投不到像面），``ok`` 只看看得见的帧数够不够。
+    """
+    import glob
+    paths = sorted(glob.glob(os.path.join(burst_dir, "color_*.png")))[:max_frames]
+    rows, miss, reasons = [], 0, []
+    for path in paths:
+        idx = int(os.path.basename(path).rsplit("_", 1)[-1].split(".")[0])
+        try:
+            fr = gc.load_frame(burst_dir, tip=gc.TOPCAM_TIP,
+                               chain=gc.TOPCAM_CHAIN, idx=idx)
+        except KeyError as e:
+            # 起栈后的头一两帧可能还没收到锁存的 ``base_link:topcam_link``
+            # 静态 TF（2026-11-08 实测）。记成漏帧，别让核验整个崩掉。
+            miss += 1
+            reasons.append("帧%d 缺静态 TF（%s）" % (idx, e))
+            continue
+        K = np.asarray(fr["K"], float)
+        R = np.asarray(fr["R_bc"], float)
+        t = np.asarray(fr["t_bc"], float)
+        uv0 = _base_to_uv((slot_xy[0], slot_xy[1], top_z), K, R, t)
+        hp = (None if uv0 is None
+              else _window_half_px(slot_xy, top_z, search_mm, K, R, t))
+        if hp is None:
+            miss += 1
+            reasons.append("帧%d 计划宫格投不到像面" % idx)
+            continue
+        with Image.open(path) as im:
+            img = np.asarray(im.convert("RGB"))
+        blob = colour_blob_uv(img, uv0, hp)
+        if blob is None:
+            miss += 1
+            reasons.append("帧%d 窗内没看见彩色块" % idx)
+            continue
+        xy = tf.ray_plane_xy(list(blob["uv"]), K, R, t, float(top_z))
+        if xy is None:
+            miss += 1
+            reasons.append("帧%d 射线与块顶平面不相交" % idx)
+            continue
+        rows.append({"frame": idx, "uv": [round(c, 2) for c in blob["uv"]],
+                     "x_mm": round(float(xy[0]) * 1000.0, 2),
+                     "y_mm": round(float(xy[1]) * 1000.0, 2),
+                     "n_px": blob["n_px"], "hue_deg": blob["hue_deg"]})
+    out = {"ok": len(rows) >= max(int(min_frames), 1),
+           "search_mm": search_mm, "top_z": top_z,
+           "n_frames": len(rows), "n_missed": miss,
+           "miss_reasons": reasons, "per_frame": rows}
+    if rows:
+        a = np.array([[r["x_mm"], r["y_mm"]] for r in rows], float)
+        med = np.median(a, axis=0)
+        out["xy_mm"] = [round(float(med[0]), 2), round(float(med[1]), 2)]
+        out["max_dev_mm"] = round(float(np.hypot(a[:, 0] - med[0],
+                                                 a[:, 1] - med[1]).max()), 2)
+        out["range_mm"] = [round(float(a[:, 0].max() - a[:, 0].min()), 2),
+                           round(float(a[:, 1].max() - a[:, 1].min()), 2)]
+        sn = sum(math.sin(math.radians(r["hue_deg"])) for r in rows)
+        cs = sum(math.cos(math.radians(r["hue_deg"])) for r in rows)
+        out["hue_deg"] = round(math.degrees(math.atan2(sn, cs)) % 360.0, 1)
+    return out
+
+
 def compare_layout(manifest, post_blocks, tol_untouched_mm=5.0,
-                   tol_untouched_deg=3.0, tol_moved_mm=40.0):
+                   tol_untouched_deg=3.0, tol_moved_mm=40.0,
+                   target_colour=None):
     """跑完再拍一遍真值 → 判「不丢指定块 / 不掉块 / 不撞」。
 
     三条判据各自的量（都不靠「看起来对」）：
 
     · **不丢指定块**：目标块的终态必须落在计划的那一格（``cell_index_of``）。
+      **量具是彩色顶面质心**（``target_colour``，见 ``measure_target_colour``）：
+      垫面在俯视深度里分辨不出 29.5 mm 台阶，深度真值在这里会假红。给了
+      ``target_colour`` 而它 ``ok=False``（看得见的帧不够）⇒ 直接判红，
+      **不退回深度、也不拿计划位当量值**。深度给出的同一位置写进 ``notes``
+      供对照，只记录、不判。
     · **不掉块**：``stage4_clear_model.terminal_report`` —— 每块有真支撑
       （台面 / 垫面 / 真的压在另一块上）、不穿插、不出桌。掉到地上 = 不在
       台面支撑里，必然红。
-    · **不撞**：**没被碰的块不许动**。静置的块被推动只有一种原因：臂或夹爪
-      碰到了它。清障块本身有 40 mm 的落点公差（抓取/落点误差），不加严。
-      这条是间接判据，所以在报告里把每块的位移都列出来，别只看结论。
+    · **不撞**：**没被碰的块不许动** —— 按**位移**判（``tol_untouched_mm``）。
+      静置的块被推动只有一种原因：臂或夹爪碰到了它。清障块本身有 40 mm 的落点
+      公差（抓取/落点误差），不加严。这条是间接判据，所以报告里把每块的位移
+      都列出来，别只看结论。
+
+      **转角只记录、不判红**（2026-11-08 用户拍板）。依据是实测的重复性：臂不动、
+      同一场景连拍两组 burst，深度真值的块 yaw 自己就差 4.5°（塔）到 36°（单块）
+      —— 3° 的公差**低于测量底噪**，判了只会假红。同一场景的彩色剪影取向只差
+      1–2°，可见这是深度口径的问题，不是块真的在转。位移的重复性是 0.2–1.7 mm，
+      5 mm 的公差撑得住。要恢复 yaw 判据，先换测量口径（见台账第二百八十四轮）。
+
+    计划里的块与跑后真值里的块**按三维位置配对**（见 ``_match_blocks``），
+    不按 id、不比颜色。
 
     返回 ``{"ok": bool, "checks": [...], "blocks": [...], "terminal": ...}``。
     """
     exp = {str(b["id"]): b for b in manifest.get("final_layout") or []}
     post = {str(b["id"]): b for b in post_blocks}
     moved = {str(a["block"]) for a in manifest.get("actions") or []}
+    match, missing, extra = _match_blocks(exp, post)
     checks, rows = [], []
     ok = True
 
@@ -298,8 +540,6 @@ def compare_layout(manifest, post_blocks, tol_untouched_mm=5.0,
         ok = ok and bool(good)
         checks.append({"check": name, "ok": bool(good), "detail": detail})
 
-    missing = sorted(set(exp) - set(post))
-    extra = sorted(set(post) - set(exp))
     add("块数一致（没丢块、没多块）", not missing and not extra,
         "缺 %s / 多 %s" % (missing or "无", extra or "无"))
 
@@ -311,36 +551,72 @@ def compare_layout(manifest, post_blocks, tol_untouched_mm=5.0,
 
     tid = str(manifest.get("target"))
     cell = manifest.get("cell")
-    if tid in post and cell is not None:
-        tb = post[tid]
+    notes = []
+    if target_colour is not None and cell is not None:
+        name = "指定块落在计划的那一格（#%s，彩色顶面质心）" % cell
+        if not target_colour.get("ok"):
+            add(name, False,
+                "彩色量不够帧（%d 帧看见 / 需 ≥5，漏 %d 帧）—— 没有量值，不判过"
+                % (target_colour.get("n_frames") or 0,
+                   target_colour.get("n_missed") or 0))
+        else:
+            tx, ty = [float(v) / 1000.0 for v in target_colour["xy_mm"]]
+            got = cm.cell_index_of(tx, ty)
+            cx, cy = cm.cell_center(int(cell))
+            rng = target_colour.get("range_mm") or [0.0, 0.0]
+            add(name, got == int(cell),
+                "实际格 %r，位置 (%.1f, %.1f) mm，距格心 %.1f mm"
+                "（%d 帧中位；极差 x=%.1f / y=%.1f mm；单帧最大偏离 %.1f mm；"
+                "色相 %.0f°；窗 ±%.0f mm）"
+                % (got, tx * 1000, ty * 1000,
+                   math.hypot(tx - cx, ty - cy) * 1000.0,
+                   target_colour.get("n_frames") or 0, rng[0], rng[1],
+                   target_colour.get("max_dev_mm") or 0.0,
+                   target_colour.get("hue_deg") or 0.0,
+                   target_colour.get("search_mm") or 0.0))
+        if tid in match:
+            db = post[match[tid][0]]
+            dgot = cm.cell_index_of(float(db["x"]), float(db["y"]))
+            notes.append("同一位置深度真值给出 (%.1f, %.1f) mm → 格 %r"
+                         % (float(db["x"]) * 1000, float(db["y"]) * 1000, dgot))
+        else:
+            notes.append("深度真值里配不上目标块 #%s" % tid)
+    elif tid in match and cell is not None:
+        pi = match[tid][0]
+        tb = post[pi]
         got = cm.cell_index_of(float(tb["x"]), float(tb["y"]))
         add("指定块落在计划的那一格（#%s）" % cell, got == int(cell),
             "实际格 %r，位置 (%.1f, %.1f) mm"
             % (got, float(tb["x"]) * 1000, float(tb["y"]) * 1000))
+    elif tid not in match:
+        add("指定块落在计划的那一格（#%s）" % cell, False,
+            "跑后真值里找不到目标块 #%s（已丢？）" % tid)
 
-    for bid in sorted(post, key=lambda s: (len(s), s)):
-        b, e = post[bid], exp.get(bid)
-        row = {"id": bid, "moved": bid in moved}
-        if e is None:
-            row["d_mm"] = None
-            rows.append(row)
-            continue
+    for bid in sorted(match, key=lambda s: (len(s), s)):
+        pi, d3 = match[bid]
+        b, e = post[pi], exp[bid]
         d = math.hypot(float(b["x"]) - float(e["x"]),
                        float(b["y"]) - float(e["y"])) * 1000.0
-        dyaw = abs(((float(b.get("yaw", 0.0)) - float(e.get("yaw", 0.0)))
-                    + 180.0) % 360.0 - 180.0)
-        row.update(d_mm=round(d, 2), dyaw_deg=round(dyaw, 2),
-                   dz_mm=round((float(b["z"]) - float(e["z"])) * 1000.0, 2))
+        # 积木是正方形：yaw 与 yaw+90° 是同一个盒子，必须按 90° 折角比
+        dyaw = abs((float(b.get("yaw", 0.0)) - float(e.get("yaw", 0.0))
+                    + 45.0) % 90.0 - 45.0)
+        row = {"id": bid, "post_id": pi, "moved": bid in moved,
+               "d_mm": round(d, 2), "dyaw_deg": round(dyaw, 2),
+               "dz_mm": round((float(b["z"]) - float(e["z"])) * 1000.0, 2)}
         rows.append(row)
         if bid in moved:
             add("被搬的块 #%s 落在计划位附近" % bid, d <= tol_moved_mm,
                 "%.1f mm（公差 %.0f）" % (d, tol_moved_mm))
         else:
-            add("没被碰的块 #%s 没被动过" % bid,
-                d <= tol_untouched_mm and dyaw <= tol_untouched_deg,
-                "位移 %.1f mm / 转角 %.1f°（公差 %.0f mm / %.0f°）"
-                % (d, dyaw, tol_untouched_mm, tol_untouched_deg))
+            # 只按位移判；转角写进 detail 供人看（口径见函数 docstring）
+            add("没被碰的块 #%s 没被动过" % bid, d <= tol_untouched_mm,
+                "位移 %.1f mm（公差 %.0f）；转角 %.1f°（只记录，不判）"
+                % (d, tol_untouched_mm, dyaw))
+    for pi in extra:
+        rows.append({"id": None, "post_id": pi, "moved": False,
+                     "d_mm": None, "dyaw_deg": None, "dz_mm": None})
     return {"ok": ok, "checks": checks, "blocks": rows, "terminal": rep,
+            "notes": notes,
             "tolerances": {"untouched_mm": tol_untouched_mm,
                            "untouched_deg": tol_untouched_deg,
                            "moved_mm": tol_moved_mm}}
@@ -353,21 +629,46 @@ def verify_main(args):
         manifest = json.load(f)
     with open(args.verify, encoding="utf-8") as f:
         post = json.load(f)
+    colour = None
+    if args.colour_burst:
+        exp = {str(b["id"]): b for b in manifest.get("final_layout") or []}
+        slot = exp.get(str(manifest.get("target")))
+        if slot is None:
+            log("!! manifest 的 final_layout 里没有目标块，算不出彩色量的窗口")
+            return 2
+        size = float(slot.get("size") or cm.PAD_PITCH)
+        top_z = float(slot["z"]) + size / 2.0
+        colour = measure_target_colour(
+            args.colour_burst, (float(slot["x"]), float(slot["y"])), top_z,
+            search_mm=args.colour_search_mm)
+        if colour.get("ok"):
+            rng = colour.get("range_mm") or [0.0, 0.0]
+            log("  彩色量：%d/%d 帧看见，中位 (%.1f, %.1f) mm，极差 x=%.1f "
+                "y=%.1f mm，色相 %.0f°，块顶高 %.1f mm"
+                % (colour["n_frames"], colour["n_frames"] + colour["n_missed"],
+                   colour["xy_mm"][0], colour["xy_mm"][1], rng[0], rng[1],
+                   colour["hue_deg"], top_z * 1000.0))
+        else:
+            log("  彩色量：只看见 %d 帧（需 ≥5），漏 %d 帧 —— 判红"
+                % (colour["n_frames"], colour["n_missed"]))
     rep = compare_layout(manifest, post["blocks"],
                          tol_untouched_mm=args.untouched_mm,
                          tol_untouched_deg=args.untouched_deg,
-                         tol_moved_mm=args.moved_mm)
+                         tol_moved_mm=args.moved_mm,
+                         target_colour=colour)
     out_dir = args.out_dir or os.path.dirname(mpath)
     vpath = os.path.join(out_dir, "verify.json")
     with open(vpath, "w", encoding="utf-8") as f:
-        json.dump(dict(rep, manifest=mpath, post_truth=args.verify), f,
-                  ensure_ascii=False, indent=1)
+        json.dump(dict(rep, manifest=mpath, post_truth=args.verify,
+                       colour=colour), f, ensure_ascii=False, indent=1)
     for c in rep["checks"]:
         log("  %s %s   %s" % ("PASS" if c["ok"] else "FAIL",
                               c["check"], c["detail"]))
+    for n in rep.get("notes") or []:
+        log("    注：%s" % n)
     for b in rep["blocks"]:
-        log("    块 %-3s %s  位移 %s mm / 转角 %s° / Δz %s mm"
-            % (b["id"], "被搬" if b["moved"] else "未动",
+        log("    块 %-3s→%-3s %s  位移 %s mm / 转角 %s° / Δz %s mm"
+            % (b["id"], b.get("post_id"), "被搬" if b["moved"] else "未动",
                b.get("d_mm"), b.get("dyaw_deg"), b.get("dz_mm")))
     log("→ %s" % vpath)
     log("结论：%s" % ("PASS" if rep["ok"] else "FAIL"))
@@ -411,6 +712,11 @@ def main(argv=None):
                     help="没被碰的块允许的最大转角（°，缺省 3）")
     ap.add_argument("--moved-mm", type=float, default=40.0,
                     help="被搬的块离计划落点的最大距离（mm，缺省 40）")
+    ap.add_argument("--colour-burst", default=None,
+                    help="跑后俯视 burst 目录；给了就用彩色顶面质心量目标块落格"
+                         "（垫面深度分辨不出 29.5 mm 台阶；缺省 None = 用深度真值）")
+    ap.add_argument("--colour-search-mm", type=float, default=60.0,
+                    help="彩色量的搜索窗半径（mm，围绕计划宫格；缺省 60）")
     ap.add_argument("--scene-index", type=int, default=0)
     ap.add_argument("--truth", default=None,
                     help="覆盖报告里记的 truth 路径（报告在板上生成时是板上绝对路径）")

@@ -15,9 +15,12 @@
 """
 import inspect
 import json
+import math
 import os
 import sys
 import tempfile
+
+import numpy as np
 
 sys.dont_write_bytecode = True
 
@@ -361,10 +364,15 @@ def section_verify():
           not r['ok'] and any('没被动过' in c['check'] and not c['ok']
                               for c in r['checks']))
 
+    # 2026-11-08 用户拍板：转角只记录、不判（深度口径对块的 yaw 重复性 4.5–36°，
+    # 3° 的公差低于测量底噪）。原地转 8° ⇒ 仍 PASS，但报告里看得见这 8°。
     b = [dict(x) for x in post]
-    b[2]['yaw'] += 8.0                       # 旁观块被转 8°
-    check('旁观块被转 8° ⇒ FAIL（不撞）',
-          not cr.compare_layout(mani, b)['ok'])
+    b[2]['yaw'] += 8.0
+    r = cr.compare_layout(mani, b)
+    check('旁观块只被转 8°（位移 0）⇒ PASS（yaw 只记录）', r['ok'])
+    check('转过的角度仍出现在报告里',
+          any(abs(float(row.get('dyaw_deg') or 0) - 8.0) < 0.01
+              for row in r['blocks']))
 
     b = [dict(x) for x in post]
     b[1]['x'], b[1]['y'] = 0.40, 0.30        # 没抓住，块还在原位
@@ -394,11 +402,182 @@ def section_verify():
     r = cr.compare_layout(mani, b)
     check('多一块 ⇒ FAIL（块数一致）', not r['ok'])
 
+    # --- 2026-11-08 真机第一场暴露的两个 bug（都修了，这里钉住） --------
+    # 真值的 id 是「同一份文件内按位置重排」的序号：跑后再拍一遍，块的 id 会和
+    # 计划里的 final_layout 完全不同。按 id 配对会报出 240 mm 的假位移。
+    ren = sorted([dict(x) for x in post], key=lambda x: (x['x'], x['y']))
+    for i, x in enumerate(ren):
+        x['id'] = i
+    check('场景1 实况：跑后 id 按位置重排 ⇒ 仍 PASS（按三维位置配对）',
+          cr.compare_layout(mani, ren)['ok'])
+    r = cr.compare_layout(mani, ren)
+    check('报告里同时给出计划 id 与跑后 id',
+          all('post_id' in row for row in r['blocks']))
+
+    # 方块 yaw 只有 mod 90 有定义：转 90° 是同一个盒子，不是「被转了 90°」
+    b = [dict(x) for x in post]
+    for x in b:
+        x['yaw'] += 90.0
+    check('旁观块 yaw 差 90° ⇒ PASS（方块按 90° 折角比）',
+          cr.compare_layout(mani, b)['ok'])
+
+    # 真机第一场的实测数：两塔 y 差 4.2/5.1 mm、yaw 差 7.6/17.2°。彩色剪影证明
+    # 块没动（取向差 ≤2°、重心差 <1 px）。位移 5 mm 内 ⇒ PASS；yaw 进报告不判。
+    b = [dict(x) for x in post]
+    b[2]['yaw'] = 37.2
+    b[2]['y'] += 0.0045
+    r = cr.compare_layout(mani, b)
+    check('场景1 实况 4.5 mm / 17.2° ⇒ PASS（位移在 5 mm 内）', r['ok'])
+
+    # 但位移超 5 mm 仍然红 —— 判据放宽的是 yaw，不是位移
+    b = [dict(x) for x in post]
+    b[2]['y'] += 0.0055
+    r = cr.compare_layout(mani, b)
+    check('旁观块位移 5.5 mm ⇒ FAIL（5 mm 仍是硬判据）',
+          not r['ok'] and any('没被动过' in c['check'] and not c['ok']
+                              for c in r['checks']))
+
+    # 掉块 + 重排同时发生：缺块要按「配不上」报，不能因为 id 对不上就误报位移
+    few = sorted([dict(x) for x in post][:2], key=lambda x: (x['x'], x['y']))
+    for i, x in enumerate(few):
+        x['id'] = i
+    r = cr.compare_layout(mani, few)
+    check('少一块且 id 重排 ⇒ FAIL 且报「缺」',
+          not r['ok'] and any('块数一致' in c['check'] and not c['ok']
+                              for c in r['checks']))
+
+
+def _img(w, h, rgb=(255, 255, 255)):
+    a = np.zeros((h, w, 3), np.uint8)
+    a[:, :] = rgb
+    return a
+
+
+def _box(a, r0, r1, c0, c1, rgb):
+    a[r0:r1, c0:c1] = rgb
+
+
+def _colour(x_mm, y_mm, n=10, ok=True):
+    return {'ok': ok, 'xy_mm': [x_mm, y_mm], 'n_frames': n,
+            'n_missed': 10 - n, 'range_mm': [3.0, 4.0], 'max_dev_mm': 4.0,
+            'hue_deg': 35.0, 'search_mm': 60.0}
+
+
+def section_colour():
+    print('\n[8] 目标块彩色量具（垫面深度分辨不出 29.5 mm 台阶）')
+    h, s, v = cr.hsv_of(np.array([[[255, 0, 0]]], np.uint8))
+    check('红：h≈0、s=255、v=255', abs(h[0, 0] % 360.0) < 1e-3
+          and abs(s[0, 0] - 255) < 0.5 and abs(v[0, 0] - 255) < 0.5)
+    h, s, v = cr.hsv_of(np.array([[[255, 255, 255]]], np.uint8))
+    check('白垫：s=0（被饱和度门限排除）', s[0, 0] == 0.0)
+    h, s, v = cr.hsv_of(np.array([[[0, 0, 0]]], np.uint8))
+    check('黑标记：v=0（被亮度门限排除）', v[0, 0] == 0.0)
+
+    tan = (210, 160, 90)
+    a = _img(80, 80)
+    _box(a, 30, 50, 30, 50, tan)
+    b = cr.colour_blob_uv(a, (40, 40), 35)
+    check('白底 + 20×20 色块 ⇒ 质心在块心',
+          b is not None and abs(b['uv'][0] - 39.5) < 0.6
+          and abs(b['uv'][1] - 39.5) < 0.6)
+    check('质地相 ≈ 35°', b is not None and abs(b['hue_deg'] - 35.0) < 8.0)
+
+    a = _img(80, 80)
+    _box(a, 30, 50, 30, 50, (0, 0, 0))
+    check('只有黑块 ⇒ None（不靠亮度门限硬凑）',
+          cr.colour_blob_uv(a, (40, 40), 35) is None)
+    check('全白窗口 ⇒ None（不靠饱和度门限硬凑）',
+          cr.colour_blob_uv(_img(80, 80), (40, 40), 35) is None)
+
+    # 侧面比顶面暗：取最亮 40% ⇒ 质心落在顶面，不被侧面拖向画面下方
+    a = _img(80, 80)
+    _box(a, 30, 40, 30, 50, (230, 180, 100))
+    _box(a, 40, 50, 30, 50, (170, 120, 60))
+    b = cr.colour_blob_uv(a, (40, 40), 35)
+    check('明暗两半 ⇒ 质心落在亮的顶面（v < 块心 39.5）',
+          b is not None and b['uv'][1] < 36.0 and abs(b['uv'][0] - 39.5) < 0.6)
+
+    # 窗口里两种颜色：按像素数取主色簇，不把两色混成一个假色
+    a = _img(80, 80)
+    _box(a, 25, 55, 25, 55, (150, 50, 200))
+    _box(a, 5, 15, 5, 15, tan)
+    b = cr.colour_blob_uv(a, (40, 40), 40)
+    check('两种颜色 ⇒ 取占多数的那一簇（紫 277°）',
+          b is not None and abs(b['hue_deg'] - 277.5) < 8.0
+          and abs(b['uv'][0] - 39.5) < 1.0)
+
+    # 几何：_base_to_uv 与 ray_plane_xy 必须互为逆（同一投影点，不另写一份）
+    K = np.array([[1376.4, 0.0, 974.3], [0.0, 1374.6, 517.4], [0.0, 0.0, 1.0]])
+    R = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+    t = np.array([0.0, 0.0, 1.5])
+    p = (0.4242, -0.11224, 0.03238)
+    uv = cr._base_to_uv(p, K, R, t)
+    back = cr.tf.ray_plane_xy(uv, K, R, t, p[2])
+    check('base→uv→base 往返 < 0.01 mm',
+          back is not None
+          and math.hypot(back[0] - p[0], back[1] - p[1]) < 1e-5)
+    h60 = cr._window_half_px((0.4242, -0.11224), 0.03238, 60.0, K, R, t)
+    h30 = cr._window_half_px((0.4242, -0.11224), 0.03238, 30.0, K, R, t)
+    # 相机距垫面 ≈1.47 m、fx≈1376 ⇒ 30 mm 半格投影 ≈ 28 px（不是 16 px）
+    check('30 mm 半窗 ≈28 px、60 mm 窗约是其两倍',
+          26.0 < h30 < 30.0 and h60 > 1.9 * h30)
+
+    with tempfile.TemporaryDirectory() as d:
+        r = cr.measure_target_colour(d, (0.4242, -0.11224), 0.03238)
+    check('空 burst ⇒ ok=False（fail-closed，不拿计划位当量值）',
+          r['ok'] is False and not r['per_frame'])
+
+    # ---- 接进 compare_layout -------------------------------------------
+    final = [{'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+              'size': 0.0295},
+             {'id': 8, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 10.0,
+              'size': 0.0295},
+             {'id': 3, 'x': 0.60, 'y': 0.30, 'z': 0.01475, 'yaw': 20.0,
+              'size': 0.0295}]
+    mani = {'target': 0, 'cell': 4,
+            'actions': [{'block': '8'}, {'block': '0'}],
+            'final_layout': [dict(b) for b in final]}
+    post = [dict(b) for b in final]
+
+    r = cr.compare_layout(mani, post, target_colour=_colour(424.2, -112.24))
+    check('彩色量在格心 ⇒ PASS', r['ok'])
+    check('判据名写明用彩色量',
+          any('彩色' in c['check'] for c in r['checks']))
+
+    # 场景 2 实况：深度把垫上那块并进幻影、质心拉偏到 (433.7, −145.3)，且
+    # z 读成台面高（0.01475）⇒ 深度判「没落格」；彩色 (419.7, −121.1) 距格心
+    # 9.9 mm ⇒ PASS。数值取自 runs/2026-11-08-stage4-entry/e9/s2/ 实测。
+    post2 = [dict(b) for b in final]
+    post2[0]['x'], post2[0]['y'], post2[0]['z'] = 0.4337, -0.1453, 0.01475
+    check('场景2 实况：只用深度 ⇒ 目标块判「没落格」（这是要修掉的假红）',
+          not cr.compare_layout(mani, post2)['ok'])
+    r = cr.compare_layout(mani, post2, target_colour=_colour(419.7, -121.1))
+    check('场景2 实况：改彩色量 ⇒ PASS', r['ok'])
+    check('深度给出的位置仍写进 notes（看得见分歧，不藏）',
+          any('深度真值' in n for n in r.get('notes') or []))
+    d4 = [c['detail'] for c in r['checks'] if '彩色' in c['check']][0]
+    check('报告写清距格心 9.9 mm、帧数、极差、色相',
+          '9.9 mm' in d4 and '10 帧' in d4 and '色相' in d4)
+
+    r = cr.compare_layout(mani, post2, target_colour=_colour(460.0, -112.24))
+    check('彩色量偏出宫格 36 mm ⇒ FAIL（判据仍是 30 mm 半格）', not r['ok'])
+    r = cr.compare_layout(mani, post2, target_colour=_colour(424.2, -112.24,
+                                                             n=3, ok=False))
+    check('彩色量只看见 3 帧 ⇒ FAIL（不够帧不判过）',
+          not r['ok'] and any('不够帧' in c['detail'] for c in r['checks']))
+
+    # 变异检查：把饱和度门限拆掉，全白窗口那条用例必须红 —— 否则那条用例
+    # 通过的原因不是它自己以为的原因。
+    ns = _mut('COLOUR_S_MIN, COLOUR_V_MIN = 90.0, 60.0',
+              'COLOUR_S_MIN, COLOUR_V_MIN = 0.0, 60.0')
+    check('变异：拆掉饱和度门限 ⇒ 全白窗口不再返回 None（用例是承重的）',
+          ns['colour_blob_uv'](_img(80, 80), (40, 40), 35) is not None)
+
 
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
-               section_gap, section_mutation, section_verify):
+               section_gap, section_mutation, section_verify, section_colour):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001
