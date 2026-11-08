@@ -269,6 +269,45 @@ def _max(vals):
     return max(vals) if vals else None
 
 
+def pool_results(results):
+    """把同一批的多帧合成一行（契约要的是每批 5 个布局的合并率）。
+
+    合并的是**计数**，不是比率 —— 各帧命令数不同，比率的算术平均会撒谎。
+    几何误差取各帧的最大值（最坏情况），漏检/多检直接相加。
+    """
+    groups = {}
+    for r in results:
+        groups.setdefault(r.get("batch") or "?", []).append(r)
+    out = []
+    for batch, rs in groups.items():
+        n_cmd = sum(r["n_commands"] for r in rs)
+        tp = sum(r["true_pos"] for r in rs)
+        auto = sum(round((r["auto_top1_rate"] or 0.0) * r["n_commands"]) for r in rs)
+        counts = {}
+        for r in rs:
+            for k, v in r["counts"].items():
+                counts[k] = counts.get(k, 0) + v
+        out.append({
+            "label": "%s（%d 帧）" % (batch, len(rs)),
+            "batch": batch, "dirs": [r["dir"] for r in rs],
+            "n_frames": len(rs),
+            "counts": counts,
+            "commands": [c for r in rs for c in r["commands"]],
+            "n_commands": n_cmd,
+            "n_skipped_not_unique": sum(r["n_skipped_not_unique"] for r in rs),
+            "n_indep_disagree": sum(r.get("n_indep_disagree", 0) for r in rs),
+            "indep_disagree": [d for r in rs for d in r.get("indep_disagree", [])],
+            "n_truth": sum(r["n_truth"] for r in rs),
+            "n_matched": sum(r["n_matched"] for r in rs),
+            "n_false_pos": sum(r["n_false_pos"] for r in rs),
+            "true_pos": tp, "wrong_ok": sum(r["wrong_ok"] for r in rs),
+            "id_rate": (tp / n_cmd) if n_cmd else None,
+            "auto_top1_rate": (auto / n_cmd) if n_cmd else None,
+            "geom": [g for r in rs for g in r["geom"]],
+        })
+    return out
+
+
 def judge_batch(res):
     """单批判据 → (通过?, 失败项列表)。"""
     g = [x for x in res["geom"] if x["found"]]
@@ -317,6 +356,8 @@ def main():
     ap.add_argument("frames", nargs="+", help="label=帧目录，如 s0=.../topcam-home")
     ap.add_argument("--no-split", action="store_true",
                     help="关掉尺寸先验切分（对照 S2）")
+    ap.add_argument("--pool", action="store_true",
+                    help="按批合并多帧（契约要的每批 5 布局合并率）")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
@@ -333,22 +374,29 @@ def main():
 
     results = [eval_frame(lbl, d, split=not args.no_split) for lbl, d in specs]
     print(render(results))
+    judged = results
+    if args.pool:
+        pooled = pool_results(results)
+        print("\n## 按批合并（%d 帧 → %d 批）\n" % (len(results), len(pooled)))
+        print(render(pooled))
+        judged = pooled
     if args.json:
         os.makedirs(os.path.dirname(os.path.abspath(args.json)) or ".",
                     exist_ok=True)
         with open(args.json, "w", encoding="utf-8") as f:
-            json.dump({"kind": "stage4-e5", "results": results},
-                      f, ensure_ascii=False, indent=1)
+            json.dump({"kind": "stage4-e5", "results": results,
+                       "pooled": pool_results(results)}, f,
+                      ensure_ascii=False, indent=1)
         print("\n→ %s" % args.json)
     # 未通过的命令明细打出来（最多 10 条），别让人翻 JSON
-    bad = [c for r in results for c in r["commands"]
+    bad = [c for r in judged for c in r["commands"]
            if not c["correct"] and c["status"] in ("ok", "ambiguous")]
     if bad:
         print("\n未命中明细（%d 条）：" % len(bad))
         for c in bad[:10]:
             print("  %-24s target=%s 命中真值=%s %s %s" % (
                 c["text"], c["target"], c["truth_id"], c["status"], c["reason"]))
-    return 0 if all(judge_batch(r)[0] for r in results) else 1
+    return 0 if all(judge_batch(r)[0] for r in judged) else 1
 
 
 if __name__ == "__main__":

@@ -150,7 +150,9 @@ def section_indep():
 def _res(**kw):
     base = {"label": "x", "counts": {"ok": 3}, "n_truth": 2, "n_matched": 2,
             "n_false_pos": 0, "n_commands": 3, "id_rate": 1.0,
-            "auto_top1_rate": 1.0, "wrong_ok": 0,
+            "auto_top1_rate": 1.0, "wrong_ok": 0, "true_pos": 3,
+            "batch": "t", "dir": "/dev/null", "commands": [],
+            "n_skipped_not_unique": 0,
             "n_indep_disagree": 0, "indep_disagree": [],
             "geom": [{"truth_id": 0, "found": True, "dxy_mm": 0.5,
                       "dtop_mm": 0.5, "dyaw_deg": 0.5},
@@ -158,6 +160,48 @@ def _res(**kw):
                       "dtop_mm": 0.6, "dyaw_deg": 0.6}]}
     base.update(kw)
     return base
+
+
+# ------------------------------------------------------------------ 按批合并
+def section_pool():
+    print('\n[4] 按批合并：合并的是计数，不是比率的算术平均')
+    a = _res(label="a", batch="S0", n_commands=10, true_pos=10,
+             n_truth=2, n_matched=2)
+    b = _res(label="b", batch="S0", n_commands=10, true_pos=10,
+             n_truth=2, n_matched=2)
+    p = ev.pool_results([a, b])
+    check("同批两帧 → 一行", len(p) == 1, str([x["label"] for x in p]))
+    check("命令数相加", p[0]["n_commands"] == 20, str(p[0]["n_commands"]))
+    check("块数相加", p[0]["n_truth"] == 4, str(p[0]["n_truth"]))
+    check("几何误差取最坏值（不是平均）",
+          max(g["dxy_mm"] for g in p[0]["geom"]) == 0.6)
+
+    # 这条是分水岭：100% 的 10 条 + 0% 的 90 条 = 10%，不是 50%
+    c = _res(label="c", batch="S1", n_commands=10, true_pos=10, n_truth=2,
+             n_matched=2)
+    d = _res(label="d", batch="S1", n_commands=90, true_pos=0, n_truth=2,
+             n_matched=2)
+    p = ev.pool_results([c, d])
+    check("合并 ID = 总对/总命令 = 10%（率的平均会撒谎成 50%）",
+          abs(p[0]["id_rate"] - 0.10) < 1e-9, str(p[0]["id_rate"]))
+    check("合并后这条判红", not ev.judge_batch(p[0])[0])
+
+    p = ev.pool_results([_res(batch="S0"), _res(batch="S2")])
+    check("不同批 → 两行", len(p) == 2, str([x["batch"] for x in p]))
+
+    # 漏检、误配、独立复核分歧都要相加
+    e = _res(batch="S0", n_matched=1, n_truth=2, wrong_ok=1,
+             n_indep_disagree=1, n_skipped_not_unique=2)
+    g = _res(batch="S0", n_matched=1, n_truth=2, wrong_ok=2,
+             n_indep_disagree=3, n_skipped_not_unique=4)
+    p = ev.pool_results([e, g])[0]
+    check("多检/漏检按块相加（配对 2 / 真值 4）",
+          p["n_matched"] == 2 and p["n_truth"] == 4)
+    check("误配相加", p["wrong_ok"] == 3, str(p["wrong_ok"]))
+    check("独立复核分歧相加", p["n_indep_disagree"] == 4,
+          str(p["n_indep_disagree"]))
+    check("跳过的非唯一命令相加", p["n_skipped_not_unique"] == 6,
+          str(p["n_skipped_not_unique"]))
 
 
 def section_judge():
@@ -191,6 +235,7 @@ def main():
     section_gen()
     section_indep()
     section_judge()
+    section_pool()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('未通过：' + '; '.join(FAILS))
