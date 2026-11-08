@@ -325,10 +325,80 @@ def section_mutation():
           '未变异时应为 0.059')
 
 
+# ------------------------------------------------------------------ [7]
+def section_verify():
+    print('\n[7] 跑后核验：不丢指定块 / 不掉块 / 不撞')
+    final = [
+        # 目标：垫心（宫格 4）
+        {'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+         'size': 0.0295},
+        # 清障块：自由区落点
+        {'id': 8, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 10.0,
+         'size': 0.0295},
+        # 旁观块：原地不动
+        {'id': 3, 'x': 0.60, 'y': 0.30, 'z': 0.01475, 'yaw': 20.0,
+         'size': 0.0295},
+    ]
+    mani = {'target': 0, 'cell': 4,
+            'actions': [{'block': '8'}, {'block': '0'}],
+            'final_layout': [dict(b) for b in final]}
+    post = [dict(b) for b in final]
+
+    r = cr.compare_layout(mani, post)
+    check('完美终态 ⇒ PASS', r['ok'])
+    check('三条判据都出现了（块数 / 终态 / 格 / 每块）',
+          len(r['checks']) >= 5)
+
+    b = [dict(x) for x in post]
+    b[1]['x'] += 0.020                       # 清障块落偏 20 mm
+    check('清障块落点偏 20 mm ⇒ PASS（40 mm 公差内）',
+          cr.compare_layout(mani, b)['ok'])
+
+    b = [dict(x) for x in post]
+    b[2]['x'] += 0.020                       # 旁观块被推 20 mm
+    r = cr.compare_layout(mani, b)
+    check('旁观块被推 20 mm ⇒ FAIL（不撞）',
+          not r['ok'] and any('没被动过' in c['check'] and not c['ok']
+                              for c in r['checks']))
+
+    b = [dict(x) for x in post]
+    b[2]['yaw'] += 8.0                       # 旁观块被转 8°
+    check('旁观块被转 8° ⇒ FAIL（不撞）',
+          not cr.compare_layout(mani, b)['ok'])
+
+    b = [dict(x) for x in post]
+    b[1]['x'], b[1]['y'] = 0.40, 0.30        # 没抓住，块还在原位
+    r = cr.compare_layout(mani, b)
+    check('清障块没搬走（抓空了）⇒ FAIL（不丢）',
+          not r['ok'] and any('落在计划位' in c['check'] and not c['ok']
+                              for c in r['checks']))
+
+    b = [dict(x) for x in post]
+    b[1]['z'] = -0.5                         # 掉到地上
+    r = cr.compare_layout(mani, b)
+    check('块掉到地上 ⇒ FAIL（不掉块 / 终态非法）', not r['ok']
+          and not r['terminal']['ok'])
+
+    b = [dict(x) for x in post]
+    b[0]['x'] += 0.065                       # 目标没放到垫心（偏出宫格）
+    r = cr.compare_layout(mani, b)
+    check('目标没落在指定格 ⇒ FAIL', not r['ok'])
+
+    b = [dict(x) for x in post][:2]          # 少一块
+    r = cr.compare_layout(mani, b)
+    check('少一块 ⇒ FAIL（块数一致）', not r['ok'])
+
+    b = [dict(x) for x in post] + [{'id': 9, 'x': 0.30, 'y': 0.20,
+                                    'z': 0.01475, 'yaw': 0.0,
+                                    'size': 0.0295}]
+    r = cr.compare_layout(mani, b)
+    check('多一块 ⇒ FAIL（块数一致）', not r['ok'])
+
+
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
-               section_gap, section_mutation):
+               section_gap, section_mutation, section_verify):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

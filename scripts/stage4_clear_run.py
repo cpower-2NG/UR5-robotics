@@ -41,6 +41,7 @@
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -270,6 +271,109 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
     return plans, layout, q
 
 
+def compare_layout(manifest, post_blocks, tol_untouched_mm=5.0,
+                   tol_untouched_deg=3.0, tol_moved_mm=40.0):
+    """跑完再拍一遍真值 → 判「不丢指定块 / 不掉块 / 不撞」。
+
+    三条判据各自的量（都不靠「看起来对」）：
+
+    · **不丢指定块**：目标块的终态必须落在计划的那一格（``cell_index_of``）。
+    · **不掉块**：``stage4_clear_model.terminal_report`` —— 每块有真支撑
+      （台面 / 垫面 / 真的压在另一块上）、不穿插、不出桌。掉到地上 = 不在
+      台面支撑里，必然红。
+    · **不撞**：**没被碰的块不许动**。静置的块被推动只有一种原因：臂或夹爪
+      碰到了它。清障块本身有 40 mm 的落点公差（抓取/落点误差），不加严。
+      这条是间接判据，所以在报告里把每块的位移都列出来，别只看结论。
+
+    返回 ``{"ok": bool, "checks": [...], "blocks": [...], "terminal": ...}``。
+    """
+    exp = {str(b["id"]): b for b in manifest.get("final_layout") or []}
+    post = {str(b["id"]): b for b in post_blocks}
+    moved = {str(a["block"]) for a in manifest.get("actions") or []}
+    checks, rows = [], []
+    ok = True
+
+    def add(name, good, detail):
+        nonlocal ok
+        ok = ok and bool(good)
+        checks.append({"check": name, "ok": bool(good), "detail": detail})
+
+    missing = sorted(set(exp) - set(post))
+    extra = sorted(set(post) - set(exp))
+    add("块数一致（没丢块、没多块）", not missing and not extra,
+        "缺 %s / 多 %s" % (missing or "无", extra or "无"))
+
+    rep = cm.terminal_report(post_blocks)
+    add("全桌终态合法（不悬空、不穿插、不出桌）", rep["ok"],
+        "overlaps=%d off_table=%s out_of_bounds=%s"
+        % (len(rep.get("overlaps") or []), rep.get("off_table"),
+           rep.get("out_of_bounds")))
+
+    tid = str(manifest.get("target"))
+    cell = manifest.get("cell")
+    if tid in post and cell is not None:
+        tb = post[tid]
+        got = cm.cell_index_of(float(tb["x"]), float(tb["y"]))
+        add("指定块落在计划的那一格（#%s）" % cell, got == int(cell),
+            "实际格 %r，位置 (%.1f, %.1f) mm"
+            % (got, float(tb["x"]) * 1000, float(tb["y"]) * 1000))
+
+    for bid in sorted(post, key=lambda s: (len(s), s)):
+        b, e = post[bid], exp.get(bid)
+        row = {"id": bid, "moved": bid in moved}
+        if e is None:
+            row["d_mm"] = None
+            rows.append(row)
+            continue
+        d = math.hypot(float(b["x"]) - float(e["x"]),
+                       float(b["y"]) - float(e["y"])) * 1000.0
+        dyaw = abs(((float(b.get("yaw", 0.0)) - float(e.get("yaw", 0.0)))
+                    + 180.0) % 360.0 - 180.0)
+        row.update(d_mm=round(d, 2), dyaw_deg=round(dyaw, 2),
+                   dz_mm=round((float(b["z"]) - float(e["z"])) * 1000.0, 2))
+        rows.append(row)
+        if bid in moved:
+            add("被搬的块 #%s 落在计划位附近" % bid, d <= tol_moved_mm,
+                "%.1f mm（公差 %.0f）" % (d, tol_moved_mm))
+        else:
+            add("没被碰的块 #%s 没被动过" % bid,
+                d <= tol_untouched_mm and dyaw <= tol_untouched_deg,
+                "位移 %.1f mm / 转角 %.1f°（公差 %.0f mm / %.0f°）"
+                % (d, dyaw, tol_untouched_mm, tol_untouched_deg))
+    return {"ok": ok, "checks": checks, "blocks": rows, "terminal": rep,
+            "tolerances": {"untouched_mm": tol_untouched_mm,
+                           "untouched_deg": tol_untouched_deg,
+                           "moved_mm": tol_moved_mm}}
+
+
+def verify_main(args):
+    """跑后核验：读真值 + manifest，判「不丢指定块 / 不掉块 / 不撞」。"""
+    mpath = args.manifest or os.path.join(args.out_dir or "", "manifest.json")
+    with open(mpath, encoding="utf-8") as f:
+        manifest = json.load(f)
+    with open(args.verify, encoding="utf-8") as f:
+        post = json.load(f)
+    rep = compare_layout(manifest, post["blocks"],
+                         tol_untouched_mm=args.untouched_mm,
+                         tol_untouched_deg=args.untouched_deg,
+                         tol_moved_mm=args.moved_mm)
+    out_dir = args.out_dir or os.path.dirname(mpath)
+    vpath = os.path.join(out_dir, "verify.json")
+    with open(vpath, "w", encoding="utf-8") as f:
+        json.dump(dict(rep, manifest=mpath, post_truth=args.verify), f,
+                  ensure_ascii=False, indent=1)
+    for c in rep["checks"]:
+        log("  %s %s   %s" % ("PASS" if c["ok"] else "FAIL",
+                              c["check"], c["detail"]))
+    for b in rep["blocks"]:
+        log("    块 %-3s %s  位移 %s mm / 转角 %s° / Δz %s mm"
+            % (b["id"], "被搬" if b["moved"] else "未动",
+               b.get("d_mm"), b.get("dyaw_deg"), b.get("dz_mm")))
+    log("→ %s" % vpath)
+    log("结论：%s" % ("PASS" if rep["ok"] else "FAIL"))
+    return 0 if rep["ok"] else 1
+
+
 def run_script_text(plans, board_dir, log_dir):
     lines = ["#!/bin/bash",
              "# E9 自主移遮挡：按顺序执行本场计划。任何一步 rc≠0 立即停",
@@ -294,9 +398,19 @@ def run_script_text(plans, board_dir, log_dir):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="E9 真机半段：探针方案 → 可执行计划序列（离线）")
-    ap.add_argument("--probe-report", required=True)
-    ap.add_argument("--urdf", required=True)
-    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--probe-report", default=None)
+    ap.add_argument("--urdf", default=None)
+    ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--verify", default=None,
+                    help="跑后真值 json；给了就只做「不丢/不掉/不撞」核验，不生成计划")
+    ap.add_argument("--manifest", default=None,
+                    help="配合 --verify：manifest 路径（缺省 = --out-dir/manifest.json）")
+    ap.add_argument("--untouched-mm", type=float, default=5.0,
+                    help="没被碰的块允许的最大位移（mm，缺省 5）")
+    ap.add_argument("--untouched-deg", type=float, default=3.0,
+                    help="没被碰的块允许的最大转角（°，缺省 3）")
+    ap.add_argument("--moved-mm", type=float, default=40.0,
+                    help="被搬的块离计划落点的最大距离（mm，缺省 40）")
     ap.add_argument("--scene-index", type=int, default=0)
     ap.add_argument("--truth", default=None,
                     help="覆盖报告里记的 truth 路径（报告在板上生成时是板上绝对路径）")
@@ -318,6 +432,14 @@ def main(argv=None):
     ap.add_argument("--board-log-dir", default="$HOME/precision/logs/e9",
                     help="板上执行日志目录（写进 run.sh）")
     args = ap.parse_args(argv)
+
+    if args.verify:
+        return verify_main(args)
+
+    if not (args.probe_report and args.out_dir):
+        ap.error("生成计划要给 --probe-report 与 --out-dir（核验请用 --verify）")
+    if not args.urdf:
+        ap.error("生成计划要给 --urdf")
 
     with open(args.probe_report, encoding="utf-8") as f:
         report = json.load(f)
@@ -360,6 +482,7 @@ def main(argv=None):
         "batch": truth.get("batch"), "index": truth.get("index"),
         "target": attempt["id"],
         "scene_index": args.scene_index,
+        "cell": report.get("cell"),
         "pad_thick": pad_thick,
         "survey_tool0": list(survey),
         "gap_check": "probe_verified",
