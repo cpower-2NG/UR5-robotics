@@ -153,6 +153,19 @@ def section_zone():
     check("min_class_share 能滤掉弱票簇", weak["blocks"] == []
           and weak["dropped_not_block"] == 1, weak)
 
+    # 自定义保留区：E9 真机半段要让**垫面与北侧自由区**也进真值（块落到垫上以后
+    # 它在拾取区外，按 ZONE_M 会被丢掉 ⇒ 后续场次看不见它，规划会撞）
+    wide = (0.20, 0.80, -0.30, 0.65)
+    edge = tf.build_truth([row(0, uv=(460.0, 240.0))], CAM,
+                          zone_m=wide)          # x ≈ 0.743 m
+    check("--zone 加宽后拾取区外的块保留", len(edge["blocks"]) == 1,
+          edge["blocks"])
+    check("真值里记下用的是哪个区", edge["zone_m"] == list(wide),
+          edge["zone_m"])
+    still_out = tf.build_truth([row(0, uv=(460.0, 240.0))], CAM)
+    check("不给 --zone 时仍按拾取区丢", still_out["blocks"] == []
+          and still_out["dropped_out_of_zone"] == 1, still_out)
+
 
 # ---------------------------------------------------------------- 过滤/编号
 def section_filter():

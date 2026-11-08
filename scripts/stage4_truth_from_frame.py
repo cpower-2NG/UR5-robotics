@@ -127,7 +127,8 @@ def in_zone_xy(x, y, zone_m=None):
 
 def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                 batch="REAL", index=0, keep_outside=False,
-                drop_unknown=True, min_class_share=0.0, layers=True):
+                drop_unknown=True, min_class_share=0.0, layers=True,
+                zone_m=None):
     """``find_blocks`` 的行 → ``scene_truth.json`` 的形状（射线 ∩ 平面）。
 
     ``cam`` 给 ``{'K','R_bc','t_bc'}``（``graspnet_candidates.load_frame`` 的
@@ -171,7 +172,7 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                           plane_z)
         if xy is None:
             continue                      # 射线打不到平面上：不是块
-        if not keep_outside and not in_zone_xy(xy[0], xy[1]):
+        if not keep_outside and not in_zone_xy(xy[0], xy[1], zone_m):
             n_out += 1
             continue
         yaw = float(r.get("yaw", 0.0))
@@ -228,7 +229,7 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
         "blocks": blocks,
         "dropped_out_of_zone": n_out,
         "dropped_not_block": n_unknown,
-        "zone_m": list(sp.ZONE_M),
+        "zone_m": list(sp.ZONE_M if zone_m is None else zone_m),
     }
 
 
@@ -394,7 +395,23 @@ def main(argv=None):
                          "（塔的上下层 xy 相同，靠 z 分开）")
     ap.add_argument("--no-layers", action="store_true",
                     help="关掉塔的分层展开（每簇只当一块；E9 的塔必须开着）")
+    ap.add_argument("--zone", default=None, metavar="X0,X1,Y0,Y1",
+                    help="真值保留区（base 系米）。缺省 = 拾取区 ZONE_M。"
+                         "E9 真机半段要覆盖垫面与北侧自由区，例如 "
+                         "0.20,0.80,-0.30,0.65")
     args = ap.parse_args(argv)
+
+    zone = None
+    if args.zone:
+        try:
+            vals = [float(v) for v in args.zone.split(",")]
+        except ValueError:
+            vals = []
+        if len(vals) != 4:
+            print("!! --zone 要四个数 X0,X1,Y0,Y1（米），收到 %r" % args.zone,
+                  file=sys.stderr)
+            return 2
+        zone = tuple(vals)
 
     if not os.path.isdir(args.frame):
         print("!! 帧目录不存在：%s" % args.frame, file=sys.stderr)
@@ -429,12 +446,12 @@ def main(argv=None):
                 keep_outside=True,
                 drop_unknown=not args.keep_unknown,
                 min_class_share=args.min_class_share,
-                layers=not args.no_layers))
+                layers=not args.no_layers, zone_m=zone))
         truth = consensus(truths, radius_m=args.cluster_mm / 1000.0,
                           min_frames=args.min_frames)
         if not args.keep_outside:
             keep = [b for b in truth["blocks"]
-                    if in_zone_xy(b["x"], b["y"])]
+                    if in_zone_xy(b["x"], b["y"], zone)]
             truth["dropped_out_of_zone"] = len(truth["blocks"]) - len(keep)
             truth["blocks"] = keep
             for j, b in enumerate(truth["blocks"]):
@@ -463,7 +480,7 @@ def main(argv=None):
                             keep_outside=args.keep_outside,
                             drop_unknown=not args.keep_unknown,
                             min_class_share=args.min_class_share,
-                            layers=not args.no_layers)
+                            layers=not args.no_layers, zone_m=zone)
         n = len(truth["blocks"])
         print("帧 %s：台面 z=%.2f mm，块 %d 个（位置=射线∩各自顶面平面），"
               "区外丢 %d / 非积木丢 %d"
