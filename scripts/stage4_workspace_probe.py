@@ -92,29 +92,40 @@ def apply_scene(node, scene_client, get_scene, truth, prev_ids):
 
 
 # ------------------------------------------------------------------ 单块评测
-def gripper_gaps(node, fk_client, js, target, others, table, q):
-    """FK → 夹爪三个 OBB → 与目标块 / 其他块 / 桌面的最小间隙（米）。"""
+def gripper_gaps(node, fk_client, js, target, others, table, q, other_names=None):
+    """FK → 夹爪三个 OBB → 与目标块 / 其他块 / 桌面的最小间隙（米）。
+
+    ``other_names``（可选，与 ``others`` 同序）：给了就额外返回
+    ``per_other``（名字 → 该障碍物的最小间隙，米）。E9 靠它把「整块不可抓」
+    归因到**具体是哪一块挡住了**；不给时行为与之前逐位相同。
+    """
     fk = mp.fk_tool(node, fk_client, js)
     if fk is None:
         return None
     obbs = sm.gripper_obbs(fk[mp.IK_LINK], q)
     out = {"target": None, "others": None, "table": None}
+    per = ({n: None for n in other_names}
+           if other_names is not None else None)
     for lk in obbs:
         g = sm.gap(lk, target)
         out["target"] = g if out["target"] is None else min(out["target"], g)
         g = sm.gap(lk, table)
         out["table"] = g if out["table"] is None else min(out["table"], g)
-        for o in others:
+        for i, o in enumerate(others):
             g = sm.gap(lk, o)
             out["others"] = g if out["others"] is None else min(out["others"], g)
+            if per is not None:
+                nm = other_names[i]
+                per[nm] = g if per[nm] is None else min(per[nm], g)
     if out["others"] is None:
         out["others"] = float("inf")
+    out["per_other"] = per
     out["min"] = min(out["target"], out["others"], out["table"])
     return out
 
 
 def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
-                       target, others, table, pool):
+                       target, others, table, pool, other_names=None):
     """一个候选位姿的判定。返回 (verdict, detail)；成功时 detail 里带解。"""
     ps = mp.pose_stamped(*cand["pos"], cand["quat"])
     sol, seed_i = mp.solve_ik(node, ik_client, ps, pool, avoid=False,
@@ -122,7 +133,8 @@ def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
     if sol is None:
         return "unreachable", {"seed": None}
 
-    gaps = gripper_gaps(node, fk_client, sol, target, others, table, mp.OPEN_Q)
+    gaps = gripper_gaps(node, fk_client, sol, target, others, table, mp.OPEN_Q,
+                        other_names=other_names)
     if gaps is None:
         return "fk_failed", {"seed": seed_i}
     detail = {"seed": seed_i,
@@ -130,6 +142,8 @@ def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
               "gap_others_mm": (None if gaps["others"] == float("inf")
                                 else round(gaps["others"] * 1000.0, 1)),
               "gap_table_mm": round(gaps["table"] * 1000.0, 1)}
+    if gaps["per_other"] is not None:
+        detail["per_other"] = gaps["per_other"]
 
     vreq = GetStateValidity.Request()
     vreq.robot_state.joint_state = sol
@@ -160,14 +174,21 @@ def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
 
 
 def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
-                   target, others, table, pool, full_scan=False):
+                   target, others, table, pool, full_scan=False,
+                   vertical_only=False, other_names=None):
     """一个块：先试 B 档（竖直向下）4 个位姿，再试其余 20 个；命中即停。
 
     「命中即停」只影响统计粒度（有多少个位姿可行），不影响两个布尔量：
     B/C 都是存在性判据。``full_scan=True`` 则 24 个全测 —— 用来回答
     「为什么 C 没比 B 多」，代价是慢。
+
+    ``vertical_only=True`` 只测 B 档的 4 个位姿（E9 的口径：E7 已证明 C 档
+    在这套几何下没有额外信息量，清障规划不把它当前提）。
+    ``other_names`` 透传给 :func:`evaluate_candidate`，给 E9 做遮挡归因。
     """
     cands = sm.grasp_candidates(block_truth, mp.TABLE_TOP)
+    if vertical_only:
+        cands = [c for c in cands if c["vertical"]]
     cands.sort(key=lambda c: (not c["vertical"], c["axis"], -c["sign"],
                               c["closing"], c["variant"]))
     reasons = {}
@@ -181,7 +202,7 @@ def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
         n_eval += 1
         verdict, detail = evaluate_candidate(
             node, ik_client, fk_client, validity_client, cand,
-            target, others, table, pool)
+            target, others, table, pool, other_names=other_names)
         reasons[verdict] = reasons.get(verdict, 0) + 1
         row = {"axis": cand["axis"], "sign": cand["sign"],
                "closing": cand["closing"], "variant": cand["variant"],

@@ -141,11 +141,17 @@ def _cross_axes(a, b):
     return out
 
 
-def gap(a, b):
-    """两 OBB 的间隙下界（米）。重叠时为 0，不会给负数。
+def separation(a, b):
+    """两 OBB 的**带符号**间隙（米）：>0 分离、≈0 接触、<0 重叠。
 
-    对 15 条候选分离轴逐条算「投影间隙」，取最大 —— 凸体分离时真实距离 =
-    max 方向上的间隙，而我们只查这 15 条，所以这是**下界**。
+    与 :func:`gap` 的区别只有一个：**不把负数截成 0**。S3/S4 的布局允许块
+    之间**接触**（E7/E8 的 ``gap`` 判据是「不相交」，接触与穿插都返回 0，
+    分不出来），而终态合法性要把「接触」和「穿插」分开 —— 所以这里保留符号。
+
+    对 15 条候选分离轴逐条算「投影间隙」取最大：分离时它是真实距离；重叠时
+    它是**某个轴上的重叠深度**（不保证是最小平移距离，但 < −tol 就足以判「确实
+    穿插」）。用的时候一律带容差比（见 ``PEN_TOL``），别拿 0 当边界 ——
+    S4 的接触对间距就是 29.5 mm 边对边，数值上贴着 0。
     """
     d = b.center - a.center
     best = -float("inf")
@@ -153,7 +159,16 @@ def gap(a, b):
         ra = sum(a.half[i] * abs(axis.dot(a.axes[i])) for i in range(3))
         rb = sum(b.half[i] * abs(axis.dot(b.axes[i])) for i in range(3))
         best = max(best, abs(axis.dot(d)) - (ra + rb))
-    return max(0.0, best)
+    return best
+
+
+def gap(a, b):
+    """两 OBB 的间隙下界（米）。重叠时为 0，不会给负数。
+
+    对 15 条候选分离轴逐条算「投影间隙」，取最大 —— 凸体分离时真实距离 =
+    max 方向上的间隙，而我们只查这 15 条，所以这是**下界**。
+    """
+    return max(0.0, separation(a, b))
 
 
 def collides(a, b, margin=0.0):

@@ -146,6 +146,33 @@ def section_gap():
           str(sm.gap(a, b)))
 
 
+def section_separation():
+    print('\n[1b] 带符号间隙：分离 > 0、接触 ≈ 0、穿插 < 0（S4 终态要区分接触与穿插）')
+    a = unit((0, 0, 0))
+    check('沿 x 分开 100 mm → +100 mm',
+          abs(sm.separation(a, unit((0.2, 0, 0))) - 0.1) < 1e-9,
+          str(sm.separation(a, unit((0.2, 0, 0)))))
+    check('贴面 → 0（不是负数）',
+          abs(sm.separation(a, unit((0.1, 0, 0)))) < 1e-12,
+          str(sm.separation(a, unit((0.1, 0, 0)))))
+    check('沿 x 穿插 50 mm → −50 mm',
+          abs(sm.separation(a, unit((0.05, 0, 0))) + 0.05) < 1e-9,
+          str(sm.separation(a, unit((0.05, 0, 0)))))
+    check('完全重合 → −100 mm（半边长之和）',
+          abs(sm.separation(a, unit((0, 0, 0))) + 0.1) < 1e-9,
+          str(sm.separation(a, unit((0, 0, 0)))))
+    # 同一对 OBB：gap 会把接触与穿插都压成 0，separation 必须分得开
+    touch, pen = unit((0.1, 0, 0)), unit((0.05, 0, 0))
+    check('gap 对「接触」与「穿插」都给 0（所以不能用它判终态）',
+          sm.gap(a, touch) == 0.0 and sm.gap(a, pen) == 0.0)
+    check('separation 对两者给不同符号',
+          sm.separation(a, touch) >= 0.0 and sm.separation(a, pen) < 0.0)
+    # 斜向穿透也一样（重叠深度不会跑到正数）
+    check('斜向穿插仍是负数',
+          sm.separation(a, unit((0.04, 0.04, 0.04))) < 0.0,
+          str(sm.separation(a, unit((0.04, 0.04, 0.04)))))
+
+
 def section_margin():
     print('\n[2] margin：间隙 ≤ margin 即判碰撞')
     a = unit((0, 0, 0))
@@ -403,10 +430,17 @@ def section_mutation():
           real and not mut['collides'](a, b, 0.04))
 
     # B. gap 给负数
-    mut = _mut('    return max(0.0, best)', '    return best')
+    mut = _mut('    return max(0.0, separation(a, b))', '    return separation(a, b)')
     check('变异「重叠时给负数」：真实 0、改坏后 < 0',
           sm.gap(a, unit((0.05, 0, 0))) == 0.0
           and mut['gap'](a, unit((0.05, 0, 0))) < 0.0)
+
+    # H. separation 被截成非负（退回 gap 的语义）：穿插就判不出来了
+    mut = _mut('    return best', '    return max(0.0, best)')
+    check('变异「separation 截掉负号」：真实穿插为负、改坏后接触与穿插都是 0',
+          sm.separation(a, unit((0.05, 0, 0))) < 0.0
+          and mut['separation'](a, unit((0.05, 0, 0))) == 0.0
+          and mut['separation'](a, unit((0.1, 0, 0))) == 0.0)
 
     # C. 手指左右写反
     base = ((0.0, 0.0, 0.5), (0.0, 0.0, 0.0, 1.0))
@@ -467,6 +501,7 @@ def main():
     section_rpy()
     section_interp()
     section_gap()
+    section_separation()
     section_margin()
     section_scene()
     section_gripper()
