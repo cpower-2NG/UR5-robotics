@@ -52,6 +52,16 @@ pkill -f 'ros2 launch yolo_bringup'
 
 ## 第三步：分两段起 —— 先「不动手」，预检全绿再「动手」
 
+**起栈前先锁 GPU 最高频**（2026-11-08 用户拍板，见入口实验 E6）：
+
+```bash
+sudo jetson_clocks          # GPU 306 → 1173 MHz；RNGNet 板载 114.3 → 57.6 ms
+```
+
+> ⚠️ **重启即失效**，每次起栈前重跑。默认 governor（`nvhost_podgov`）下短帧跑不到满频，
+> RNGNet 板载延迟会从 57.6 ms 涨到 114.3 ms，**超 E6 的 100 ms 门**。
+> 想恢复默认：`sudo jetson_clocks --restore`。
+
 ```bash
 # 板上 —— 第一段：驱动 + MoveIt + 感知，但不自动抓
 export ROS_DOMAIN_ID=99            # ⚠️ 现场跑在 99，不是默认 0
