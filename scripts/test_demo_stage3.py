@@ -71,6 +71,18 @@ def test_bias_seed_single_equals_arg():
     assert seeds == ["--bias-seed=-2.791,-0.248"], seeds
 
 
+@case
+def test_teardown_argv_has_go_and_flag():
+    """拆塔是在判分之后单独调的：必须带 --teardown-only，且仍带 --go。"""
+    argv = d.teardown_argv(ns(), "/run", "/g.json", "/s.json", None)
+    assert "--teardown-only" in argv
+    assert "--go" in argv
+    assert "--frame" not in argv and "--joints" not in argv
+    for flag in ("--scene", "--grid", "--zcal", "--urdf", "--d-mm",
+                 "--tower-half-edge"):
+        assert flag in argv, flag
+
+
 # ---------------------------------------------------------------- 场景
 @case
 def test_scene_only_overrides_frames():

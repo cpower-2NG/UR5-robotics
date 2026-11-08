@@ -134,15 +134,19 @@ cd ~/robotics/worktrees/ur5-vision-grasp/stage3
 bash scripts/demo_stage3.sh             # 3 层，与六轮验收同口径
 bash scripts/demo_stage3.sh --frames 2  # 更快：每个视点少抓一帧
 bash scripts/demo_stage3.sh --dry-run   # 离线：不连板、不动臂，只生成计划
+bash scripts/demo_stage3.sh --keep-tower  # 判分通过后保留塔（默认会拆）
 ```
 
 脚本自己串：只读预检（robot_mode / safety_mode / PLAYING / JTC / dashboard 节点数 /
 夹爪 `0x0200`）→ 走到 `stage2high` 抓垫位帧 → `stage2_pad.py` 重解垫位 →
-`stage3_round.py --go` 跑 N 层 → 判分（`person_review` 时再问一次人眼复核）。
+`stage3_round.py --go` 跑 N 层 → 判分（`person_review` 时再问一次人眼复核）→
+**判分通过后 `stage3_round.py --teardown-only --go` 把塔逐层拆回拾取区**。
+一次演示因此以台面还原结束；`verdict` 不是 `ok` 时**不拆**，塔留原地给人看。
 
 - 动臂前必须由人在**交互终端**敲 `yes`；stdin 不是 TTY 直接拒绝（红线 6
   「有交互终端」档）。**夹爪初始化不代跑**：`0x0200` 不是 1 就把命令打给人。
 - 任何一步判红立即退出，不续跑、不重试。日志在 `<run-dir>/demo.log`。
+- 拆塔单独复跑：`stage3_round.py --teardown-only --go`（同样走执行器闸门）。
 
 ---
 

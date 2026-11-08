@@ -1334,6 +1334,32 @@ def retry_bad_pose(board, chain, cdir, round_no, k, pair, pose_frames,
     return meas2, row
 
 
+def teardown_only(args, rdir, scene, grid, slot_mm, zcal, chain):
+    """只拆塔：把塔位逐层拆回拾取区（**判分之后**调用，见 demo_stage3.py）。
+
+    与 ``--go`` 开工时的自动拆塔是同一个 ``se.teardown_tower``；差别只在
+    时机与落点：塔建完、判过分之后才拆，产出写 ``<run>/teardown-after/``，
+    不新开 round 目录。塔位本来就空 ⇒ 0 层，属正常。
+    """
+    if not args.go:
+        print("--teardown-only 必须配 --go（这会动臂）；只想预演就别加")
+        return 2
+    os.makedirs(args.run_dir, exist_ok=True)
+    board = pr.Board(s2.BOARD_ALIAS, args.run_dir)
+    print(">>> 需要人动手：确认急停就绪、两指行程内无手无遮挡；"
+          "执行器在板上还会核对 PLAYING / JTC / robot_mode。"
+          "机器人会把塔位逐层拆回拾取区")
+    board.push()
+    import stage3_entry as se
+    try:
+        doc = se.teardown_tower(args, board, chain, scene, grid, rdir,
+                                slot_mm, zcal, tag="teardown-after")
+    except se.EntryStop as exc:
+        print("!! 拆塔停：%s" % exc.why)
+        return exc.rc
+    return 0 if doc.get("final_empty") else 1
+
+
 def run_round(args):
     why = unsupported_group(args.group)
     if why:                      # 放在最前：任何动臂动作之前就拒
@@ -1365,6 +1391,8 @@ def run_round(args):
 
     os.makedirs(args.run_dir, exist_ok=True)
     rdir = args.run_dir
+    if args.teardown_only:
+        return teardown_only(args, rdir, scene, grid, slot_mm, zcal, chain)
     # 偏置先验：命令行 > run 目录里上一轮攒下的估计 > 无。
     # 没有它，每轮第 1 层都只能不补，第 1↔2 层之间就有一个 ≈|b̂| 的折角。
     try:
@@ -1399,9 +1427,9 @@ def run_round(args):
     if args.measure_only:
         return measure_only(args, chain, cdir, slot_mm, grid, zcal)
 
-    n_layers = int(args.n_layers)
+    n_layers = int(args.n_layers or 0)
     if n_layers < 1:
-        print("--n-layers 至少 1")
+        print("--n-layers 至少 1（--teardown-only / --measure-only 不需要）")
         return 2
     board = pr.Board(s2.BOARD_ALIAS, rdir)
     teardown = None
@@ -2104,7 +2132,8 @@ def main(argv=None):
     ap.add_argument("--extra-frame", dest="extra_frames", action="append",
                     default=None, help="同姿态另一帧（yaw 融合），可重复")
     ap.add_argument("--round", type=int, default=None)
-    ap.add_argument("--n-layers", type=int, required=True)
+    ap.add_argument("--n-layers", type=int, default=None,
+                    help="要堆几层（--teardown-only / --measure-only 不需要）")
     ap.add_argument("--group", choices=GROUPS, default="open")
     ap.add_argument("--arm", choices=ARMS, default="geometric")
     ap.add_argument("--zcal", default=None,
@@ -2174,6 +2203,9 @@ def main(argv=None):
     ap.add_argument("--review-note", default=None)
     ap.add_argument("--measure-only", action="store_true",
                     help="只做终态复测/判分，不抓不放")
+    ap.add_argument("--teardown-only", action="store_true",
+                    help="只拆塔：把塔位逐层拆回拾取区（判分之后用；"
+                         "必须配 --go，仍走执行器闸门）")
     ap.add_argument("--go", action="store_true",
                     help="真跑；**每次都要当次授权**，闸门在 precision_exec")
     args = ap.parse_args(argv)

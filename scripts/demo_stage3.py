@@ -211,6 +211,7 @@ def authorized(log, n_layers):
     log.say("    接下来会动臂：先走到 stage2high 抓一帧，再跑 %d 层抓放。"
             % n_layers)
     log.say("    塔位若还立着，机器人会先自己逐层拆回拾取区（不需要人拆）。")
+    log.say("    判分通过后，机器人会把新建的塔再逐层拆回拾取区，台面还原。")
     log.say("    夹爪开合在执行器里，属同一次当次授权。")
     log.say("=" * 62)
     if not ask_yes(log, "确认无误请输入 yes 并回车： "):
@@ -329,6 +330,23 @@ def round_argv(args, rundir, grid, scene, seed):
     return argv
 
 
+def teardown_argv(args, rundir, grid, scene, seed):
+    """判分之后的收尾动作：同一套轮次参数 + ``--teardown-only``（仍带 --go）。"""
+    return round_argv(args, rundir, grid, scene, seed) + ["--teardown-only"]
+
+
+def teardown_after(args, log, rundir, grid, scene, seed):
+    """判分通过后把塔拆回拾取区 —— 一次演示以台面还原结束。"""
+    log.say("\n== 第 4 步：拆塔回拾取区（动臂）==")
+    rc, _ = log.cmd(teardown_argv(args, rundir, grid, scene, seed), cwd=HERE)
+    if rc != 0:
+        log.say("!! 拆塔没走完（rc=%d）—— 塔位可能还有块，先看现场；"
+                "下次 --go 开工也会先自动拆。" % rc)
+    else:
+        log.say("拆塔完成：塔位已空，块回拾取区。")
+    return rc
+
+
 def round_dirs(rundir):
     try:
         return {d for d in os.listdir(rundir)
@@ -419,6 +437,8 @@ def parse_args(argv=None):
                     help="离线：不连板、不动臂，只生成三层计划")
     ap.add_argument("--skip-preflight", action="store_true",
                     help="跳过只读预检（仍要人敲 yes）")
+    ap.add_argument("--keep-tower", action="store_true",
+                    help="判分通过后不自动拆塔（留现场看；默认会拆回拾取区）")
     return ap.parse_args(argv)
 
 
@@ -450,7 +470,7 @@ def main(argv=None):
     log.say("  层数：%d    融合帧数：%d    板子：%s"
             % (args.n_layers, args.frames, BOARD_ALIAS))
     log.say("  本次动作：只读预检 → 抓垫位帧 → 重解垫位 → %d 层抓放 → 判分"
-            % args.n_layers)
+            " → 拆塔" % args.n_layers)
     if args.dry_run:
         log.say("  **离线模式**：不连板、不动臂，只生成计划")
 
@@ -520,6 +540,15 @@ def main(argv=None):
         verdict = None
 
     log.say("\n== 结束 ==")
+    td_rc = 0
+    if not args.dry_run:
+        if verdict == "ok" and rc == 0 and args.keep_tower:
+            log.say("\n== 第 4 步：拆塔 —— 已按 --keep-tower 跳过 ==")
+        elif verdict == "ok" and rc == 0:
+            td_rc = teardown_after(args, log, rundir, grid, scene, seed)
+        else:
+            log.say("\n== 第 4 步：拆塔 —— 本轮没通过，不拆；"
+                    "塔留在原地给人看 ==")
     log.say("  轮次目录：%s" % rundir)
     log.say("  日志：%s" % log.path)
     if args.dry_run:
@@ -530,8 +559,13 @@ def main(argv=None):
         log.say("  结论：verdict=ok")
     else:
         log.say("  结论：verdict=%s（rc=%d）" % (verdict, rc))
+    if td_rc != 0:
+        log.say("  收尾：拆塔没走完（rc=%d）—— 塔位可能还有块" % td_rc)
+    elif not args.dry_run and verdict == "ok" and rc == 0 \
+            and not args.keep_tower:
+        log.say("  收尾：塔已拆回拾取区")
     log.close()
-    return 0 if verdict == "ok" and rc == 0 else 1
+    return 0 if verdict == "ok" and rc == 0 and td_rc == 0 else 1
 
 
 if __name__ == "__main__":
