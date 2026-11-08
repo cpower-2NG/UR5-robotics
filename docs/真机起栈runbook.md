@@ -58,6 +58,9 @@ export ROS_DOMAIN_ID=99            # ⚠️ 现场跑在 99，不是默认 0
 cd ~/yolo_ros_original/ros2_ws
 source /opt/ros/humble/setup.bash && source install/setup.bash
 # ⚠️ 七个 camera_* 从站点配置现读（site.yaml 的 topcam.extrinsics），别手拼、别照抄旧文
+#    本栈里 `/camera/` 就是俯视相机（所以参数叫 camera_*）；阶段 4 的 real.launch.py 里叫
+#    topcam_*，读的是**同一块** site.yaml —— 起栈脚本 `~/precision/restart_stack3.sh`
+#    已改成现读（2026-11-08），不再硬编码，两个入口从此只有一个数。
 ros2 launch yolo_bringup bringup.launch.py camera_source:=realsense \
     robot_ip:=<ur-controller-ip> \
     planner_params_file:=$HOME/site_real.yaml \
