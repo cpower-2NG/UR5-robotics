@@ -246,6 +246,9 @@ def section_blockers():
     check('dependents：塔顶 8 顶上没有块', cm.dependents(blocks, 8) == [])
     check('dependents：孤立块 7 没有依赖块', cm.dependents(blocks, 7) == [])
     check('dependents：未知 id 返回空', cm.dependents(blocks, 'nope') == [])
+    # 探针递归里 bid 是 blocker_scores 的 str 键 —— 不能因为类型不同就漏依赖
+    check('dependents：str 形式的塔底 id 也认塔顶',
+          cm.dependents(blocks, '0') == [8])
     moved = [cm.place_in_cell(b, 2) if b['id'] == 8 else dict(b)
              for b in blocks]
     check('dependents：先把塔顶 8 挪到垫上后，塔底 0 顶面空了',

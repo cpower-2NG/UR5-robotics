@@ -275,8 +275,10 @@ def dependents(blocks, bid, tol=0.001):
     """
     idx = None
     tops = [float(b["z"]) + float(b["size"]) / 2.0 for b in blocks]
+    # 按字符串比：``blocker_scores`` 的键是 ``str(id)``（探针递归时 bid 是 str），
+    # 直接用 == 会让「被挡住的块自己上面还压着块」这种情况静默漏掉依赖。
     for k, b in enumerate(blocks):
-        if b.get("id") == bid:
+        if str(b.get("id")) == str(bid):
             idx = k
             break
     if idx is None:

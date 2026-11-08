@@ -21,6 +21,11 @@
 
     top = table_top + 块高        size = --block-size
     z   = top − size / 2
+
+**叠放（塔）**：``find_blocks`` 一根塔只给一个连通域（每层的侧面落在同一批格子
+上），``h`` 是塔高。``layer_count`` 按 ``h/size`` 定层数，顶层用实测顶面算
+``z = table_top + n·size``，下层按 coaxial 推定 —— 细节见 ``build_truth`` 的
+docstring。E9 真机半段必须开着这一条（``--no-layers`` 是旧行为的逃生口）。
     yaw = find_blocks 的顶面 PCA 长边（均匀尺度不改变主轴方向 ⇒ 对深度偏差免疫）
 
 ``table_top`` 默认 0.0 —— 生产栈在真机上用的就是 ``target_plane_z = 台面 + 块高``
@@ -63,6 +68,35 @@ import graspnet_candidates as gc                                  # noqa: E402
 import stage4_specify as sp                                       # noqa: E402
 
 BLOCK_SIZE_M = 0.0295
+MAX_LAYERS = 5
+LAYER_TOL = 0.4          # |h − n·size| / size 的容忍；超了不认成塔
+
+
+def layer_count(h_m, size, tol=LAYER_TOL, max_layers=MAX_LAYERS):
+    """一个顶面簇的实测高度 → ``(层数 n, 说明)``；单块给 ``(1, None)``。
+
+    为什么层数只能从高度反推：``find_blocks`` 的顶面掩码取「每格**最高**点」，
+    而塔的每一层侧面都落在同一批格子上 ⇒ 整根塔连成**一个**连通域，``ext`` 仍是
+    一块的边长，``h`` 才是塔高。2026-11-08 用 11-02 三阶塔的真机腕部帧核实过：
+    二层塔给出 ``h=62.9 mm / ext 29.8×31.9``，**塔底一个点都不可见**（同帧
+    ``max_h_mm=33`` 的带扫只剩台面噪声）。
+
+    所以塔的各层位置是**推出来的**（见 ``build_truth`` 的 coaxial 注释），不是量
+    出来的。残差超过 ``tol*size`` 就不认（宁可当单块留 warn，也不凭空造块）。
+    """
+    h_mm = float(h_m) * 1000.0
+    s_mm = float(size) * 1000.0
+    if h_mm < 1.5 * s_mm:
+        return 1, None
+    n = int(round(h_mm / s_mm))
+    if n < 2:
+        return 1, None
+    if n > max_layers:
+        return 1, "h=%.1f mm 超过 %d 层上限，按单块处理" % (h_mm, max_layers)
+    if abs(h_mm - n * s_mm) > tol * s_mm:
+        return 1, "h=%.1f mm 不像 %d 层（%.1f mm/层），按单块处理" % (
+            h_mm, n, s_mm)
+    return n, None
 
 
 def ray_plane_xy(uv, K, R_bc, t_bc, plane_z):
@@ -93,13 +127,25 @@ def in_zone_xy(x, y, zone_m=None):
 
 def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                 batch="REAL", index=0, keep_outside=False,
-                drop_unknown=True, min_class_share=0.0):
+                drop_unknown=True, min_class_share=0.0, layers=True):
     """``find_blocks`` 的行 → ``scene_truth.json`` 的形状（射线 ∩ 平面）。
 
     ``cam`` 给 ``{'K','R_bc','t_bc'}``（``graspnet_candidates.load_frame`` 的
     字段）。``low=True`` 的行（5 mm…min_h 的诊断簇）不是块，丢掉。
-    实测 ``h`` 与块高差超过 6 mm 时**不失败**，写 ``warn_h_mm`` —— 叠放或顶面
-    测量出问题由人看报告判；位置仍按「一块高」处理。
+
+    **叠放（E9 的塔）**：``layers=True`` 时，一个簇的实测 ``h`` 若是层高的整数倍
+    （见 ``layer_count``），就把它展开成 n 块。位置口径：
+
+    - 顶层 = **实测**：``uv`` 射线 ∩ 平面 ``z = table_top + n·size``（顶层顶面）；
+    - 下面各层 = **推定 coaxial**：xy/yaw 沿用顶层，``z`` 每层差一个 ``size``。
+
+    为什么下层只能推定：塔的每层侧面落在同一批格子上 ⇒ ``find_blocks`` 只给一个
+    连通域，塔底被顶层整块遮住、一个点都不剩（``layer_count`` 的注释里有实测）。
+    物理上顶层必须压在塔底范围内才站得住，xy 差 ≤ 半块（14.75 mm）；A3 开口
+    95 mm 对 29.5 mm 的块有 32 mm 余量。每块都记 ``meas.from``，人看得出哪块是
+    量的、哪块是推的。
+
+    实测 ``h`` 与 ``n·size`` 差超过 6 mm 时**不失败**，写 ``warn_h_mm``。
     """
     blocks = []
     n_out = 0
@@ -116,7 +162,11 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
             n_unknown += 1
             continue
         size = float(block_size)
-        plane_z = float(table_top) + size
+        h_mm = float(r.get("h", 0.0))
+        n_layers, layer_note = (layer_count(h_mm / 1000.0, size)
+                                if layers else (1, None))
+        # 顶层顶面 = table_top + n·size；射线 ∩ 的就是这个平面
+        plane_z = float(table_top) + n_layers * size
         xy = ray_plane_xy(r["uv"], cam["K"], cam["R_bc"], cam["t_bc"],
                           plane_z)
         if xy is None:
@@ -124,35 +174,49 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
         if not keep_outside and not in_zone_xy(xy[0], xy[1]):
             n_out += 1
             continue
-        top = plane_z
-        h_mm = float(r.get("h", 0.0))
-        entry = {
-            "id": int(r.get("idx", len(blocks))),
-            "color": r.get("class", "unknown"),
-            "layer": 0,
-            "size": size,
-            "top": top,
-            "x": xy[0],
-            "y": xy[1],
-            "z": top - size / 2.0,
-            "yaw": float(r.get("yaw", 0.0)),
-            # 只为追溯，不参与碰撞几何
-            "meas": {
-                "h_mm": round(h_mm, 2),
-                "uv": r.get("uv"),
-                "depth_xy_mm": [round(float(r["cx"]), 1),
-                                round(float(r["cy"]), 1)],
-                "depth_top_mm": round(float(r.get("top", 0.0)), 2),
-                "ext_mm": [round(float(v), 2) for v in r.get("ext", [])],
-                "ext_rect_mm": [round(float(v), 2)
-                                for v in r.get("ext_rect", [])],
-                "class_share": r.get("class_share"),
-            },
-        }
-        if abs(h_mm - size * 1000.0) > 6.0:
-            entry["warn_h_mm"] = round(h_mm - size * 1000.0, 2)
-        blocks.append(entry)
-    blocks.sort(key=lambda b: (b["x"], b["y"]))
+        yaw = float(r.get("yaw", 0.0))
+        for k in range(1, n_layers + 1):          # k=1 塔底 … n 顶层
+            top = float(table_top) + k * size
+            entry = {
+                "id": int(r.get("idx", len(blocks))),
+                "color": r.get("class", "unknown"),
+                "layer": k - 1,
+                "size": size,
+                "top": top,
+                "x": xy[0],
+                "y": xy[1],
+                "z": top - size / 2.0,
+                "yaw": yaw,
+                # 只为追溯，不参与碰撞几何
+                "meas": {},
+            }
+            if k == n_layers:                     # 顶层：实测的那个
+                entry["meas"] = {
+                    "from": "measured_top_face",
+                    "h_mm": round(h_mm, 2),
+                    "uv": r.get("uv"),
+                    "depth_xy_mm": [round(float(r["cx"]), 1),
+                                    round(float(r["cy"]), 1)],
+                    "depth_top_mm": round(float(r.get("top", 0.0)), 2),
+                    "ext_mm": [round(float(v), 2) for v in r.get("ext", [])],
+                    "ext_rect_mm": [round(float(v), 2)
+                                    for v in r.get("ext_rect", [])],
+                    "class_share": r.get("class_share"),
+                }
+                if abs(h_mm - n_layers * size * 1000.0) > 6.0:
+                    entry["warn_h_mm"] = round(
+                        h_mm - n_layers * size * 1000.0, 2)
+            else:                                 # 下层：coaxial 推定
+                entry["meas"] = {
+                    "from": "coaxial_with_top_face",
+                    "tower_layers": n_layers,
+                    "top_face_h_mm": round(h_mm, 2),
+                }
+            if layer_note:
+                entry["meas"]["layer_note"] = layer_note
+            blocks.append(entry)
+    # 同一根塔的各层 xy 相同 —— 用 layer 作最后一级键，别让排序抖动
+    blocks.sort(key=lambda b: (b["x"], b["y"], b["layer"]))
     for i, b in enumerate(blocks):
         b["id"] = i
     return {
@@ -218,7 +282,11 @@ def consensus(truths, radius_m=0.020, min_frames=None):
             for c in clusters:
                 cx = _median([p["x"] for p in c["pts"]])
                 cy = _median([p["y"] for p in c["pts"]])
-                d = math.hypot(b["x"] - cx, b["y"] - cy)
+                cz = _median([p["z"] for p in c["pts"]])
+                # 三维距离：塔的上下层 xy 完全相同（coaxial），只按 xy 聚会把
+                # 两层并成一块 —— 层间差一个 size（29.5 mm）> radius 就分开。
+                d = math.sqrt((b["x"] - cx) ** 2 + (b["y"] - cy) ** 2
+                              + (b["z"] - cz) ** 2)
                 if d <= radius_m and (best_d is None or d < best_d):
                     best, best_d = c, d
             if best is None:
@@ -239,24 +307,28 @@ def consensus(truths, radius_m=0.020, min_frames=None):
             colors[p["color"]] = colors.get(p["color"], 0) + 1
         color = max(colors, key=colors.get)
         size = float(pts[0]["size"])
-        table_top = float(pts[0]["top"]) - size
+        # top 逐层不同（塔顶 = n·size），沿用各帧自己的 top 取中位；
+        # 旧写法 ``top − size`` 反推台面，在塔上会算出 n−1 层的高度。
+        top = _median([float(p["top"]) for p in pts])
+        layer = int(max(p.get("layer", 0) for p in pts))
         blocks.append({
             "id": 0,
             "color": color,
-            "layer": 0,
+            "layer": layer,
             "size": size,
-            "top": table_top + size,
+            "top": top,
             "x": mx,
             "y": my,
-            "z": table_top + size / 2.0,
+            "z": top - size / 2.0,
             "yaw": _yaw_square([float(p["yaw"]) for p in pts]),
             "meas": {"n_frames": len(c["frames"]),
                      "n_pts": len(pts),
+                     "from": pts[0]["meas"].get("from"),
                      "x_spread_mm": round((max(xs) - min(xs)) * 1000, 2),
                      "y_spread_mm": round((max(ys) - min(ys)) * 1000, 2),
                      "colors": colors,
                      "h_mm_median": round(_median(
-                         [p["meas"]["h_mm"] for p in pts]), 2)},
+                         [p["meas"].get("h_mm", 0.0) for p in pts]), 2)},
         })
     blocks.sort(key=lambda b: (b["x"], b["y"]))
     for i, b in enumerate(blocks):
@@ -318,7 +390,10 @@ def main(argv=None):
     ap.add_argument("--min-frames", type=int, default=None,
                     help="共识要求至少出现的帧数（默认 max(3, ⌈n/2⌉)）")
     ap.add_argument("--cluster-mm", type=float, default=20.0,
-                    help="共识聚类的距离阈值（毫米），默认 20")
+                    help="共识聚类的距离阈值（毫米），默认 20；按三维距离算"
+                         "（塔的上下层 xy 相同，靠 z 分开）")
+    ap.add_argument("--no-layers", action="store_true",
+                    help="关掉塔的分层展开（每簇只当一块；E9 的塔必须开着）")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.frame):
@@ -353,7 +428,8 @@ def main(argv=None):
                 batch=os.path.basename(args.frame.rstrip("/")), index=i,
                 keep_outside=True,
                 drop_unknown=not args.keep_unknown,
-                min_class_share=args.min_class_share))
+                min_class_share=args.min_class_share,
+                layers=not args.no_layers))
         truth = consensus(truths, radius_m=args.cluster_mm / 1000.0,
                           min_frames=args.min_frames)
         if not args.keep_outside:
@@ -371,10 +447,10 @@ def main(argv=None):
                  truth["dropped_out_of_zone"]))
         for b in truth["blocks"]:
             m = b["meas"]
-            print("  #%d %-9s x=%7.1f y=%7.1f top=%6.1f yaw=%5.1f  "
+            print("  #%d %-9s x=%7.1f y=%7.1f top=%6.1f 层 %d yaw=%5.1f  "
                   "帧 %2d/%d  散布 x=%.1f y=%.1f mm  颜色 %s"
                   % (b["id"], b["color"], b["x"] * 1000, b["y"] * 1000,
-                     b["top"] * 1000, b["yaw"], m["n_frames"],
+                     b["top"] * 1000, b["layer"] + 1, b["yaw"], m["n_frames"],
                      truth["n_frames"], m["x_spread_mm"], m["y_spread_mm"],
                      m["colors"]))
     else:
@@ -386,19 +462,22 @@ def main(argv=None):
                             index=0 if idx is None else idx,
                             keep_outside=args.keep_outside,
                             drop_unknown=not args.keep_unknown,
-                            min_class_share=args.min_class_share)
+                            min_class_share=args.min_class_share,
+                            layers=not args.no_layers)
         n = len(truth["blocks"])
-        print("帧 %s：台面 z=%.2f mm，块 %d 个（位置=射线∩平面 z=%.1f mm），"
+        print("帧 %s：台面 z=%.2f mm，块 %d 个（位置=射线∩各自顶面平面），"
               "区外丢 %d / 非积木丢 %d"
               % (args.frame, table_z * 1000.0, n,
-                 (args.table_top + args.block_size) * 1000,
                  truth["dropped_out_of_zone"], truth["dropped_not_block"]))
         for b in truth["blocks"]:
-            print("  #%d %-11s x=%7.1f y=%7.1f top=%6.1f yaw=%6.1f  h=%6.1f%s"
+            print("  #%d %-11s x=%7.1f y=%7.1f top=%6.1f yaw=%6.1f  "
+                  "h=%6.1f  层 %d（%s）%s"
                   % (b["id"], b["color"], b["x"] * 1000, b["y"] * 1000,
-                     b["top"] * 1000, b["yaw"], b["meas"]["h_mm"],
+                     b["top"] * 1000, b["yaw"],
+                     float(b["meas"].get("h_mm") or 0.0), b["layer"] + 1,
+                     b["meas"].get("from", "?"),
                      "" if "warn_h_mm" not in b
-                     else "  ⚠ h−size=%+.1f mm" % b["warn_h_mm"]))
+                     else "  ⚠ h−层高=%+.1f mm" % b["warn_h_mm"]))
     if n == 0:
         print("!! 一块都没量出来 —— 俯视里没有块，或分割/颜色表不对",
               file=sys.stderr)

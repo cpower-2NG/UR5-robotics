@@ -98,9 +98,11 @@ def section_depth_immunity():
     print('\n[2] 位置对深度偏差免疫（深度只进 meas，不进几何）')
     a = tf.build_truth([row(0, uv=(355.0, 275.0), cx=400.0, cy=300.0,
                             top=32.0)], CAM)["blocks"][0]
-    # 同一块，深度整体读远 3.3%（cx/cy/top 都往后推）
+    # 同一块，深度整体读远 3.3%（cx/cy/top 都往后推）。
+    # h 是**相对拟合台面**的高度，深度整体读远时台面一起被推远 ⇒ h 不变
+    # （h 若跟着 top 走，78.9 mm 会被 layer_count 读成三层塔）。
     b = tf.build_truth([row(0, uv=(355.0, 275.0), cx=413.2, cy=309.9,
-                            top=78.9)], CAM)["blocks"][0]
+                            top=78.9, h=32.0)], CAM)["blocks"][0]
     check("x 不受深度影响", a["x"] == b["x"], (a["x"], b["x"]))
     check("y 不受深度影响", a["y"] == b["y"], (a["y"], b["y"]))
     check("top 不受深度影响", a["top"] == b["top"], (a["top"], b["top"]))
@@ -171,13 +173,86 @@ def section_filter():
 # ---------------------------------------------------------------- 警告而非失败
 def section_warn():
     print('\n[6] h 与边长对不上：不失败，只打 warn 字段')
-    b = tf.build_truth([row(0, top=61.0, h=57.0)], CAM)["blocks"][0]
-    check("warn_h_mm 存在且 ≈ 57 − 29.5", "warn_h_mm" in b
-          and abs(b["warn_h_mm"] - 27.5) < 0.01, b.get("warn_h_mm"))
+    # 45 mm 既不是一块（29.5）也不是两层（59）—— 残差 14 mm > 0.4×29.5，
+    # 所以不认成塔（35 mm 以上就够触发「不像单块」了，见 layer_count）
+    t = tf.build_truth([row(0, top=45.0, h=45.0)], CAM)
+    check("不像塔 ⇒ 仍是一块", len(t["blocks"]) == 1, len(t["blocks"]))
+    b = t["blocks"][0]
+    check("warn_h_mm 存在且 ≈ 45 − 29.5", "warn_h_mm" in b
+          and abs(b["warn_h_mm"] - 15.5) < 0.01, b.get("warn_h_mm"))
+    check("meas 里写明为什么没展开", "layer_note" in b["meas"], b["meas"])
     check("top 仍按台面+size 算（不拿噪声高度改碰撞盒）",
           abs(b["top"] - 0.0295) < 1e-12, b["top"])
     ok = tf.build_truth([row(0, top=33.0, h=33.0)], CAM)["blocks"][0]
     check("对得上的块没有 warn", "warn_h_mm" not in ok)
+
+
+# ---------------------------------------------------------------- 塔的分层
+def section_layers():
+    print('\n[9] 塔：h 是塔高 ⇒ 展开成 n 块；顶层实测、下层 coaxial 推定')
+    # 二层塔：h = 59.4 mm（真机实测 62.9，见 layer_count 注释）
+    t = tf.build_truth([row(0, uv=(380.0, 240.0), top=59.4, h=59.4,
+                            yaw=12.0)], CAM)
+    check("展开成 2 块", len(t["blocks"]) == 2,
+          [(b["layer"], b["top"]) for b in t["blocks"]])
+    lo, hi = t["blocks"][0], t["blocks"][1]
+    check("先塔底后塔顶（id 按层升）", lo["layer"] == 0 and hi["layer"] == 1,
+          [lo["layer"], hi["layer"]])
+    check("塔顶层 top = 台面 + 2×size",
+          abs(hi["top"] - 0.059) < 1e-12, hi["top"])
+    check("塔底 top = 台面 + size", abs(lo["top"] - 0.0295) < 1e-12, lo["top"])
+    check("塔顶 z = 59 − size/2", abs(hi["z"] - 0.04425) < 1e-12, hi["z"])
+    check("塔底 z = 29.5 − size/2", abs(lo["z"] - 0.01475) < 1e-12, lo["z"])
+    check("两层 xy/yaw 相同（coaxial）",
+          lo["x"] == hi["x"] and lo["y"] == hi["y"] and lo["yaw"] == hi["yaw"])
+    check("塔顶标 measured_top_face",
+          hi["meas"]["from"] == "measured_top_face", hi["meas"])
+    check("塔底标 coaxial_with_top_face",
+          lo["meas"]["from"] == "coaxial_with_top_face"
+          and lo["meas"]["tower_layers"] == 2, lo["meas"])
+
+    # 顶层的位置必须按 z=59 的平面解 —— 按 z=29.5 解会沿视线偏 20+ mm
+    right = tf.ray_plane_xy((380.0, 240.0), CAM["K"], CAM["R_bc"],
+                            CAM["t_bc"], 0.059)
+    wrong = tf.ray_plane_xy((380.0, 240.0), CAM["K"], CAM["R_bc"],
+                            CAM["t_bc"], 0.0295)
+    check("塔顶 xy 用 z=59 平面（不是 z=29.5）",
+          abs(hi["x"] - right[0]) < 1e-12
+          and abs(hi["x"] - wrong[0]) > 1e-3,
+          (hi["x"] - 0.400, right[0] - 0.400, wrong[0] - 0.400))
+
+    # 三层塔
+    t3 = tf.build_truth([row(0, h=88.5, top=88.5)], CAM)
+    check("h=88.5 ⇒ 3 块，塔顶 top=88.5",
+          len(t3["blocks"]) == 3
+          and abs(t3["blocks"][-1]["top"] - 0.0885) < 1e-12,
+          [(b["layer"], b["top"]) for b in t3["blocks"]])
+
+    # 关掉就回到旧行为
+    off = tf.build_truth([row(0, h=59.4, top=59.4)], CAM, layers=False)
+    check("--no-layers ⇒ 1 块（旧行为）", len(off["blocks"]) == 1,
+          len(off["blocks"]))
+
+    # 单块不受影响
+    one = tf.build_truth([row(0, h=30.0, top=30.0)], CAM)["blocks"]
+    check("单块仍是 1 块、plane 不变", len(one) == 1
+          and abs(one[0]["top"] - 0.0295) < 1e-12
+          and one[0]["meas"]["from"] == "measured_top_face", one)
+
+    # 共识：coaxial 两层的 xy 完全相同，只按 xy 聚会并成一块
+    frames = [tf.build_truth([row(0, uv=(380.0, 240.0), h=59.4, top=59.4)],
+                             CAM),
+              tf.build_truth([row(0, uv=(381.0, 240.0), h=59.4, top=59.4)],
+                             CAM),
+              tf.build_truth([row(0, uv=(379.0, 240.0), h=59.4, top=59.4)],
+                             CAM)]
+    c = tf.consensus(frames, min_frames=3)
+    check("共识后仍是 2 块（按三维距离分上下层）", len(c["blocks"]) == 2,
+          [(b["layer"], round(b["top"], 4)) for b in c["blocks"]])
+    check("共识保留层号与 top",
+          [b["layer"] for b in c["blocks"]] == [0, 1]
+          and abs(c["blocks"][1]["top"] - 0.059) < 1e-9,
+          [(b["layer"], b["top"]) for b in c["blocks"]])
 
 
 # ---------------------------------------------------------------- 空真值
@@ -238,6 +313,7 @@ def main():
     section_warn()
     section_empty()
     section_consensus()
+    section_layers()
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('失败项：' + ', '.join(FAILS))
