@@ -794,7 +794,8 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
                grip_speed_pct=None, release_speed_pct=None,
                release_dwell_s=0.0, surface_z=None, carry_z=None,
                survey_tool0=None, tower_box=None, held_half_edge=0.020,
-               held_off_xy=None, place_clearance=None, block_h_m=None):
+               held_off_xy=None, place_clearance=None, block_h_m=None,
+               min_block_gap=None):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -844,6 +845,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
       ``wz`` 是块顶离台面的高度，块底 = ``wz − block_h_m``，抓取/放置几何
       全锚在块底。2026-11-02 拆塔事故就是漏了这个参数 —— 91.34 被当块高，
       `GRASP_Z_MAX` 把绝对 277 mm 截成 224 mm，指尖落到最底层。
+    · ``min_block_gap``：抓取时「离最近邻块中心距」的下限（m）。默认
+      ``None`` = ``MIN_BLOCK_GAP``（60 mm，阶段 2/3 的老行为，逐字节不变）。
+      **只有调用方已经用独立几何判过间隙时才许放宽**：E9 探针
+      （``stage4_clear_probe``）用自有 OBB + SAT 逐个候审判「夹爪碰不碰」，
+      比「中心距 ≥60 mm」这个粗判据细 —— 贴面块只要在合拢轴方向让开就能
+      合法抓取。E9 执行器因此显式传 ``0.0``，并把「探针先判过」写进 manifest。
     """
     if block_h_m is None and (block["h"] if block.get("h") is not None
                               else block["top"]) / 1000.0 > MAX_TABLE_BLOCK_TOP_M:
@@ -925,11 +932,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     else:
         sx, sy = slot
 
+    gap_floor = MIN_BLOCK_GAP if min_block_gap is None else float(min_block_gap)
     gap = check_block_gap(block, blocks)
-    if gap is not None and gap < MIN_BLOCK_GAP:
+    if gap is not None and gap < gap_floor:
         raise PlanError("块 #%d 离最近邻块只有 %.1f mm（下限 %.0f mm）—— "
                         "夹爪全开 95 mm 会碰邻块" % (block["idx"], gap * 1000,
-                                                   MIN_BLOCK_GAP * 1000))
+                                                   gap_floor * 1000))
     if cand["dist_mm"] > 12.0:
         raise PlanError("候选离块心 %.1f mm，超过 12 mm 锚定半径" % cand["dist_mm"])
 

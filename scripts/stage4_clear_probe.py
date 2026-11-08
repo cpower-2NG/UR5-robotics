@@ -52,6 +52,7 @@ sys.path.insert(0, HERE)
 
 import rclpy                                                  # noqa: E402
 import stage4_clear_model as cm                               # noqa: E402
+import stage4_moveit_joints as mj                             # noqa: E402
 import stage4_moveit_probe as mp                              # noqa: E402
 import stage4_scene_model as sm                               # noqa: E402
 import stage4_workspace_probe as wp                           # noqa: E402
@@ -331,7 +332,16 @@ def main(argv=None):
     ap.add_argument("--gate", type=float, default=GATE)
     ap.add_argument("--max-targets", type=int, default=0,
                     help="每场只测前 N 个目标块（冒烟用）")
+    ap.add_argument("--group", default="ur5_manipulator",
+                    help="MoveIt 规划组：仿真 ur5_manipulator / 真机 ur_manipulator")
+    ap.add_argument("--table-top", type=float, default=0.0,
+                    help="桌面高度（base 系，m）；真机 0.0")
+    ap.add_argument("--keep-scene", action="store_true",
+                    help="跑完不撤场景（默认撤，免得幽灵块跟着 MoveIt 活下去）")
     args = ap.parse_args(argv)
+
+    mp.GROUP = args.group
+    mp.TABLE_TOP = float(args.table_top)
 
     rclpy.init()
     node = Node("stage4_clear_probe")
@@ -353,6 +363,16 @@ def main(argv=None):
             node.destroy_node()
             rclpy.shutdown()
             return 2
+
+    # 模型关节名从 /get_planning_scene 现取 —— 真机模型没有夹爪关节，未过滤的
+    # /joint_states 发进 /compute_ik 会 SIGABRT 打死 move_group（2026-11-08 实测）。
+    mp.MODEL_JOINTS = mp.fetch_model_joints(node, clients["getscene"])
+    if mp.MODEL_JOINTS is None:
+        mp.MODEL_JOINTS = list(mj.ARM_JOINTS)
+        log("!! 取不到模型关节名，退回 6 个臂关节（真机安全，仿真会被丢夹爪）")
+    else:
+        log("模型关节 %d 个；规划组 %s；桌面 z=%.3f m"
+            % (len(mp.MODEL_JOINTS), mp.GROUP, mp.TABLE_TOP))
 
     start_js = mp.read_joint_state(node)
     if start_js is None:
@@ -389,6 +409,16 @@ def main(argv=None):
         scenes.append({"truth": path, "batch": truth.get("batch"),
                        "index": truth.get("index"), "attempts": attempts})
 
+    # 清理：把探针放进 MoveIt 的块/垫/桌面撤掉（规划场景残留会跟着栈活下去）。
+    cleanup = None
+    if not args.keep_scene and clients["ids"]:
+        gone = wp.remove_objects(node, clients["scene"], clients["ids"])
+        time.sleep(0.2)
+        world, attached = mp.scene_ids(mp.read_scene(node, clients["getscene"]))
+        cleanup = {"ok": gone, "world": world, "attached": attached}
+        log("\n清理场景：ok=%s 剩余 world=%s attached=%s"
+            % (gone, world, attached))
+
     node.destroy_node()
     rclpy.shutdown()
 
@@ -410,10 +440,13 @@ def main(argv=None):
 
     passed = bool(n and ratio >= args.gate)
     report = {"truths": args.truth, "cell": args.cell,
+              "group": mp.GROUP, "table_top": mp.TABLE_TOP,
+              "model_joints": mp.MODEL_JOINTS,
               "scenes": scenes, "per_batch": per_batch,
               "pooled": {"n": n, "ok": n_ok, "ratio": ratio},
               "fail_reasons": reason_hist,
-              "gate": args.gate, "pass": passed}
+              "gate": args.gate, "pass": passed,
+              "scene_cleanup": cleanup}
 
     log("\n== 汇总 ==")
     for batch, b in sorted(per_batch.items()):
