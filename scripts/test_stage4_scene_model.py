@@ -258,6 +258,108 @@ def section_gripper():
                                   [0.022, 0.030, 0.1442]))
 
 
+def section_mat_quat():
+    print('\n[5b] 旋转矩阵 → 四元数：四个分支都走一遍 + 往返')
+    for name, q in (('单位', (0.0, 0.0, 0.0, 1.0)),
+                    ('绕 x 180°', (1.0, 0.0, 0.0, 0.0)),
+                    ('绕 y 180°', (0.0, 1.0, 0.0, 0.0)),
+                    ('绕 z 180°', (0.0, 0.0, 1.0, 0.0)),
+                    ('绕 z 90°', (0.0, 0.0, math.sin(math.pi / 4),
+                                 math.sin(math.pi / 4)))):
+        m = sm.quat_to_mat(q)
+        back = sm.quat_to_mat(sm.mat_to_quat(m))
+        check('往返 %s' % name, np.allclose(back, m, atol=1e-12),
+              str(back))
+
+    rng = np.random.RandomState(7)
+    worst = 0.0
+    for _ in range(50):
+        rpy = rng.uniform(-math.pi, math.pi, 3)
+        m = sm.quat_to_mat(sm.rpy_to_quat(rpy))
+        worst = max(worst, float(np.max(np.abs(
+            sm.quat_to_mat(sm.mat_to_quat(m)) - m))))
+    check('50 个随机姿态往返误差 < 1e-12', worst < 1e-12, '%.3g' % worst)
+
+
+def _block():
+    # S1 风格：29.5 mm 立方、yaw=30°、块心离台面 14.75 mm
+    return {'id': 3, 'x': 0.40, 'y': 0.30, 'z': 0.01475,
+            'size': 0.0295, 'yaw': 30.0}
+
+
+def section_grasp():
+    print('\n[5c] 抓取候选：12 个摆位 × 2 个腕部朝向；指尖恰好越过面 18.5 mm')
+    b = _block()
+    cands = sm.grasp_candidates(b)
+    keys = {(c['axis'], c['sign'], c['closing']) for c in cands}
+    check('12 个摆位（3 轴 × 2 方向 × 2 合拢轴）', len(keys) == 12,
+          str(sorted(keys)))
+    check('每个摆位 2 个腕部朝向 ⇒ 24 个位姿', len(cands) == 24)
+
+    vert = [c for c in cands if c['vertical']]
+    check('B 档（a=(0,0,−1)）每块 4 个位姿 = 2 摆位 × 2 朝向', len(vert) == 4,
+          str(len(vert)))
+    check('B 档的摆位只来自块 z 轴向下',
+          {(c['axis'], c['sign']) for c in vert} == {(2, -1)},
+          str({(c['axis'], c['sign']) for c in vert}))
+    check('B 档的合拢轴覆盖另外两轴',
+          {c['closing'] for c in vert} == {0, 1})
+
+    top_z = b['z'] + b['size'] / 2.0
+    for c in vert:
+        rot = sm.quat_to_mat(c['quat'])
+        tip = sm.fingertip(c['pose'])
+        check('B 档位姿#%d：tool z = (0,0,−1)' % c['variant'],
+              np.allclose(rot[:, 2], [0, 0, -1], atol=1e-12))
+        check('B 档位姿#%d：tool x = ±合拢轴（块轴 %d）' % (c['variant'], c['closing']),
+              np.allclose(rot[:, 0],
+                          sm.block_axes(b)[c['closing']] * (1 - 2 * c['variant']),
+                          atol=1e-12))
+        check('B 档位姿#%d：指尖在块顶下 18.5 mm、水平对准块心' % c['variant'],
+              abs(tip[2] - (top_z - sm.GRASP_DEPTH)) < 1e-12
+              and abs(tip[0] - b['x']) < 1e-12 and abs(tip[1] - b['y']) < 1e-12,
+              str(tip))
+
+    # 侧抓：接近轴 = 块 x 轴；指尖越过该面 18.5 mm
+    side = [c for c in cands
+            if (c['axis'], c['sign'], c['closing'], c['variant']) == (0, 1, 1, 0)]
+    check('侧抓候选存在', len(side) == 1)
+    if side:
+        c = side[0]
+        tip = sm.fingertip(c['pose'])
+        expect = np.array([b['x'], b['y'], b['z']]) - sm.block_axes(b)[0] * (
+            b['size'] / 2.0 - sm.GRASP_DEPTH)
+        check('侧抓指尖 = 被接近面 + 18.5 mm（沿 a 深入）',
+              np.allclose(tip, expect, atol=1e-12), '%s vs %s' % (tip, expect))
+        check('侧抓 tool z = 块 x 轴（朝向块心）',
+              np.allclose(sm.quat_to_mat(c['quat'])[:, 2],
+                          sm.block_axes(b)[0], atol=1e-12))
+
+    # 位姿是真的抓得住：全开夹爪在竖直抓取位姿上不得碰块，横向余量 32.75 mm
+    v0 = [c for c in cands if c['vertical']][0]
+    obbs = sm.gripper_obbs(v0['pose'], sm.GRIPPER['stroke_half'])
+    blk = sm.block_obb(b, 0.0)
+    g = min(sm.gap(o, blk) for o in obbs)
+    check('全开夹爪在抓取位姿上离块 ≥ 32.75 mm（两侧各 32.75）',
+          abs(g - 0.03275) < 1e-9, '%.6f' % g)
+    # 而指尖确实进了块的范围（否则不算抓）：指尖点在块体内
+    tip = sm.fingertip(v0['pose'])
+    check('指尖点落在块内（越过顶面 18.5 mm）',
+          blk.center[2] - blk.half[2] < tip[2] < blk.center[2] + blk.half[2])
+
+    # 两个腕部朝向是同一个几何（180° 绕 a 自映射）—— 只是 IK 分支不同
+    def _corner_set(obbs):
+        pts = [np.round(c, 9) for o in obbs for c in o.corners()]
+        return sorted(tuple(p) for p in pts)
+
+    o0 = sm.gripper_obbs([c for c in cands if c['vertical']][0]['pose'],
+                         sm.GRIPPER['stroke_half'])
+    o1 = sm.gripper_obbs([c for c in cands if c['vertical']][1]['pose'],
+                         sm.GRIPPER['stroke_half'])
+    check('variant 0/1 的夹爪占据同一空间（180° 绕 tool z 自映射）',
+          _corner_set(o0) == _corner_set(o1))
+
+
 def section_urdf_sync():
     print('\n[5] 反查 URDF：常量漂移就红')
     path = os.path.join(HERE, '..', 'ros2_ws', 'src', 'arm_grasp_sim',
@@ -323,6 +425,41 @@ def section_mutation():
           abs(sm.fingertip(base)[2] - 0.7042) < 1e-9
           and abs(bad_tip[2] - 0.56) < 1e-9, str(bad_tip))
 
+    # E. 抓取深度符号写反：指尖会跑到块上方之外，位姿就抓空
+    b = _block()
+    top_z = b['z'] + b['size'] / 2.0
+    v_real = [c for c in sm.grasp_candidates(b) if c['vertical']][0]
+    real_tip = sm.fingertip(v_real['pose'])[2]
+    mut = _mut('pos = face - a * (tip_z - grasp_depth)',
+               'pos = face + a * (tip_z - grasp_depth)')
+    v_bad = [c for c in mut['grasp_candidates'](b) if c['vertical']][0]
+    bad_tip = mut['fingertip'](v_bad['pose'])[2]
+    check('变异「抓取深度符号写反」：真实越面 18.5 mm、改坏后掉到台面下',
+          abs(real_tip - (top_z - sm.GRASP_DEPTH)) < 1e-12
+          and bad_tip < 0.0, str(bad_tip))
+
+    # F. 「竖直向下」的判据写反：选出来的「B 档」位姿全跑到桌面底下
+    mut = _mut('np.allclose(a, (0.0, 0.0, -1.0),',
+               'np.allclose(a, (0.0, 0.0, 1.0),')
+    real_v = [c for c in sm.grasp_candidates(b) if c['vertical']]
+    bad_v = [c for c in mut['grasp_candidates'](b) if c['vertical']]
+    check('变异「竖直判据写反」：真实 B 档 tool0 在块顶上方、改坏后全在台面下',
+          len(real_v) == 4 and len(bad_v) == 4
+          and all(c['pos'][2] > top_z + 0.15 for c in real_v)
+          and all(c['pos'][2] < -0.1 for c in bad_v),
+          'real=%s bad=%s' % (round(real_v[0]['pos'][2], 3) if real_v else None,
+                              round(bad_v[0]['pos'][2], 3) if bad_v else None))
+
+    # G. y 轴叉乘写反：旋转矩阵成镜像，四元数还原出的 tool z 不再指向块心
+    mut = _mut('yv = np.cross(a, c)', 'yv = np.cross(c, a)')
+    real_z = sm.quat_to_mat(v_real['quat'])[:, 2]
+    bad_z = sm.quat_to_mat(
+        [c for c in mut['grasp_candidates'](b) if c['vertical']][0]['quat'])[:, 2]
+    check('变异「y 轴叉乘写反」：真实 tool z=(0,0,−1)、改坏后不再指向块心',
+          np.allclose(real_z, [0, 0, -1], atol=1e-12)
+          and not np.allclose(bad_z, [0, 0, -1], atol=1e-6),
+          'bad_z=%s' % np.round(bad_z, 3))
+
 
 def main():
     print('=' * 68)
@@ -333,6 +470,8 @@ def main():
     section_margin()
     section_scene()
     section_gripper()
+    section_mat_quat()
+    section_grasp()
     section_urdf_sync()
     section_mutation()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))

@@ -34,6 +34,10 @@ GRIPPER = {
     "tip_z": 0.2042,                    # tool0 → 指尖外沿（闭合时）
 }
 
+# 抓取深度：指尖外沿越过被接近面 18.5 mm（A3 定案，与块高无关 —— 见
+# docs/阶段/阶段1-点对点抓放/A3精密抓放-实验记录.md §3）
+GRASP_DEPTH = 0.0185
+
 
 def rpy_to_quat(rpy):
     """XYZ 欧拉角（弧度）→ 四元数 (x, y, z, w)。
@@ -227,6 +231,111 @@ def gripper_obbs(base_pose, finger_q, extra=None):
         c = center + rot.dot(np.array([sign * (fx / 2.0 + q), 0.0, finger_z]))
         out.append(Obb(c, [fx / 2.0, fy / 2.0, fz / 2.0], rot,
                        name="ag95_%s_finger" % side))
+    return out
+
+
+def mat_to_quat(rot):
+    """3×3 旋转矩阵 → 四元数 (x, y, z, w)。
+
+    用 Shepperd 的分支写法（选最大对角元开方），避免迹接近 −1 时的数值放大；
+    常规迹 > 0 分支就是最直白的那个公式。
+    """
+    m = np.asarray(rot, dtype=float)
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+        w = 0.25 * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+        w = (m[2, 1] - m[1, 2]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+        w = (m[0, 2] - m[2, 0]) / s
+    else:
+        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+        w = (m[1, 0] - m[0, 1]) / s
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    return (x / n, y / n, z / n, w / n)
+
+
+def block_axes(block):
+    """块的三条世界系单位轴（yaw 绕 base z）。
+
+    顺序与 ``block_obb`` 的局部 x/y/z 一致；第三轴恒为 (0,0,1)（gen_scene 只给
+    绕竖直轴的 yaw，块不会翻面）。
+    """
+    yaw = math.radians(block.get("yaw", 0.0))
+    c, s = math.cos(yaw), math.sin(yaw)
+    return [np.array([c, s, 0.0]),
+            np.array([-s, c, 0.0]),
+            np.array([0.0, 0.0, 1.0])]
+
+
+def grasp_candidates(block, table_top_z=0.0, grasp_depth=GRASP_DEPTH):
+    """E7：一个块的全部平行指抓取候选（12 个**摆位** × 2 个腕部朝向）。
+
+    约定（这是判据口径，别改）：
+    - ``a`` = tool0 的 **z 轴**，指向块心 = **接近方向**；夹爪在块的 −a 一侧；
+    - ``c`` = tool0 的 **x 轴** = **合拢轴**，两指沿 ±c 开合；
+    - y = a × c，保证右手系；
+    - 指尖外沿越过被接近的那个面 ``grasp_depth``（A3 的 18.5 mm，与块高无关）；
+      于是 tool0 在 ``face + a·grasp_depth − a·tip_z``（tip_z=204.2，闭指尖外沿）。
+
+    摆位 = 3 轴 × 2 方向（a 的正负）× 2 个合拢轴（垂直于 a 的另两轴）= 12。
+    ``variant`` 0/1 是绕 a 转 180° 的两个腕部朝向：**碰撞几何完全相同**
+    （本体与两指都是中心在 tool 轴上的长方体，180° 自映射），只有 IK 分支不同。
+
+    ``vertical`` = True 即 B 档（只允许竖直向下接近，a=(0,0,−1)）：每块 2 个摆位。
+    """
+    size = block.get("size")
+    if size is None:
+        size = block["top"] - table_top_z
+    size = float(size)
+    z = block.get("z")
+    if z is None:
+        z = table_top_z + size / 2.0
+    center = np.array([float(block["x"]), float(block["y"]), float(z)])
+    axes = block_axes(block)
+    tip_z = GRIPPER["tip_z"]
+
+    out = []
+    for i in range(3):
+        for sign in (1.0, -1.0):
+            a = axes[i] * sign
+            face = center - a * (size / 2.0)          # 被接近的面（块心 − a·半边）
+            pos = face - a * (tip_z - grasp_depth)    # 指尖恰越过该面 grasp_depth
+            for j in range(3):
+                if j == i:
+                    continue
+                c = axes[j]
+                yv = np.cross(a, c)
+                for variant, (cc, yy) in enumerate(((c, yv), (-c, -yv))):
+                    rot = np.column_stack([cc, yy, a])
+                    out.append({
+                        "block": block.get("id"),
+                        "axis": i, "sign": int(sign), "closing": j,
+                        "variant": variant,
+                        "vertical": bool(np.allclose(a, (0.0, 0.0, -1.0),
+                                                     atol=1e-9)),
+                        "approach": a.tolist(),
+                        "pos": pos.tolist(),
+                        "quat": mat_to_quat(rot),
+                        "pose": (pos.tolist(), mat_to_quat(rot)),
+                    })
     return out
 
 
