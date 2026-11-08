@@ -29,8 +29,12 @@
   H. **同一静止对连跑 5 次** ⇒ 每次都 2，**没有一次静默放行**。
   I. **变异测试**：把代码改回旧语义 / 改掉关键常量，结论必须跟着变 ——
      证明 A/G/C 的期望不是空转。
+  J. **`--info` 的两种形状**：顶层 `K` 与 `camera_info.K`（`precision_capture` 的
+     `meta_NNN.json`）。2026-11-08 前只认第一种 ⇒ KeyError 让进程以 **1** 退出，
+     把「证据不足 = 2」伪装成「检测到变化 = 1」。含一条变异测试钉住新分支。
 """
 
+import json
 import os
 import re
 import subprocess
@@ -93,7 +97,14 @@ def run_pair(pa, pb):
     return r.returncode, r.stdout
 
 
-def _run_mutated(pa, pb, tmp, tag, subs):
+def run_pair_info(pa, pb, info):
+    """同上，额外带 `--info`（内参）。"""
+    r = subprocess.run([sys.executable, SCRIPT, "--old", pa, "--new", pb,
+                        "--info", info], capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def _run_mutated(pa, pb, tmp, tag, subs, extra=()):
     """把主脚本按 ``subs``（[(正则, 替换), ...]）改掉再跑 —— 变异测试用。
 
     每条替换必须**恰好命中一次**；否则测试装置本身坏了，直接抛。
@@ -106,7 +117,7 @@ def _run_mutated(pa, pb, tmp, tag, subs):
     path = os.path.join(tmp, "mut-%s.py" % tag)
     with open(path, "w", encoding="utf-8") as f:
         f.write(src)
-    r = subprocess.run([sys.executable, path, "--old", pa, "--new", pb],
+    r = subprocess.run([sys.executable, path, "--old", pa, "--new", pb] + list(extra),
                        capture_output=True, text=True)
     return r.returncode, r.stdout
 
@@ -294,6 +305,62 @@ def part_i(tmp, base_g, results_g):
     check("I3 变异后 5 px ⇒ 2（MOVING_PX 真的在用）", rc1 == 2, "got %d" % rc1)
 
 
+def part_j(tmp):
+    print("\n--- J --info 的两种形状（顶层 K / camera_info.K）---")
+    base = scene(seed=41)
+    th = np.radians(1.0)
+    R = np.array([[np.cos(th), 0, np.sin(th)],
+                  [0, 1, 0],
+                  [-np.sin(th), 0, np.cos(th)]])
+    Hm = K @ R @ np.linalg.inv(K)
+    b = cv2.warpPerspective(base, Hm, (base.shape[1], base.shape[0]),
+                            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    pa, pb = write_pair(base, b, tmp, "-j")
+
+    info_top = os.path.join(tmp, "info-top.json")
+    info_meta = os.path.join(tmp, "meta-j.json")
+    with open(info_top, "w", encoding="utf-8") as f:
+        json.dump({"K": K.reshape(-1).tolist()}, f)
+    with open(info_meta, "w", encoding="utf-8") as f:
+        # precision_capture.py 的 meta_NNN.json 形状
+        json.dump({"camera": "topcam",
+                   "camera_info": {"width": 1280, "height": 720,
+                                   "K": K.reshape(-1).tolist()}}, f)
+
+    ang_re = re.compile(r"单应分解（用内参）：旋转 \*\*([\d.]+)°\*\*")
+
+    rc_t, out_t = run_pair_info(pa, pb, info_top)
+    check("J 顶层 K ⇒ 退出码 1（旧形状照样能用）", rc_t == 1, "got %d" % rc_t)
+    m_t = ang_re.search(out_t)
+    check("J 顶层 K ⇒ 打出单应分解", m_t is not None)
+
+    rc_m, out_m = run_pair_info(pa, pb, info_meta)
+    check("J camera_info.K ⇒ 退出码 1（不再 KeyError）", rc_m == 1, "got %d" % rc_m)
+    m_m = ang_re.search(out_m)
+    check("J camera_info.K ⇒ 打出单应分解", m_m is not None)
+    check("J 两种形状解出同一个角度",
+          m_t is not None and m_m is not None
+          and abs(float(m_t.group(1)) - float(m_m.group(1))) < 0.01,
+          "%s vs %s" % (m_t.group(1) if m_t else "-", m_m.group(1) if m_m else "-"))
+
+    # 证据不足分支**带着 info** 也必须返回 2，不能崩成 1
+    rng = np.random.RandomState(43)
+    a2 = np.clip(base.astype(np.int16)
+                 + rng.normal(0, 3, base.shape).astype(np.int16), 0, 255).astype(np.uint8)
+    ps, pt = write_pair(base, a2, tmp, "-j2")
+    rc_s, out_s = run_pair_info(ps, pt, info_meta)
+    check("J 静止 + camera_info.K ⇒ 退出码 2（不是崩成 1）", rc_s == 2, "got %d" % rc_s)
+    check("J 静止 + camera_info.K ⇒ 判「证据不足」", "证据不足" in out_s)
+
+    # 变异：把嵌套查找删掉 ⇒ J 的两条「打出单应分解」必须红
+    nested_line = '        k = (obj.get("camera_info") or {}).get("K")'
+    rc_v, out_v = _run_mutated(pa, pb, tmp, "j-nested",
+                               [(re.escape(nested_line), "        k = None")],
+                               extra=("--info", info_meta))
+    check("J 变异（删嵌套查找）⇒ 不再打单应分解（J 的期望不空转）",
+          "单应分解（用内参）" not in out_v, "got %d" % rc_v)
+
+
 def main():
     import tempfile
     print("俯视相机漂移判定的自检（E3a：证据不足 ⇒ 2，不再返回 0）")
@@ -305,6 +372,7 @@ def main():
         results_g = part_g(tmp)
         part_h(tmp)
         part_i(tmp, scene(seed=21), results_g)
+        part_j(tmp)
     print("\n%s" % ("全部通过" if not _failed
                     else "FAIL %d 条：%s" % (len(_failed), "、".join(_failed))))
     return 1 if _failed else 0

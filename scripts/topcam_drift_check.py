@@ -225,6 +225,24 @@ def plane_terms(p):
             float(np.linalg.norm(t)))
 
 
+def load_K(path):
+    """从内参 json 读 K —— 两种形状都认。
+
+    - ``{"K": [...]}``：早期 ``info.json`` / 手写的内参文件。
+    - ``{"camera_info": {"K": [...]}}``：``precision_capture.py`` 的 ``meta_NNN.json``。
+      （2026-11-08 前这里只认第一种，门把 meta 传进来就 KeyError ⇒ 进程以 1 退出，
+       把「证据不足 = 2」伪装成「检测到变化 = 1」。）
+    """
+    with open(path, encoding="utf-8") as f:
+        obj = json.load(f)
+    k = obj.get("K")
+    if k is None:
+        k = (obj.get("camera_info") or {}).get("K")
+    if k is None:
+        raise ValueError("顶层和 camera_info 下都没有 K")
+    return np.array(k, dtype=float).reshape(3, 3)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -315,17 +333,23 @@ def main():
 
     # ── 附加：把单应拆成旋转角（要内参）──────────────────────────────
     if args.info:
-        K = np.array(json.load(open(args.info))["K"]).reshape(3, 3)
-        if H is not None:
-            ang, ax, S = rotation_of(H, K)
-            print("\n单应分解（用内参）：旋转 **%.3f°**  轴 %s" % (ang, np.round(ax, 3)))
-            print("  K⁻¹HK 奇异值 %s  ⇒ %s"
-                  % (np.round(S, 5),
-                     "三个都≈1，与**纯转动**一致（整幅图才会被一个单应解释）"
-                     if max(abs(S - 1)) < 0.02 else
-                     "偏离 1 较多，里面有平移成分，角度只能当参考"))
-            print("  参考量级：f·θ = %.1f px（画面里该看到多大的整体位移）"
-                  % (K[0, 0] * math.radians(ang)))
+        try:
+            K = load_K(args.info)
+        except (OSError, ValueError, KeyError) as e:
+            # 读不到内参只影响这条**附加**分解，不该改判定的退出码。
+            print("\n⚠️ 内参读不了（%s）：%s ⇒ 跳过单应分解" % (args.info, e))
+        else:
+            if H is not None:
+                ang, ax, S = rotation_of(H, K)
+                print("\n单应分解（用内参）：旋转 **%.3f°**  轴 %s"
+                      % (ang, np.round(ax, 3)))
+                print("  K⁻¹HK 奇异值 %s  ⇒ %s"
+                      % (np.round(S, 5),
+                         "三个都≈1，与**纯转动**一致（整幅图才会被一个单应解释）"
+                         if max(abs(S - 1)) < 0.02 else
+                         "偏离 1 较多，里面有平移成分，角度只能当参考"))
+                print("  参考量级：f·θ = %.1f px（画面里该看到多大的整体位移）"
+                      % (K[0, 0] * math.radians(ang)))
 
     # ── 附加：PnP 对拍 + 原判据那三件套 ──────────────────────────────
     if args.old_json and args.new_json:
