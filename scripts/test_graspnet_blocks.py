@@ -13,6 +13,7 @@
     python3 scripts/test_graspnet_blocks.py
 """
 
+import math
 import os
 import sys
 
@@ -159,6 +160,137 @@ def test_synthetic_mutation_min_h_5mm():
     high = [b for b in blocks if not b['low']]
     assert len(high) == 2, '5 mm 阈值下应把平板也算进来（2 个），实际 %d' % len(high)
     assert any(abs(b['h'] - 8.0) < 2.0 for b in high)
+
+
+def _grid_pts(long_mm, short_mm, n_long=40, n_short=30, yaw_deg=0.0):
+    """铺一张矩形点阵（米），按 yaw 旋转。返回 (N,2) 数组。"""
+    a = np.radians(yaw_deg)
+    xs = np.linspace(-long_mm / 2, long_mm / 2, n_long)
+    ys = np.linspace(-short_mm / 2, short_mm / 2, n_short)
+    X, Y = np.meshgrid(xs, ys)
+    P = np.stack([X.ravel(), Y.ravel()], 1) / 1000.0
+    R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    return P @ R.T
+
+
+@case
+def test_split_single_block_stays_whole():
+    P = _grid_pts(29.5, 29.5)
+    rect = gc.min_area_rect_2d(P)
+    pieces = gc.split_top_face(P, rect)
+    assert len(pieces) == 1, '单块不该被切：%d 份' % len(pieces)
+
+
+@case
+def test_split_two_same_size_blocks():
+    P = _grid_pts(59.0, 29.5, n_long=80)
+    rect = gc.min_area_rect_2d(P)
+    pieces = gc.split_top_face(P, rect)
+    assert len(pieces) == 2, '两块并排应切成 2 份，实际 %d' % len(pieces)
+    c = sorted(float(P[p, 0].mean()) * 1000 for p in pieces)
+    gap = c[1] - c[0]
+    assert abs(gap - 29.5) < 2.0, '两份中心应相距≈29.5 mm，实际 %.1f' % gap
+
+
+@case
+def test_split_three_in_a_row():
+    P = _grid_pts(88.5, 29.5, n_long=120)
+    rect = gc.min_area_rect_2d(P)
+    pieces = gc.split_top_face(P, rect)
+    assert len(pieces) == 3, '三块并排应切成 3 份，实际 %d' % len(pieces)
+
+
+@case
+def test_split_rotated_pair():
+    P = _grid_pts(59.0, 29.5, n_long=80, yaw_deg=30.0)
+    rect = gc.min_area_rect_2d(P)
+    pieces = gc.split_top_face(P, rect)
+    assert len(pieces) == 2, '旋转 30° 的两块应仍切成 2 份，实际 %d' % len(pieces)
+    # 两份中心沿长边方向分开 ≈29.5 mm
+    c = [float(P[p].mean(0) @ np.array([np.cos(np.radians(30)),
+                                        np.sin(np.radians(30))])) * 1000
+         for p in pieces]
+    assert abs(abs(c[1] - c[0]) - 29.5) < 2.0, '沿长边间距 %.1f' % abs(c[1] - c[0])
+
+
+@case
+def test_split_refuses_non_integer_ratio():
+    """长边 45 mm 不是块边整数倍 ⇒ 不硬切（宁可整簇报一块）。"""
+    P = _grid_pts(45.0, 29.5)
+    rect = gc.min_area_rect_2d(P)
+    assert len(gc.split_top_face(P, rect)) == 1
+
+
+@case
+def test_split_refuses_wrong_short_side():
+    """短边 40 mm 不像块边 ⇒ 即使长边是整数倍也不切。"""
+    P = _grid_pts(80.0, 40.0)
+    rect = gc.min_area_rect_2d(P)
+    assert len(gc.split_top_face(P, rect)) == 1
+
+
+@case
+def test_split_refuses_empty_piece():
+    """所有点挤在同一位置 ⇒ k-means 会留空簇，必须退回整块而不是报空份。"""
+    P = np.zeros((200, 2))
+    rect = {'yaw_deg': 0.0, 'ext_mm': [59.0, 29.5]}
+    assert len(gc.split_top_face(P, rect)) == 1
+
+
+@case
+def test_split_mutation_short_side_off():
+    """去掉「短边 ≈ 块边」这道检查 ⇒ 40×80 的宽板会被硬切成 3 份。"""
+    P = _grid_pts(80.0, 40.0)
+    rect = gc.min_area_rect_2d(P)
+    src = gc.split_top_face.__code__
+    # 用等价的宽松参数复现「没有 short_ok」：把 block_mm 设成恰好让短边合格的
+    # 值是不行的（会同时改变 k），所以直接改 tol 也不对 —— 这里用源码热替换。
+    import inspect
+    code = inspect.getsource(gc.split_top_face)
+    code = code.replace('    if not (short_ok and long_ok):', '    if not long_ok:')
+    ns = {'np': np, 'math': math}
+    exec(compile(code, '<mut>', 'exec'), ns)
+    assert len(ns['split_top_face'](P, rect)) > 1, \
+        '变异没生效 —— 上面那道短边检查的断言没盯着这一行'
+
+
+def _synth_frame_touching_pair():
+    """两块**同色**方块并排贴在一起：顶面掩码上是一整片（S2 的复现）。"""
+    h, w = 480, 640
+    fx = fy = 500.0
+    depth = np.full((h, w), 0.500, dtype=np.float32)
+    color = np.full((h, w, 3), 40, dtype=np.uint8)
+
+    def put(u0, half_u, half_v, d, rgb):
+        depth[240 - half_v:240 + half_v, u0 - half_u:u0 + half_u] = d
+        color[240 - half_v:240 + half_v, u0 - half_u:u0 + half_u] = rgb
+
+    # 每个 36×36 px（≈34 mm），并在 u=233 处**紧贴**：合并后 36×72 px。
+    put(214, 19, 19, 0.470, (220, 30, 30))
+    put(252, 19, 19, 0.470, (220, 30, 30))
+    return {'depth': depth, 'color': color,
+            'R_bc': np.diag([1.0, -1.0, -1.0]),
+            't_bc': np.array([0.0, 0.0, 0.500]),
+            'K': np.array([[fx, 0.0, 320.0], [0.0, fy, 240.0], [0.0, 0.0, 1.0]])}
+
+
+@case
+def test_synthetic_touching_pair_split():
+    """split=False 报 1 个（合并），split=True 报 2 个（尺寸先验切开）。"""
+    frame = _synth_frame_touching_pair()
+    whole = [b for b in gc.find_blocks(frame)[0] if not b['low']]
+    assert len(whole) == 1, '未开切分时应是一整簇，实际 %d' % len(whole)
+    assert whole[0]['split_n'] == 1
+    assert whole[0]['ext_rect'][0] / whole[0]['ext_rect'][1] > 1.8, \
+        '合并簇应明显长条：%r' % (whole[0]['ext_rect'],)
+
+    pieces = [b for b in gc.find_blocks(frame, split=True)[0] if not b['low']]
+    assert len(pieces) == 2, '开切分后应是两块，实际 %d：%r' % (
+        len(pieces), [(round(b['cx']), round(b['cy'])) for b in pieces])
+    assert all(b['split_n'] == 2 for b in pieces)
+    xs = sorted(b['cx'] for b in pieces)
+    # 两块中心相距应≈一个块边（34 mm）
+    assert abs((xs[1] - xs[0]) - 34.0) < 4.0, '两份中心间距 %.1f mm' % (xs[1] - xs[0])
 
 
 @case

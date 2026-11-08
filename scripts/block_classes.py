@@ -200,16 +200,43 @@ def hue_distance(a, b):
     return min(d, 360.0 - d)
 
 
-def nearest_class_by_hue(hue_deg, names=None):
-    """色相 → (类别名, 差几度)。用**实测**色相表，不是 PALETTE。
+# 2026-11-08 量的**仿真渲染色相**（度）。与上面那张真机表**并列，不可混用**。
+#
+# 为什么必须分开：gen_scene 用 ``PALETTE`` 的 RGB 摆块，但 gz 的光照/材质/色调
+# 映射会把渲染色相挪一段（暖色整条链 +4…10°，青几乎不动）。拿真机表去判仿真像素，
+# 橙(渲染 38.5°) 离真机黄(40°)只有 1.5° ⇒ 整条暖色链错位一档、且**不报错**。
+# 实测：三帧十七块，橙色全被判成 yellow、s0 的黄被判成 yellowgreen。
+#
+# 量法：E6 存档三帧（S0/S1/S2 各一布局）逐块取顶面中位 RGB 的色相；同一颜色跨帧
+# 完全一致（share 0.96–1.00），所以每类一个数就够。7 类各至少 1 块。
+# ⚠️ 橙 38.5° 与棕 33.6° 只差 4.9°，比真机表的 8° 还窄；这两类在此表上靠的是
+#    **渲染确定性**（不是余量）。改 gz 光照/材质/色调映射后必须重新量。
+# 真机路径**永远不用这张表**——它是仿真专用的，调用方必须显式传。
+SIM_HUE_DEG = {
+    "red": 359.5,
+    "orange": 38.5,
+    "tan": 33.6,
+    "yellow": 55.0,
+    "yellowgreen": 72.0,
+    "cyan": 181.4,
+    "purple": 287.4,
+}
 
-    ⚠️ 这里只比色相。橙(20.5°)↔棕(28.5°)、黄(40°)↔黄绿(53°) 的间隔分别只有
-    8° 和 13°，落在实测噪声底（中位 1.0°、最大 6.0°）之上但不算宽裕；
+
+def nearest_class_by_hue(hue_deg, names=None, table=None):
+    """色相 → (类别名, 差几度)。默认用**真机实测**色相表，不是 PALETTE。
+
+    ``table`` 只在判**仿真渲染**像素时传 ``SIM_HUE_DEG``；不传就是真机表。
+    两张表的来历与为什么不能混用见各自定义上方。
+
+    ⚠️ 这里只比色相。真机表里橙(20.5°)↔棕(28.5°)、黄(40°)↔黄绿(53°) 的间隔
+    分别只有 8° 和 13°，落在实测噪声底（中位 1.0°、最大 6.0°）之上但不算宽裕；
     逐像素判、再按块取多数，是为了让噪声不决定单个块的类别
     （``palette_survey.py`` 里 find_modes 用直方图找峰，反而分不出这 7 类）。
     """
-    names = [n for n in (names or DEFAULT_CLASSES) if n in MEASURED_HUE_DEG]
+    table = MEASURED_HUE_DEG if table is None else table
+    names = [n for n in (names or DEFAULT_CLASSES) if n in table]
     if not names:
-        raise ValueError("没有可用的实测色相 —— 类别表与 MEASURED_HUE_DEG 没有交集")
-    best = min(names, key=lambda n: hue_distance(hue_deg, MEASURED_HUE_DEG[n]))
-    return best, hue_distance(hue_deg, MEASURED_HUE_DEG[best])
+        raise ValueError("没有可用的色相 —— 类别表与给定的色相表没有交集")
+    best = min(names, key=lambda n: hue_distance(hue_deg, table[n]))
+    return best, hue_distance(hue_deg, table[best])

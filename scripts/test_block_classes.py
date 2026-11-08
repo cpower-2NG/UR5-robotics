@@ -179,8 +179,52 @@ def read_yaml_names(path):
     return list(nm or []), int(doc.get('nc', len(nm or [])))
 
 
+def section_hue_table():
+    """两张色相表必须各判各的 —— 混用会静默错一档（2026-11-08 实测）。"""
+    print('\n[2] 色相表：真机表与仿真表各判各的')
+
+    # 两张表必须是同一批类名（只差数值），否则调用方换个来源就会漏类
+    check('真机表与仿真表的类名集合一致',
+          set(block_classes.SIM_HUE_DEG) == set(block_classes.MEASURED_HUE_DEG),
+          '%r vs %r' % (sorted(block_classes.SIM_HUE_DEG),
+                        sorted(block_classes.MEASURED_HUE_DEG)))
+
+    # 不传 table = 真机表：每类自己那张表的中心值都必须判回自己
+    bad = [(n, block_classes.nearest_class_by_hue(h)[0])
+           for n, h in block_classes.MEASURED_HUE_DEG.items()
+           if block_classes.nearest_class_by_hue(h)[0] != n]
+    check('真机表：每个中心色相判回自己', not bad, str(bad))
+
+    bad = [(n, block_classes.nearest_class_by_hue(h, table=block_classes.SIM_HUE_DEG)[0])
+           for n, h in block_classes.SIM_HUE_DEG.items()
+           if block_classes.nearest_class_by_hue(h, table=block_classes.SIM_HUE_DEG)[0] != n]
+    check('仿真表：每个中心色相判回自己', not bad, str(bad))
+
+    # 这是本节的**核心**：同一台仿真渲染色相，用真机表会错、用仿真表才对。
+    # 实测三帧十七块：橙色渲染 38.5°，真机表下离 yellow(40°) 只有 1.5° ⇒ 判成
+    # yellow；黄 55° ⇒ 判成 yellowgreen。把这条写死成断言，谁要是让 table 参数
+    # 失效（比如内部仍读全局表），这里立刻红。
+    check('仿真橙 38.5°：用真机表会误判成 yellow（记录已知陷阱）',
+          block_classes.nearest_class_by_hue(38.5)[0] == 'yellow')
+    check('仿真橙 38.5°：显式传仿真表判回 orange',
+          block_classes.nearest_class_by_hue(
+              38.5, table=block_classes.SIM_HUE_DEG)[0] == 'orange')
+
+    # 变异：把 table 参数改成无效 ⇒ 上面那条「显式传表」必须变成 red
+    import inspect
+    src = inspect.getsource(block_classes)
+    src = src.replace('    table = MEASURED_HUE_DEG if table is None else table\n',
+                      '    table = MEASURED_HUE_DEG\n')
+    ns = {}
+    exec(compile(src, '<mut>', 'exec'), ns)
+    check('变异「忽略 table 参数」→ 仿真橙被判成 yellow',
+          ns['nearest_class_by_hue'](
+              38.5, table=ns['SIM_HUE_DEG'])[0] == 'yellow',
+          '变异没生效 —— 说明上面那条断言没盯着 table 参数')
+
+
 def section_datasets():
-    print('\n[2] 交付关卡：data.yaml ↔ dataset_manifest.json')
+    print('\n[3] 交付关卡：data.yaml ↔ dataset_manifest.json')
     found = find_datasets()
     if not found:
         print('  （仓里没有数据集目录 —— 跳过。'
@@ -228,7 +272,7 @@ def section_mutation():
     import importlib.util
     import tempfile
 
-    print('\n[3] 变异：把校验改坏，对应的拒绝必须失效')
+    print('\n[4] 变异：把校验改坏，对应的拒绝必须失效')
     src_path = os.path.join(HERE, 'block_classes.py')
     src = open(src_path).read()
 
@@ -272,6 +316,7 @@ def section_mutation():
 def main():
     print('=' * 68)
     section_palette()
+    section_hue_table()
     section_datasets()
     section_mutation()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
