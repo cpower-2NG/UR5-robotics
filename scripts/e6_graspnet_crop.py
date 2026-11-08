@@ -120,6 +120,9 @@ def run_frame(frame_dir, net, dev):
     out["vram_peak_mb"] = round(
         (__import__("torch").cuda.max_memory_allocated() / 2 ** 20)
         if __import__("torch").cuda.is_available() else 0.0, 1)
+    out["rss_peak_mb"] = round(
+        __import__("resource").getrusage(
+            __import__("resource").RUSAGE_SELF).ru_maxrss / 1024.0, 1)
     json.dump(out, open(os.path.join(frame_dir, "graspnet.json"), "w"),
               ensure_ascii=False, indent=1)
     return out

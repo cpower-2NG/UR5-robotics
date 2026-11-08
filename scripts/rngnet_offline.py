@@ -50,6 +50,20 @@ class _NoCollision:
 _stub.ModelFreeCollisionDetector = _NoCollision
 sys.modules["dataset.collision_detector"] = _stub
 
+# ---- 同一类桩：customgraspnetAPI/__init__ 顶层 import graspnet_eval，那一条链是
+# **评测**（dexnet → autolab_core → skimage/matplotlib 可视化），推理只用 .grasp
+# 里的 Grasp/GraspGroup 容器。板上没有那套可视化依赖，屏蔽掉的是评测入口本身。
+_eval_stub = types.ModuleType("customgraspnetAPI.graspnet_eval")
+
+
+class _NoEval:
+    def __init__(self, *a, **k):
+        raise RuntimeError("GraspNetEval 已在离线 runner 禁用（评测路径不参与推理）")
+
+
+_eval_stub.GraspNetEval = _NoEval
+sys.modules["customgraspnetAPI.graspnet_eval"] = _eval_stub
+
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
@@ -282,8 +296,16 @@ def run_frame(frame_dir, localnet, anchors):
                                      if ch and "angle_deg" in ch else None)}
         baseline.append(row)
 
+    import resource
+    vram_mb = (torch.cuda.max_memory_allocated() / 2 ** 20
+               if torch.cuda.is_available() else 0.0)
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
     return {
         "frame": str(frame_dir), "infer_sec": round(dt, 2),
+        # E6 的板载门是 ≤100 ms/帧，秒级取整太粗 ⇒ 同时记毫秒与峰值资源
+        "infer_ms": round(dt * 1000, 1),
+        "vram_peak_mb": round(vram_mb, 1),
+        "rss_peak_mb": round(rss_mb, 1),
         "n_centers": len(centers), "n_raw": len(rows), "n_keep": len(keep),
         "table_z_mm": table_z,
         "keep_head": keep[:500],
