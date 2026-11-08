@@ -83,6 +83,19 @@ def test_teardown_argv_has_go_and_flag():
         assert flag in argv, flag
 
 
+@case
+def test_teardown_decision_ignores_build_rc():
+    """person_review 的 rc=1 不是失败：复核后重判 ok 必须仍然拆塔。
+
+    这里只验纯函数；主流程里 rc 只是打印用，不进闸门。
+    """
+    assert d.teardown_decision("ok", False) == "teardown"
+    assert d.teardown_decision("ok", True) == "keep"
+    for bad in ("person_review", "fail", "missing_data", None):
+        assert d.teardown_decision(bad, False) == "leave", bad
+        assert d.teardown_decision(bad, True) == "leave", bad
+
+
 # ---------------------------------------------------------------- 场景
 @case
 def test_scene_only_overrides_frames():

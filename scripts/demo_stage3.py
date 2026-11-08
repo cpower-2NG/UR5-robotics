@@ -374,6 +374,18 @@ def show_score(log, cdir):
     return res.get("verdict")
 
 
+def teardown_decision(verdict, keep_tower):
+    """判分通过才拆；--keep-tower 跳过；其它一律留塔给人看。
+
+    只看 ``verdict``，**不看建塔那一步的退出码**：``stage3_round.py`` 遇到
+    ``person_review`` 返回 1（不是失败），人工复核后重判 ok 时 rc 仍是 1；
+    若把 rc 也当闸门，复核通过的轮次会被误判成「没通过」而不拆。
+    """
+    if verdict != "ok":
+        return "leave"
+    return "keep" if keep_tower else "teardown"
+
+
 def review_if_needed(args, log, cdir):
     """verdict=person_review 时请人看一眼塔，批准后重判。"""
     round_json = os.path.join(cdir, "round.json")
@@ -529,22 +541,31 @@ def main(argv=None):
 
     new_dirs = sorted(round_dirs(rundir) - before)
     cdir = (os.path.join(rundir, new_dirs[0]) if new_dirs else None)
-    if rc != 0:
-        log.say("\n!! 本轮判红（rc=%d）。停在原地，不续跑；块可能还在爪里或"
-                "半放，先看示教器。" % rc)
     if cdir and not args.dry_run:
         if os.path.exists(os.path.join(cdir, "score.json")):
             review_if_needed(args, log, cdir)
         verdict = show_score(log, cdir)
     else:
         verdict = None
+    # 警告放在判分之后：person_review 的 rc=1 不是臂出错，别先说成「判红」。
+    if not args.dry_run and rc != 0:
+        if verdict == "ok":
+            log.say("\n（建塔那段的退出码是 %d，属 person_review；"
+                    "人眼复核后重判 ok）" % rc)
+        elif verdict == "person_review":
+            log.say("\n!! 判分停在 person_review（rc=%d）：这是「机器判不了」，"
+                    "不是臂中途出错；塔留在原地。" % rc)
+        else:
+            log.say("\n!! 本轮判红（rc=%d）。停在原地，不续跑；块可能还在爪里或"
+                    "半放，先看示教器。" % rc)
 
     log.say("\n== 结束 ==")
     td_rc = 0
+    decision = teardown_decision(verdict, args.keep_tower)
     if not args.dry_run:
-        if verdict == "ok" and rc == 0 and args.keep_tower:
+        if decision == "keep":
             log.say("\n== 第 4 步：拆塔 —— 已按 --keep-tower 跳过 ==")
-        elif verdict == "ok" and rc == 0:
+        elif decision == "teardown":
             td_rc = teardown_after(args, log, rundir, grid, scene, seed)
         else:
             log.say("\n== 第 4 步：拆塔 —— 本轮没通过，不拆；"
@@ -555,17 +576,16 @@ def main(argv=None):
         log.say("  离线模式：不发轨迹、不判分。")
         log.close()
         return 0 if rc == 0 else rc
-    if verdict == "ok" and rc == 0:
+    if verdict == "ok":
         log.say("  结论：verdict=ok")
     else:
         log.say("  结论：verdict=%s（rc=%d）" % (verdict, rc))
     if td_rc != 0:
         log.say("  收尾：拆塔没走完（rc=%d）—— 塔位可能还有块" % td_rc)
-    elif not args.dry_run and verdict == "ok" and rc == 0 \
-            and not args.keep_tower:
+    elif not args.dry_run and decision == "teardown":
         log.say("  收尾：塔已拆回拾取区")
     log.close()
-    return 0 if verdict == "ok" and rc == 0 and td_rc == 0 else 1
+    return 0 if verdict == "ok" and td_rc == 0 else 1
 
 
 if __name__ == "__main__":
