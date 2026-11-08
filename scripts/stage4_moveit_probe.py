@@ -11,6 +11,8 @@
   先用 ``avoid_collisions=False`` 解一次（拿到候选解），再开碰撞检查解一次。
   开了就失败、且**独立核验器**认定候选解离所有块/桌面都 ≥5 mm ⇒ 记一次假碰撞。
   两次都解不出 ⇒ 单列 ``unreachable``（可能是限位/够不着），**不算** M1 通过。
+  M1b（反假绿灯）在两种模型上判法不同：模型带夹爪（仿真）⇒ 必然重叠的位姿必须被拒；
+  模型不带夹爪（真机）⇒ 往 ``wrist_3_link`` 放盒子，同一状态必须由有效翻成无效。
 - **M2 20/20 无碰撞**：每块取 2 个抓取朝向 × 2 个接近高度规划整条轨迹，
   再逐点用 ``/compute_fk`` + ``stage4_scene_model`` 的 OBB 间隙核验
   （接触场景余量 3 mm）。**不用 MoveIt 自己的碰撞结论判 MoveIt**。
@@ -19,6 +21,15 @@
 
 夹爪在接近阶段是**全开**的（比闭合更占地方），所以规划起点和核验都按全开
 （``stroke_half``）算 —— 这是保守方向。
+
+**真机与仿真的两处硬差别（2026-11-08 实测，都用参数/现取消掉，不要写死）**：
+
+1. 规划组名不同：仿真 ``ur5_manipulator``、真机 ``ur_manipulator`` → ``--group``。
+2. 真机模型**只有 6 个臂关节**（robot_description 里 0 个 ag95 关节/连杆），而
+   真机 ``/joint_states`` 里带 ag95 两指。把未过滤的 ``/joint_states`` 发进
+   ``/compute_ik`` 会让 move_group 抛 C++ 异常 **SIGABRT 整进程死掉**（不是返回
+   错误码）。所以：模型关节名从 ``/get_planning_scene`` 现取，所有请求边界过滤
+   （``stage4_moveit_joints``），attach 连杆也按 FK 实测是否存在自动退回 ``tool0``。
 
 用法（仿真栈已起）::
 
@@ -39,6 +50,7 @@ sys.path.insert(0, HERE)
 
 import numpy as np                                            # noqa: E402
 import rclpy                                                  # noqa: E402
+import stage4_moveit_joints as mj                             # noqa: E402
 import stage4_scene_model as sm                               # noqa: E402
 from geometry_msgs.msg import Pose, PoseStamped               # noqa: E402
 from moveit_msgs.msg import (AttachedCollisionObject,        # noqa: E402
@@ -53,20 +65,32 @@ from rclpy.node import Node                                   # noqa: E402
 from sensor_msgs.msg import JointState                        # noqa: E402
 from shape_msgs.msg import SolidPrimitive                     # noqa: E402
 
+# 规划组名：**仿真与真机不是同一个**（2026-11-08 实测）。
+#   仿真（arm_grasp_sim 的 SRDF）           → ur5_manipulator
+#   真机（ur_moveit_config 的 SRDF，官方）  → ur_manipulator（chain base_link→tool0）
+# 名字对不上时 /compute_ik 回 -15（FAILURE）、/plan_kinematic_path 回 99999，
+# 且**不报「组不存在」** —— 看起来像「全都够不着」。所以干脆做成参数。
 GROUP = "ur5_manipulator"
 IK_LINK = "tool0"
-ATTACH_LINK = "ag95_base_link"
+# attach 连杆：仿真模型带 AG-95（ag95_base_link 存在）；**真机模型只有臂**
+# （2026-11-08 实测：robot_description 里 0 个 ag95 连杆/关节），退回 tool0。
+ATTACH_CANDIDATES = ("ag95_base_link", "tool0")
 BASE = "base_link"
 FINGER_JOINTS = ("ag95_left_finger_joint", "ag95_right_finger_joint")
-ARM_JOINTS = ("shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
-              "wrist_1_joint", "wrist_2_joint", "wrist_3_joint")
-TOUCH_LINKS = ["ag95_left_finger_link", "ag95_right_finger_link",
-               "tool0", "ag95_base_link"]
+ARM_JOINTS = mj.ARM_JOINTS
+TOUCH_CANDIDATES = ["ag95_left_finger_link", "ag95_right_finger_link",
+                    "tool0", "ag95_base_link"]
+# 规划模型认识的关节名。``None`` 只在起服务之前出现；随后由
+# ``fetch_model_joints`` 现取，取不到就退回 6 个臂关节（见 ``main``）。
+MODEL_JOINTS = None
 # M1a 判「臂杆原点够高」用的连杆（tool0 由 gap 单独覆盖，不重复）
 CHECK_LINKS = ["wrist_3_link", "wrist_2_link", "wrist_1_link", "forearm_link",
                "upper_arm_link", "shoulder_link", "base_link_inertia"]
 
-TABLE_TOP = 0.0            # 仿真台面顶面 = base z 0（块心 z=0.01475 可反推）
+# 台面顶面在 base 系的高度。仿真 = 0；**真机不是 0**（2026-10-02 示教器读数：
+# 基座系指尖碰台面 z=+3.88 mm，且俯视 `table_plane_z` 的真机读数 ≈ 0）。
+# 真机半段必须用当次俯视 burst 量出来的值（`--table-top`），不要沿用这里的 0.0。
+TABLE_TOP = 0.0
 OPEN_Q = sm.GRIPPER["stroke_half"]   # 接近阶段夹爪全开
 SAFE_MARGIN = 0.005        # M1 判「明显空着」的余量
 CONTACT_MARGIN = 0.003     # M2 接触场景余量（契约：2–3 mm）
@@ -95,6 +119,33 @@ def wait_service(node, client, name, timeout=60.0):
 
 
 # --------------------------------------------------------------- 关节状态
+def fetch_model_joints(node, scene_client):
+    """规划模型认识的关节名（``GetPlanningScene`` 的 ROBOT_STATE 里带着）。
+
+    取不到返回 ``None``。**这是唯一可信的来源**：真机 ``/joint_states`` 含
+    ag95 两指，真机模型不含 —— 拿 /joint_states 当白名单等于没过滤。
+    """
+    req = GetPlanningScene.Request()
+    req.components.components = PlanningSceneComponents.ROBOT_STATE
+    resp = call(node, scene_client, req, timeout=20.0)
+    if resp is None:
+        return None
+    names = list(resp.scene.robot_state.joint_state.name)
+    return names or None
+
+
+def guard(js, where):
+    """发请求前的最后一道闸：名字不在模型里 ⇒ **抛异常，不发**。
+
+    发出去不是「返回错误码」，是 move_group 抛 C++ 异常 SIGABRT（2026-11-08
+    真机实测）。fail-closed 在这里的含义就是：宁可这次探针失败，也不能打死栈。
+    """
+    bad = mj.unknown(js.name, MODEL_JOINTS)
+    if bad:
+        raise RuntimeError("%s：请求里有规划模型不认识的关节 %s —— 发出去会打死 "
+                           "move_group，已拦下" % (where, ", ".join(bad)))
+
+
 def read_joint_state(node, timeout=15.0):
     got = {}
 
@@ -109,9 +160,14 @@ def read_joint_state(node, timeout=15.0):
     if "js" not in got:
         return None
     src = got["js"]
+    drop = mj.unknown(src.name, MODEL_JOINTS)
+    if drop:
+        log("   /joint_states 里模型不认识的关节已丢弃：%s" % ", ".join(drop))
     js = JointState()
-    js.name = list(src.name)
-    js.position = [float(p) for p in src.position]
+    js.name, js.position = mj.keep_known(src.name, src.position, MODEL_JOINTS)
+    if not js.name:
+        log("!! 过滤后一个关节都不剩 —— 模型关节名与 /joint_states 完全不匹配")
+        return None
     return js
 
 
@@ -120,12 +176,13 @@ def joints_map(js):
 
 
 def with_joints(js, updates):
-    """以 js 为底，覆盖/追加若干关节值，返回新的 JointState。"""
-    m = joints_map(js)
-    m.update({k: float(v) for k, v in updates.items()})
+    """以 js 为底，覆盖/追加若干关节值，返回新的 JointState。
+
+    模型不认识的更新**丢弃**（老实现是追加 —— 正是打死 move_group 的写法）。
+    """
     out = JointState()
-    out.name = list(js.name) + [k for k in updates if k not in js.name]
-    out.position = [m[k] for k in out.name]
+    out.name, out.position = mj.merge_known(js.name, js.position, updates,
+                                            MODEL_JOINTS)
     return out
 
 
@@ -215,6 +272,7 @@ def scene_ids(sc):
 # --------------------------------------------------------------- FK / 核验
 def fk_tool(node, fk_client, js, links=(IK_LINK,)):
     """一次 FK 拿若干连杆的 (xyz, quat)。失败返回 None。"""
+    guard(js, "/compute_fk")
     req = GetPositionFK.Request()
     req.header.frame_id = BASE
     req.fk_link_names = list(links)
@@ -249,6 +307,7 @@ def pose_stamped(x, y, z, quat, frame=BASE):
 
 
 def make_ik_req(js, ps, avoid, timeout=0.5):
+    guard(js, "/compute_ik")
     req = GetPositionIK.Request()
     ik = req.ik_request
     ik.group_name = GROUP
@@ -404,6 +463,7 @@ def check_m1a(node, ik_client, fk_client, validity_client, seed_js, truth,
 
         gap = gripper_gap(node, fk_client, sol, blocks, table)
         vreq = GetStateValidity.Request()
+        guard(sol, "/check_state_validity")
         vreq.robot_state.joint_state = sol
         vreq.group_name = GROUP
         vr = call(node, validity_client, vreq)
@@ -441,7 +501,7 @@ def check_m1a(node, ik_client, fk_client, validity_client, seed_js, truth,
 
 
 def check_m1b(node, ik_client, seed_js, truth):
-    """M1b：几何上必然重叠的位姿，MoveIt 必须拒绝。
+    """M1b（**模型带夹爪时**用，即仿真）：几何上必然重叠的位姿，MoveIt 必须拒绝。
 
     位姿 = 块心上方 (body_z + 指长/2) = 132.1 mm 的 tool0（两指合拢时正好把块夹在
     中间）。两指闭合态沿 x 只跨 ±22 mm，块就卡在中间 —— 真重叠，独立判据 gap=0。
@@ -449,6 +509,9 @@ def check_m1b(node, ik_client, seed_js, truth):
     种子先取「同一块上方 50 mm 的悬停解」，再下探 —— 从停泊位直接解这么低的位姿
     常常解不出（上一版 6 块里 1 块 unreachable 就是这个原因），那属于 IK 搜索失败，
     不是「MoveIt 收下了碰撞」。
+
+    ⚠️ **真机模型没有夹爪几何**（2026-11-08 实测：robot_description 里 0 个 ag95
+    连杆），这个构造在真机上根本不构成重叠 ⇒ 真机走 ``check_m1b_scene_alive``。
     """
     rows = []
     for b in truth["blocks"]:
@@ -485,6 +548,77 @@ def check_m1b(node, ik_client, seed_js, truth):
     return rows
 
 
+# --------------------------------------------------------------- M1b（臂-only）
+def check_m1b_scene_alive(node, scene_client, validity_client, fk_client,
+                          js, name="m1b-probe"):
+    """反假绿灯（真机模型无夹爪时的替代判法）：场景是不是**真的**进了 MoveIt。
+
+    真机 ``robot_description`` 里没有 AG-95（0 个连杆/关节），所以「两指插进块里」
+    不是碰撞 —— 原来的 M1b 构造在真机上必然假绿。这里换成模型无关的构造：
+
+    1. 在 ``wrist_3_link`` **当前位置**放一个 20 cm 盒子（几何上必然与该连杆重叠，
+       不依赖任何夹爪几何）；
+    2. 同一关节状态：放之前必须 VALID，放之后必须 INVALID 且接触里出现这个盒子；
+    3. 移除盒子后必须回到 VALID。
+
+    三步缺一：说明场景请求没生效 —— 那样 M1a 的「全 ok」就没有意义（正是 M1b
+    本来要防的假绿灯）。
+    """
+    fk = fk_tool(node, fk_client, js, ("wrist_3_link",))
+    if fk is None:
+        return {"pass": False, "note": "FK 拿不到 wrist_3_link"}
+    p = fk["wrist_3_link"][0]
+
+    def valid_now():
+        vreq = GetStateValidity.Request()
+        guard(js, "/check_state_validity")
+        vreq.robot_state.joint_state = js
+        vreq.group_name = GROUP
+        vr = call(node, validity_client, vreq)
+        if vr is None:
+            return None, []
+        return bool(vr.valid), [(c.contact_body_1, c.contact_body_2)
+                                for c in vr.contacts]
+
+    obj = CollisionObject()
+    obj.header.frame_id = BASE
+    obj.id = name
+    box = SolidPrimitive()
+    box.type = SolidPrimitive.BOX
+    box.dimensions = [0.20, 0.20, 0.20]
+    pose = Pose()
+    pose.position.x, pose.position.y, pose.position.z = [float(v) for v in p]
+    pose.orientation.w = 1.0
+    obj.primitives = [box]
+    obj.primitive_poses = [pose]
+    obj.operation = CollisionObject.ADD
+
+    before_valid, _ = valid_now()
+    added = send_scene(node, scene_client, world_objs=[obj])
+    time.sleep(0.5)
+    during_valid, during_pairs = valid_now()
+    obj.operation = CollisionObject.REMOVE
+    removed = send_scene(node, scene_client, world_objs=[obj])
+    time.sleep(0.5)
+    after_valid, _ = valid_now()
+
+    touched = any(name in pr for pr in during_pairs)
+    out = {"probe_object": name, "box_center": [float(v) for v in p],
+           "box_size_m": 0.20,
+           "before_valid": before_valid, "added": added,
+           "during_valid": during_valid,
+           "during_contacts": ["%s×%s" % pr for pr in during_pairs][:6],
+           "touched_probe": touched,
+           "removed": removed, "after_valid": after_valid}
+    out["pass"] = bool(added and removed and before_valid is True
+                       and during_valid is False and touched
+                       and after_valid is True)
+    log("  M1b(场景活性) 放盒前=%s 放盒后=%s（接触含盒子=%s） 移除后=%s → %s"
+        % (before_valid, during_valid, touched, after_valid,
+           "PASS" if out["pass"] else "FAIL"))
+    return out
+
+
 # --------------------------------------------------------------- M2
 def goal_constraints(ps):
     c = Constraints()
@@ -512,6 +646,7 @@ def goal_constraints(ps):
 
 
 def plan_to(node, plan_client, start_js, ps, timeout=8.0):
+    guard(start_js, "/plan_kinematic_path")
     req = GetMotionPlan.Request()
     mpr = req.motion_plan_request
     mpr.group_name = GROUP
@@ -641,6 +776,22 @@ def find_obj(scene, oid, which):
     return None
 
 
+def pick_attach(node, fk_client, js):
+    """挑 attach 连杆与 ``touch_links``：只留模型里**真的存在**的连杆。
+
+    仿真模型带 AG-95 ⇒ ``ag95_base_link``；真机模型只有臂 ⇒ 退回 ``tool0``
+    （2026-11-08：真机 robot_description 里 0 个 ag95 连杆，写到 attach 里只会
+    让请求被拒/报错）。判断方式是 FK 能不能解出这个连杆 —— 不用猜模型版本。
+    """
+    exist = []
+    for link in list(ATTACH_CANDIDATES) + [t for t in TOUCH_CANDIDATES
+                                           if t not in ATTACH_CANDIDATES]:
+        if fk_tool(node, fk_client, js, (link,)) is not None:
+            exist.append(link)
+    link = next((c for c in ATTACH_CANDIDATES if c in exist), None)
+    return link, [t for t in TOUCH_CANDIDATES if t in exist]
+
+
 def attach_detach(node, scene_client, get_scene, fk_client, start_js, truth):
     """attach → 核验 → detach → 核验，判据三条：
 
@@ -657,21 +808,28 @@ def attach_detach(node, scene_client, get_scene, fk_client, start_js, truth):
     wq = (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
 
     out = {"object": oid, "world_pose": [float(v) for v in W]}
+    link, touches = pick_attach(node, fk_client, start_js)
+    out["link"] = link
+    out["touch_links"] = touches
+    if link is None:
+        out.update(pass_=False, note="模型里没有一个可用的 attach 连杆")
+        log("  attach: 模型里找不到可用 attach 连杆 → FAIL")
+        return out
     before = read_scene(node, get_scene)
     w0, a0 = scene_ids(before)
     out["before"] = {"world": w0, "attached": a0}
 
-    fk = fk_tool(node, fk_client, start_js, (ATTACH_LINK,))
+    fk = fk_tool(node, fk_client, start_js, (link,))
     if fk is None:
         out.update(pass_=False, note="FK 拿不到 link 位姿")
         return out
-    link_p, link_q = fk[ATTACH_LINK]
+    link_p, link_q = fk[link]
     R = sm.quat_to_mat(link_q)
     local_expect = R.T @ (W - link_p)
 
     aco = AttachedCollisionObject()
-    aco.link_name = ATTACH_LINK
-    aco.touch_links = TOUCH_LINKS
+    aco.link_name = link
+    aco.touch_links = touches
     aco.object.id = oid
     aco.object.header.frame_id = BASE
     box = SolidPrimitive()
@@ -738,10 +896,22 @@ def main(argv=None):
     ap.add_argument("--truth", required=True, help="scene_truth.json")
     ap.add_argument("--report", default=None, help="结果 JSON 输出路径")
     ap.add_argument("--plans", type=int, default=20, help="M2 要求干净的条数")
+    ap.add_argument("--table-top", type=float, default=0.0,
+                    help="台面顶面在 base 系的 z（米）。仿真 0；真机用当次"
+                         "俯视 burst 量出的 table_z")
+    ap.add_argument("--group", default="ur5_manipulator",
+                    help="规划组名。仿真 ur5_manipulator；真机（ur_moveit_config）"
+                         "是 ur_manipulator —— 名字不对会静默变成「全都够不着」")
     ap.add_argument("--skip-m1", action="store_true")
     ap.add_argument("--skip-m2", action="store_true")
     ap.add_argument("--skip-attach", action="store_true")
+    ap.add_argument("--keep-scene", action="store_true",
+                    help="跑完不撤掉加进 MoveIt 的块/桌面（默认撤，避免幽灵块）")
     args = ap.parse_args(argv)
+
+    global TABLE_TOP, GROUP, MODEL_JOINTS
+    TABLE_TOP = float(args.table_top)
+    GROUP = args.group
 
     rclpy.init()
     node = Node("stage4_moveit_probe")
@@ -768,6 +938,17 @@ def main(argv=None):
         rclpy.shutdown()
         return 2
 
+    # 模型关节名必须在**读 /joint_states 之前**拿到：真机上 /joint_states 含
+    # ag95 两指，而真机模型只有 6 个臂关节。拿不到就退回臂关节白名单，
+    # 绝不发未经过滤的 /joint_states（发出去会 SIGABRT 打死 move_group）。
+    MODEL_JOINTS = fetch_model_joints(node, get_scene)
+    if MODEL_JOINTS:
+        log("规划模型关节（%d）：%s"
+            % (len(MODEL_JOINTS), ", ".join(MODEL_JOINTS)))
+    else:
+        MODEL_JOINTS = list(mj.ARM_JOINTS)
+        log("!! /get_planning_scene 取不到模型关节名 —— 退回只发 6 个臂关节")
+
     with open(args.truth, encoding="utf-8") as f:
         truth = json.load(f)
     start_js = read_joint_state(node)
@@ -781,6 +962,8 @@ def main(argv=None):
 
     report = {"truth": args.truth, "batch": truth.get("batch"),
               "index": truth.get("index"), "table_top": TABLE_TOP,
+              "group": GROUP,
+              "model_joints": list(MODEL_JOINTS),
               "open_q_mm": OPEN_Q * 1000.0,
               "joints0": joints_map(start_js),
               "joints_plan": joints_map(plan_js)}
@@ -807,29 +990,50 @@ def main(argv=None):
     # 2) M1
     if not args.skip_m1:
         log("\n== M1 无假碰撞 ==")
-        seed_closed = close_fingers(start_js)
         m1a = check_m1a(node, ik_client, fk_client, validity_client, plan_js,
                         truth, blocks, table)
-        log("  --- M1b：必然重叠的位姿必须被拒 ---")
-        m1b = check_m1b(node, ik_client, seed_closed, truth)
         a_false = [r for r in m1a if r["verdict"] == "false_collision"]
         a_unreach = [r for r in m1a if r["verdict"] == "unreachable"]
         a_grip = [r for r in m1a if r["verdict"] == "gripper_collide"]
         a_ok = [r for r in m1a if r["verdict"] == "ok"]
-        b_bad = [r for r in m1b if r["verdict"] != "ok"]
         report["m1a"] = m1a
-        report["m1b"] = m1b
-        report["m1_summary"] = {
-            "m1a_n": len(m1a), "m1a_ok": len(a_ok),
-            "m1a_false_collision": len(a_false),
-            "m1a_unreachable": len(a_unreach),
-            "m1a_gripper_collide": len(a_grip),
-            "m1a_min_ok": M1A_GOOD_ENOUGH,
-            "m1b_n": len(m1b), "m1b_ok": len(m1b) - len(b_bad),
-            "m1b_bad": [r.get("verdict") for r in b_bad],
-            "pass": bool(m1a and m1b and not a_false and not a_unreach
-                         and not a_grip and len(a_ok) >= M1A_GOOD_ENOUGH
-                         and not b_bad)}
+
+        fingers_in_model = bool(set(FINGER_JOINTS) & set(MODEL_JOINTS))
+        base_pass = bool(m1a and not a_false and not a_unreach and not a_grip
+                         and len(a_ok) >= M1A_GOOD_ENOUGH)
+        if fingers_in_model:
+            # 仿真：模型带 AG-95 ⇒ 用「两指必然重叠块」的原判法
+            log("  --- M1b：必然重叠的位姿必须被拒（模型含夹爪）---")
+            m1b = check_m1b(node, ik_client, close_fingers(start_js), truth)
+            b_bad = [r for r in m1b if r["verdict"] != "ok"]
+            report["m1b_kind"] = "fingers"
+            report["m1b"] = m1b
+            report["m1_summary"] = {
+                "m1a_n": len(m1a), "m1a_ok": len(a_ok),
+                "m1a_false_collision": len(a_false),
+                "m1a_unreachable": len(a_unreach),
+                "m1a_gripper_collide": len(a_grip),
+                "m1a_min_ok": M1A_GOOD_ENOUGH,
+                "m1b_kind": "fingers",
+                "m1b_n": len(m1b), "m1b_ok": len(m1b) - len(b_bad),
+                "m1b_bad": [r.get("verdict") for r in b_bad],
+                "pass": bool(base_pass and m1b and not b_bad)}
+        else:
+            # 真机：模型**没有夹爪几何** ⇒ 原判法必然假绿。换成模型无关的场景
+            # 活性判法（往 wrist_3_link 当前位置放盒子 ⇒ 同一状态必须翻成无效）。
+            log("  --- M1b：模型无夹爪 ⇒ 改判「场景是否真的进了 MoveIt」---")
+            m1b = check_m1b_scene_alive(node, scene_client, validity_client,
+                                        fk_client, plan_js)
+            report["m1b_kind"] = "scene_alive"
+            report["m1b"] = m1b
+            report["m1_summary"] = {
+                "m1a_n": len(m1a), "m1a_ok": len(a_ok),
+                "m1a_false_collision": len(a_false),
+                "m1a_unreachable": len(a_unreach),
+                "m1a_gripper_collide": len(a_grip),
+                "m1a_min_ok": M1A_GOOD_ENOUGH,
+                "m1b_kind": "scene_alive", "m1b_pass": bool(m1b["pass"]),
+                "pass": bool(base_pass and m1b["pass"])}
         log("M1 汇总：%s" % json.dumps(report["m1_summary"],
                                        ensure_ascii=False))
 
@@ -857,6 +1061,19 @@ def main(argv=None):
         log("\n== attach / detach ==")
         report["attach"] = attach_detach(node, scene_client, get_scene,
                                             fk_client, start_js, truth)
+
+    # 5) 清理：把本探针放进 MoveIt 的块/桌面撤掉。规划场景是 MoveIt 侧的状态，
+    #    残留会跟着栈活下去 —— 之后真机规划会撞上「幽灵块」（假碰撞，比漏检更烦）。
+    if not args.keep_scene:
+        for o in objs:
+            o.operation = CollisionObject.REMOVE
+        cleaned = send_scene(node, scene_client, world_objs=objs)
+        time.sleep(0.5)
+        left_w, left_a = scene_ids(read_scene(node, get_scene))
+        report["scene_cleanup"] = {"ok": cleaned, "world": left_w,
+                                   "attached": left_a}
+        log("\n清理场景：ok=%s 剩余 world=%s attached=%s"
+            % (cleaned, left_w, left_a))
 
     node.destroy_node()
     rclpy.shutdown()
