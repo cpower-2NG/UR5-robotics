@@ -125,6 +125,25 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 开跑前的四条通用前置见本文件第三步与 `待执行命令.md` 顶部表；`--go` 前的当次授权
 按 `AGENTS.md` §1 红线 6。
 
+### 一键演示（不依赖 AI）
+
+开发机上（人在终端旁）：
+
+```bash
+cd ~/robotics/worktrees/ur5-vision-grasp/stage3
+bash scripts/demo_stage3.sh             # 3 层，与六轮验收同口径
+bash scripts/demo_stage3.sh --frames 2  # 更快：每个视点少抓一帧
+bash scripts/demo_stage3.sh --dry-run   # 离线：不连板、不动臂，只生成计划
+```
+
+脚本自己串：只读预检（robot_mode / safety_mode / PLAYING / JTC / dashboard 节点数 /
+夹爪 `0x0200`）→ 走到 `stage2high` 抓垫位帧 → `stage2_pad.py` 重解垫位 →
+`stage3_round.py --go` 跑 N 层 → 判分（`person_review` 时再问一次人眼复核）。
+
+- 动臂前必须由人在**交互终端**敲 `yes`；stdin 不是 TTY 直接拒绝（红线 6
+  「有交互终端」档）。**夹爪初始化不代跑**：`0x0200` 不是 1 就把命令打给人。
+- 任何一步判红立即退出，不续跑、不重试。日志在 `<run-dir>/demo.log`。
+
 ---
 
 ## 已知坑速查（详细证据在台账）
