@@ -1181,14 +1181,54 @@ def merge_bias_estimate(prev, new_layers):
 
 
 # ---------------------------------------------------------------- 选块
+def _pool_shortfall(analysis, zone):
+    """候选池不够时的诊断：哪几块在拾取区外、差多少 / 哪几块没有够近的候选。
+
+    只用于把异常说清楚（2026-11-08：紫块中心 y=167.2 mm、区下界 170 mm，
+    差 2.8 mm 就整轮判红，旧报错却写「缺 无」，看不出是摆位问题）。
+    """
+    if not zone or len(zone) != 4:
+        return ""
+    x0, x1, y0, y1 = [float(v) * 1000.0 for v in zone]
+    per = {p.get("block_idx"): p for p in analysis.get("per_block") or []}
+    outside, no_cand = [], []
+    for b in analysis.get("blocks") or []:
+        name = b.get("class") or "#%d" % b["idx"]
+        if not s2.in_zone(b, zone):
+            off = []
+            if b["cx"] < x0:
+                off.append("x 差 %.1f mm" % (x0 - b["cx"]))
+            if b["cx"] > x1:
+                off.append("x 超 %.1f mm" % (b["cx"] - x1))
+            if b["cy"] < y0:
+                off.append("y 差 %.1f mm" % (y0 - b["cy"]))
+            if b["cy"] > y1:
+                off.append("y 超 %.1f mm" % (b["cy"] - y1))
+            outside.append("%s(cx=%.1f cy=%.1f，%s)"
+                           % (name, b["cx"], b["cy"], "、".join(off)))
+            continue
+        p = per.get(b["idx"]) or {}
+        if not p.get("best") or p.get("dist_mm") is None \
+                or p["dist_mm"] > pr.MAX_CAND_MM:
+            no_cand.append(name)
+    bits = []
+    if outside:
+        bits.append("拾取区外 %d 块：%s" % (len(outside), "；".join(outside)))
+    if no_cand:
+        bits.append("没有够近的候选 %d 块：%s"
+                    % (len(no_cand), "、".join(no_cand)))
+    return ("；" + "；".join(bits)) if bits else ""
+
+
 def build_items(analysis, scene, n, arm="geometric", zcal=None):
     """候选池 → 逐层要抓的块（按候选离块心最近排序，不按颜色）。"""
     zcal = zcal or {"pick": 0.0}
     pool = s2.candidate_pool(analysis, scene["pick_zone"])
     chosen, missing, unknown = s2.choose_blocks(pool, order=None, n=n)
     if len(chosen) < n:
-        raise RuntimeError("候选池只够 %d 块（要 %d）—— 缺 %s，未定色 %d 块"
-                           % (len(chosen), n, missing or "无", len(unknown)))
+        raise RuntimeError("候选池只够 %d 块（要 %d）—— 缺 %s，未定色 %d 块%s"
+                           % (len(chosen), n, missing or "无", len(unknown),
+                              _pool_shortfall(analysis, scene["pick_zone"])))
     items = []
     for k, entry in enumerate(chosen, 1):
         block, cand = entry["block"], entry["best"]

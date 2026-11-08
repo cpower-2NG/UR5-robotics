@@ -919,6 +919,27 @@ def test_pick_item_converts_runtime_error():
 
 
 @case
+def test_build_items_names_out_of_zone_block():
+    """候选池不够时，报错要点名哪块在拾取区外、差多少（别只写「缺 无」）。"""
+    analysis = {"blocks": [
+        {"idx": 0, "class": "yellow", "cx": 421.9, "cy": 358.5},
+        {"idx": 1, "class": "purple", "cx": 440.6, "cy": 167.2}],
+        "per_block": [
+            {"block_idx": 0, "class": "yellow", "best": {"i": 0}, "dist_mm": 1.4},
+            {"block_idx": 1, "class": "purple", "best": {"i": 1}, "dist_mm": 1.7}]}
+    scene = {"pick_zone": [0.25, 0.575, 0.17, 0.42]}
+    try:
+        s3r.build_items(analysis, scene, 2)
+    except RuntimeError as exc:
+        msg = str(exc)
+        assert "purple" in msg, msg
+        assert "拾取区外 1 块" in msg, msg
+        assert "y 差 2.8 mm" in msg, msg
+    else:
+        raise AssertionError("没有报错")
+
+
+@case
 def test_pick_item_skips_crowded_block():
     """第一选被邻距护栏拒掉时换下一块；全挤在一起就干净停机。"""
     blocks = [{"idx": 0, "cx": 400.0, "cy": 300.0},
