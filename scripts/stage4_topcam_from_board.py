@@ -18,11 +18,24 @@
 板静止 ⇒ 两路**不必同时**拍；缺的只是腕部一次「看得全」的采集（E2 那批腕部帧
 只看到 7–12 个角点、RMS 12–25 px，用不了）。
 
-⚠️ 这里假设「板自那次存盘之后没动过」。输出的数**不是**外参的事实源，必须再过
-E3b 的端到端两路垫 PnP（≤2 mm/0.5°）才算通过。
+⚠️ 两条路的前提不同：
+   · `--store`：假设「板自那次存盘之后没动过」。板挪过就不能用 —— 2026-11-09
+     真机上板被挪了约 350 mm，这条前提已经不成立。
+   · `--topcam-burst`：俯视**现场现拍一块板**，`cam←board` 与 `base←board` 各测各的
+     （板静止 ⇒ 不必同时拍），不经过任何存盘。板动过之后一律走这条。
+   无论哪条，输出的数**都不是**外参的事实源，必须再过端到端两路垫 PnP
+   （判据 B：≤2 mm / 1.2°）才算通过。
 
 用法：
 
+    # 板挪过 / 不确定：腕部看板 + 俯视现拍板
+    python3 scripts/stage4_topcam_from_board.py \\
+        --wrist-burst runs/<run>/p1-board/wrist \\
+        --topcam-burst runs/<run>/p1-board/topcam \\
+        --board docs/calib/charuco_A4_30mm_5x5.json \\
+        --out runs/<run>/topcam-from-board.json
+
+    # 板没动过：复用存盘里的 cam←board
     python3 scripts/stage4_topcam_from_board.py \\
         --wrist-burst runs/<run>/wrist-board --board docs/calib/charuco_A4_30mm_5x5.json \\
         --store runs/<run>/marker-store-board-moved-fused.json \\
@@ -92,6 +105,14 @@ def fuse_base_board(burst_dir, board_meta):
                      'rms_px': round(float(rms), 3)})
     if not Ts:
         return None, {'n_attempted': len(rows), 'n_failed': fails, 'frames': rows}
+    return _fused(Ts, rows, fails)
+
+
+def _fused(Ts, rows, fails):
+    """一组位姿 → 融合值 + 逐帧统计（腕部/俯视两路共用，口径必须一致）。"""
+    if not Ts:
+        return None, {'n_attempted': len(rows), 'n_failed': fails,
+                      'frames': rows}
     T_f = s4jc.mean_pose(Ts)
     dev_t = max(float(np.linalg.norm(T[:3, 3] - T_f[:3, 3])) * 1000 for T in Ts)
     dev_a = max(float(np.degrees(np.linalg.norm(
@@ -104,6 +125,41 @@ def fuse_base_board(burst_dir, board_meta):
             'max_dev_mm': round(dev_t, 3), 'max_dev_deg': round(dev_a, 4),
             'frames': rows}
     return T_f, stat
+
+
+def fuse_cam_board(burst_dir, board_meta):
+    """**俯视** burst → ``cam←board`` 的融合位姿 + 逐帧统计。
+
+    与 ``fuse_base_board`` 的唯一区别：不碰 TF。板静止时它才是「板今天在哪」的
+    现测证据 —— 存盘那份 ``cam←board`` 的前提是「板自存盘后没动过」，本项目已经
+    在真机上把板挪过（2026-11-09，约 350 mm），那条前提不能默认成立。
+    """
+    Ts, rows, fails = [], [], 0
+    for idx in frame_indices(burst_dir):
+        meta = json.load(open(_p(burst_dir, 'meta', '.json', idx), encoding='utf-8'))
+        info = meta['camera_info']
+        K = np.asarray(info['K'], dtype=float).reshape(3, 3)
+        dist = np.asarray(info.get('D') or [0.0] * 5, dtype=float).reshape(-1, 1)
+        det = tmc.detect_board(_p(burst_dir, 'color', '.png', idx),
+                               board_meta, K, dist)
+        if det is None:
+            fails += 1
+            rows.append({'idx': idx, 'ok': False})
+            continue
+        (R_cb, t_cb), n_pts, rms = det
+        Ts.append(s4jc._T(R_cb, t_cb))
+        rows.append({'idx': idx, 'ok': True, 'n_corners': int(n_pts),
+                     'rms_px': round(float(rms), 3)})
+    return _fused(Ts, rows, fails)
+
+
+def link_from_optical_tf(tf_doc):
+    """俯视 burst 的 ``tf.json`` → ``link←optical``（驱动实测链，非理想旋转）。"""
+    try:
+        R_lo, t_lo = tmc.chain_from_tf(tf_doc, tmc.TOPCAM_LINK_TO_OPTICAL_KEYS)
+        return s4jc._T(R_lo, t_lo), 'tf-json'
+    except SystemExit:
+        return s4jc._T(tmc.R_LINK_TO_OPTICAL, np.zeros(3)), 'ideal(fallback)'
 
 
 def link_from_optical(doc):
@@ -136,22 +192,33 @@ def main(argv=None):
     ap.add_argument('--wrist-burst', required=True,
                     help='腕部看板的采集目录（precision_capture --burst）')
     ap.add_argument('--board', required=True, help='板规格 JSON（含 board_w_mm）')
-    ap.add_argument('--store', required=True, help='存盘 base←board（融合版）')
+    ap.add_argument('--topcam-burst', default=None,
+                    help='★ 俯视 burst：现场现测 cam←board，**不经过存盘**。'
+                         '板自存盘后挪过（或不确定）时必须用它 —— 存盘那条路的前提'
+                         '是「板没动」，本项目真机已挪过约 350 mm')
+    ap.add_argument('--store', default=None,
+                    help='存盘 base←board（融合版）；假定板自存盘后没动过。'
+                         '与 --topcam-burst 至少给一个')
     ap.add_argument('--extrinsics', default=None,
                     help='旧外参文档；缺省 = 存盘里 from_extrinsics 记的那份')
     ap.add_argument('--out', help='写结果 JSON 的位置')
     a = ap.parse_args(argv)
 
     board_meta = json.load(open(a.board, encoding='utf-8'))
-    store = json.load(open(a.store, encoding='utf-8'))
-    ext_path = a.extrinsics or store.get('from_extrinsics')
-    if not ext_path:
+    if not a.store and not a.topcam_burst:
+        raise SystemExit('--store 与 --topcam-burst 至少给一个：板自存盘后没动过用前者，'
+                         '板动过或不确定用后者（现场现拍一块板，不依赖存盘）')
+    store = json.load(open(a.store, encoding='utf-8')) if a.store else None
+    ext_path = a.extrinsics or (store or {}).get('from_extrinsics')
+    old_doc = None
+    if ext_path:
+        if not os.path.isabs(ext_path):
+            ext_path = os.path.join(REPO, ext_path)
+        if not os.path.exists(ext_path):
+            raise SystemExit('旧外参文档不存在：%s' % ext_path)
+        old_doc = json.load(open(ext_path, encoding='utf-8'))
+    elif not a.topcam_burst:
         raise SystemExit('存盘没有 from_extrinsics，必须显式给 --extrinsics')
-    if not os.path.isabs(ext_path):
-        ext_path = os.path.join(REPO, ext_path)
-    if not os.path.exists(ext_path):
-        raise SystemExit('旧外参文档不存在：%s' % ext_path)
-    old_doc = json.load(open(ext_path, encoding='utf-8'))
 
     T_wb, stat = fuse_base_board(a.wrist_burst, board_meta)
     if T_wb is None:
@@ -159,42 +226,88 @@ def main(argv=None):
               '是不是被夹爪挡了' % stat['n_attempted'], file=sys.stderr)
         return 2
 
-    base_cam_new, base_link_new, (R_old, t_old), link_src = compose_extrinsic(
-        T_wb, store, old_doc)
+    T_cb = tstat = store_diag = None
+    if a.topcam_burst:
+        # 板「现在」在哪：腕部近距离看 + 俯视现拍一块板。两路各自独立测板，
+        # 板静止 ⇒ 不必同时拍。不经过存盘 ⇒ 板挪过也成立。
+        T_cb, tstat = fuse_cam_board(a.topcam_burst, board_meta)
+        if T_cb is None:
+            print('!! 俯视 burst 一帧都没解出板（试了 %d 帧）—— 看板是否出画/被挡'
+                  % tstat['n_attempted'], file=sys.stderr)
+            return 2
+        base_cam_new = s4jc._compose(T_wb, s4jc._inv(T_cb))
+        tf0 = json.load(open(_p(a.topcam_burst, 'tf', '.json',
+                                frame_indices(a.topcam_burst)[0]),
+                             encoding='utf-8'))
+        T_lo, link_src = link_from_optical_tf(tf0)
+        base_link_new = s4jc._compose(base_cam_new, s4jc._inv(T_lo))
+        if store is not None:
+            T_sb = s4jc._T(np.asarray(store['base_from_board_R'], dtype=float),
+                           np.asarray(store['base_from_board_t'], dtype=float))
+            store_diag = {
+                'translation_mm': round(float(np.linalg.norm(
+                    T_sb[:3, 3] - T_wb[:3, 3])) * 1000.0, 3),
+                'angle_deg': round(float(np.degrees(np.linalg.norm(
+                    Rot.from_matrix(T_sb[:3, :3].T @ T_wb[:3, :3]).as_rotvec()))), 4)}
+    else:
+        base_cam_new, base_link_new, _old, link_src = compose_extrinsic(
+            T_wb, store, old_doc)
     R_new, t_new = base_cam_new[:3, :3], base_cam_new[:3, 3]
     R_link, t_link = base_link_new[:3, :3], base_link_new[:3, 3]
 
-    d_t = float(np.linalg.norm(t_new - t_old)) * 1000.0
-    d_a = float(np.degrees(np.linalg.norm(
-        Rot.from_matrix(R_old.T @ R_new).as_rotvec())))
+    if old_doc is not None:
+        R_old, t_old = tmc.base_from_camera(old_doc)
+        d_t = float(np.linalg.norm(t_new - t_old)) * 1000.0
+        d_a = float(np.degrees(np.linalg.norm(
+            Rot.from_matrix(R_old.T @ R_new).as_rotvec())))
+    else:
+        d_t = d_a = None
     launch = tmc.fmt_launch(R_link, t_link, prefix='topcam')
 
     report = {
         'version': 1,
         'kind': 'stage4-topcam-extrinsic-from-board',
         'wrist_burst': os.path.abspath(a.wrist_burst),
-        'store': os.path.abspath(a.store),
-        'old_extrinsics': os.path.abspath(ext_path),
+        'store': os.path.abspath(a.store) if a.store else None,
+        'topcam_burst': os.path.abspath(a.topcam_burst) if a.topcam_burst else None,
+        'old_extrinsics': os.path.abspath(ext_path) if ext_path else None,
         'link_from_optical_source': link_src,
         'wrist_base_board': {'R': T_wb[:3, :3].tolist(), 't': T_wb[:3, 3].tolist(),
                              **stat},
+        'topcam_cam_board': ({'R': T_cb[:3, :3].tolist(),
+                              't': T_cb[:3, 3].tolist(), **tstat}
+                             if T_cb is not None else None),
+        'board_moved_vs_store': store_diag,
         'new_base_topcam_optical': {'R': R_new.tolist(),
                                     't': [float(v) for v in t_new]},
         'new_base_topcam_link': {'R': R_link.tolist(),
                                  't': [float(v) for v in t_link],
                                  'q': [float(v) for v in tmc.matrix_to_quat(R_link)]},
-        'delta_vs_old': {'translation_mm': round(d_t, 4),
-                         'angle_deg': round(d_a, 4)},
+        'delta_vs_old': ({'translation_mm': round(d_t, 4),
+                          'angle_deg': round(d_a, 4)}
+                         if d_t is not None else None),
         'launch_args': launch,
-        'note': '必须再过 E3b 端到端两路垫 PnP 复核（≤2 mm/0.5°）才能进 launch',
+        'note': '必须再过 E3b 端到端两路垫 PnP 复核（≤2 mm/1.2°）才能进 launch',
     }
     print('腕部看板：%d/%d 帧可用，角点 min/中位 %d/%d，RMS 中位 %s px，'
           '帧间最大偏离 %.3f mm / %.3f°'
           % (stat['n_used'], stat['n_attempted'], stat['corner_min'],
              stat['corner_median'], stat['rms_median_px'],
              stat['max_dev_mm'], stat['max_dev_deg']))
+    if tstat is not None:
+        print('俯视看板：%d/%d 帧可用，角点 min/中位 %d/%d，RMS 中位 %s px，'
+              '帧间最大偏离 %.3f mm / %.3f°'
+              % (tstat['n_used'], tstat['n_attempted'], tstat['corner_min'],
+                 tstat['corner_median'], tstat['rms_median_px'],
+                 tstat['max_dev_mm'], tstat['max_dev_deg']))
+    if store_diag is not None:
+        print('板相对存盘挪了：%.1f mm / %.2f°（存盘前提已失效，所以走现拍）'
+              % (store_diag['translation_mm'], store_diag['angle_deg']))
     print('base←topcam(光学)：t = %s m' % np.round(t_new, 6).tolist())
-    print('与旧外参差：%.3f mm / %.4f°（链来源 %s）' % (d_t, d_a, link_src))
+    if d_t is not None:
+        print('与旧外参差：%.3f mm / %.4f°（链来源 %s）' % (d_t, d_a, link_src))
+    else:
+        print('没给旧外参 ⇒ 不打印与旧值的差（链来源 %s）' % link_src)
     print(launch)
     if a.out:
         with open(a.out, 'w', encoding='utf-8') as f:
