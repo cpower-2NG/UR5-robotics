@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""把一次真机俯视 burst 量成 E8 探针能吃的 ``scene_truth.json``。
+"""把一次 burst（俯视或**腕部**）量成 E8/E9 探针能吃的 ``scene_truth.json``。
+
+两路相机只用 ``--camera`` 区分（2026-11-09 用户拍板）：
+
+    ``--camera wrist``    规划感知（E9 起默认走这条）：手眼外参定位置，毫米级
+    ``--camera topcam``   跑后判分器（``--verify --colour-burst``），默认值
+
+两者**只差 tf 链与内参** —— 下面的几何（射线 ∩ 平面、分层、颜色、yaw）一层不动。
 
 为什么需要这个工具
 ------------------
@@ -292,14 +299,29 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
     }
 
 
-def measure_dir(frame_dir, index=None, split=True, yaw_method="colour"):
-    """俯视帧 → (frame, find_blocks 行, 台面 z)。俯视链纯静态，不经过臂。
+CAMERAS = {
+    # 规划感知走**腕部**（用户 2026-11-09 定）：俯视的绝对 xy 有 20–45 mm
+    # 系统偏差，只能当视场引导；腕部链由手眼外参定，是毫米级。
+    "wrist": (gc.TIP, gc.CHAIN),
+    # 俯视只剩一个角色：跑完之后的判分器（`--verify --colour-burst`）。
+    "topcam": (gc.TOPCAM_TIP, gc.TOPCAM_CHAIN),
+}
+
+
+def measure_dir(frame_dir, index=None, split=True, yaw_method="colour",
+                camera="topcam"):
+    """一帧 → (frame, find_blocks 行, 台面 z)。
+
+    ``camera``：``'topcam'``（默认，判分器）或 ``'wrist'``（规划感知）。两者
+    只差 tf 链与 K —— 腕部链经过 ``tool0``，位置随当帧关节走。
 
     ``yaw_method='colour'``（默认）把每行的 yaw 换成彩色像素掩码矩形
     （见 ``colour_yaw_rows``）；``'depth'`` 是旧口径（PCA），只为复现旧证据。
     """
-    frame = gc.load_frame(frame_dir, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN,
-                          idx=index)
+    if camera not in CAMERAS:
+        raise ValueError("camera 只能是 %s，收到 %r" % (sorted(CAMERAS), camera))
+    tip, chain = CAMERAS[camera]
+    frame = gc.load_frame(frame_dir, tip=tip, chain=chain, idx=index)
     rows, table_z = gc.find_blocks(frame, split=split)
     if yaw_method == "colour":
         colour_yaw_rows(frame, rows)
@@ -435,12 +457,14 @@ def consensus(truths, radius_m=0.020, min_frames=None):
     }
 
 
-def survey(frame_dir, split=True, table_top=0.0, yaw_method="colour"):
+def survey(frame_dir, split=True, table_top=0.0, yaw_method="colour",
+           camera="topcam"):
     idxs = gc.list_frame_indices(frame_dir)
-    print("帧数 %d（yaw 口径：%s）" % (len(idxs), yaw_method))
+    print("帧数 %d（yaw 口径：%s，相机：%s）"
+          % (len(idxs), yaw_method, camera))
     for idx in idxs:
         frame, rows, table_z = measure_dir(frame_dir, index=idx, split=split,
-                                           yaw_method=yaw_method)
+                                           yaw_method=yaw_method, camera=camera)
         t = build_truth(rows, frame, table_top=table_top)
         print("  idx=%-3s 深度台面=%8.2f mm  块数=%2d  区外=%2d  非积木=%2d"
               % (idx, table_z * 1000.0, len(t["blocks"]),
@@ -455,8 +479,9 @@ def survey(frame_dir, split=True, table_top=0.0, yaw_method="colour"):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="真机俯视 burst → E8 探针的 scene_truth.json（射线 ∩ 平面）")
-    ap.add_argument("--frame", required=True, help="俯视帧目录（burst）")
+        description="真机 burst（俯视/腕部）→ 探针的 scene_truth.json"
+                    "（射线 ∩ 平面）")
+    ap.add_argument("--frame", required=True, help="帧目录（burst）")
     ap.add_argument("--index", type=int, default=None,
                     help="用第几帧（默认：burst 里取第 0 帧）")
     ap.add_argument("--block-size", type=float, default=BLOCK_SIZE_M,
@@ -486,6 +511,9 @@ def main(argv=None):
     ap.add_argument("--yaw-depth", action="store_true",
                     help="yaw 退回 find_blocks 的深度 PCA 长边（旧口径，只为"
                          "复现旧证据；默认用彩色像素掩码矩形）")
+    ap.add_argument("--camera", choices=sorted(CAMERAS), default="topcam",
+                    help="用哪路相机：topcam=俯视判分器（默认）、wrist=腕部"
+                         "规划感知（要当帧关节在帧目录里，burst 自带）")
     ap.add_argument("--zone", default=None, metavar="X0,X1,Y0,Y1",
                     help="真值保留区（base 系米）。缺省 = 拾取区 ZONE_M。"
                          "E9 真机半段要覆盖垫面与北侧自由区，例如 "
@@ -514,7 +542,8 @@ def main(argv=None):
     if args.survey:
         survey(args.frame, split=not args.no_split,
                table_top=args.table_top,
-               yaw_method="depth" if args.yaw_depth else "colour")
+               yaw_method="depth" if args.yaw_depth else "colour",
+               camera=args.camera)
         return 0
 
     yaw_method = "depth" if args.yaw_depth else "colour"
@@ -533,7 +562,8 @@ def main(argv=None):
         for i in idxs:
             fr, rows_i, _ = measure_dir(args.frame, index=i,
                                         split=not args.no_split,
-                                        yaw_method=yaw_method)
+                                        yaw_method=yaw_method,
+                                        camera=args.camera)
             truths.append(build_truth(
                 rows_i, fr, table_top=args.table_top,
                 block_size=args.block_size,
@@ -569,7 +599,8 @@ def main(argv=None):
     else:
         frame, rows, table_z = measure_dir(args.frame, index=idx,
                                            split=not args.no_split,
-                                           yaw_method=yaw_method)
+                                           yaw_method=yaw_method,
+                                           camera=args.camera)
         truth = build_truth(rows, frame, table_top=args.table_top,
                             block_size=args.block_size,
                             batch=os.path.basename(args.frame.rstrip("/")),

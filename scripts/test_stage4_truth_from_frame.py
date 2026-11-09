@@ -404,6 +404,57 @@ def section_consensus_yaw():
           c2["blocks"][0]["meas"].get("yaw_source"))
 
 
+def section_camera():
+    print('\n[12] --camera 只换 tf 链/K，几何一层不动')
+    check("wrist 用 gc.TIP/gc.CHAIN",
+          tf.CAMERAS["wrist"] == (tf.gc.TIP, tf.gc.CHAIN), tf.CAMERAS["wrist"])
+    check("topcam 用 TOPCAM_TIP/TOPCAM_CHAIN",
+          tf.CAMERAS["topcam"] == (tf.gc.TOPCAM_TIP, tf.gc.TOPCAM_CHAIN),
+          tf.CAMERAS["topcam"])
+
+    # 载荷参数真的转发到 load_frame（不打桩到 find_blocks；拿不到帧就说明转发对了）
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def fake_load(frame_dir, tip=None, chain=None, idx=None):
+        seen.update(tip=tip, chain=chain, idx=idx)
+        raise _Stop
+
+    real = tf.gc.load_frame
+    tf.gc.load_frame = fake_load
+    try:
+        for cam, want in (("wrist", tf.CAMERAS["wrist"]),
+                          ("topcam", tf.CAMERAS["topcam"])):
+            seen.clear()
+            try:
+                tf.measure_dir("x", index=7, camera=cam)
+            except _Stop:
+                pass
+            check("%s 转发 tip/chain/idx 到 load_frame" % cam,
+                  (seen.get("tip"), seen.get("chain"), seen.get("idx"))
+                  == (want[0], want[1], 7), seen)
+        seen.clear()
+        try:
+            tf.measure_dir("x", index=7)        # 缺省 = topcam
+        except _Stop:
+            pass
+        check("缺省相机 = topcam",
+              (seen.get("tip"), seen.get("chain"))
+              == (tf.gc.TOPCAM_TIP, tf.gc.TOPCAM_CHAIN), seen)
+    finally:
+        tf.gc.load_frame = real
+
+    try:
+        tf.measure_dir("x", camera="lidar")
+        raised = None
+    except ValueError as e:
+        raised = str(e)
+    check("未知相机名报错而不是静默用俯视",
+          raised is not None and "lidar" in raised, raised)
+
+
 def main():
     section_ray_plane()
     section_depth_immunity()
@@ -416,6 +467,7 @@ def main():
     section_layers()
     section_colour_yaw()
     section_consensus_yaw()
+    section_camera()
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('失败项：' + ', '.join(FAILS))
