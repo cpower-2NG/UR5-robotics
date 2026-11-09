@@ -55,6 +55,15 @@ def raises(fn, *a, **kw):
     return False, ''
 
 
+def system_exits(fn, *a, **kw):
+    """``SystemExit`` 不是 ``Exception``（是 ``BaseException``），raises() 抓不到。"""
+    try:
+        fn(*a, **kw)
+    except SystemExit as e:
+        return True, str(e)
+    return False, ''
+
+
 def _mut(old, new):
     src = inspect.getsource(cr)
     assert old in src, '变异锚点不在源码里：%r' % old
@@ -689,11 +698,111 @@ def section_colour():
           ns['colour_blob_uv'](_img(80, 80), (40, 40), 35) is not None)
 
 
+# ----------------------------------------------------------------- [10]
+class _Args(object):
+    def __init__(self, **kw):
+        self.grid = kw.get('grid')
+        self.allow_model_pad = kw.get('allow_model_pad', False)
+
+
+def section_pad_pose():
+    print('\n[10] 实测垫位姿接线：--grid > manifest 记录 > 目录约定文件；都没有就停')
+    tmp = tempfile.mkdtemp(prefix='cr-padpose-')
+    real = {'kind': 'stage2-grid', 'grid_center_base_mm': [442.3, -197.9],
+            'grid_yaw_base_deg': -91.07,
+            'checks': {'n_frames': 3, 'rms_adopted_px': 0.84}}
+    gpath = os.path.join(tmp, 'grid-pre.json')
+    with open(gpath, 'w', encoding='utf-8') as f:
+        json.dump(real, f)
+    try:
+        p = cr.apply_pad_pose(_Args(), tmp)
+        check('只有目录约定文件 ⇒ 用它', p == gpath, str(p))
+        check('装进去的是实测值（不是模型常量）',
+              abs(cm.PAD_CENTER[0] * 1000 - 442.3) < 1e-9 and
+              abs(math.degrees(cm.PAD_YAW_RAD) + 91.07) < 1e-9,
+              str(cm.PAD_CENTER))
+
+        # --grid 优先于目录里的文件
+        alt = os.path.join(tmp, 'alt.json')
+        with open(alt, 'w', encoding='utf-8') as f:
+            json.dump({'kind': 'stage2-grid', 'grid_center_base_mm': [400.0, -150.0],
+                       'grid_yaw_base_deg': -180.0}, f)
+        p = cr.apply_pad_pose(_Args(grid=alt), tmp)
+        check('--grid 优先于目录文件',
+              p == alt and abs(cm.PAD_CENTER[0] * 1000 - 400.0) < 1e-9, str(p))
+
+        # manifest 记录（相对路径按 hint_dir 解析）
+        cr.apply_pad_pose(_Args(), tmp, recorded='grid-pre.json')
+        check('manifest 记录的相对路径解析到 hint_dir',
+              abs(cm.PAD_CENTER[0] * 1000 - 442.3) < 1e-9, str(cm.PAD_CENTER))
+
+        # manifest 记录的路径不存在 ⇒ 退到目录约定文件，而不是崩
+        cr.apply_pad_pose(_Args(), tmp, recorded='gone.json')
+        check('记录的路径不在了 ⇒ 退到目录约定文件',
+              abs(cm.PAD_CENTER[0] * 1000 - 442.3) < 1e-9)
+
+        # 一个都没有 ⇒ SystemExit（fail-closed）
+        empty = os.path.join(tmp, 'empty')
+        ok, err = system_exits(cr.apply_pad_pose, _Args(), empty)
+        check('一处都找不到 ⇒ 报错停下（fail-closed）', ok and 'stage2_pad' in err)
+        ok, _ = system_exits(cr.apply_pad_pose, _Args(), empty, 'missing.json')
+        check('manifest 记录的路径也不在、目录里也没有 ⇒ 停', ok)
+
+        # 显式 --allow-model-pad 才退回常量
+        p = cr.apply_pad_pose(_Args(allow_model_pad=True), empty)
+        check('--allow-model-pad ⇒ 退回模型常量且返回 None', p is None)
+
+        # manifest 记账
+        rec = cr.pad_pose_record(gpath)
+        check('pad_pose_record 标 measured、不记绝对路径',
+              rec['measured'] is True and rec['source'] == 'grid-pre.json'
+              and 'center_mm' in rec and 'yaw_deg' in rec, str(rec))
+        rec0 = cr.pad_pose_record(None)
+        check('没用实测值 ⇒ measured=False（不装成实测）',
+              rec0['measured'] is False and rec0['source'] == cm.PAD_POSE_SOURCE)
+
+        # 计划端与判分端同源核对：两份垫位姿差得明显要喊出来
+        cr.apply_pad_pose(_Args(grid=gpath), tmp)     # 判分端 = 442.3/−91.07
+        lines = []
+        real_log = cr.log
+        cr.log = lambda *a: lines.append(' '.join(str(x) for x in a))
+        try:
+            same = os.path.join(tmp, 'truth-same.json')
+            with open(same, 'w', encoding='utf-8') as f:
+                json.dump({'pad_pose': {'center_mm': [442.3, -197.9],
+                                        'yaw_deg': -91.07}}, f)
+            cr.warn_pad_pose_mismatch({'truth': same})
+            check('计划/判分同一份 ⇒ 不喊', not lines, str(lines))
+            diff = os.path.join(tmp, 'truth-diff.json')
+            with open(diff, 'w', encoding='utf-8') as f:
+                json.dump({'pad_pose': {'center_mm': [424.2, -112.24],
+                                        'yaw_deg': -179.778}}, f)
+            cr.warn_pad_pose_mismatch({'truth': diff})
+            check('计划/判分不是同一份 ⇒ 喊出来',
+                  any('不是同一份' in ln for ln in lines), str(lines))
+            lines.clear()
+            legacy = os.path.join(tmp, 'truth-old.json')
+            with open(legacy, 'w', encoding='utf-8') as f:
+                json.dump({'blocks': []}, f)
+            cr.warn_pad_pose_mismatch({'truth': legacy})
+            check('旧场景没记垫位姿 ⇒ 明说无法核对',
+                  any('无法核对' in ln for ln in lines), str(lines))
+        finally:
+            cr.log = real_log
+    finally:
+        cm.reset_pad()
+        cm._GS.reset_pad()
+
+    check('复位后不再残留实测垫位姿',
+          cm.PAD_CENTER == cm._DEFAULT_PAD_CENTER and
+          '未实测' in cm.PAD_POSE_SOURCE)
+
+
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
                section_gap, section_mutation, section_verify, section_fuse,
-               section_colour):
+               section_colour, section_pad_pose):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

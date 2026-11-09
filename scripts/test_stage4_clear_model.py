@@ -291,6 +291,130 @@ def section_mutation():
           and mut['terminal_report'](orphan)['ok'])
 
 
+# ------------------------------------------------------------------ [8]
+def section_pad_pose():
+    print('\n[8] 垫位姿：每场实测 —— 计划与判分读同一份，缺文件就停')
+    import tempfile
+    gs = cm._GS
+    tmp = tempfile.mkdtemp(prefix='padpose-')
+    real_center, real_yaw = (442.3, -197.9), -91.07
+    grid = {'kind': 'stage2-grid', 'pitch_mm': cm.PAD_PITCH * 1000.0,
+            'grid_center_base_mm': list(real_center),
+            'grid_yaw_base_deg': real_yaw,
+            'checks': {'n_frames': 3, 'rms_adopted_px': 0.84}}
+    gpath = os.path.join(tmp, 'grid-pre.json')
+    with open(gpath, 'w', encoding='utf-8') as f:
+        json.dump(grid, f)
+
+    try:
+        # 默认值是模型常量，且标记成「未实测」
+        check('默认垫位姿 = 模型常量（未实测）',
+              cm.PAD_CENTER == (cm._DEFAULT_PAD_CENTER) and
+              '未实测' in cm.PAD_POSE_SOURCE, cm.PAD_POSE_SOURCE)
+
+        doc = cm.load_grid(gpath)
+        check('load_grid 读入实测垫心',
+              abs(cm.PAD_CENTER[0] * 1000 - real_center[0]) < 1e-9 and
+              abs(cm.PAD_CENTER[1] * 1000 - real_center[1]) < 1e-9,
+              str(cm.PAD_CENTER))
+        check('load_grid 读入实测 yaw',
+              abs(math.degrees(cm.PAD_YAW_RAD) - real_yaw) < 1e-9,
+              str(math.degrees(cm.PAD_YAW_RAD)))
+        check('load_grid 记下来源（不再自称模型常量）',
+              cm.PAD_POSE_SOURCE == os.path.abspath(gpath), cm.PAD_POSE_SOURCE)
+        check('load_grid 原样返回文档', doc is not None and doc['kind'] == 'stage2-grid')
+
+        # 换了垫位姿之后，格心/反查必须整体跟着换
+        check('第 4 格 = 实测垫心',
+              all(abs(a - b) < 1e-12 for a, b in zip(cm.cell_center(4), cm.PAD_CENTER)))
+        check('重配后格心反查 = 自己',
+              all(cm.cell_index_of(*cm.cell_center(i)) == i for i in range(9)))
+        check('旧垫心不再被判成格 4（模型常量已退场）',
+              cm.cell_index_of(*cm._DEFAULT_PAD_CENTER) != 4,
+              str(cm.cell_index_of(*cm._DEFAULT_PAD_CENTER)))
+
+        # 判分端与计划端（gen_scene 的 SDF）必须落到同一批坐标
+        gs.load_grid(gpath)
+        check('gen_scene 与判分端读到同一垫心', gs.PAD_CENTER_MM ==
+              (real_center[0], real_center[1]), str(gs.PAD_CENTER_MM))
+        check('gen_scene 与判分端读到同一 yaw',
+              abs(gs.PAD_YAW_DEG - real_yaw) < 1e-9, str(gs.PAD_YAW_DEG))
+        sdf = gs._pad_grid_sdf()
+        worst = 0.0
+        n_found = 0
+        for i in range(9):
+            r, c = divmod(i, 3)
+            m = re.search(r'<visual name="cell_%d%d">.*?<pose>([-\d.]+) ([-\d.]+) '
+                          r'[-\d.]+ 0 0 ([-\d.]+)</pose>' % (r, c), sdf, re.S)
+            if not m:
+                continue
+            n_found += 1
+            px, py = float(m.group(1)), float(m.group(2))
+            cx, cy = cm.cell_center(i)
+            worst = max(worst, math.hypot(px - cx, py - cy) * 1000.0)
+        check('SDF 里 9 个宫格', n_found == 9, str(n_found))
+        check('SDF 宫格心 = 判分格心（≤0.01 mm）', worst < 0.01, '%.4f mm' % worst)
+
+        # 计划侧落盘的 scene_truth.json 必须带上实测标记
+        out = os.path.join(tmp, 'scene')
+        gs.write_scene('S0', 0, out)
+        truth = json.load(open(os.path.join(out, 'scene_truth.json'), encoding='utf-8'))
+        check('scene_truth 记录实测垫位姿',
+              truth['pad_pose']['measured'] is True and
+              abs(truth['pad_pose']['yaw_deg'] - real_yaw) < 1e-9,
+              str(truth['pad_pose']))
+
+        # fail-closed：缺文件 / 不是 stage2-grid / 缺字段 一律抛
+        for name, payload in (
+                ('非 stage2-grid', {'kind': 'something-else',
+                                    'grid_center_base_mm': [0, 0],
+                                    'grid_yaw_base_deg': 0}),
+                ('缺 grid_center_base_mm', {'kind': 'stage2-grid',
+                                            'grid_yaw_base_deg': 0}),
+                ('缺 grid_yaw_base_deg', {'kind': 'stage2-grid',
+                                          'grid_center_base_mm': [0, 0]})):
+            p = os.path.join(tmp, 'bad.json')
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(payload, f)
+            raised = False
+            try:
+                cm.load_grid(p)
+            except ValueError:
+                raised = True
+            check('%s → 报错停下' % name, raised and cm.PAD_CENTER ==
+                  (real_center[0] / 1000.0, real_center[1] / 1000.0))
+        raised = False
+        try:
+            cm.load_grid(os.path.join(tmp, 'nope.json'))
+        except (IOError, OSError):
+            raised = True
+        check('缺文件 → 报错停下', raised)
+
+        # find_grid：grid-pre.json 优先于 grid.json
+        open(os.path.join(tmp, 'grid.json'), 'w').close()
+        check('find_grid 优先 grid-pre.json',
+              cm.find_grid(tmp) == os.path.join(tmp, 'grid-pre.json'),
+              str(cm.find_grid(tmp)))
+        os.remove(os.path.join(tmp, 'grid-pre.json'))
+        check('没有 grid-pre.json 时退到 grid.json',
+              cm.find_grid(tmp) == os.path.join(tmp, 'grid.json'))
+        check('空目录 → None', cm.find_grid(os.path.join(tmp, 'empty')) is None)
+    finally:
+        cm.reset_pad()
+        gs.reset_pad()
+
+    check('reset_pad 回到模型常量（判分端）',
+          cm.PAD_CENTER == cm._DEFAULT_PAD_CENTER and
+          cm.PAD_YAW_RAD == cm._DEFAULT_PAD_YAW_RAD and
+          '未实测' in cm.PAD_POSE_SOURCE)
+    check('reset_pad 回到模型常量（计划端）',
+          gs.PAD_CENTER_MM == gs._DEFAULT_PAD_CENTER_MM and
+          gs.PAD_YAW_DEG == gs._DEFAULT_PAD_YAW_DEG)
+    check('复位后 gen_scene 默认值仍与判分端同步',
+          math.degrees(cm.PAD_YAW_RAD) == gs.PAD_YAW_DEG and
+          tuple(v * 1000.0 for v in cm.PAD_CENTER) == gs.PAD_CENTER_MM)
+
+
 def main():
     print('=' * 68)
     section_gen_scene_sync()
@@ -300,6 +424,7 @@ def main():
     section_terminal()
     section_blockers()
     section_mutation()
+    section_pad_pose()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('未通过：' + '; '.join(FAILS))

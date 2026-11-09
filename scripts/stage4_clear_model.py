@@ -19,6 +19,7 @@
 不在这里的东西：IK / 碰撞服务、场景增删、递归清障的搜索 —— 那些要 ROS，
 在 ``stage4_clear_probe.py``。
 """
+import json
 import math
 import os
 import sys
@@ -57,6 +58,75 @@ PAD_YAW_RAD = math.radians(_GS.PAD_YAW_DEG)
 PAD_PITCH = float(_GS.PAD_PITCH_MM) / 1000.0        # 宫格 60 mm
 PAD_THICK = float(_GS.PAD_THICK_M)                  # 垫厚 2.88 mm
 PAD_HALF = 0.15                                     # 垫 300×300 mm
+
+# ── 垫位姿：真机每场开跑实测，不许沿用常量 ──────────────────────────
+# 上面 ``PAD_CENTER`` / ``PAD_YAW_RAD`` 是**模型默认值**（= gen_scene 的仿真
+# 世界），只在没有实测 ``grid.json`` 时成立。真机每场开跑都要用
+# ``stage2_pad.py --camera topcam`` 从俯视帧重解一次垫位姿（见
+# ``docs/待执行命令.md``「每轮开跑前重解垫位姿」），再由 ``load_grid()`` 覆盖进来。
+#
+# 为什么不能沿用常量：垫是会被挪动的物体，它同时决定**往哪放**（计划落点）
+# 和**判对不对**（落格）—— 一旦错了，计划与判分同源一起错，还互相「自洽」，
+# 谁都发现不了。2026-11-09 实测模型常量与印刷垫差 **87.5 mm / 88.7°**
+# （台账第二百九十五轮）：计划把块放到 88 mm 外，判分再拿同一个错格心去量。
+PAD_POSE_SOURCE = 'gen_scene 模型常量（未实测）'
+
+_DEFAULT_PAD_CENTER = PAD_CENTER
+_DEFAULT_PAD_YAW_RAD = PAD_YAW_RAD
+
+
+def configure_pad(center_mm=None, yaw_deg=None, source=None):
+    """把宫格参考换成实测垫位姿。``center_mm`` 是 base 系**毫米**。"""
+    global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE
+    if center_mm is not None:
+        PAD_CENTER = (float(center_mm[0]) / 1000.0,
+                      float(center_mm[1]) / 1000.0)
+    if yaw_deg is not None:
+        PAD_YAW_RAD = math.radians(float(yaw_deg))
+    if source is not None:
+        PAD_POSE_SOURCE = str(source)
+
+
+def reset_pad():
+    """回到模型默认垫位姿（自检用；真机运行不该调用它）。"""
+    global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE
+    PAD_CENTER = _DEFAULT_PAD_CENTER
+    PAD_YAW_RAD = _DEFAULT_PAD_YAW_RAD
+    PAD_POSE_SOURCE = 'gen_scene 模型常量（未实测）'
+
+
+def load_grid(path):
+    """读 ``stage2_pad.py`` 产出的 grid.json，按**实测垫位姿**配置宫格。
+
+    缺文件、不是 stage2-grid、缺字段 ⇒ 一律抛异常（fail-closed）。宁可停下
+    让人看清，也不要拿模型常量悄悄把块放到 88 mm 外。
+    """
+    with open(path, encoding='utf-8') as f:
+        doc = json.load(f)
+    if doc.get('kind') != 'stage2-grid':
+        raise ValueError('%s 不是 stage2-grid（kind=%r）'
+                         % (path, doc.get('kind')))
+    try:
+        center = doc['grid_center_base_mm']
+        yaw = doc['grid_yaw_base_deg']
+    except KeyError as exc:
+        raise ValueError('%s 缺字段 %s' % (path, exc))
+    configure_pad(center, yaw, source=os.path.abspath(path))
+    return doc
+
+
+def find_grid(hint_dir):
+    """在一堆可能的目录里找本场的实测垫位姿。返回路径或 ``None``。
+
+    约定文件名（按优先级）：``grid-pre.json``（每场跑前那一次）、``grid.json``。
+    """
+    if not hint_dir:
+        return None
+    for name in ('grid-pre.json', 'grid.json'):
+        p = os.path.join(hint_dir, name)
+        if os.path.exists(p):
+            return p
+    return None
 
 # 仿真桌面（1.15×1.10×0.04，位姿 (0.225, 0.10, −0.02)）。这份字面量在
 # gen_scene.build_world 的 SDF 字符串里，没有名字；这里自检会反查源码，

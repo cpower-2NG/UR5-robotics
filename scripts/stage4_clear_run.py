@@ -704,6 +704,85 @@ def compare_layout(manifest, post_blocks, tol_untouched_mm=5.0,
                            "moved_mm": tol_moved_mm}}
 
 
+def apply_pad_pose(args, hint_dir, recorded=None):
+    """把本场**实测**垫位姿装进宫格参考（计划与判分共用这一份）。
+
+    优先级：``--grid`` > manifest 里记的路径（它记的就是这份计划当初用的那份）
+    > 同目录约定文件（``grid-pre.json`` / ``grid.json``）。一个都找不到 ⇒
+    报错停下（fail-closed），除非显式给了 ``--allow-model-pad``。
+
+    为什么 fail-closed：垫会被人挪动，模型常量是**仿真世界**的位姿。2026-11-09
+    实测两者差 87.5 mm / 88.7°（台账第二百九十五轮）—— 用常量会把块放到错格上，
+    再用同一个错格心判它「对」，两边一起错。
+    """
+    path = getattr(args, "grid", None)
+    if not path and recorded:
+        path = recorded if os.path.isabs(recorded) else os.path.join(
+            hint_dir, recorded)
+        if not os.path.exists(path):
+            path = None
+    if not path:
+        path = cm.find_grid(hint_dir)
+    if path:
+        doc = cm.load_grid(path)
+        log("  垫位姿：%.1f, %.1f mm / %.3f°  ← %s（%d 帧 RMS %.2f px）"
+            % (doc["grid_center_base_mm"][0], doc["grid_center_base_mm"][1],
+               doc["grid_yaw_base_deg"], path,
+               doc.get("checks", {}).get("n_frames", 0),
+               doc.get("checks", {}).get("rms_adopted_px", float("nan"))))
+        return path
+    if getattr(args, "allow_model_pad", False):
+        cm.reset_pad()          # 真复位：不许残留上一次的实测值
+        log("  ⚠ 没找到实测垫位姿，按 --allow-model-pad 用模型常量 %.1f, %.1f mm / %.3f°"
+            % (cm.PAD_CENTER[0] * 1000.0, cm.PAD_CENTER[1] * 1000.0,
+               math.degrees(cm.PAD_YAW_RAD)))
+        return None
+    raise SystemExit(
+        "没有实测垫位姿（grid.json）：%s\n"
+        "  每场开跑前必须先解：python3 scripts/stage2_pad.py --camera topcam "
+        "--frame <跑前俯视帧> --mat <stage2-mat.json> --out %s/grid-pre.json\n"
+        "  （或用 --grid 指定；只做仿真复现时才加 --allow-model-pad）"
+        % (cm.PAD_POSE_SOURCE, hint_dir or "<out-dir>"))
+
+
+def pad_pose_record(path):
+    """manifest 里记一行「这份计划用的是哪份垫位姿」。"""
+    if not path:
+        return {"source": cm.PAD_POSE_SOURCE, "measured": False}
+    return {"source": os.path.basename(path), "measured": True,
+            "center_mm": [round(cm.PAD_CENTER[0] * 1000.0, 2),
+                          round(cm.PAD_CENTER[1] * 1000.0, 2)],
+            "yaw_deg": round(math.degrees(cm.PAD_YAW_RAD), 3)}
+
+
+def warn_pad_pose_mismatch(manifest, tol_mm=5.0, tol_deg=1.0):
+    """计划与判分必须用**同一份**垫位姿。
+
+    计划落点来自探针报告（``gen_scene --grid`` 那一刻写进 ``scene_truth.json``），
+    判分走本场实测的 grid.json —— 两个入口，可能拿到两份。差得明显就喊出来，
+    免得「计划按 A 放、判分按 B 判」又变成自洽的错误。"""
+    tpath = manifest.get("truth")
+    if not tpath or not os.path.exists(tpath):
+        return
+    try:
+        with open(tpath, encoding="utf-8") as f:
+            posed = (json.load(f) or {}).get("pad_pose")
+    except (ValueError, OSError):
+        return
+    if not posed:
+        log("  ⚠ 计划侧 scene_truth 没记垫位姿（旧场景）—— 无法核对计划/判分同源")
+        return
+    d_mm = math.hypot(posed["center_mm"][0] - cm.PAD_CENTER[0] * 1000.0,
+                      posed["center_mm"][1] - cm.PAD_CENTER[1] * 1000.0)
+    d_deg = abs(posed["yaw_deg"] - math.degrees(cm.PAD_YAW_RAD))
+    if d_mm > tol_mm or d_deg > tol_deg:
+        log("  ⚠ 计划与判分的垫位姿不是同一份：计划 %.1f, %.1f mm / %.3f°，"
+            "判分 %.1f, %.1f mm / %.3f°（差 %.1f mm / %.3f°）—— 这条判决不可信"
+            % (posed["center_mm"][0], posed["center_mm"][1], posed["yaw_deg"],
+               cm.PAD_CENTER[0] * 1000.0, cm.PAD_CENTER[1] * 1000.0,
+               math.degrees(cm.PAD_YAW_RAD), d_mm, d_deg))
+
+
 def verify_main(args):
     """跑后核验：读真值 + manifest，判「不丢指定块 / 不掉块 / 不撞」。
 
@@ -714,6 +793,9 @@ def verify_main(args):
     mpath = args.manifest or os.path.join(args.out_dir or "", "manifest.json")
     with open(mpath, encoding="utf-8") as f:
         manifest = json.load(f)
+    apply_pad_pose(args, os.path.dirname(os.path.abspath(mpath)),
+                   manifest.get("pad_pose"))
+    warn_pad_pose_mismatch(manifest)
     with open(args.verify, encoding="utf-8") as f:
         post = json.load(f)
     fusion = None
@@ -854,6 +936,12 @@ def main(argv=None):
                     help="从帧目录的 joint_states.json 取 q_start")
     ap.add_argument("--q-start", default=None,
                     help="逗号分隔的 6 个关节角（弧度）")
+    ap.add_argument("--grid", default=None, metavar="GRID.json",
+                    help="本场**实测**垫位姿（stage2_pad.py 从跑前俯视帧解出）。"
+                         "缺省 = <out-dir>/grid-pre.json 或 grid.json；"
+                         "一个都找不到就停（fail-closed）")
+    ap.add_argument("--allow-model-pad", action="store_true",
+                    help="只在仿真复现/自检时用：允许退回 gen_scene 模型常量")
     ap.add_argument("--pad-thick", type=float, default=None,
                     help="垫厚（m），目标块放垫上；缺省 = stage4_clear_model.PAD_THICK")
     ap.add_argument("--place-clearance", type=float, default=None,
@@ -885,6 +973,8 @@ def main(argv=None):
         report = json.load(f)
     scene, truth = load_scene(report, args.scene_index, args.truth)
     attempt = pick_attempt(scene, args.target)
+    os.makedirs(args.out_dir, exist_ok=True)
+    grid_path = apply_pad_pose(args, args.out_dir)
     pad_thick = cm.PAD_THICK if args.pad_thick is None else float(args.pad_thick)
     actions, blocks = actions_from_attempt(truth, attempt, pad_thick)
 
@@ -928,6 +1018,7 @@ def main(argv=None):
         "target": attempt["id"],
         "scene_index": args.scene_index,
         "cell": report.get("cell"),
+        "pad_pose": pad_pose_record(grid_path),
         "pad_thick": pad_thick,
         "survey_tool0": list(survey),
         "gap_check": "probe_verified",

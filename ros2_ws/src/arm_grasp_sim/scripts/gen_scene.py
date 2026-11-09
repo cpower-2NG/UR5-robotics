@@ -28,10 +28,49 @@ import sys
 BLOCK_M = 0.0295                     # 29.5 mm 方块
 ZONE = (0.25, 0.575, 0.17, 0.42)     # 拾取区 xmin,xmax,ymin,ymax（base 系）
 MIN_GAP_ISOLATED_M = 0.060           # S0 的非接触安全间距
-PAD_CENTER_MM = (424.2, -112.24)     # 阶段 3 重解的垫位
+PAD_CENTER_MM = (424.2, -112.24)     # 阶段 3 重解的垫位（**未实测**；真机请用 --grid）
 PAD_YAW_DEG = -179.778
 PAD_PITCH_MM = 60.0
 PAD_THICK_M = 0.00288
+
+PAD_POSE_SOURCE = "模型常量（未实测）"
+_DEFAULT_PAD_CENTER_MM = PAD_CENTER_MM
+_DEFAULT_PAD_YAW_DEG = PAD_YAW_DEG
+
+
+def configure_pad(center_mm=None, yaw_deg=None, source=None):
+    """换成**实测**垫位姿（base 系毫米 / 度）。垫一动就重配，别沿用常量。"""
+    global PAD_CENTER_MM, PAD_YAW_DEG, PAD_POSE_SOURCE
+    if center_mm is not None:
+        PAD_CENTER_MM = (float(center_mm[0]), float(center_mm[1]))
+    if yaw_deg is not None:
+        PAD_YAW_DEG = float(yaw_deg)
+    if source is not None:
+        PAD_POSE_SOURCE = str(source)
+
+
+def reset_pad():
+    """回到模型默认垫位姿（自检用；真机运行不该调用它）。"""
+    global PAD_CENTER_MM, PAD_YAW_DEG, PAD_POSE_SOURCE
+    PAD_CENTER_MM = _DEFAULT_PAD_CENTER_MM
+    PAD_YAW_DEG = _DEFAULT_PAD_YAW_DEG
+    PAD_POSE_SOURCE = "模型常量（未实测）"
+
+
+def load_grid(path):
+    """读 ``stage2_pad.py`` 的 grid.json，按实测垫位姿配置宫格。
+    缺文件、不是 stage2-grid、缺字段 ⇒ 抛异常（fail-closed）。"""
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if doc.get("kind") != "stage2-grid":
+        raise ValueError("%s 不是 stage2-grid（kind=%r）" % (path, doc.get("kind")))
+    try:
+        center = doc["grid_center_base_mm"]
+        yaw = doc["grid_yaw_base_deg"]
+    except KeyError as exc:
+        raise ValueError("%s 缺字段 %s" % (path, exc))
+    configure_pad(center, yaw, source=os.path.abspath(path))
+    return doc
 
 # 与 scripts/block_classes.py::PALETTE 一致（test_gen_scene.py 会核对）
 PALETTE = {
@@ -470,6 +509,11 @@ def write_scene(batch, index, out_dir):
     payload = {
         "batch": batch, "index": index, "block_size_m": BLOCK_M,
         "zone_m": list(ZONE), "blocks": blocks,
+        "pad_pose": {"center_mm": list(PAD_CENTER_MM),
+                     "yaw_deg": PAD_YAW_DEG,
+                     "pitch_mm": PAD_PITCH_MM,
+                     "source": PAD_POSE_SOURCE,
+                     "measured": PAD_POSE_SOURCE != "模型常量（未实测）"},
     }
     with open(truth, "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -484,7 +528,15 @@ def main(argv=None):
     ap.add_argument("--out-dir", default="/tmp/grasp_scene")
     ap.add_argument("--list", action="store_true", help="列出所有批次/布局数量")
     ap.add_argument("--validate-all", action="store_true", help="生成并校验全部布局")
+    ap.add_argument("--grid", default=None, metavar="GRID.json",
+                    help="本场**实测**垫位姿（stage2_pad.py 产出）。给这一项，"
+                         "计划落点才与真垫对齐；不给就用模块常量（未实测）")
     args = ap.parse_args(argv)
+
+    if args.grid:
+        load_grid(args.grid)
+        print("垫位姿（实测）: %.2f, %.2f mm / %.3f°  ← %s"
+              % (PAD_CENTER_MM[0], PAD_CENTER_MM[1], PAD_YAW_DEG, args.grid))
 
     if args.list:
         for b, n in BATCH_COUNTS.items():
