@@ -614,6 +614,35 @@ def test_exec_accepts_dict_gripper_actions():
 
 
 @case
+def test_empty_grasp_is_a_verdict_that_stops_the_plan():
+    """闭合回读 → gripped/empty/unknown；空夹与读不到都不许再抬升/搬运。
+
+    2026-11-09 s3：clear 步 ``grasp.after`` 回读 0.0（空夹），执行器照样把
+    空手抬升、搬到槽位、松手、再回巡检位 —— 一整圈白动。
+
+    断言分两层：阈值方向归 ``grasp_verdict``，**「停不停」归 ``close_reaction``
+    —— 只测前者的话，把执行器里的 break 删掉测试照样绿。变异测试：把 ``<=``
+    改成 ``<``、把 tol 改小、或把 ``close_reaction`` 里的 ``True`` 改成
+    ``False``，三者都会红。
+    """
+    import precision_exec as pe
+    assert pe.grasp_verdict(None) == "unknown"
+    assert pe.grasp_verdict(0.0) == "empty"
+    assert pe.grasp_verdict(pe.AG95_EMPTY_TOL_MM) == "empty"
+    assert pe.grasp_verdict(pe.AG95_EMPTY_TOL_MM + 0.1) == "gripped"
+    # 真夹住时的回读（2026-11-08 s2 实测）必须落在 gripped
+    assert pe.grasp_verdict(24.98) == "gripped"
+    # 判据方向：空 = 一路合到头。反过来（大开口当空夹）会把好抓判红。
+    assert pe.grasp_verdict(95.0) == "gripped"
+    # 第二层：真的要停。s3 的实测读数就是 0.0；s2 的实测读数是 24.98。
+    assert pe.close_reaction(None)[2] is True
+    assert pe.close_reaction(0.0)[2] is True
+    assert pe.close_reaction(24.98)[2] is False
+    assert "空夹" in pe.close_reaction(0.0)[1]
+    assert pe.close_reaction(24.98)[1] == ""
+
+
+@case
 def test_grasp_at_block_center_uses_the_centroid(chain):
     """抓块心：抓取段三个航点落在**块心**上，不是候选锚点。
 

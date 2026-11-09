@@ -76,6 +76,37 @@ JOINT_DRIFT_RAD = 0.05
 # 注意回读**不是**爪距：空载全开 95.0 / 全闭 0.0（两端都对），但夹住 31.5–32.3 mm
 # 的块稳定读 24.9–25.3 mm —— 偏差只长在接触段，只能当**相对判据**（没滑）用。
 AG95_EMPTY_TOL_MM = 5.0
+
+
+def grasp_verdict(pos):
+    """闭合后的回读 → ``gripped`` / ``empty`` / ``unknown``。
+
+    0 mm 附近 = 手指一路合到头（指间没东西）；读不到 = 判不了。**两种都不许
+    再抬升/搬运**：2026-11-09 s3 空夹后照样把空手搬完 lift/to_slot/place 一整圈。
+    """
+    if pos is None:
+        return "unknown"
+    if pos <= AG95_EMPTY_TOL_MM:
+        return "empty"
+    return "gripped"
+
+
+def close_reaction(pos):
+    """闭合回读 → ``(verdict, 人话, 是否就地停)``。
+
+    「就地停」这一条单独成函数，是为了能被离线自检真正覆盖到 —— 只测
+    ``grasp_verdict`` 的阈值方向，测不到「空夹之后还接着搬运」那个行为。
+    """
+    verdict = grasp_verdict(pos)
+    if verdict == "unknown":
+        return verdict, "闭合后读不到位置 —— 判不了夹没夹住，就地停", True
+    if verdict == "empty":
+        return (verdict,
+                "闭合后回读 %.1f mm ≈ 全闭 —— **空夹**，不再抬升/搬运" % pos,
+                True)
+    return verdict, "", False
+
+
 GRIP_OPEN_MM = 95.0
 GRIP_CLOSE_MM = 0.0
 
@@ -563,12 +594,14 @@ def main():
                 # 中间值**不等于**开口（见 AG95_EMPTY_TOL_MM），这里只判「夹到没」。
                 if _action_name(w["after"]) == "close":
                     closed_at = pos
-                    if pos is None:
-                        print("   ⚠️ 闭合后读不到位置 —— 判不了夹没夹住")
+                    # 空夹/读不到 ⇒ **就地停**：再抬升、再去槽位、再松手都是白动，
+                    # 还会把空手带到别的块上面（2026-11-09 s3：空夹后照样跑完
+                    # lift/to_slot/place 全程）。臂停在抓取位，由人决定怎么收。
+                    verdict, msg, stop = close_reaction(pos)
+                    if stop:
+                        print("   ⚠️ " + msg)
                         ok_all = False
-                    elif pos <= AG95_EMPTY_TOL_MM:
-                        print("   ⚠️ 闭合后回读 %.1f mm ≈ 全闭 —— **空夹**" % pos)
-                        ok_all = False
+                        break
                 elif name == "lift":
                     lifted_at = pos
             dwell = w.get("dwell_s")
