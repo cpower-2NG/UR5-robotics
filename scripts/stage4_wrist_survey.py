@@ -94,6 +94,39 @@ def project_block(cam, R, block_xy, z_top):
     return fx * pc[0] / pc[2] + cx, fy * pc[1] / pc[2] + cy
 
 
+def survey_plan(chain, q_start, zone=PICK_ZONE_M, height=SURVEY_H_M,
+                yaw_deg=0.0, transit_dz=0.10):
+    """从 ``q_start`` 平动到巡检位，产出可直接执行的计划 dict。
+
+    返回 ``(plan, checks, cam, margins)``。预检不过抛 ``pp.PlanError``
+    （调用方据此整份不写、不执行，fail-closed）。
+
+    这是**唯一**构造巡检位计划的地方：E9 的 ``run.sh`` 收尾段（跑后判分帧）
+    和手动出计划都走它，两处的位姿因此逐位一致 —— 跑前跑后必须是**同一个
+    位姿**，否则两帧真值的块位置不能直接比。
+    """
+    marg, tool0, cam = coverage(zone, height, yaw_deg)
+    if min(marg) <= 0:
+        raise pp.PlanError("巡检位有角点出画幅（四边余量 %s px）"
+                           % (tuple(int(round(m)) for m in marg),))
+    wps, checks, meta = pp.build_move(
+        chain, q_start,
+        tuple(float(v) for v in tool0), name="survey",
+        transit_dz=float(transit_dz))
+    wps, added = pp.split_jumps(wps, chain, q_start=q_start)
+    if len(checks) != len(wps) - added:
+        raise pp.PlanError("巡检位预检记录不完整")
+    plan = {"version": 2,
+            "meta": dict(meta, checks=checks, splits_added=added,
+                         q_start_deg=[round(float(np.degrees(v)), 2)
+                                      for v in q_start],
+                         purpose="e9-wrist-survey",
+                         survey_cam_base_m=[round(float(v), 6) for v in cam],
+                         coverage_px=[round(float(v), 1) for v in marg]),
+            "q_start": [float(v) for v in q_start], "waypoints": wps}
+    return plan, checks, cam, marg
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="E9 腕部巡检位 → 平动计划")
     ap.add_argument("--urdf", required=True)
@@ -160,30 +193,19 @@ def main(argv=None):
         return 2
 
     try:
-        wps, checks, meta = pp.build_move(
-            chain, q_start, tuple(float(v) for v in tool0), name="survey",
-            transit_dz=args.transit_dz)
+        plan, checks, cam, marg = survey_plan(
+            chain, q_start, zone=zone, height=args.height,
+            yaw_deg=args.yaw, transit_dz=args.transit_dz)
     except pp.PlanError as e:
         print("!! 预检不过：%s" % e, file=sys.stderr)
         print("   计划**没有**写出 —— 不要执行。", file=sys.stderr)
         return 2
 
-    wps, added = pp.split_jumps(wps, chain, q_start=q_start)
-    if len(checks) != len(wps) - added:
-        print("!! 预检记录不完整", file=sys.stderr)
-        return 2
-    plan = {"version": 2,
-            "meta": dict(meta, checks=checks, splits_added=added,
-                         q_start_deg=[round(float(np.degrees(v)), 2)
-                                      for v in q_start],
-                         purpose="e9-wrist-survey",
-                         survey_cam_base_m=[round(float(v), 6) for v in cam],
-                         coverage_px=[round(float(v), 1) for v in marg]),
-            "q_start": [float(v) for v in q_start], "waypoints": wps}
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(plan, f, ensure_ascii=False, indent=1)
-    print("计划 → %s（%d 条航点，插点 %d）" % (args.out, len(wps), added))
+    print("计划 → %s（%d 条航点，插点 %d）"
+          % (args.out, len(plan["waypoints"]), plan["meta"]["splits_added"]))
     for c in checks:
         print("  %-14s IK %7.3f mm %7.3f°  肘高 %s mm"
               % (c["name"], c["ik_pos_mm"], c["ik_rot_deg"],

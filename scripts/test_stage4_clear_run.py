@@ -185,7 +185,9 @@ def section_plans():
     os.makedirs(out, exist_ok=True)
     plans, layout, q_end = cr.plan_sequence(ch, q0, acts, blocks, out)
 
-    check('两个动作各出一份计划', len(plans) == 2)
+    check('两个动作各出一份计划 + 收尾一条腕部巡检位',
+          len(plans) == 3 and [p['kind'] for p in plans]
+          == ['clear', 'target', 'survey'])
     p1 = json.load(open(plans[0]['path'], encoding='utf-8'))
     p2 = json.load(open(plans[1]['path'], encoding='utf-8'))
     check('第一份 q_start = 起始关节', p1['q_start'] == q0)
@@ -217,12 +219,33 @@ def section_plans():
     check('终态布局：目标块在垫上 top = 垫厚 + 边长',
           abs(cr.find_block(layout, '0')['top']
               - (cm.PAD_THICK + 0.0295)) < 1e-9)
-    check('q_end = 最后一份计划的终点',
-          q_end == p2['waypoints'][-1]['q'])
+    # 收尾那条：跑后判分帧与跑前巡检帧必须**逐位一致**（相机落在拾取区中心
+    # 上方 500 mm），否则两次真值的块位置没有可比性。
+    p3 = json.load(open(plans[2]['path'], encoding='utf-8'))
+    check('第三份 q_start = 第二份终点（整链衔接）',
+          p3['q_start'] == p2['waypoints'][-1]['q'])
+    check('收尾计划朝向腕部巡检位（purpose 标明）',
+          p3['meta'].get('purpose') == 'e9-wrist-survey')
+    cam = p3['meta']['survey_cam_base_m']
+    check('巡检位相机 = 拾取区中心、台面上方 500 mm',
+          abs(cam[0] - 0.4125) < 1e-6 and abs(cam[1] - 0.295) < 1e-6
+          and abs(cam[2] - 0.5) < 1e-6)
+    check('巡检位四边余量全 >0（拾取区整块在画幅内）',
+          min(p3['meta']['coverage_px']) > 0)
+    check('q_end = 最后一份计划的终点（停在巡检位）',
+          q_end == p3['waypoints'][-1]['q'])
 
     # 搬运那一步的抓点必须在**塔上的位置**
     ap = p1['waypoints'][0]
     check('approach 的 q 与 q_start 不同（确实动了）', ap['q'] != q0)
+
+    # 旧计划（--no-wrist-survey）只为复现：序列回到 2 份、q_end 是第二次搬运
+    out2 = tempfile.mkdtemp(prefix='e9-plan-unit-nowrist-')
+    plans2, _, q2 = cr.plan_sequence(ch, q0, acts, blocks, out2,
+                                     wrist_survey=False)
+    last2 = json.load(open(plans2[-1]['path'], encoding='utf-8'))
+    check('--no-wrist-survey ⇒ 只有 2 份、q_end 回到第二次搬运终点',
+          len(plans2) == 2 and q2 == last2['waypoints'][-1]['q'])
 
 
 # ------------------------------------------------------------------ [5]
@@ -447,6 +470,98 @@ def section_verify():
                               for c in r['checks']))
 
 
+def section_fuse():
+    print('\n[7b] 跑后融合：腕部管内权威、俯视补区外')
+    zone = (0.25, 0.575, 0.17, 0.42)
+    # 拾取区：两座 2 层塔（腕部看见的）
+    wrist = [
+        {'id': 0, 'x': 0.4406, 'y': 0.3443, 'z': 0.01475, 'yaw': 86.0,
+         'size': 0.0295},
+        {'id': 1, 'x': 0.4406, 'y': 0.3443, 'z': 0.04425, 'yaw': 86.0,
+         'size': 0.0295},
+        {'id': 2, 'x': 0.5350, 'y': 0.1737, 'z': 0.01475, 'yaw': 90.0,
+         'size': 0.0295},
+        {'id': 3, 'x': 0.5350, 'y': 0.1737, 'z': 0.04425, 'yaw': 90.0,
+         'size': 0.0295},
+    ]
+    # 俯视看见的：区外两块（垫面 / 北侧自由区）+ 区内同一批塔（含一根被数错层的）
+    topcam = [
+        {'id': 0, 'x': 0.415, 'y': -0.1622, 'z': 0.01475, 'yaw': 10.0,
+         'size': 0.0295},                       # 垫面：区外，保留
+        {'id': 1, 'x': 0.5207, 'y': 0.5021, 'z': 0.01475, 'yaw': 20.0,
+         'size': 0.0295},                       # 自由区：区外，保留
+        {'id': 2, 'x': 0.4406, 'y': 0.3443, 'z': 0.01475, 'yaw': 86.0,
+         'size': 0.0295},                       # 区内：俯视不算数
+        {'id': 3, 'x': 0.5350, 'y': 0.1737, 'z': 0.01475, 'yaw': 90.0,
+         'size': 0.0295},                       # 区内：俯视把 2 层塔数成 1 块
+        {'id': 4, 'x': 0.3054, 'y': 0.2812, 'z': 0.01475, 'yaw': 0.0,
+         'size': 0.0295},                       # 区内的幻影：必须被挡掉
+    ]
+    blocks, prov = cr.fuse_post_blocks(topcam, wrist, zone=zone)
+    check('融合后 = 腕部 4 + 俯视区外 2', len(blocks) == 6
+          and prov['n_wrist'] == 4 and prov['n_topcam_used'] == 2)
+    check('俯视在区内报的 3 块全被丢掉（含幻影）',
+          len(prov['topcam_inside_zone_dropped']) == 3)
+    check('两块 2 层塔在融合结果里仍是 4 块（俯视数错层不影响）',
+          sum(1 for b in blocks
+              if abs(b['x'] - 0.4406) < 1e-4 or abs(b['x'] - 0.5350) < 1e-4)
+          == 4)
+    check('垫面 / 自由区的块来自俯视',
+          sorted(b['_source'] for b in blocks).count('topcam') == 2)
+    check('融合后的 id 不撞车（配对靠位置，不靠 id）',
+          len({str(b['id']) for b in blocks}) == 6)
+
+    # 跨界的同一块：腕部按 zone 裁到了区边内、俯视按坐标判成区外，差 3 mm。
+    # 不设去重就会多出一块 ⇒ 假「多块」。40 mm 内视为同一块。
+    w2 = [{'id': 0, 'x': 0.3000, 'y': 0.4170, 'z': 0.01475, 'yaw': 0.0,
+           'size': 0.0295}]
+    t2 = [{'id': 0, 'x': 0.3000, 'y': 0.4230, 'z': 0.01475, 'yaw': 0.0,
+           'size': 0.0295}]
+    blocks, prov = cr.fuse_post_blocks(t2, w2, zone=zone)
+    check('跨界同一块（差 6 mm）⇒ 只算一块', len(blocks) == 1
+          and len(prov['topcam_duplicate_dropped']) == 1)
+
+    t3 = [{'id': 0, 'x': 0.3000, 'y': 0.5000, 'z': 0.01475, 'yaw': 0.0,
+           'size': 0.0295}]
+    blocks, _ = cr.fuse_post_blocks(t3, w2, zone=zone)
+    check('区外 83 mm 处的不同块 ⇒ 保留（去重不吞真块）', len(blocks) == 2)
+
+    # 融合结果直接喂现有判据：块数守恒、目标落格仍按彩色量
+    final = [
+        {'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+         'size': 0.0295},
+        {'id': 1, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 86.0,
+         'size': 0.0295},
+        {'id': 2, 'x': 0.5350, 'y': 0.1737, 'z': 0.01475, 'yaw': 90.0,
+         'size': 0.0295},
+        {'id': 3, 'x': 0.5350, 'y': 0.1737, 'z': 0.04425, 'yaw': 90.0,
+         'size': 0.0295},
+        {'id': 4, 'x': 0.4406, 'y': 0.3443, 'z': 0.01475, 'yaw': 86.0,
+         'size': 0.0295},
+        {'id': 5, 'x': 0.4406, 'y': 0.3443, 'z': 0.04425, 'yaw': 86.0,
+         'size': 0.0295},
+    ]
+    mani = {'target': 0, 'cell': 4, 'actions': [{'block': 1}, {'block': 0}],
+            'final_layout': [dict(b) for b in final]}
+    # 跑后实况：区内 4 块来自腕部；垫面 / 自由区 2 块来自俯视
+    fused, _ = cr.fuse_post_blocks(
+        [{'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+          'size': 0.0295},
+         {'id': 1, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 86.0,
+          'size': 0.0295}],
+        [dict(b) for b in wrist], zone=zone)
+    r = cr.compare_layout(mani, fused)
+    check('融合结果喂 compare_layout ⇒ PASS', r['ok'])
+
+    # 清障块不见了（自由区那格空了）
+    fused2 = [dict(b) for b in fused
+              if not (abs(b['x'] - 0.52) < 1e-6 and abs(b['y'] - 0.54) < 1e-6)]
+    r = cr.compare_layout(mani, fused2)
+    check('融合后少一块 ⇒ FAIL（块数一致）', not r['ok']
+          and any('块数一致' in c['check'] and not c['ok']
+                  for c in r['checks']))
+
+
 def _img(w, h, rgb=(255, 255, 255)):
     a = np.zeros((h, w, 3), np.uint8)
     a[:, :] = rgb
@@ -577,7 +692,8 @@ def section_colour():
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
-               section_gap, section_mutation, section_verify, section_colour):
+               section_gap, section_mutation, section_verify, section_fuse,
+               section_colour):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001
