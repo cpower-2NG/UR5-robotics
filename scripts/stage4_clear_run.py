@@ -21,10 +21,12 @@
 ``min_block_gap=0.0``，并在 manifest 里写 ``gap_check: probe_verified``。
 **没有探针判决的调用方不许这样放宽。**
 
-跑后核验（``--verify``）另读两份输入：跑后深度真值 json，和（可选的）跑后
-俯视 burst 目录。目标块「落在指定格」用**彩色顶面质心**量 —— 垫面在俯视深度
-里分辨不出 29.5 mm 台阶（2026-11-08 实测，见 ``measure_target_colour``）；
-其余判据仍用深度真值。仍不 import ROS。
+跑前/跑后各拍**三个腕部机位**（``E9_VIEWS``：拾取区 / 北侧自由区 / 垫面），
+全部走腕部几何链，俯视不参与任何绝对坐标（2026-11-09 用户拍板：规划与判分都
+用腕部相机）。跑后核验（``--view-truth``）读这三份机位真值合并成一份终态。
+目标块「落在指定格」用**彩色顶面质心**量 —— 垫面在深度里分辨不出 29.5 mm 台阶
+（2026-11-08 实测，见 ``measure_target_colour``）；其余判据仍用深度真值。
+仍不 import ROS。
 
 指令顺序（每条都在 manifest 里可见）
 ------------------------------------
@@ -68,6 +70,35 @@ import urkin                                                      # noqa: E402
 #: ``SURVEY_TOOL0["place"]``（那在 y≈−0.39 m，每步白跑一趟）。
 #: tool0 z=0.40 ⇒ 指尖 0.196 m，高过任何 29.5 mm 块；x/y 在拾取区上方。
 E9_SURVEY_TOOL0 = (0.520, 0.300, 0.400)
+
+#: 跑前/跑后**判分机位**（base 系，m）：一个量具、三个机位，全部由**腕部相机**拍。
+#:
+#: 为什么是三个（2026-11-09 用户拍板「规划与判分都走腕部，俯视不给绝对坐标」）：
+#: 一个 500 mm 高的俯视视场只有约 0.70×0.40 m，装不下全场；三个区**互不重叠**
+#: 且合起来覆盖所有会放块的地方 ——
+#:
+#: · ``pick`` 拾取区（塔、块数/塔层、旁观块）—— 既有 500 mm 巡检位，已验证；
+#: · ``free`` 北侧自由区（清障块的落点，``FREE_X``/``FREE_Y``）—— 在 pick 视场外
+#:   （pick 只到 y≈0.49），不给它机位就**看不见被搬走的块**，判分直接缺块；
+#: · ``pad`` 垫面（目标块落格）—— 在 pick 视场外（垫在 y≤0），而且垫面在深度里
+#:   分不出 29.5 mm 台阶，落格要用彩色顶面质心。
+#:
+#: 位姿由 ``stage4_wrist_survey.survey_plan`` 从 zone+height **现算**，跑前跑后
+#: 各调一次这个常量 ⇒ 逐位一致，不靠人手抄坐标。改这里 = 改判分机位，须记录。
+E9_VIEWS = (
+    {"name": "pick", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500,
+     "purpose": "块数/塔层/旁观块（拾取区）"},
+    {"name": "free", "zone": (0.280, 0.750, 0.460, 0.620), "height": 0.450,
+     "purpose": "清障块落点（北侧自由区）"},
+    {"name": "pad", "zone": (0.310, 0.610, -0.300, 0.000), "height": 0.500,
+     "purpose": "目标块落格（垫面，彩色顶面质心）"},
+)
+
+#: 机位之间的悬停抬高（m）。**不能用 0.10**：free 机位在 y≈0.455、z≈0.474，
+#: 再抬 0.10 到 z≈0.574 就出了 UR5 的臂展（2026-11-09 实测：IK 位置残差
+#: 11.4 mm，从 s7 与 home 两个起点都复现）。0.06 两个起点都过，0.04 会在
+#: home 起点上逼出 236° 的整圈翻转（``unwrap`` 的 180° 上限）。改它要重测。
+VIEW_TRANSIT_DZ = 0.06
 
 
 def log(*a):
@@ -224,16 +255,59 @@ def to_pp_block(b):
             "yaw": float(b.get("yaw", 0.0))}
 
 
+def plan_views(chain, q_start, views, out_dir, start=0):
+    """从 ``q_start`` 依次平动到每个判分机位，各写一份计划。
+
+    **跑前（``--views-only``）与跑后（``plan_sequence`` 末尾）都走这一个函数**，
+    所以两边的机位逐位一致 —— 「跑前跑后是同一台量具」就是这么落地的，不靠人
+    手抄坐标。任何机位出画幅 / IK 不过 ⇒ ``pp.PlanError``，调用方整份不写
+    （fail-closed：不许跑完才发现某个机位拍不了）。
+
+    返回 ``(plans, q_end)``。
+    """
+    import stage4_wrist_survey as ws   # 惰性 import：只在这条路径上拉 scipy
+    plans, q = [], [float(v) for v in q_start]
+    for i, v in enumerate(views, start=int(start) + 1):
+        vp, checks, cam, marg = ws.survey_plan(
+            chain, q, zone=tuple(v["zone"]), height=float(v["height"]),
+            transit_dz=float(v.get("transit_dz", VIEW_TRANSIT_DZ)))
+        name = "%02d-view-%s.json" % (i, v["name"])
+        path = os.path.join(out_dir, name)
+        vp["meta"]["e9"] = {
+            "kind": "view", "view": v["name"], "block": None, "slot": None,
+            "from_xy": [float(cam[0]), float(cam[1])],
+            "grasp_yaw_deg": 0.0, "gap_check": "n/a",
+            "checks": checks,
+            "coverage_px": [round(float(m), 1) for m in marg],
+            "zone_m": [float(x) for x in v["zone"]],
+            "height_m": float(v["height"]),
+            "purpose": "判分机位「%s」：%s"
+                       % (v["name"], v.get("purpose", "")),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(vp, f, ensure_ascii=False, indent=1)
+        plans.append({"index": i, "name": name, "path": path,
+                      "kind": "view", "view": v["name"], "block": None,
+                      "slot": [float(cam[0]), float(cam[1])],
+                      "from_xy": [float(cam[0]), float(cam[1])],
+                      "grasp_yaw_deg": 0.0,
+                      "zone_m": [float(x) for x in v["zone"]],
+                      "n_waypoints": len(vp["waypoints"])})
+        q = [float(x) for x in vp["waypoints"][-1]["q"]]
+    return plans, q
+
+
 def plan_sequence(chain, q_start, actions, blocks, out_dir,
                   survey_tool0=E9_SURVEY_TOOL0, place_clearance=None,
-                  wrist_survey=True):
+                  wrist_survey=True, views=None):
     """逐步生成计划；任何一步预检失败就抛 ``pp.PlanError``，不写半份序列。
 
-    ``wrist_survey=True``（缺省）在序列末尾多出一条**回到腕部巡检位**的平动。
-    跑后判分帧必须与跑前巡检帧在**同一个位姿**上拍（2026-11-09 用户定：块数/
-    塔层由腕部判），所以这一步写进本场 ``run.sh``，由执行链末端自动完成。
-    它过不了预检就抛错 ⇒ ``run.sh`` 不写、整场不执行（fail-closed），
-    不许跑完才发现拍不了判分帧。
+    ``wrist_survey=True``（缺省）在序列末尾依次平动到 ``views`` 里的每个
+    **判分机位**（缺省 ``E9_VIEWS``：pick / free / pad），每份计划后面都拍一组
+    腕部 burst（见 ``run_script_text``）。跑后判分帧必须与跑前在**同一个位姿**
+    上拍（2026-11-09 用户定：规划与判分都走腕部），所以这些机位写进本场
+    ``run.sh``，由执行链末端自动完成。任何一个机位过不了预检就抛错 ⇒
+    ``run.sh`` 不写、整场不执行（fail-closed），不许跑完才发现拍不了判分帧。
     """
     layout = [dict(b) for b in blocks]
     q = [float(v) for v in q_start]
@@ -288,28 +362,10 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
         move_in_layout(layout, act["block"], act["slot"][0], act["slot"][1],
                        act["surface_z"])
     if wrist_survey:
-        # 惰性 import：``stage4_wrist_survey`` 拉 scipy，只在这条路径上需要。
-        import stage4_wrist_survey as ws
-        sp_plan, sp_checks, cam, marg = ws.survey_plan(chain, q)
-        name = "%02d-survey-wrist.json" % (len(plans) + 1)
-        path = os.path.join(out_dir, name)
-        sp_plan["meta"]["e9"] = {
-            "kind": "survey", "block": None, "slot": None,
-            "from_xy": [float(cam[0]), float(cam[1])],
-            "grasp_yaw_deg": 0.0, "gap_check": "n/a",
-            "checks": sp_checks, "coverage_px": [round(float(v), 1)
-                                                 for v in marg],
-            "purpose": "跑后判分帧的位姿（与跑前巡检帧逐位一致）",
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(sp_plan, f, ensure_ascii=False, indent=1)
-        plans.append({"index": len(plans) + 1, "name": name, "path": path,
-                      "kind": "survey", "block": None,
-                      "slot": [float(cam[0]), float(cam[1])],
-                      "from_xy": [float(cam[0]), float(cam[1])],
-                      "grasp_yaw_deg": 0.0,
-                      "n_waypoints": len(sp_plan["waypoints"])})
-        q = [float(v) for v in sp_plan["waypoints"][-1]["q"]]
+        vplans, q = plan_views(
+            chain, q, E9_VIEWS if views is None else views, out_dir,
+            start=len(plans))
+        plans.extend(vplans)
     return plans, layout, q
 
 
@@ -360,6 +416,56 @@ def fuse_post_blocks(topcam_blocks, wrist_blocks, zone=None, dedup_m=0.040):
             "n_wrist": len(wrist), "n_topcam_used": len(taken),
             "topcam_inside_zone_dropped": inside,
             "topcam_duplicate_dropped": dup}
+    return out, prov
+
+
+def merge_truth_blocks(truths, dedup_m=0.040, layer_m=0.015):
+    """多个**机位**的跑后真值 → 一份终态（2026-11-09 全腕部口径）。
+
+    ``truths`` = ``[(机位名, blocks), ...]``，按给定顺序定权威（先来的留下）。
+    三个机位的覆盖区互不重叠，正常情况下没有重复；只在区界上（拾取区与自由区
+    都到 y≈0.46–0.49）同一块可能被两个机位各报一次 —— 那时按 ``dedup_m`` 距离
+    判重复，只留先报的，并列进 ``duplicates`` 供追溯。
+
+    ⚠ 去重必须**带层**：塔的两层 XY 完全重合、只差 29.5 mm 高。只按 XY 去重会把
+    上层当重复吃掉（2026-11-09 实测：3 根两层塔 6 块被合掉 2 块，判成「缺块」）。
+    ⇒ 只有 XY ≤ ``dedup_m`` **且** 顶面高度差 ≤ ``layer_m`` 才算同一块。
+    ``layer_m`` 取半层高：同层重复的读数差在毫米级，不同层差一整层 29.5 mm。
+
+    返回 ``(blocks, provenance)``；每块带 ``_source``（机位名）与唯一 ``id``。
+    """
+    out, dup = [], []
+    prov = {"views": [], "duplicates": dup,
+            "dedup_mm": round(float(dedup_m) * 1000.0, 1),
+            "layer_mm": round(float(layer_m) * 1000.0, 1)}
+
+    def _same(o, b, x, y):
+        if math.hypot(float(o["x"]) - x, float(o["y"]) - y) > float(dedup_m):
+            return False
+        ot, bt = o.get("top"), b.get("top")
+        if ot is None or bt is None:
+            return False          # 没高度就判不了层 ⇒ 宁可不合
+        return abs(float(ot) - float(bt)) <= float(layer_m)   # top 单位是米
+
+    for name, blocks in truths:
+        kept = 0
+        for b in blocks:
+            x, y = float(b["x"]), float(b["y"])
+            near = [o for o in out if _same(o, b, x, y)]
+            if near:
+                dup.append({"view": str(name),
+                            "x_mm": round(x * 1000.0, 1),
+                            "y_mm": round(y * 1000.0, 1),
+                            "top_mm": (None if b.get("top") is None
+                                       else round(float(b["top"]) * 1000.0, 1)),
+                            "kept_view": near[0]["_source"]})
+                continue
+            out.append(dict(b, _source=str(name)))
+            kept += 1
+        prov["views"].append({"view": str(name), "n_blocks": len(blocks),
+                              "n_kept": kept})
+    for i, b in enumerate(out):
+        b["id"] = "%s%d" % (b["_source"], i)
     return out, prov
 
 
@@ -502,9 +608,15 @@ def _window_half_px(xy, z, half_mm, K, R, t):
                         for c in cors))
 
 
+#: 彩色量具能用在哪些相机上 → ``(tip, chain)``。2026-11-09 起 E9 用 ``wrist``
+#: （垫视角），``topcam`` 只为复现旧证据保留。
+COLOUR_CAMERAS = {"topcam": (gc.TOPCAM_TIP, gc.TOPCAM_CHAIN),
+                  "wrist": (gc.TIP, gc.CHAIN)}
+
+
 def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=60.0,
-                          max_frames=10, min_frames=5):
-    """跑后俯视 burst → 目标块顶面质心（台面 mm，中位）与可复现性。
+                          max_frames=10, min_frames=5, camera="topcam"):
+    """跑后某一路相机的 burst → 目标块顶面质心（台面 mm，中位）与可复现性。
 
     **为什么目标块要换彩色量**（2026-11-08 用户拍板）：垫面在俯视深度里
     分辨不出 29.5 mm 的台阶 —— 实测 10 帧只有 3 帧有真台阶，跑前同一带本来
@@ -520,14 +632,17 @@ def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=60.0,
     "per_frame", "search_mm", "top_z"}``。漏帧不静默：每一帧漏的原因都写下来
     （缺静态 TF / 窗内没看见 / 投不到像面），``ok`` 只看看得见的帧数够不够。
     """
+    if camera not in COLOUR_CAMERAS:
+        raise ValueError("camera 只能是 %s，收到 %r"
+                         % (sorted(COLOUR_CAMERAS), camera))
+    tip, chain = COLOUR_CAMERAS[camera]
     import glob
     paths = sorted(glob.glob(os.path.join(burst_dir, "color_*.png")))[:max_frames]
     rows, miss, reasons = [], 0, []
     for path in paths:
         idx = int(os.path.basename(path).rsplit("_", 1)[-1].split(".")[0])
         try:
-            fr = gc.load_frame(burst_dir, tip=gc.TOPCAM_TIP,
-                               chain=gc.TOPCAM_CHAIN, idx=idx)
+            fr = gc.load_frame(burst_dir, tip=tip, chain=chain, idx=idx)
         except KeyError as e:
             # 起栈后的头一两帧可能还没收到锁存的 ``base_link:topcam_link``
             # 静态 TF（2026-11-08 实测）。记成漏帧，别让核验整个崩掉。
@@ -716,6 +831,20 @@ def apply_pad_pose(args, hint_dir, recorded=None):
     再用同一个错格心判它「对」，两边一起错。
     """
     path = getattr(args, "grid", None)
+    if not path and isinstance(recorded, dict):
+        # manifest 直接记下了当初用的那份**实测值**（source + center_mm + yaw_deg）：
+        # 就地装上，别再去猜文件路径 —— 计划目录里通常没有那份 grid.json。
+        center = recorded.get("center_mm")
+        yaw = recorded.get("yaw_deg")
+        if recorded.get("measured") and center is not None and yaw is not None:
+            cm.configure_pad(center, yaw,
+                             source="manifest.pad_pose（%s）"
+                             % recorded.get("source", "?"))
+            log("  垫位姿：%.1f, %.1f mm / %.3f°  ← manifest 记录（%s）"
+                % (float(center[0]), float(center[1]), float(yaw),
+                   recorded.get("source", "?")))
+            return None
+        recorded = None           # 模型常量或字段不全 ⇒ 走常规查找（fail-closed）
     if not path and recorded:
         path = recorded if os.path.isabs(recorded) else os.path.join(
             hint_dir, recorded)
@@ -786,9 +915,13 @@ def warn_pad_pose_mismatch(manifest, tol_mm=5.0, tol_deg=1.0):
 def verify_main(args):
     """跑后核验：读真值 + manifest，判「不丢指定块 / 不掉块 / 不撞」。
 
-    给了 ``--wrist-truth``（跑后**腕部** burst 的共识真值）就按区域融合：
-    区内用腕部、区外补俯视（见 ``fuse_post_blocks``）。不给则沿用旧的单一俯视
-    真值 —— 那条路对塔的块数不可靠（README/台账第二百九十二轮），只为复现旧证据。
+    三种口径，按 ``args`` 选（**新证据一律用第一条**）：
+
+    1. ``--view-truth 机位=json``（可重复，2026-11-09 起 E9 的唯一口径）：
+       跑后**每个腕部机位**各出一份真值，合并成一份终态（``merge_truth_blocks``）。
+       全场不碰俯视的绝对坐标 —— 俯视 base 外参今天两路自测互差 75 mm，不能用。
+    2. ``--verify + --wrist-truth``：区内用腕部、区外补俯视（``fuse_post_blocks``）。
+    3. ``--verify`` 单份俯视真值：旧口径，对塔的块数不可靠，只为复现旧证据。
     """
     mpath = args.manifest or os.path.join(args.out_dir or "", "manifest.json")
     with open(mpath, encoding="utf-8") as f:
@@ -796,10 +929,29 @@ def verify_main(args):
     apply_pad_pose(args, os.path.dirname(os.path.abspath(mpath)),
                    manifest.get("pad_pose"))
     warn_pad_pose_mismatch(manifest)
-    with open(args.verify, encoding="utf-8") as f:
-        post = json.load(f)
     fusion = None
-    if args.wrist_truth:
+    if args.view_truth:
+        truths = []
+        for spec in args.view_truth:
+            if "=" in spec:
+                name, path = spec.split("=", 1)
+            else:
+                name = os.path.splitext(os.path.basename(spec))[0]
+                path = spec
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+            blocks = doc.get("blocks") or []
+            truths.append((name, blocks))
+            log("  机位 %-5s %2d 块  ← %s" % (name, len(blocks), path))
+        merged, fusion = merge_truth_blocks(
+            truths, dedup_m=args.merge_dedup_mm / 1000.0)
+        log("  合并：%d 块（区界重复丢 %d）"
+            % (len(merged), len(fusion["duplicates"])))
+        post = {"blocks": merged}
+    else:
+        with open(args.verify, encoding="utf-8") as f:
+            post = json.load(f)
+    if not args.view_truth and args.wrist_truth:
         with open(args.wrist_truth, encoding="utf-8") as f:
             wtruth = json.load(f)
         zone = None
@@ -832,12 +984,14 @@ def verify_main(args):
         top_z = float(slot["z"]) + size / 2.0
         colour = measure_target_colour(
             args.colour_burst, (float(slot["x"]), float(slot["y"])), top_z,
-            search_mm=args.colour_search_mm)
+            search_mm=args.colour_search_mm, camera=args.colour_camera)
+        colour["camera"] = args.colour_camera
         if colour.get("ok"):
             rng = colour.get("range_mm") or [0.0, 0.0]
-            log("  彩色量：%d/%d 帧看见，中位 (%.1f, %.1f) mm，极差 x=%.1f "
+            log("  彩色量（%s）：%d/%d 帧看见，中位 (%.1f, %.1f) mm，极差 x=%.1f "
                 "y=%.1f mm，色相 %.0f°，块顶高 %.1f mm"
-                % (colour["n_frames"], colour["n_frames"] + colour["n_missed"],
+                % (args.colour_camera,
+                   colour["n_frames"], colour["n_frames"] + colour["n_missed"],
                    colour["xy_mm"][0], colour["xy_mm"][1], rng[0], rng[1],
                    colour["hue_deg"], top_z * 1000.0))
         else:
@@ -868,7 +1022,14 @@ def verify_main(args):
     return 0 if rep["ok"] else 1
 
 
-def run_script_text(plans, board_dir, log_dir, wrist_burst_dir=None):
+def run_script_text(plans, board_dir, log_dir, burst_dirs=None):
+    """计划序列 → 板端 ``.sh`` 文本。
+
+    ``burst_dirs``：``{机位名: 板上目录}``。某个机位计划执行完就**当场**拍一组
+    腕部 burst —— 臂必须停在该机位上拍，不能等全部跑完再补（那时臂在最后一个
+    机位）。拍不到就 fail：没有跑后帧就没有判分，不许把「没拍」混成「没跑红」。
+    """
+    burst_dirs = burst_dirs or {}
     lines = ["#!/bin/bash",
              "# E9 自主移遮挡：按顺序执行本场计划。任何一步 rc≠0 立即停",
              "# （fail-closed，不跳过、不重试）。令牌 = 当次 STOP→PLAY 握手产物。",
@@ -885,17 +1046,68 @@ def run_script_text(plans, board_dir, log_dir, wrist_burst_dir=None):
         lines.append('rc=$?')
         lines.append('[ $rc -eq 0 ] || fail "%s rc=$rc"' % p["name"])
         lines.append('sleep 1')
-    if wrist_burst_dir:
-        # 跑后判分帧：臂此时正停在腕部巡检位（序列最后一条计划放进来的）。
-        # 拍不到就 fail —— 没有跑后帧就没有判分，不许把「没拍」混成「没跑红」。
-        lines.append('echo "===== 跑后腕部判分帧 : burst 20"')
-        lines.append(
-            '~/precision/run.sh ~/precision/precision_capture.py '
-            '--camera wrist --burst 20 %s' % wrist_burst_dir)
-        lines.append('rc=$?')
-        lines.append('[ $rc -eq 0 ] || fail "跑后腕部 burst rc=$rc"')
+        view = p.get("view")
+        if p.get("kind") == "view" and view in burst_dirs:
+            # 判分帧：臂刚停在这个机位上，就地拍（换机位就拍不到了）。
+            lines.append('echo "===== 判分机位 %s : burst 20"' % view)
+            lines.append(
+                '~/precision/run.sh ~/precision/precision_capture.py '
+                '--camera wrist --burst 20 %s' % burst_dirs[view])
+            lines.append('rc=$?')
+            lines.append('[ $rc -eq 0 ] || fail "机位 %s burst rc=$rc"' % view)
     lines.append('echo "ALL DONE"')
     return "\n".join(lines) + "\n"
+
+
+def q_start_of_args(ap, args):
+    """``--from-frame`` / ``--q-start`` → ``(chain, q_start)``；都没有就报错。"""
+    chain = urkin.Chain(args.urdf)
+    if args.from_frame:
+        js = json.load(open(os.path.join(args.from_frame,
+                                         "joint_states.json")))
+        q_start = [float(js["position"][js["name"].index(n)])
+                   for n in chain.move_joints]
+    elif args.q_start:
+        q_start = [float(v) for v in args.q_start.split(",")]
+    else:
+        ap.error("要给 --from-frame 或 --q-start")
+    return chain, q_start
+
+
+def views_only_main(ap, args):
+    """只出**跑前**判分机位计划：``E9_VIEWS`` 每个机位一份 + 各自一组 burst。
+
+    跑前这一趟的目的是两件事：解垫位姿（pad 机位）与量场景真值（pick 机位）、
+    确认自由区是空的（free 机位）。位姿与跑后逐位一致，因为两边都走
+    ``plan_views``。
+    """
+    chain, q_start = q_start_of_args(ap, args)
+    os.makedirs(args.out_dir, exist_ok=True)
+    base = args.board_wrist_burst_dir
+    if base is None:
+        base = "$HOME/precision/e9/%s/wrist-pre" % os.path.basename(
+            os.path.abspath(args.out_dir))
+    burst_dirs = {v["name"]: os.path.join(base, v["name"]) for v in E9_VIEWS}
+    try:
+        plans, _q_end = plan_views(chain, q_start, E9_VIEWS, args.out_dir)
+    except pp.PlanError as e:
+        log("!! 机位预检不过：%s" % e)
+        log("   计划**没有**写出 —— 不要执行。")
+        return 1
+    sh = run_script_text(plans, args.board_dir, args.board_log_dir, burst_dirs)
+    spath = os.path.join(args.out_dir, "pre.sh")
+    with open(spath, "w", encoding="utf-8") as f:
+        f.write(sh)
+    os.chmod(spath, 0o755)
+    for p, v in zip(plans, E9_VIEWS):
+        log("  %-24s 机位 %-5s 相机 (%0.3f, %0.3f)  区 %s  %d 航点"
+            % (p["name"], p["view"], p["slot"][0], p["slot"][1],
+               tuple(v["zone"]), p["n_waypoints"]))
+    for k in ("pick", "free", "pad"):
+        if k in burst_dirs:
+            log("  跑前 burst %-5s → %s" % (k, burst_dirs[k]))
+    log("→ %s" % spath)
+    return 0
 
 
 def main(argv=None):
@@ -915,8 +1127,20 @@ def main(argv=None):
     ap.add_argument("--moved-mm", type=float, default=40.0,
                     help="被搬的块离计划落点的最大距离（mm，缺省 40）")
     ap.add_argument("--colour-burst", default=None,
-                    help="跑后俯视 burst 目录；给了就用彩色顶面质心量目标块落格"
-                         "（垫面深度分辨不出 29.5 mm 台阶；缺省 None = 用深度真值）")
+                    help="跑后**垫视角** burst 目录；给了就用彩色顶面质心量目标块"
+                         "落格（垫面深度分辨不出 29.5 mm 台阶；缺省 None = 用深度"
+                         "真值）。E9 从 2026-11-09 起给腕部的 pad 机位")
+    ap.add_argument("--colour-camera", choices=sorted(COLOUR_CAMERAS),
+                    default="topcam",
+                    help="彩色量用哪一路相机（缺省 topcam = 旧证据口径；"
+                         "E9 现在用 wrist）")
+    ap.add_argument("--view-truth", action="append", default=None,
+                    metavar="机位=JSON",
+                    help="跑后某个**机位**的共识真值（可重复；E9 用 pick/free/pad "
+                         "三份）。给了它就不需要 --verify：合并成一份终态")
+    ap.add_argument("--views-only", action="store_true",
+                    help="只出**跑前机位计划**（E9_VIEWS 三个机位 + 各自 burst），"
+                         "不生成抓放序列；写 <out-dir>/pre.sh")
     ap.add_argument("--colour-search-mm", type=float, default=60.0,
                     help="彩色量的搜索窗半径（mm，围绕计划宫格；缺省 60）")
     ap.add_argument("--wrist-truth", default=None,
@@ -937,7 +1161,8 @@ def main(argv=None):
     ap.add_argument("--q-start", default=None,
                     help="逗号分隔的 6 个关节角（弧度）")
     ap.add_argument("--grid", default=None, metavar="GRID.json",
-                    help="本场**实测**垫位姿（stage2_pad.py 从跑前俯视帧解出）。"
+                    help="本场**实测**垫位姿（stage4_pad_from_burst.py 从跑前"
+                         "腕部 pad 机位 burst 解出）。"
                          "缺省 = <out-dir>/grid-pre.json 或 grid.json；"
                          "一个都找不到就停（fail-closed）")
     ap.add_argument("--allow-model-pad", action="store_true",
@@ -954,20 +1179,26 @@ def main(argv=None):
     ap.add_argument("--board-log-dir", default="$HOME/precision/logs/e9",
                     help="板上执行日志目录（写进 run.sh）")
     ap.add_argument("--board-wrist-burst-dir", default=None,
-                    help="板上跑后腕部 burst 目录（写进 run.sh）；缺省 "
-                         "$HOME/precision/e9/<本场目录名>/wrist-post")
+                    help="板上腕部 burst 的**根**目录（写进 run.sh）；缺省 "
+                         "$HOME/precision/e9/<本场目录名>/wrist-post，每个机位一个子目录")
     ap.add_argument("--no-wrist-survey", action="store_true",
-                    help="不在序列末尾加「回到腕部巡检位」的计划（只为复现旧计划；"
+                    help="不在序列末尾加判分机位（只为复现旧计划；"
                          "没有它就没有跑后判分帧，E9 判分不许用）")
     args = ap.parse_args(argv)
 
-    if args.verify:
+    if args.verify or args.view_truth:
         return verify_main(args)
 
-    if not (args.probe_report and args.out_dir):
-        ap.error("生成计划要给 --probe-report 与 --out-dir（核验请用 --verify）")
+    if not args.out_dir:
+        ap.error("要给 --out-dir")
     if not args.urdf:
-        ap.error("生成计划要给 --urdf")
+        ap.error("要给 --urdf")
+
+    if args.views_only:
+        return views_only_main(ap, args)
+
+    if not args.probe_report:
+        ap.error("生成计划要给 --probe-report（核验请用 --verify）")
 
     with open(args.probe_report, encoding="utf-8") as f:
         report = json.load(f)
@@ -978,17 +1209,7 @@ def main(argv=None):
     pad_thick = cm.PAD_THICK if args.pad_thick is None else float(args.pad_thick)
     actions, blocks = actions_from_attempt(truth, attempt, pad_thick)
 
-    if args.from_frame:
-        js = json.load(open(os.path.join(args.from_frame,
-                                         "joint_states.json")))
-        chain = urkin.Chain(args.urdf)
-        q_start = [float(js["position"][js["name"].index(n)])
-                   for n in chain.move_joints]
-    elif args.q_start:
-        chain = urkin.Chain(args.urdf)
-        q_start = [float(v) for v in args.q_start.split(",")]
-    else:
-        ap.error("要给 --from-frame 或 --q-start")
+    chain, q_start = q_start_of_args(ap, args)
 
     survey = (E9_SURVEY_TOOL0 if args.survey is None else
               tuple(float(v) for v in args.survey.split(",")))
@@ -1007,10 +1228,13 @@ def main(argv=None):
         log("   计划**没有**写出完整序列 —— 不要执行。")
         return 1
 
-    burst_dir = args.board_wrist_burst_dir
-    if burst_dir is None and not args.no_wrist_survey:
-        burst_dir = "$HOME/precision/e9/%s/wrist-post" % os.path.basename(
+    burst_base = args.board_wrist_burst_dir
+    if burst_base is None:
+        burst_base = "$HOME/precision/e9/%s/wrist-post" % os.path.basename(
             os.path.abspath(args.out_dir))
+    burst_dirs = ({} if args.no_wrist_survey else
+                  {v["name"]: os.path.join(burst_base, v["name"])
+                   for v in E9_VIEWS})
     manifest = {
         "probe_report": args.probe_report,
         "truth": scene["truth"],
@@ -1027,7 +1251,8 @@ def main(argv=None):
         "q_start": q_start,
         "q_end": q_end,
         "wrist_survey": not args.no_wrist_survey,
-        "wrist_burst_dir": burst_dir,
+        "views": [] if args.no_wrist_survey else [dict(v) for v in E9_VIEWS],
+        "view_burst_dirs": burst_dirs,
         "final_layout": [{k: b.get(k) for k in
                           ("id", "x", "y", "z", "yaw", "size")}
                          for b in final_layout],
@@ -1038,25 +1263,26 @@ def main(argv=None):
         json.dump(manifest, f, ensure_ascii=False, indent=1)
 
     sh = run_script_text(plans, args.board_dir, args.board_log_dir,
-                         wrist_burst_dir=burst_dir)
+                         burst_dirs=burst_dirs)
     spath = os.path.join(args.out_dir, "run.sh")
     with open(spath, "w", encoding="utf-8") as f:
         f.write(sh)
     os.chmod(spath, 0o755)
 
     for p in plans:
-        if p["kind"] == "survey":
-            log("  %-28s %-6s 腕部巡检位 相机 (%.3f, %.3f)  %d 航点"
-                % (p["name"], p["kind"], p["slot"][0], p["slot"][1],
-                   p["n_waypoints"]))
+        if p["kind"] == "view":
+            log("  %-28s %-6s 机位 %-5s 相机 (%.3f, %.3f)  %d 航点"
+                % (p["name"], p["kind"], p["view"], p["slot"][0],
+                   p["slot"][1], p["n_waypoints"]))
             continue
         log("  %-28s %-6s 块 %-3s (%.3f, %.3f) → (%.3f, %.3f)  ψ=%6.1f°  %d 航点"
             % (p["name"], p["kind"], p["block"],
                p["from_xy"][0], p["from_xy"][1], p["slot"][0], p["slot"][1],
                p["grasp_yaw_deg"], p["n_waypoints"]))
-    if burst_dir:
-        log("  跑后腕部 burst → %s（判分时 --verify --wrist-truth 用它）"
-            % burst_dir)
+    for k in ("pick", "free", "pad"):
+        if k in burst_dirs:
+            log("  跑后 burst %-5s → %s（判分时 --view-truth %s=… 用它）"
+                % (k, burst_dirs[k], k))
     log("→ %s" % mpath)
     log("→ %s" % spath)
     return 0

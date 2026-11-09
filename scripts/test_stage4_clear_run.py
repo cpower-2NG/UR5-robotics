@@ -194,9 +194,10 @@ def section_plans():
     os.makedirs(out, exist_ok=True)
     plans, layout, q_end = cr.plan_sequence(ch, q0, acts, blocks, out)
 
-    check('两个动作各出一份计划 + 收尾一条腕部巡检位',
-          len(plans) == 3 and [p['kind'] for p in plans]
-          == ['clear', 'target', 'survey'])
+    check('两个动作各出一份计划 + 收尾三个判分机位',
+          len(plans) == 5 and [p['kind'] for p in plans]
+          == ['clear', 'target', 'view', 'view', 'view']
+          and [p['view'] for p in plans[2:]] == ['pick', 'free', 'pad'])
     p1 = json.load(open(plans[0]['path'], encoding='utf-8'))
     p2 = json.load(open(plans[1]['path'], encoding='utf-8'))
     check('第一份 q_start = 起始关节', p1['q_start'] == q0)
@@ -233,16 +234,24 @@ def section_plans():
     p3 = json.load(open(plans[2]['path'], encoding='utf-8'))
     check('第三份 q_start = 第二份终点（整链衔接）',
           p3['q_start'] == p2['waypoints'][-1]['q'])
-    check('收尾计划朝向腕部巡检位（purpose 标明）',
-          p3['meta'].get('purpose') == 'e9-wrist-survey')
+    check('收尾第一份是 pick 机位（e9 kind/view 标明）',
+          p3['meta']['e9'].get('kind') == 'view'
+          and p3['meta']['e9'].get('view') == 'pick')
     cam = p3['meta']['survey_cam_base_m']
     check('巡检位相机 = 拾取区中心、台面上方 500 mm',
           abs(cam[0] - 0.4125) < 1e-6 and abs(cam[1] - 0.295) < 1e-6
           and abs(cam[2] - 0.5) < 1e-6)
     check('巡检位四边余量全 >0（拾取区整块在画幅内）',
           min(p3['meta']['coverage_px']) > 0)
-    check('q_end = 最后一份计划的终点（停在巡检位）',
-          q_end == p3['waypoints'][-1]['q'])
+    p5 = json.load(open(plans[4]['path'], encoding='utf-8'))
+    check('四、五份依次衔接（pick→free→pad）',
+          json.load(open(plans[3]['path'], encoding='utf-8'))['q_start']
+          == p3['waypoints'][-1]['q']
+          and p5['q_start']
+          == json.load(open(plans[3]['path'],
+                            encoding='utf-8'))['waypoints'][-1]['q'])
+    check('q_end = 最后一份计划的终点（停在 pad 机位）',
+          q_end == p5['waypoints'][-1]['q'])
 
     # 搬运那一步的抓点必须在**塔上的位置**
     ap = p1['waypoints'][0]
@@ -571,6 +580,111 @@ def section_fuse():
                   for c in r['checks']))
 
 
+def section_step_cap():
+    print('\n[4b] 单关节跳变上限：同一末端位姿换分支不许「先原地转半圈」')
+    rad = math.radians
+
+    def q_at(deg0, deg_other=0.0):
+        q = [rad(deg_other)] * 6
+        q[0] = rad(deg0)
+        return q
+
+    ok_guard = lambda qa, qb: (True, 0.0)                 # noqa: E731
+    real_ik = pp.ik_candidates
+    real_cap = pp.MAX_JOINT_STEP_DEG
+    try:
+        # 两航点、各只有一支解，第二支要 joint0 转 200°（s9 的 309°/201° 同形）
+        sets = {'w1': [q_at(5.0)], 'w2': [q_at(205.0)]}
+
+        def fake_ik(chain, xyz, yaw_deg, seeds=None, n_random=0):
+            return [np.asarray(q, float) for q in sets[xyz[2]]]
+
+        pp.ik_candidates = fake_ik
+        tgt = [('w1', (0.0, 0.0, 'w1')), ('w2', (0.0, 0.0, 'w2'))]
+
+        ok, err = raises(pp.solve_path, None, tgt, [0.0] * 6, guard=ok_guard)
+        check('单步 200° 超 170° 上限 ⇒ PlanError、不返回计划',
+              ok and '单步' in err, err)
+        check('报错点明是哪一串航点', ok and 'w2' in err, err)
+
+        path = pp.solve_path(None, tgt, [0.0] * 6, guard=ok_guard,
+                             max_step_deg=float('inf'))
+        check('放开上限后同一组解能出链（拒绝确实来自上限）', len(path) == 2)
+
+        # 上限是运行时读模块常量，不是 def 时绑定的默认参数（这条是回归点）
+        pp.MAX_JOINT_STEP_DEG = 210.0
+        path = pp.solve_path(None, tgt, [0.0] * 6, guard=ok_guard)
+        check('改模块常量当场生效（不是 def 时绑死的默认值）', len(path) == 2)
+        pp.MAX_JOINT_STEP_DEG = 170.0
+
+        # 不误杀：单步全在限内的链照常放行
+        sets = {'w1': [q_at(80.0)], 'w2': [q_at(180.0)]}
+        path = pp.solve_path(None, tgt, [0.0] * 6, guard=ok_guard)
+        check('单步 80°/100° 全在限内 ⇒ 放行（不误杀）', len(path) == 2)
+
+        # 真语义：宁可多走一点，也不许有一跳 200°。
+        # 候选 B 总行程 200°（但单关节 200°，超限）；候选 C 总行程 √5·90° ≈ 201.2°
+        # （每个关节 90°，都合规）⇒ 有上限时必须选 C。
+        sets_w2 = [q_at(200.0), q_at(0.0, deg_other=90.0)]
+        sets = {'w1': [q_at(0.0)], 'w2': sets_w2}
+        free = pp.solve_path(None, tgt, [0.0] * 6, guard=ok_guard,
+                             max_step_deg=float('inf'))
+        capped = pp.solve_path(None, tgt, [0.0] * 6, guard=ok_guard)
+        check('不设上限 ⇒ 挑总行程最小的坏分支（200° 单步）',
+              abs(math.degrees(free[-1][0]) - 200.0) < 1e-6,
+              str(np.degrees(free[-1])))
+        check('有上限 ⇒ 改挑合规分支（多走 1° 也认）',
+              abs(math.degrees(capped[-1][0])) < 1e-6
+              and abs(math.degrees(capped[-1][1]) - 90.0) < 1e-6,
+              str(np.degrees(capped[-1])))
+    finally:
+        pp.ik_candidates = real_ik
+        pp.MAX_JOINT_STEP_DEG = real_cap
+
+
+def section_merge_truth():
+    print('\n[7c] 多机位跑后真值合并：去重必须带层')
+    two = [{'x': 0.4406, 'y': 0.3443, 'top': 0.04425, 'size': 0.0295},
+           {'x': 0.4406, 'y': 0.3443, 'top': 0.01475, 'size': 0.0295}]
+    blocks, prov = cr.merge_truth_blocks([('pick', two)])
+    check('同一机位两层塔：XY 完全重合也保留 2 块（只按 XY 去重的回归）',
+          len(blocks) == 2 and not prov['duplicates'], str(blocks))
+
+    towers = [{'x': x, 'y': y, 'top': t, 'size': 0.0295}
+              for (x, y) in ((0.4406, 0.3443), (0.5350, 0.1737),
+                             (0.4100, 0.2500))
+              for t in (0.01475, 0.04425)]
+    blocks, _ = cr.merge_truth_blocks([('pick', towers)])
+    check('三根两层塔 = 6 块（2026-11-09 假「缺块」的回归）',
+          len(blocks) == 6, str(len(blocks)))
+
+    # 区界上同一块被两个机位各报一次：同层、差 5 mm ⇒ 合一块
+    a = [{'x': 0.3000, 'y': 0.4600, 'top': 0.01475, 'size': 0.0295}]
+    b = [{'x': 0.3000, 'y': 0.4650, 'top': 0.01480, 'size': 0.0295}]
+    blocks, prov = cr.merge_truth_blocks([('pick', a), ('free', b)])
+    check('两机位各报一次（同层、差 5 mm）⇒ 合一块',
+          len(blocks) == 1 and len(prov['duplicates']) == 1, str(prov))
+    check('duplicates 记了层高（top_mm），可追溯',
+          prov['duplicates'][0]['top_mm'] == 14.8
+          and prov['duplicates'][0]['kept_view'] == 'pick',
+          str(prov['duplicates']))
+    check('每块带 _source、id 唯一', blocks[0]['_source'] == 'pick'
+          and len({str(x['id']) for x in blocks}) == 1)
+
+    # 同 XY 不同层：塔的上下两块，不许当重复吃掉
+    blocks, prov = cr.merge_truth_blocks(
+        [('pick', [{'x': 0.30, 'y': 0.46, 'top': 0.01475}]),
+         ('free', [{'x': 0.30, 'y': 0.46, 'top': 0.04425}])])
+    check('同 XY 不同层 ⇒ 2 块、不算重复',
+          len(blocks) == 2 and not prov['duplicates'], str(prov))
+
+    # 高度缺失 ⇒ 判不了层，宁可不合（不合是「多一块」，会是显式红，不是静默丢块）
+    blocks, _ = cr.merge_truth_blocks(
+        [('pick', [{'x': 0.30, 'y': 0.46}]),
+         ('free', [{'x': 0.30, 'y': 0.46}])])
+    check('缺 top ⇒ 判不了层，宁可不合', len(blocks) == 2)
+
+
 def _img(w, h, rgb=(255, 255, 255)):
     a = np.zeros((h, w, 3), np.uint8)
     a[:, :] = rgb
@@ -752,6 +866,29 @@ def section_pad_pose():
         p = cr.apply_pad_pose(_Args(allow_model_pad=True), empty)
         check('--allow-model-pad ⇒ 退回模型常量且返回 None', p is None)
 
+        # manifest 直接记下**实测值本身**（dict，不是路径）。计划目录里通常
+        # 没有那份 grid.json（2026-11-09 实测：TypeError: expected str, bytes
+        # or os.PathLike object, not dict），就地装上即可。
+        cm.reset_pad()
+        p = cr.apply_pad_pose(
+            _Args(), empty,
+            recorded={'source': 'grid-pre.json', 'measured': True,
+                      'center_mm': [461.3, -158.2], 'yaw_deg': -89.41})
+        check('manifest 记的是实测值 ⇒ 就地装上（不必去找文件）',
+              p is None and abs(cm.PAD_CENTER[0] * 1000 - 461.3) < 1e-9
+              and abs(math.degrees(cm.PAD_YAW_RAD) + 89.41) < 1e-9,
+              str(cm.PAD_CENTER))
+        ok, err = system_exits(
+            cr.apply_pad_pose, _Args(), empty,
+            {'source': 'model', 'measured': False})
+        check('manifest 记的是模型常量 ⇒ 不装，仍 fail-closed 停下',
+              ok and 'stage2_pad' in err, err)
+        ok, _ = system_exits(
+            cr.apply_pad_pose, _Args(), empty,
+            {'measured': True, 'center_mm': [461.3, -158.2]})   # 缺 yaw
+        check('manifest 字段不全 ⇒ 不猜，仍 fail-closed 停下', ok)
+        cm.reset_pad()
+
         # manifest 记账
         rec = cr.pad_pose_record(gpath)
         check('pad_pose_record 标 measured、不记绝对路径',
@@ -801,7 +938,8 @@ def section_pad_pose():
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
-               section_gap, section_mutation, section_verify, section_fuse,
+               section_step_cap, section_gap, section_mutation, section_verify,
+               section_fuse, section_merge_truth,
                section_colour, section_pad_pose):
         try:
             fn()

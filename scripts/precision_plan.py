@@ -159,6 +159,16 @@ MAX_WRIST_TURN = float(np.radians(210.0))
 GUARD_SAMPLES = 8
 TABLE_PLANE_Z = 0.0
 MIN_BLOCK_GAP = 0.060
+#: 相邻航点之间**单关节**的跳变上限（度）。见 `solve_path` 的注释。
+#: 同一笛卡尔位姿有多支 IK 解，其中一些要求先把腕子/大臂原地转半圈才接得上；
+#: 只按总行程最小化会挑中它们。2026-11-09 E9 第 2 场就是这么出的：链里出现
+#: 309° / 201° 的单关节跳变，末段 `survey_place` 上真机后被控制器中止 status=6
+#: （姿态看上去「先原地拧一圈」，当场被叫停）。
+#: 取 **170°** 的依据（同一份代码、同一份输入复跑）：
+#:   · 第 1 场（真跑通）整链最大单步 136° ⇒ 170° 放行，不误杀；
+#:   · 第 2 场无论上限给 180 / 170 / 150 / 120，能解的链最大单步都要 179.7°
+#:     ⇒ 170° 一律拒绝，生成器直接 PlanError、不写计划（fail-closed）。
+MAX_JOINT_STEP_DEG = 170.0
 
 # ---- 阶段 3（堆叠）用的几何常量
 # 相机（color optical）相对 tool0 的偏置（m，yaw 0）；出处见 SURVEY_TOOL0 的注释。
@@ -414,6 +424,12 @@ def joint_dist(a, b):
     return float(np.linalg.norm(d))
 
 
+def max_joint_step_deg(a, b):
+    """相邻两个解之间**单个关节**的最大跳变（度，按字面值）。"""
+    return float(np.max(np.abs(np.asarray(a, float) - np.asarray(b, float)))
+                 ) * 180.0 / np.pi
+
+
 def travel_cost(a, b):
     """关节行程按**字面值**算（欧氏、不折 2π）—— JTC 插的就是字面值。
 
@@ -542,13 +558,21 @@ def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
 
 
 def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
-               n_random=32, yaws=None, guard=None):
+               n_random=32, yaws=None, guard=None, max_step_deg=None):
     """给一串末端目标选**一条前后一致的 IK 分支链**（最小总关节行程）。
 
     `targets` 是 [(名字, xyz), ...]。``yaws`` 可选，逐点姿态角；缺省全用
     ``yaw_deg``。阶段 2 需要「抓取角」和「放置角」不同（夹着块转腕），
     所以这里必须能逐点给 yaw —— 一个全局 yaw 表达不了两段姿态。
+
+    ``max_step_deg``：相邻两点的**单关节**跳变上限。同一个笛卡尔位姿常有好几支
+    IK 解，其中一些要「先原地把腕子转半圈」才到得了；只按总行程最小化会挑中它们
+    （2026-11-09 E9 第 2 场实测：链里出现 309° / 201° 的单关节跳变，末段
+    ``survey_place`` 上真机后被控制器中止 status=6）。超过上限的转移一律不走；
+    整条链都过不了 ⇒ ``PlanError``（fail-closed，宁可不写计划也不发怪姿态）。
     """
+    if max_step_deg is None:            # 运行时读，便于自检/复现时改档对比
+        max_step_deg = MAX_JOINT_STEP_DEG
     sets = [ik_candidates(chain, xyz,
                           yaw_deg if yaws is None else yaws[i],
                           seeds=[q_start], n_random=n_random)
@@ -562,12 +586,16 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
             return guard(qa, qb)
         return check_guard(chain, qa, qb, table_z)
 
+    def _step_ok(qa, qb):
+        return (max_step_deg is None
+                or max_joint_step_deg(qa, qb) <= float(max_step_deg))
+
     INF = float("inf")
     cost = [[INF] * len(s) for s in sets]
     prev = [[None] * len(s) for s in sets]
     for j, q in enumerate(sets[0]):
         ok, _ = _guard(q_start, q)
-        if ok:
+        if ok and _step_ok(q_start, q):
             cost[0][j] = travel_cost(q, q_start)
     for i in range(1, len(sets)):
         for j, q in enumerate(sets[i]):
@@ -575,7 +603,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
                 if not np.isfinite(cost[i - 1][k]):
                     continue
                 ok, _ = _guard(qp, q)
-                if not ok:
+                if not ok or not _step_ok(qp, q):
                     continue
                 c = cost[i - 1][k] + travel_cost(q, qp)
                 if c < cost[i][j]:
@@ -583,8 +611,11 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
                     prev[i][j] = k
     ends = [(c, j) for j, c in enumerate(cost[-1]) if np.isfinite(c)]
     if not ends:
-        raise PlanError("这些航点的所有 IK 分支组合都过不了高度护栏：%s"
-                        % "、".join(name for name, _ in targets))
+        raise PlanError(
+            "这些航点的所有 IK 分支组合都过不了高度护栏或单步 %.0f° 上限"
+            "（同一末端位姿换分支会要求先原地转半圈）：%s"
+            % (float(max_step_deg or 0.0),
+               "、".join(name for name, _ in targets)))
     _, j = min(ends)
     path = []
     for i in range(len(sets) - 1, -1, -1):

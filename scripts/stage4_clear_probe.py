@@ -338,7 +338,32 @@ def main(argv=None):
                     help="桌面高度（base 系，m）；真机 0.0")
     ap.add_argument("--keep-scene", action="store_true",
                     help="跑完不撤场景（默认撤，免得幽灵块跟着 MoveIt 活下去）")
+    ap.add_argument("--grid", default=None, metavar="GRID.json",
+                    help="本场**实测**垫位姿（stage4_pad_from_burst.py 解出）。探针把目标块"
+                         "放进宫格时要用它定位；缺省 = 与 --truth 同目录的 "
+                         "grid-pre.json / grid.json，再没有就停（fail-closed）。"
+                         "模型常量与印刷垫差 87.5 mm/88.7°，真机不许用")
     args = ap.parse_args(argv)
+
+    # 垫位姿必须在建场景**之前**定下来：初态布局里有垫，终态布局里目标块要
+    # 落到宫格中心，两处都读 ``cm.PAD_CENTER``。
+    if args.grid:
+        cm.load_grid(args.grid)
+        log("垫位姿（实测）：%s" % args.grid)
+    else:
+        hint = os.path.dirname(os.path.abspath(args.truth[0]))
+        found = cm.find_grid(hint)
+        if not found:
+            print("!! 找不到本场实测垫位姿（%s 下没有 grid-pre.json / grid.json）。\n"
+                  "   先跑 stage4_pad_from_burst.py <pad 机位 burst> --out <run>/grid-pre.json 解垫，再回来；"
+                  "不要用模型常量（差 87.5 mm/88.7°）。" % hint,
+                  file=sys.stderr)
+            return 2
+        cm.load_grid(found)
+        log("垫位姿（实测）：%s" % found)
+    log("       垫心 (%.1f, %.1f) mm  yaw %.3f°"
+        % (cm.PAD_CENTER[0] * 1000.0, cm.PAD_CENTER[1] * 1000.0,
+           math.degrees(cm.PAD_YAW_RAD)))
 
     mp.GROUP = args.group
     mp.TABLE_TOP = float(args.table_top)
