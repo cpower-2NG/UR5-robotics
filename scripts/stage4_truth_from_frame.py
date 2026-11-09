@@ -26,7 +26,16 @@
 上），``h`` 是塔高。``layer_count`` 按 ``h/size`` 定层数，顶层用实测顶面算
 ``z = table_top + n·size``，下层按 coaxial 推定 —— 细节见 ``build_truth`` 的
 docstring。E9 真机半段必须开着这一条（``--no-layers`` 是旧行为的逃生口）。
-    yaw = find_blocks 的顶面 PCA 长边（均匀尺度不改变主轴方向 ⇒ 对深度偏差免疫）
+    yaw = 彩色像素掩码矩形（``stage2_geom.block_rect_yaw``）；掩码不 trusted
+          时才回退到 find_blocks 的顶面 PCA 长边
+
+    为什么不再用 PCA：PCA 的「长边」是顶面那十几个深度点的主轴，近正方形块
+    两个特征值几乎相等 ⇒ 主轴没有定义。2026-11-09 E9 真机实测四场目标塔，
+    PCA yaw mod 90 = 88.5 / 12.1 / 39.0 / 56.9°，彩色掩码 = 2.6 / 2.5 / 3.9 / 4.4°
+    （与亮度选顶面、人工覆盖图三方一致，真实 ≈0–2°）。s3/s4 按错 yaw 合拢，
+    手指夹在**两个相邻面**上把块夹倒滑落（用户当场看出来的）。像素掩码在
+    1280×720 上每毫米约 2.5 像素，角度不靠稀疏点，是阶段 2 A3 验证过的口径
+    （7/7 组 ≤6°）。yaw 走哪一路逐行记在 ``yaw_source``，共识里也标出来。
 
 ``table_top`` 默认 0.0 —— 生产栈在真机上用的就是 ``target_plane_z = 台面 + 块高``
 （runbook 里 28.5 mm），即台面视为 base z 0。示教器碰面读数 +3.88 mm、垫 PnP
@@ -125,6 +134,48 @@ def in_zone_xy(x, y, zone_m=None):
     return x0 <= x <= x1 and y0 <= y <= y1
 
 
+def colour_yaw_rows(frame, rows):
+    """把每行的 ``yaw`` 换成彩色像素掩码矩形（``stage2_geom.block_rect_yaw``）。
+
+    - trusted（轮廓填充率 ≥0.70 且像素 ≥200）⇒ 覆盖 ``yaw``，
+      ``yaw_source='colour_rect'``，原 PCA 值留在 ``yaw_pca``；
+    - 不 trusted 或没有 cv2 ⇒ 保留 PCA，``yaw_source='depth_pca'``，
+      原因记 ``yaw_note``。**不失败**：掩码坏掉不该让整场真值变空，但
+      ``yaw_source`` 会让报告和共识看得见这一行没走彩色。
+
+    返回 ``(n_colour, n_rows)``，供调用方打印。
+    """
+    try:
+        import stage2_geom as sg
+    except Exception as e:                                    # noqa: BLE001
+        for r in rows:
+            r["yaw_source"] = "depth_pca"
+            r["yaw_note"] = "stage2_geom 不可用：%s" % e
+        return 0, sum(1 for r in rows if not r.get("low"))
+    n_ok = n = 0
+    for r in rows:
+        if r.get("low"):
+            continue
+        n += 1
+        r["yaw_pca"] = float(r.get("yaw", 0.0))
+        try:
+            rr = sg.block_rect_yaw(frame, r)
+        except Exception as e:                                # noqa: BLE001
+            rr = {"yaw_deg": None, "trusted": False, "reason": str(e),
+                  "ext_mm": [0.0, 0.0], "fill": 0.0, "n_pixels": 0}
+        r["yaw_rect"] = {"ext_mm": rr.get("ext_mm"),
+                         "fill": round(float(rr.get("fill") or 0.0), 3),
+                         "n_pixels": int(rr.get("n_pixels") or 0)}
+        if rr.get("yaw_deg") is not None and rr.get("trusted"):
+            r["yaw"] = float(rr["yaw_deg"])
+            r["yaw_source"] = "colour_rect"
+            n_ok += 1
+        else:
+            r["yaw_source"] = "depth_pca"
+            r["yaw_note"] = rr.get("reason") or "掩码不 trusted"
+    return n_ok, n
+
+
 def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                 batch="REAL", index=0, keep_outside=False,
                 drop_unknown=True, min_class_share=0.0, layers=True,
@@ -203,7 +254,13 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                     "ext_rect_mm": [round(float(v), 2)
                                     for v in r.get("ext_rect", [])],
                     "class_share": r.get("class_share"),
+                    "yaw_source": r.get("yaw_source", "depth_pca"),
+                    "yaw_pca": round(float(r.get("yaw_pca",
+                                                 yaw)), 2),
+                    "yaw_rect": r.get("yaw_rect"),
                 }
+                if r.get("yaw_note"):
+                    entry["meas"]["yaw_note"] = r["yaw_note"]
                 if abs(h_mm - n_layers * size * 1000.0) > 6.0:
                     entry["warn_h_mm"] = round(
                         h_mm - n_layers * size * 1000.0, 2)
@@ -212,6 +269,8 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                     "from": "coaxial_with_top_face",
                     "tower_layers": n_layers,
                     "top_face_h_mm": round(h_mm, 2),
+                    # 下层 yaw 是推定的（沿用顶层），来源跟着顶层走
+                    "yaw_source": r.get("yaw_source", "depth_pca"),
                 }
             if layer_note:
                 entry["meas"]["layer_note"] = layer_note
@@ -233,11 +292,21 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
     }
 
 
-def measure_dir(frame_dir, index=None, split=True):
-    """俯视帧 → (frame, find_blocks 行, 台面 z)。俯视链纯静态，不经过臂。"""
+def measure_dir(frame_dir, index=None, split=True, yaw_method="colour"):
+    """俯视帧 → (frame, find_blocks 行, 台面 z)。俯视链纯静态，不经过臂。
+
+    ``yaw_method='colour'``（默认）把每行的 yaw 换成彩色像素掩码矩形
+    （见 ``colour_yaw_rows``）；``'depth'`` 是旧口径（PCA），只为复现旧证据。
+    """
     frame = gc.load_frame(frame_dir, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN,
                           idx=index)
     rows, table_z = gc.find_blocks(frame, split=split)
+    if yaw_method == "colour":
+        colour_yaw_rows(frame, rows)
+    else:
+        for r in rows:
+            r["yaw_source"] = "depth_pca"
+            r["yaw_pca"] = float(r.get("yaw", 0.0))
     return frame, rows, table_z
 
 
@@ -312,6 +381,21 @@ def consensus(truths, radius_m=0.020, min_frames=None):
         # 旧写法 ``top − size`` 反推台面，在塔上会算出 n−1 层的高度。
         top = _median([float(p["top"]) for p in pts])
         layer = int(max(p.get("layer", 0) for p in pts))
+        # yaw 只认彩色掩码那一路：PCA 在近正方形块上没有定义，混进来会把
+        # 共识角拖偏（E9 s4：PCA 146.9° vs 彩色 4.4°）。彩色一帧都没有时才
+        # 退回全 PCA，并在 yaw_source 里写明。
+        pairs = [(float(p["yaw"]),
+                  p["meas"].get("yaw_source", "depth_pca")) for p in pts]
+        colour = [v for v, s in pairs if s == "colour_rect"]
+        src_counts = {}
+        for _, s in pairs:
+            src_counts[s] = src_counts.get(s, 0) + 1
+        if colour:
+            yaw = _yaw_square(colour)
+            yaw_source = "colour_rect"
+        else:
+            yaw = _yaw_square([v for v, _ in pairs])
+            yaw_source = "depth_pca"
         blocks.append({
             "id": 0,
             "color": color,
@@ -321,10 +405,13 @@ def consensus(truths, radius_m=0.020, min_frames=None):
             "x": mx,
             "y": my,
             "z": top - size / 2.0,
-            "yaw": _yaw_square([float(p["yaw"]) for p in pts]),
+            "yaw": yaw,
             "meas": {"n_frames": len(c["frames"]),
                      "n_pts": len(pts),
                      "from": pts[0]["meas"].get("from"),
+                     "yaw_source": yaw_source,
+                     "yaw_colour_frames": len(colour),
+                     "yaw_sources": src_counts,
                      "x_spread_mm": round((max(xs) - min(xs)) * 1000, 2),
                      "y_spread_mm": round((max(ys) - min(ys)) * 1000, 2),
                      "colors": colors,
@@ -348,11 +435,12 @@ def consensus(truths, radius_m=0.020, min_frames=None):
     }
 
 
-def survey(frame_dir, split=True, table_top=0.0):
+def survey(frame_dir, split=True, table_top=0.0, yaw_method="colour"):
     idxs = gc.list_frame_indices(frame_dir)
-    print("帧数 %d" % len(idxs))
+    print("帧数 %d（yaw 口径：%s）" % (len(idxs), yaw_method))
     for idx in idxs:
-        frame, rows, table_z = measure_dir(frame_dir, index=idx, split=split)
+        frame, rows, table_z = measure_dir(frame_dir, index=idx, split=split,
+                                           yaw_method=yaw_method)
         t = build_truth(rows, frame, table_top=table_top)
         print("  idx=%-3s 深度台面=%8.2f mm  块数=%2d  区外=%2d  非积木=%2d"
               % (idx, table_z * 1000.0, len(t["blocks"]),
@@ -395,6 +483,9 @@ def main(argv=None):
                          "（塔的上下层 xy 相同，靠 z 分开）")
     ap.add_argument("--no-layers", action="store_true",
                     help="关掉塔的分层展开（每簇只当一块；E9 的塔必须开着）")
+    ap.add_argument("--yaw-depth", action="store_true",
+                    help="yaw 退回 find_blocks 的深度 PCA 长边（旧口径，只为"
+                         "复现旧证据；默认用彩色像素掩码矩形）")
     ap.add_argument("--zone", default=None, metavar="X0,X1,Y0,Y1",
                     help="真值保留区（base 系米）。缺省 = 拾取区 ZONE_M。"
                          "E9 真机半段要覆盖垫面与北侧自由区，例如 "
@@ -422,8 +513,11 @@ def main(argv=None):
 
     if args.survey:
         survey(args.frame, split=not args.no_split,
-               table_top=args.table_top)
+               table_top=args.table_top,
+               yaw_method="depth" if args.yaw_depth else "colour")
         return 0
+
+    yaw_method = "depth" if args.yaw_depth else "colour"
 
     idx = args.index
     if idx is None:
@@ -438,7 +532,8 @@ def main(argv=None):
         # 用中位位置判一次。
         for i in idxs:
             fr, rows_i, _ = measure_dir(args.frame, index=i,
-                                        split=not args.no_split)
+                                        split=not args.no_split,
+                                        yaw_method=yaw_method)
             truths.append(build_truth(
                 rows_i, fr, table_top=args.table_top,
                 block_size=args.block_size,
@@ -465,14 +560,16 @@ def main(argv=None):
         for b in truth["blocks"]:
             m = b["meas"]
             print("  #%d %-9s x=%7.1f y=%7.1f top=%6.1f 层 %d yaw=%5.1f  "
-                  "帧 %2d/%d  散布 x=%.1f y=%.1f mm  颜色 %s"
+                  "帧 %2d/%d  散布 x=%.1f y=%.1f mm  颜色 %s  yaw来源 %s(%d)"
                   % (b["id"], b["color"], b["x"] * 1000, b["y"] * 1000,
                      b["top"] * 1000, b["layer"] + 1, b["yaw"], m["n_frames"],
                      truth["n_frames"], m["x_spread_mm"], m["y_spread_mm"],
-                     m["colors"]))
+                     m["colors"], m.get("yaw_source", "?"),
+                     m.get("yaw_colour_frames", 0)))
     else:
         frame, rows, table_z = measure_dir(args.frame, index=idx,
-                                           split=not args.no_split)
+                                           split=not args.no_split,
+                                           yaw_method=yaw_method)
         truth = build_truth(rows, frame, table_top=args.table_top,
                             block_size=args.block_size,
                             batch=os.path.basename(args.frame.rstrip("/")),
@@ -488,11 +585,12 @@ def main(argv=None):
                  truth["dropped_out_of_zone"], truth["dropped_not_block"]))
         for b in truth["blocks"]:
             print("  #%d %-11s x=%7.1f y=%7.1f top=%6.1f yaw=%6.1f  "
-                  "h=%6.1f  层 %d（%s）%s"
+                  "h=%6.1f  层 %d（%s）  yaw来源 %s%s"
                   % (b["id"], b["color"], b["x"] * 1000, b["y"] * 1000,
                      b["top"] * 1000, b["yaw"],
                      float(b["meas"].get("h_mm") or 0.0), b["layer"] + 1,
                      b["meas"].get("from", "?"),
+                     b["meas"].get("yaw_source", "?"),
                      "" if "warn_h_mm" not in b
                      else "  ⚠ h−层高=%+.1f mm" % b["warn_h_mm"]))
     if n == 0:

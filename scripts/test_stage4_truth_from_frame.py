@@ -317,6 +317,93 @@ def section_consensus():
           c4["blocks"][0]["yaw"])
 
 
+def synth_frame(size_m=0.032, yaw_deg=0.0, with_depth=True):
+    """正下方看的合成俯视帧：台面 + 一块正方形顶面（尺寸/朝向可控）。
+
+    ``CAM`` 的相机 z→base −z、t_z=1.5 ⇒ 深度值 = 1.5 − base_z。方块顶面在
+    base z = size_m，其余是台面（z=0）。
+    """
+    import cv2
+    H, W = 480, 640
+    depth = np.full((H, W), 1.5) if with_depth else np.zeros((H, W))
+    if with_depth:
+        half = 600.0 * size_m / 2.0          # 600 px/m ⇒ 边长像素的一半
+        c, s = np.cos(np.radians(yaw_deg)), np.sin(np.radians(yaw_deg))
+        poly = np.array([(320.0 + c * dx - s * dy, 240.0 + s * dx + c * dy)
+                         for dx, dy in ((-half, -half), (half, -half),
+                                        (half, half), (-half, half))],
+                        np.float32)
+        mask = np.zeros((H, W), np.uint8)
+        cv2.fillPoly(mask, [poly.astype(np.int32)], 1)
+        depth[mask > 0] = 1.5 - size_m
+    return {"K": CAM["K"], "R_bc": CAM["R_bc"], "t_bc": CAM["t_bc"],
+            "depth": depth, "color": np.zeros((H, W, 3), np.uint8)}
+
+
+def section_colour_yaw():
+    print('\n[10] yaw 口径：彩色像素掩码优先（PCA 只作掩码坏掉时的回退）')
+    for ang in (0.0, 30.0, 62.0):
+        fr = synth_frame(0.032, ang)
+        rows = [row(0, top=32.0, h=32.0, yaw=150.0)]
+        n_ok, n = tf.colour_yaw_rows(fr, rows)
+        # 这张合成相机 R=diag(1,−1,−1)：图像里转 +φ，base 系是 −φ。
+        want = (-ang) % 90.0
+        check("φ=%.0f° 掩码 trusted" % ang, n_ok == 1 and n == 1, rows[0])
+        y = rows[0]["yaw"] % 90.0
+        check("φ=%.0f° yaw 测得 %.1f°（期望 %.1f°，±2°）" % (ang, y, want),
+              abs(((y - want + 45) % 90) - 45) < 2.0, y)
+        check("φ=%.0f° yaw_source=colour_rect" % ang,
+              rows[0]["yaw_source"] == "colour_rect", rows[0]["yaw_source"])
+        check("φ=%.0f° PCA 原值留在 yaw_pca" % ang,
+              abs(rows[0]["yaw_pca"] - 150.0) < 1e-9, rows[0].get("yaw_pca"))
+
+    # 掩码坏掉（这里：块心远在窗口外）⇒ 不失败，回退 PCA 并写明来源
+    fr = synth_frame(0.032, 0.0)
+    rows = [row(0, cx=100.0, cy=100.0, top=32.0, h=32.0, yaw=150.0)]
+    tf.colour_yaw_rows(fr, rows)
+    check("掩码不 trusted ⇒ yaw 保留 PCA", abs(rows[0]["yaw"] - 150.0) < 1e-9,
+          rows[0]["yaw"])
+    check("掩码不 trusted ⇒ yaw_source=depth_pca",
+          rows[0]["yaw_source"] == "depth_pca" and bool(rows[0].get("yaw_note")),
+          rows[0].get("yaw_note"))
+
+    # build_truth 把来源写进顶层 meas（下层 coaxial 跟着顶层）
+    fr = synth_frame(0.032, 20.0)
+    rows = [row(0, top=59.0, h=59.0, yaw=1.0)]
+    tf.colour_yaw_rows(fr, rows)
+    t = tf.build_truth(rows, CAM)
+    check("build_truth 顶层 meas.yaw_source=colour_rect",
+          t["blocks"][0]["meas"]["yaw_source"] == "colour_rect",
+          t["blocks"][0]["meas"].get("yaw_source"))
+    check("build_truth 下层 meas 跟着顶层来源",
+          t["blocks"][1]["meas"].get("yaw_source") == "colour_rect",
+          t["blocks"][1]["meas"].get("yaw_source"))
+
+
+def section_consensus_yaw():
+    print('\n[11] 共识只用彩色 yaw：PCA 帧不得把共识角拖偏')
+    def one(uv, yaw, src):
+        r = row(0, uv=uv, yaw=yaw)
+        r["yaw_source"] = src
+        return tf.build_truth([r], CAM)
+
+    frames = [one((320.0, 240.0), 3.0, "colour_rect"),
+              one((321.0, 240.0), 5.0, "colour_rect"),
+              one((319.0, 240.0), 70.0, "depth_pca")]
+    c = tf.consensus(frames, min_frames=3)
+    b = c["blocks"][0]
+    check("yaw 取彩色帧（≈4°），不被 70° 的 PCA 拖走",
+          abs(((b["yaw"] - 4.0 + 45) % 90) - 45) < 2.0, b["yaw"])
+    check("共识 yaw_source=colour_rect",
+          b["meas"]["yaw_source"] == "colour_rect", b["meas"])
+    check("记录彩色帧数", b["meas"]["yaw_colour_frames"] == 2, b["meas"])
+
+    c2 = tf.consensus([one((320.0, 240.0), 40.0, "depth_pca")], min_frames=1)
+    check("一帧彩色都没有 ⇒ 回退 depth_pca",
+          c2["blocks"][0]["meas"]["yaw_source"] == "depth_pca",
+          c2["blocks"][0]["meas"].get("yaw_source"))
+
+
 def main():
     section_ray_plane()
     section_depth_immunity()
@@ -327,6 +414,8 @@ def main():
     section_empty()
     section_consensus()
     section_layers()
+    section_colour_yaw()
+    section_consensus_yaw()
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('失败项：' + ', '.join(FAILS))
