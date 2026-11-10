@@ -1044,6 +1044,8 @@ class _A(object):
         self.out_dir = kw['out_dir']
         self.align_json = kw.get('align_json')
         self.hover_z = kw.get('hover_z', cr.ALIGN_HOVER_Z)
+        self.topcam_burst = kw.get('topcam_burst')
+        self.allow_blocking_view = kw.get('allow_blocking_view', False)
         self.align_burst_dir = kw.get('align_burst_dir')
         self.board_dir = kw.get('board_dir', '$HOME/precision/plans/e9')
         self.board_log_dir = kw.get('board_log_dir', '$HOME/precision/logs/e9')
@@ -1223,13 +1225,103 @@ def section_align():
           and any('不要执行' in ln for ln in lines), str(lines))
 
 
+#: 俯视外参（B1 实测的存值）：相机光轴朝 −y 略斜，仰角 ~41.6°。
+RCAM_TOP = np.array([[-0.9961, 0.0306, -0.0830],
+                     [0.0824, 0.6637, -0.7434],
+                     [0.0324, -0.7474, -0.6636]])
+
+
+def _topcam_burst(tmp, R=RCAM_TOP, t=(0.4041, 1.0755, 0.8012)):
+    """造一份**只有外参**的俯视帧目录（闸门只读 ``tf.json``）。"""
+    import stage4_scene_model as sm
+    q = sm.mat_to_quat(R)
+    tf = {'base_link:topcam_color_optical_frame': {
+        'rotation': {k: float(v) for k, v in zip('xyzw', q)},
+        'translation': {k: float(v) for k, v in zip('xyz', t)}}}
+    d = tempfile.mkdtemp(prefix='topcam-tf-', dir=tmp)
+    _write_json(d, 'tf.json', {'ok': tf})
+    return d
+
+
+def section_view_gate():
+    print('\n[12] 视线闸门：出计划时就判「两指挡不挡俯视」')
+    tmp = tempfile.mkdtemp(prefix='cr-view-')
+    burst = _topcam_burst(tmp)
+    xyz = (0.5612, 0.3548, 0.360)
+
+    # ψ = 88.75°（closing=0）：分离轴 = tool x ≈ base +y ≈ 视线 ⇒ 挡。
+    v_bad = cr.topcam_view_gate(burst, xyz, 88.75)
+    check('closing=0（ψ=88.75°）⇒ 视线闸门红（实测那条正是这个姿态）',
+          v_bad['lateral'] is False and v_bad['angle_deg'] < 15.0, str(v_bad))
+    # ψ 转 90°：两指侧对视线。
+    v_ok = cr.topcam_view_gate(burst, xyz, 178.75)
+    check('closing=1（ψ=178.75°）⇒ 侧向、闸门绿',
+          v_ok['lateral'] is True and v_ok['angle_deg'] >= 60.0, str(v_ok))
+    check('闸门记录带阈值与 burst 路径（manifest 要能复盘）',
+          abs(v_ok['min_deg'] - 60.0) < 1e-9
+          and 'topcam-tf' in v_ok['burst'], str(v_ok))
+
+    # 端到端：挡视线时 align_plan_main 必须返回 1 且**不写**计划。
+    # 用 s11 的真实几何：目标块 yaw 88.75° + closing=0 ⇒ ψ=88.75° ⇒ 两指顺着视线。
+    q0 = q_start_of(chain())
+    rep = tempfile.mkdtemp(prefix='cr-view-main-')
+    truth_s11 = tower_truth()
+    truth_s11['blocks'][0]['yaw'] = 88.75
+    tp = _write_json(rep, 'truth.json', truth_s11)
+    rp = _write_json(rep, 'probe.json',
+                     {'cell': 'T', 'scenes': [{'truth': tp,
+                                               'attempts': [tower_attempt()]}]})
+    outp = os.path.join(rep, 'plan')
+    a = _A(probe_report=rp, out_dir=outp,
+           q_start=','.join(str(v) for v in q0), topcam_burst=burst)
+    lines = []
+    real_log = cr.log
+    cr.log = lambda *x: lines.append(' '.join(str(v) for v in x))
+    try:
+        rc = cr.align_plan_main(None, a)
+    finally:
+        cr.log = real_log
+    check('视线闸门红 ⇒ rc=1、不写计划、点名 --prefer-closing',
+          rc == 1 and not os.path.exists(os.path.join(
+              outp, '00-align-hover-r1.json'))
+          and any('prefer-closing' in ln for ln in lines), str(lines))
+    # 显式承担 ⇒ 照样出计划（诊断用）。
+    a_allow = _A(probe_report=rp, out_dir=outp,
+                 q_start=','.join(str(v) for v in q0),
+                 topcam_burst=burst, allow_blocking_view=True)
+    rc = cr.align_plan_main(None, a_allow)
+    man = json.load(open(os.path.join(outp, 'align-r1.json'), encoding='utf-8'))
+    check('--allow-blocking-view ⇒ 出计划，但 manifest 里留下闸门红记录',
+          rc == 0 and man['view_gate']['lateral'] is False, str(man.get(
+              'view_gate')))
+    # 侧向朝向（ψ=178.75°）⇒ 闸门绿、正常出计划。
+    att = tower_attempt()
+    att['grasp_hit'] = dict(att['grasp_hit'] or {}, closing=1)
+    rp2 = _write_json(rep, 'probe2.json',
+                      {'cell': 'T', 'scenes': [{'truth': tp,
+                                                'attempts': [att]}]})
+    ou2 = os.path.join(rep, 'plan2')
+    a2 = _A(probe_report=rp2, out_dir=ou2,
+            q_start=','.join(str(v) for v in q0), topcam_burst=burst)
+    rc = cr.align_plan_main(None, a2)
+    man2 = json.load(open(os.path.join(ou2, 'align-r1.json'), encoding='utf-8'))
+    check('探针给了 closing=1 ⇒ 抓取角 +90°、闸门绿、计划写出',
+          rc == 0 and man2['view_gate']['lateral'] is True,
+          str(man2.get('view_gate')))
+    p2 = json.load(open(os.path.join(ou2, '00-align-hover-r1.json'),
+                        encoding='utf-8'))
+    check('悬停姿态用的就是 ψ = 块 yaw + 90',
+          abs(p2['meta']['yaw_grasp_deg'] - (88.75 + 90.0)) < 1e-6,
+          str(p2['meta']['yaw_grasp_deg']))
+
+
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
                section_step_cap, section_place_yaw_equiv, section_gap,
                section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
-               section_align):
+               section_align, section_view_gate):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

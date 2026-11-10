@@ -131,7 +131,7 @@ def _find_block(blocks, key):
     return None
 
 
-def eval_block(node, clients, block, blocks, pool):
+def eval_block(node, clients, block, blocks, pool, prefer_closing=None):
     """B 档可抓否（E7 口径）+ 每块挡了多少个候选位姿（``per_other``）。"""
     others, names = [], []
     for b in blocks:
@@ -145,7 +145,8 @@ def eval_block(node, clients, block, blocks, pool):
     table = sm.table_obb(mp.TABLE_TOP)
     return wp.evaluate_block(node, clients["ik"], clients["fk"],
                              clients["validity"], block, target, others, table,
-                             pool, vertical_only=True, other_names=names)
+                             pool, vertical_only=True, other_names=names,
+                             prefer_closing=prefer_closing)
 
 
 def inside_table(block, margin=cm.FREE_CLEAR):
@@ -195,12 +196,16 @@ def find_destination(node, clients, blocks, bid, pool):
 
 
 # ---------------------------------------------------------------- 递归清障
-def ensure_graspable(node, clients, blocks, bid, depth, pool, active):
+def ensure_graspable(node, clients, blocks, bid, depth, pool, active,
+                     prefer_closing=None):
     """保证 ``bid`` 在当前（规划后的）布局里**可以动**：可抓 ∧ 顶面无块。
 
     「可抓」不够 —— 若还有块压在 ``bid`` 上，抓走它上面那块就会掉，终态必然
     不合法（``terminal_report`` 判悬空）。所以先递归挪走**压在它上面的块**，
     再按 ``blocker_scores`` 挪走**挡住夹爪的块**，直到两个条件同时满足。
+
+    ``prefer_closing`` 只作用于 ``depth == 0`` 那一块（= 本次的目标；清障块的
+    朝向要按它们自己的几何定，不跟着目标转）。
 
     返回 ``{"blocks": 规划后的块位, "steps": 挪动记录, "final": 评测结果}``，
     或 None（深度/步数用尽、找不到可放的遮挡块）。
@@ -218,7 +223,8 @@ def ensure_graspable(node, clients, blocks, bid, depth, pool, active):
         blk = _find_block(cur, bid)
         if blk is None:
             return None
-        res = eval_block(node, clients, blk, cur, pool)
+        res = eval_block(node, clients, blk, cur, pool,
+                         prefer_closing=prefer_closing if depth == 0 else None)
         if it == 0:
             first = res
         deps = [d for d in cm.dependents(cur, bid) if str(d) not in active]
@@ -261,7 +267,8 @@ def ensure_graspable(node, clients, blocks, bid, depth, pool, active):
     return None
 
 
-def check_placement(node, clients, blocks, target_id, cell, pool):
+def check_placement(node, clients, blocks, target_id, cell, pool,
+                    prefer_closing=None):
     """把目标块放到宫格 ``cell``，核验「能在那个位姿接近/放下它」。"""
     tb = _find_block(blocks, target_id)
     if tb is None:
@@ -270,13 +277,15 @@ def check_placement(node, clients, blocks, target_id, cell, pool):
              else dict(b) for b in blocks]
     if not apply_layout(node, clients, final):
         return None
-    res = eval_block(node, clients, _find_block(final, target_id), final, pool)
+    res = eval_block(node, clients, _find_block(final, target_id), final, pool,
+                     prefer_closing=prefer_closing)
     return {"ok": res["b_ok"], "final": final, "row": res["hit"],
             "reasons": res["reasons"]}
 
 
 # ---------------------------------------------------------------- 单次尝试
-def run_attempt(node, clients, truth, target_id, cell, pool):
+def run_attempt(node, clients, truth, target_id, cell, pool,
+                prefer_closing=None):
     """一个指定目标块的完整尝试（每个尝试都从原始布局重来）。"""
     out = {"id": target_id}
     blocks = [dict(b) for b in truth["blocks"]]
@@ -285,7 +294,7 @@ def run_attempt(node, clients, truth, target_id, cell, pool):
         return out
 
     res = ensure_graspable(node, clients, blocks, target_id, 0, pool,
-                           frozenset())
+                           frozenset(), prefer_closing=prefer_closing)
     if res is None:
         out.update(ok=False, reason="no_clearing_plan")
         return out
@@ -302,7 +311,8 @@ def run_attempt(node, clients, truth, target_id, cell, pool):
                                "gap_table_mm", "per_other")}
         for r in (first.get("rows") or []) if r.get("verdict") != "ok"]
 
-    plac = check_placement(node, clients, res["blocks"], target_id, cell, pool)
+    plac = check_placement(node, clients, res["blocks"], target_id, cell, pool,
+                           prefer_closing=prefer_closing)
     if plac is None or not plac["ok"]:
         out.update(ok=False, reason="place_pose_illegal",
                    place_reasons=(plac or {}).get("reasons"))
@@ -332,6 +342,12 @@ def main(argv=None):
     ap.add_argument("--gate", type=float, default=GATE)
     ap.add_argument("--max-targets", type=int, default=0,
                     help="每场只测前 N 个目标块（冒烟用）")
+    ap.add_argument("--prefer-closing", type=int, choices=(0, 1), default=None,
+                    help="把目标块的哪个合拢轴排到最前（0=块 x 轴 / 1=块 y 轴，"
+                         "tool0 绕 z 差 90°）。E4b 低悬停要求两指侧对俯视视线："
+                         "2026-11-10 s11 实测 closing=0 时两指前后一条线、近侧指影"
+                         "压在块顶。**只改顺序不改判据** —— 偏好候选照样过 SAT+IK，"
+                         "过不了就回落，``hit`` 里如实记实际选中的 closing。")
     ap.add_argument("--group", default="ur5_manipulator",
                     help="MoveIt 规划组：仿真 ur5_manipulator / 真机 ur_manipulator")
     ap.add_argument("--table-top", type=float, default=0.0,
@@ -419,7 +435,8 @@ def main(argv=None):
                len(truth["blocks"]), len(ids)))
         attempts = []
         for tid in ids:
-            a = run_attempt(node, clients, truth, tid, args.cell, pool)
+            a = run_attempt(node, clients, truth, tid, args.cell, pool,
+                            prefer_closing=args.prefer_closing)
             attempts.append(a)
             steps = len(a.get("clearing_steps") or [])
             if a["ok"]:
@@ -465,6 +482,7 @@ def main(argv=None):
 
     passed = bool(n and ratio >= args.gate)
     report = {"truths": args.truth, "cell": args.cell,
+              "prefer_closing": args.prefer_closing,
               "group": mp.GROUP, "table_top": mp.TABLE_TOP,
               "model_joints": mp.MODEL_JOINTS,
               "scenes": scenes, "per_batch": per_batch,

@@ -32,9 +32,12 @@
 （462.9）更差。所以「用垫面每场现解外参」这条路只对**平面内**（即 ``du``）成立；
 ``dv`` 必须靠**同高度观测**，也就是把悬停降到指尖≈块顶，让视差本身消失。
 降到那么低时夹爪会挡住俯视看块顶的视线 ⇒ **抓取朝向要让开视线**（用户 2026-11-10 定）。
-本工具逐帧报 ``view_clearance_deg``（两指分离轴 vs 相机水平视线的夹角，见
-``VIEW_LATERAL_MIN_DEG``）：s10 实测 86.9° = 侧向，那一场的块顶确实看得见；
+本工具逐帧报 ``view_clearance_deg``（两指分离轴 = **tool x** vs 相机水平视线的
+夹角，见 ``VIEW_LATERAL_MIN_DEG``）。**旧的 s10「86.9° = 侧向」是拿 tool y 算的，
+2026-11-10 s11 推翻了它**：ψ=88.75° 时两指尖在彩图里只差 ~20 px（95 mm 开口该有
+~124 px），近侧手指压在块顶左上角 —— 分离轴其实是 tool x，真实夹角只有 ~5°。
 夹角小时近侧手指的影子直接盖在块顶上，量到的就不是块 —— 这时 ``view_lateral=false``。
+**降悬停之前先把夹爪转 90°**（closing=1 ⇒ ψ = 块 yaw + 90°），否则 E4b 读数无效。
 
 **符号**：``(dx, dy)`` = 块相对轴的位移 ⇒ 把计划目标平移 ``+(dx, dy)``、抓取角
 转 ``+dyaw`` 就是对准。
@@ -112,6 +115,38 @@ PAIR_SEP_MAX = 125.0
 PAIR_MID_TOL = 25.0                  # 中点离 FK 轴的上限（先紧）
 PAIR_MID_TOL_LOOSE = 40.0            # 挑不到再放宽到原来的 40 px
 
+# 固定区间只是**兜底**。两指间距在图像里本来就会随朝向变：两指顺着视线时
+# 95 mm 开口只剩 ~15 px，侧向时是 ~132 px（2026-11-10 s11 两轮实拍）。
+# 所以真正的先验是 **FK 投影出来的两指尖间距**（见 ``detect_fingers`` 的
+# ``pred_sep``）—— 它只依赖 z 与 fx/fy，外参的平移偏置在对**差**里消掉。
+# 上一轮 r2 就是被 125 px 这个上限整对拒掉：20/20 帧「深色列串不足」，
+# 而画面里两指清清楚楚。
+PAIR_SEP_TOL_REL = 0.30              # 先验间距的相对容差
+PAIR_SEP_TOL_ABS = 15.0              # 先验间距的绝对容差（px）
+#: 张爪时两指尖外缘到 tool0 轴的距离（AG-95 开口 95 mm ⇒ 半宽 47.5 mm）。
+GRIPPER_OPEN_HALF_M = 0.0475
+
+# 找指带**不能钉死在 FK 锚点上方那三个固定偏移**：锚点来自存的外参，而外参
+# 过期时它在 v 上偏 40+ px（2026-11-10 s11 r2：模型说指尖 v=610，画面里指尖
+# v≈565，垫面残差只报 26.5）⇒ 三条带全落在指尖**下面**的空台面上，
+# 「深色列串不足」20/20 帧，而画面里两指清清楚楚。
+# 改成以锚点为中心**扫**一条竖带：同一对指会在相邻带里反复出现（带高 30、
+# 步长 4 ⇒ 约 7 条），按「列位置一致」聚成一簇，取支持最多的那一簇。
+# 这仍然只用**像面**测量（u_mid / 间距 / 指尖 v 全是实测），FK 只提供搜索中心
+# 和间距先验 —— 那才是「同帧相对量」该有的样子。
+# 判据从「深色」改成「**离台面的高度**」：2026-11-10 s11 r2 实拍，AG-95 两根指
+# 的外壳在俯视彩图里是浅灰（V 70–200，随阴影变），深色的是**本体**——按颜色找
+# 只找到本体（整条带被 67–180 px 的宽串占满）。离台面 70 mm 的像素里，两指是
+# 两条 19–26 px 的窄串，本体在上方、指影在台面上，都不进带。
+FINGER_MIN_ABOVE_M = 0.090
+FINGER_SWEEP_PX = 90.0               # 扫描半径（相对 FK 锚点，向上为正）
+FINGER_SWEEP_DOWN = 60.0             # 向下也扫这么多（锚点偏高时用）
+FINGER_SWEEP_STEP = 4
+FINGER_BAND_H = 30
+FINGER_TIP_FRAC = 0.35               # 「这一行还是指」的深色比例
+FINGER_TIP_END = 4                   # 连续这么多行不达标 ⇒ 指尖到此为止
+FINGER_GROUP_TOL = 6.0               # 两簇「是同一对指」的列位置容差（px）
+
 # 抓后（held）ROI：块被举到 0.17 m、离镜头 ~1.0 m，指与块贴合 ⇒ 只有
 # 「轴左右 ±40 px、块顶投影 v 上下几十 px」里那块是干净的。整幅扫会被
 # 浅青色臂体占满（2026-11-10 实测 cyan 29116 点），块锚点跑出 −526 mm。
@@ -135,8 +170,11 @@ GRASP_ROI_DV = (-110.0, 60.0)
 # 1.5 px ÷ 10 % = 15 px。超过它 ``dy_trusted=false``（dx 照报，du 不进这根桥）。
 PARALLAX_MAX_PX = 15.0
 
-#: 视线遮挡闸门：两指的**分离轴**（tool0 的 y 轴，s10 实测）与俯视相机水平
-#: 视线的夹角。≥60° = 侧向：两列手指落在块的左右两侧，它们沿视线方向投下的
+#: 视线遮挡闸门：两指的**分离轴**（tool0 的 x 轴 = 合拢轴，2026-11-10 s11 实拍
+#: 判决：ψ=88.75° 时两指尖在俯视彩图里只差 ~20 px，而 95 mm 开口在该距离投影
+#: 该有 ~124 px ⇒ 分离轴几乎顺着视线；近侧手指本体压在块顶左上角。
+#: 旧写法取 tool y 是错的，同一帧会读成「84.9° 侧向」而实际是 5°。）与俯视相机
+#: 水平视线的夹角。≥60° = 侧向：两列手指落在块的左右两侧，它们沿视线方向投下的
 #: 影子（长度 ≈ 指尖高度 ÷ tan42° ≈ 1.1×高度）只沿像面 v 方向走，压不到块顶面；
 #: 夹角小 = 一前一后，近侧那根手指的影子直接盖在块顶上 —— 那时量到的是指影，
 #: 不是块。90° 最好，60° 是「还分得开」的下限（用户 2026-11-10 定的要求：
@@ -219,6 +257,11 @@ def view_clearance_deg(R_tool, R_cam, min_deg=VIEW_LATERAL_MIN_DEG):
 
     这是「必要条件」级别的体检，不是遮挡仿真：它只说两指是侧向并排还是前后
     一条线，具体影子落在哪儿还看块在哪、指有多高（见 ``VIEW_LATERAL_MIN_DEG``）。
+
+    **分离轴 = tool0 的 x 轴**（合拢轴；规划端 ``grasp_yaw_deg`` 同一约定：
+    ``closing`` 0/1 → ψ = 块 yaw / 块 yaw + 90°）。2026-11-10 s11 低悬停实拍
+    判决：按 tool y 算是 84.9°（假侧向），按 tool x 算只有 5°，而画面里近侧
+    手指确实压在块顶上。
     """
     Rt = np.asarray(R_tool, float)
     Rc = np.asarray(R_cam, float)
@@ -231,7 +274,7 @@ def view_clearance_deg(R_tool, R_cam, min_deg=VIEW_LATERAL_MIN_DEG):
     if nh < 0.05:                      # 俯视近垂直：没有「水平视线」可言
         return {"angle_deg": None, "elevation_deg": round(elev, 1),
                 "lateral": None}
-    a = Rt[:, 1] / max(float(np.linalg.norm(Rt[:, 1])), 1e-12)  # 分离轴 = tool y
+    a = Rt[:, 0] / max(float(np.linalg.norm(Rt[:, 0])), 1e-12)  # 分离轴 = tool x
     c = abs(float(a @ (h / nh)))                              # 线夹角 ⇒ 取绝对值
     ang = math.degrees(math.acos(max(-1.0, min(1.0, c))))
     return {"angle_deg": round(ang, 1), "elevation_deg": round(elev, 1),
@@ -386,38 +429,81 @@ def _runs(prof, thresh, u0, min_len=2, merge_gap=3):
     return merged
 
 
-def detect_fingers(color, depth, table_z, K, R, t, u_tip, anchor_v,
-                   bands=((-42, -12), (-38, -8), (-30, -6))):
-    """在 ``anchor_v`` **上方**的带里找两只深色指 → 中点 ``u``（像素）。
+def _finger_tip_v(mask, run, v_from):
+    """从 ``v_from`` 往下扫，这一串「高于台面」的列的**最下端**行 = 指尖 v。
 
-    ``anchor_v`` 取「指尖」与「块顶」两者在上（v 小）的那个的投影 v：
-      · 抓前：指尖远高于块顶 ⇒ 带落在块上方，带内只有两根指；
-      · 抓后（held）：块顶**高于**指尖 ⇒ 锚点换成块顶，带落在块顶上方，
-        仍只有两根指（否则块会填进两指之间的列，把两指连成一片）。
-    只用列剖面，不用连通域：B1 实测两指常与夹爪本体的深色连成一片，
-    按列取带内比例反而干净（本体在带上方）。
+    判据按「行内比例 ≥ ``FINGER_TIP_FRAC``」，允许 ``FINGER_TIP_END`` 行以内的
+    小缺口（深度在指的边缘会被补洞/丢失几行）。
     """
-    v = _v_channel(color)
-    H, W = v.shape
+    a, b = int(run[0]), int(run[1]) + 1
+    sub = mask[:, a:b].mean(1)
+    H = len(sub)
+    last, miss, r = int(v_from), 0, int(v_from)
+    while r < H and miss < FINGER_TIP_END:
+        if sub[r] >= FINGER_TIP_FRAC:
+            last, miss = r, 0
+        else:
+            miss += 1
+        r += 1
+    return last
+
+
+def detect_fingers(color, depth, table_z, K, R, t, u_tip, anchor_v,
+                   bands=None, pred_sep=None):
+    """在 ``anchor_v`` 附近**扫**一条竖带，找两只指。
+
+    ``anchor_v`` 只是个搜索中心（它来自存的外参，过期时能在 v 上偏 40+ px，
+    见 ``FINGER_SWEEP_PX``）；真正的判据全在像面上：
+
+      · 两条**窄的**列串（宽 ≤30 px，太宽的是夹爪本体）；
+      · 两串中点落在 ``u_tip`` ±25 px（挑不到再放宽到 ±40）；
+      · 间距先验 ``pred_sep``（FK 投影出来的两指尖外缘间距，差里消掉平移偏置）
+        或兜底区间 ``PAIR_SEP_MIN..MAX``；
+      · 同一对指会在**相邻带里反复出现** ⇒ 按列位置聚簇，取支持最多的那一簇。
+
+    「指」的判据是**离台面 ≥ ``FINGER_MIN_ABOVE_M``**，不是颜色（见该常量的
+    说明）；所以指影（落在台面上）和块（在带下方）都不进串。
+
+    ``color`` 只留给调用方签名兼容，本函数不再用它。
+
+    ``bands`` 给定时按**绝对** v 用（测试/诊断用），不给就自动扫。
+
+    返回里 ``tip_v`` 是**实测**的两指最下端行（``_finger_tip_v``）—— 它比 FK
+    投出来的 v 可靠得多，下游的 ROI 上界应该用它。
+    """
+    del color
+    H, W = depth.shape
     ysg, xsg = np.mgrid[0:H, 0:W]
     pc = np.stack([(xsg - K[0, 2]) / K[0, 0] * depth,
                    (ysg - K[1, 2]) / K[1, 1] * depth, depth], -1)
     zb = (pc @ R.T + t)[..., 2]
-    dark = (v < FINGER_DARK_V) & ~((depth > 0.1) & (zb < table_z + TABLE_BAND_M))
-    u0, u1 = int(round(u_tip - 90)), int(round(u_tip + 90))
+    lift = (depth > 0.1) & (zb > table_z + FINGER_MIN_ABOVE_M)
+    # 窗要盖住**两指外缘**：顺着视线时只有 ±47.5 mm，侧向时半间距本身就有
+    # ~66 px，再用固定 ±90 会把外侧那根切掉一半（s11 r2 实测右指 715–756 被切
+    # 在 736）⇒ 中心偏 20 px。取「先验半间距 + 60 px」与 ±90 的较大者。
+    half = 90.0 if pred_sep is None else max(90.0, 0.5 * float(pred_sep) + 60.0)
+    u0, u1 = int(round(u_tip - half)), int(round(u_tip + half))
     u0, u1 = max(0, u0), min(W - 1, u1)
+    tol_sep = (None if pred_sep is None else
+               max(PAIR_SEP_TOL_ABS, PAIR_SEP_TOL_REL * float(pred_sep)))
+    if bands is None:
+        # 双向扫：锚点可能**偏高**也可能偏低（外参偏置可正可负）。往下扫不会
+        # 扫进块里 —— 块顶最高 59 mm，够不到「高于台面 90 mm」这条线。
+        lo = int(round(anchor_v - FINGER_SWEEP_PX))
+        hi = int(round(anchor_v + FINGER_SWEEP_DOWN))
+        bands = [(o, o + FINGER_BAND_H)
+                 for o in range(lo, hi + 1, FINGER_SWEEP_STEP)]
     cands = []
-    for b0, b1 in bands:
-        va = int(round(anchor_v + b0))
-        vb = int(round(anchor_v + b1))
+    for va, vb in bands:
+        va, vb = int(round(va)), int(round(vb))
         if va < 0 or vb <= va or vb > H:
             continue
-        band = dark[va:vb, u0:u1 + 1]
+        band = lift[va:vb, u0:u1 + 1]
         if band.size == 0:
             continue
         prof = band.mean(0)
         runs = _runs(prof, FINGER_RUN_MIN, u0)
-        runs = [r for r in runs if (r[1] - r[0]) <= 30]     # 太宽的不是指
+        runs = [r for r in runs if (r[1] - r[0]) <= 40]     # 太宽的不是指
         cxs = [(a + b) / 2.0 for a, b in runs]
         pairs = []
         for mid_tol in (PAIR_MID_TOL, PAIR_MID_TOL_LOOSE):
@@ -425,36 +511,72 @@ def detect_fingers(color, depth, table_z, K, R, t, u_tip, anchor_v,
                 for j in range(i + 1, len(cxs)):
                     sep = cxs[j] - cxs[i]
                     if not (PAIR_SEP_MIN <= sep <= PAIR_SEP_MAX):
-                        continue
+                        # 兜底区间之外，只接受「贴着 FK 先验」的那一对
+                        if tol_sep is None or abs(sep - pred_sep) > tol_sep:
+                            continue
                     mid = (cxs[i] + cxs[j]) / 2.0
                     if abs(mid - u_tip) > mid_tol:
                         continue
-                    pairs.append((sep, mid, i, j))
+                    # 两指一样宽：宽度比悬殊的一对是「指 + 杂线」
+                    wa = runs[i][1] - runs[i][0]
+                    wb = runs[j][1] - runs[j][0]
+                    if max(wa, wb) > 2.5 * max(1, min(wa, wb)):
+                        continue
+                    fill = 0.5 * (prof[runs[i][0] - u0:runs[i][1] - u0 + 1].mean()
+                                  + prof[runs[j][0] - u0:runs[j][1] - u0 + 1].mean())
+                    pairs.append((sep, mid, i, j, fill))
             if pairs:
                 break
         if pairs:
             # 最宽的一对 = 两指外缘；同宽时取更贴着 FK 轴的那对。
             pairs.sort(key=lambda c: (-c[0], abs(c[1] - u_tip)))
-            sep, mid, i, j = pairs[0]
+            sep, mid, i, j, fill = pairs[0]
             n_pair = len(pairs)
-            cands.append((mid, sep, runs[i], runs[j], va, vb,
-                          "span" if j != i + 1 else "adjacent", n_pair))
+            cands.append({"mid": mid, "sep": sep, "fill": float(fill),
+                          "left": runs[i], "right": runs[j],
+                          "va": va, "vb": vb,
+                          "mode": "span" if j != i + 1 else "adjacent",
+                          "n_pairs": n_pair})
     if not cands:
         return None
-    if len(cands) >= 2:
-        mids = sorted(c[0] for c in cands)
-        if mids[-1] - mids[0] <= 3.0:
-            picks = [c for c in cands if abs(c[0] - np.median(mids)) <= 1.5]
-            best = max(picks, key=lambda c: c[5] - c[4])   # 带最高（离本体最远）
+    # 同一对指在相邻带里反复出现 ⇒ 按两串中点聚簇，取支持最多的一簇
+    groups = []
+    for c in cands:
+        lc = 0.5 * (c["left"][0] + c["left"][1])
+        rc = 0.5 * (c["right"][0] + c["right"][1])
+        for g in groups:
+            if (abs(lc - g["lc"]) <= FINGER_GROUP_TOL
+                    and abs(rc - g["rc"]) <= FINGER_GROUP_TOL):
+                g["items"].append(c)
+                g["lc"] = float(np.median([0.5 * (x["left"][0] + x["left"][1])
+                                           for x in g["items"]]))
+                g["rc"] = float(np.median([0.5 * (x["right"][0] + x["right"][1])
+                                           for x in g["items"]]))
+                break
         else:
-            best = cands[0]
-    else:
-        best = cands[0]
-    mid, sep, left, right, va, vb = best[:6]
-    return {"u_mid": float(mid), "sep_px": float(sep),
+            groups.append({"lc": float(lc), "rc": float(rc), "items": [c]})
+    groups.sort(key=lambda g: (-len(g["items"]),
+                               -float(np.max([x["fill"] for x in g["items"]])),
+                               abs(float(np.mean([x["mid"] - u_tip
+                                                  for x in g["items"]])))))
+    g = groups[0]
+    items = g["items"]
+    mid = float(np.median([c["mid"] for c in items]))
+    sep = float(np.median([c["sep"] for c in items]))
+    va = int(np.median([c["va"] for c in items]))
+    vb = int(np.median([c["vb"] for c in items]))
+    left = items[len(items) // 2]["left"]
+    right = items[len(items) // 2]["right"]
+    tip_v = None
+    if 0 <= vb - 1 < H:
+        tips = [_finger_tip_v(lift, r, vb - 1) for r in (left, right)]
+        tip_v = int(max(tips))
+    return {"u_mid": mid, "sep_px": sep,
             "finger_left": list(left), "finger_right": list(right),
-            "band_v": [int(va), int(vb)], "n_bands": len(cands),
-            "pair_mode": best[6], "n_pairs": int(best[7])}
+            "band_v": [va, vb], "n_bands": len(items),
+            "n_groups": len(groups), "tip_v": tip_v,
+            "pair_mode": items[len(items) // 2]["mode"],
+            "n_pairs": int(items[len(items) // 2]["n_pairs"])}
 
 
 def grasp_roi(p_prior, v_tip, height):
@@ -629,7 +751,7 @@ def held_block_uv(frame, table_z, expect_class=None, u_range=None, v_range=None)
 # ---------------------------------------------------------------- 逐帧
 def measure_frame(frame_dir, idx, th, block_top_mm,
                   grasp_yaw_deg=None, expect_class=None, prior_xy_mm=None,
-                  held=False, table_z=None, frame=None):
+                  held=False, table_z=None, frame=None, ext_dv=0.0):
     """一帧 → base 系 ``(dx, dy[, dyaw])``。失败抛 ``RuntimeError(原因)``。
 
     ``block_top_mm`` **必填**：块顶在 base 系的**已知**高度，不是俯视深度量的。
@@ -677,10 +799,23 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
 
     # 带锚点：指尖与块顶里更靠上（v 更小）的那个
     anchor_v = min(v_tip, p_axis_top[1])
+    # 先验间距：把两个指尖外缘（±47.5 mm，沿 tool0 的 x = 分离轴）投到同一帧。
+    # 用**差**做先验，外参的平移偏置在差里消掉，比固定区间稳。
+    pred_sep = None
+    _ax = T[:3, :3][:, 0]
+    _pa = project_pt(tip_pt - _ax * GRIPPER_OPEN_HALF_M, K, R, t)
+    _pb = project_pt(tip_pt + _ax * GRIPPER_OPEN_HALF_M, K, R, t)
+    if _pa is not None and _pb is not None:
+        pred_sep = float(abs(_pb[0] - _pa[0]))
     fingers = detect_fingers(frame["color"], frame["depth"], table_z,
-                             K, R, t, u_tip, anchor_v)
+                             K, R, t, u_tip, anchor_v, pred_sep=pred_sep)
     if fingers is None:
-        raise RuntimeError("分不出两指（深色列串不足）")
+        raise RuntimeError("分不出两指（像面列串不足）")
+    # ROI 的上界要用**实测**的指尖 v：FK 投出来的 v 被外参的 v 偏置整体推低
+    # （s11 r2 实测差 ~45 px），拿它当上界会把块顶裁掉 —— 而那正是这一场的
+    # 实况：v_lo=615 而块顶在 585。
+    v_tip_img = float(fingers["tip_v"] if fingers.get("tip_v") is not None
+                      else v_tip)
 
     # 选块。抓前：外参/先验（腕部真值或工具轴）在块顶平面上的投影；
     # 抓后：块被夹在指间，改用颜色类掩码（见 held_block_uv 的说明）。
@@ -706,7 +841,7 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
         if p_prior is None:
             raise RuntimeError("块先验投影不可用")
         max_h_mm = (z_block - table_z) * 1000.0 + 60.0
-        u_rng, v_rng = grasp_roi(p_prior, v_tip, frame["depth"].shape[0])
+        u_rng, v_rng = grasp_roi(p_prior, v_tip_img, frame["depth"].shape[0])
         blk = detect_block(frame, table_z, p_prior[0], p_prior[1],
                            expect_class=expect_class,
                            min_h_mm=10.0, max_h_mm=max(80.0, max_h_mm),
@@ -717,7 +852,10 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
 
     # 轴在块顶高度处的像素点 = 实测中点 + 轴向微分（带 → 块顶）
     band_v = 0.5 * (fingers["band_v"][0] + fingers["band_v"][1])
-    z_band = z_at_v_on_axis(axis_xy, band_v, K, R, t,
+    # 带心是**像面**行号，``z_at_v_on_axis`` 要的是**模型** v。存的外参在 v 上
+    # 有实测偏置 ⇒ 用垫标记残差 ``ext_dv``（model = image + ext_dv）换算回来，
+    # 否则 z_band 会整体错几十毫米，``shift`` 跟着错。
+    z_band = z_at_v_on_axis(axis_xy, band_v + float(ext_dv), K, R, t,
                             tool0[2], tool0[2] - 0.45)
     if z_band is None:
         raise RuntimeError("轴上找 v=%.0f 的高度失败" % band_v)
@@ -753,7 +891,10 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
             "u_mid_px": round(fingers["u_mid"], 2),
             "finger_sep_px": round(fingers["sep_px"], 2),
             "band_v": fingers["band_v"], "n_bands": fingers["n_bands"],
+            "n_finger_groups": fingers.get("n_groups"),
             "anchor_v": round(anchor_v, 1),
+            "v_tip_img": round(v_tip_img, 1),
+            "ext_dv_px": round(float(ext_dv), 2),
             "z_band_mm": round(z_band * 1000.0, 1),
             "axis_uv": [round(axis_u, 2), round(axis_v, 2)],
             "block_uv": [round(float(blk["uv"][0]), 2),
@@ -873,17 +1014,34 @@ def run_burst(burst, urdf, block_top_mm, grasp_yaw_deg=None,
     out["dropped_first"] = int(min(drop_first, len(idxs)))
     out["frames_considered"] = use
     table_z = None if table_z_mm is None else table_z_mm / 1000.0
+    # 预热帧只用来取台面高度 / 外参，但**不能假定第一帧一定装得上**：
+    # 2026-11-10 s11 r2 实测 20 帧里有 3 帧的 ``tf.json`` 缺
+    # ``base_link:topcam_link``（静态 TF 在抓帧瞬间没进缓冲区），load_frame 直接
+    # KeyError —— 那是抓帧的抖动，不是数据坏了。这里逐帧找到第一份能装上的；
+    # 一帧都装不上才报错（fail-closed，不猜外参）。
+    f0 = None
+    tf_errs = []
+    for i in use:
+        try:
+            f0 = gc.load_frame(burst, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN,
+                               idx=i)
+            break
+        except (KeyError, OSError, ValueError) as e:      # noqa: PERF203
+            tf_errs.append("f%02d %s" % (i, e))
+    if f0 is None:
+        out["reason"] = ("没有一帧能取到俯视外参（%s）—— 静态 TF 丢了，"
+                         "重拍一组 burst 再用" % "; ".join(tf_errs[:3]))
+        return out
     if table_z is None:
-        f0 = gc.load_frame(burst, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN,
-                           idx=use[0])
         table_z = _table_z_m(f0["depth"], f0["K"], f0["R_bc"], f0["t_bc"])
     out["table_z_mm"] = None if table_z is None else round(table_z * 1000, 1)
+    ext_dv = 0.0
     if T_base_pad is not None:
-        fr0 = gc.load_frame(burst, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN,
-                            idx=use[0])
-        ext = check_extrinsic(fr0, T_base_pad,
+        ext = check_extrinsic(f0, T_base_pad,
                               mat=(mat_path or DEFAULT_MAT))
         out["extrinsic"] = ext
+        if ext.get("dv_med") is not None:
+            ext_dv = float(ext["dv_med"])
         if ext["ok"] is False and not allow_stale_extrinsic:
             out["reason"] = "俯视外参过期（rms %.2f px）：%s；结果不可用"
             out["reason"] = out["reason"] % (ext["rms_px"], ext["reason"])
@@ -895,7 +1053,8 @@ def run_burst(burst, urdf, block_top_mm, grasp_yaw_deg=None,
                                 grasp_yaw_deg=grasp_yaw_deg,
                                 expect_class=expect_class,
                                 prior_xy_mm=prior_xy_mm, held=held,
-                                block_top_mm=block_top_mm, table_z=table_z)
+                                block_top_mm=block_top_mm, table_z=table_z,
+                                ext_dv=ext_dv)
             out["frames"].append(rec)
         except Exception as e:                       # noqa: BLE001
             errs.append({"idx": i, "error": str(e)})

@@ -338,6 +338,36 @@ def apply_align_jsons(truth, actions, paths, target):
     return recs
 
 
+def topcam_view_gate(burst, xyz, yaw_deg, min_deg=None):
+    """出计划时先判「这个抓取朝向挡不挡俯视视线」。返回检查记录。
+
+    E4b 的低悬停要求俯视在**同一帧**里同时看清块顶与两指；两指前后一条线时
+    近侧手指的影子直接压在块顶上（2026-11-10 s11 实拍：ψ=88.75°，两指尖只差
+    ~20 px，而 95 mm 开口该有 ~124 px）。所以这也是**计划阶段**的闸门，不是等
+    量不出数才发现：偏好的合拢轴没被探针选中时（``hit.closing`` 回落）在这里就红。
+
+    ``burst`` 只用来取俯视外参（``tf_*.json``，静态链，不需要深度/彩色）。
+    相机近乎垂直向下时返回 ``lateral=None``（没有水平视线可言），不拦。
+    """
+    import stage4_align as sa
+    if len(list(xyz)) != 3:
+        raise ValueError("topcam_view_gate 要 (x, y, z) 三个数，收到 %r"
+                         % (xyz,))
+    try:
+        R, _t = gc.cam_pose(burst, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN)
+    except FileNotFoundError:
+        R, _t = gc.cam_pose(burst, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN,
+                            idx=0)
+    T = pp.target_matrix([float(v) for v in xyz], float(yaw_deg))
+    rec = sa.view_clearance_deg(T[:3, :3], R, **({} if min_deg is None
+                                                 else {"min_deg": min_deg}))
+    rec["min_deg"] = (sa.VIEW_LATERAL_MIN_DEG if min_deg is None
+                      else float(min_deg))
+    rec["burst"] = os.path.abspath(burst)
+    rec["grasp_yaw_deg"] = round(float(yaw_deg), 3)
+    return rec
+
+
 def plan_align_hover(chain, q_start, action, out_dir, hover_z=ALIGN_HOVER_Z,
                      transit_dz=0.10, name="00-align-hover.json"):
     """E4b 低悬停计划：tool0 停在目标块正上方 ``hover_z``，姿态 = 计划抓取角。
@@ -1310,6 +1340,27 @@ def align_plan_main(ap, args):
     if act is None:
         log("!! 动作表里没有目标块 %s" % attempt["id"])
         return 1
+    view = None
+    if args.topcam_burst:
+        try:
+            view = topcam_view_gate(args.topcam_burst,
+                                    [float(act["from_xy"][0]),
+                                     float(act["from_xy"][1]),
+                                     float(args.hover_z)],
+                                    act["grasp_yaw_deg"])
+        except (OSError, ValueError) as e:
+            log("!! 视线闸门算不出来（%s）—— 计划**没有**写出。" % e)
+            return 1
+        log("  视线闸门：分离轴 vs 俯视水平视线 %.1f°（%s）"
+            % (view["angle_deg"], "侧向" if view["lateral"] else "**挡视线**"))
+        if view["lateral"] is False and not args.allow_blocking_view:
+            log("!! 这个抓取朝向会挡住俯视看块顶（%.1f° < %.0f°）⇒ 量不出可信 dy。\n"
+                "   先把探针改成 --prefer-closing 1 重跑（让两指转 90° 侧对视线），\n"
+                "   或显式 --allow-blocking-view 承担读数无效。计划**没有**写出。"
+                % (view["angle_deg"], view["min_deg"]))
+            return 1
+    else:
+        log("  视线闸门：没给 --topcam-burst，**跳过**（量的时候还会再判一次）")
     chain, q_start = q_start_of_args(ap, args)
     try:
         rec, _plan = plan_align_hover(chain, q_start, act, args.out_dir,
@@ -1332,6 +1383,7 @@ def align_plan_main(ap, args):
     os.chmod(spath, 0o755)
     man = {"round": len(recs) + 1, "target": attempt["id"],
            "align_applied": recs, "align_burst_dir": burst,
+           "view_gate": view,
            "plan": rec, "q_start": [float(v) for v in q_start]}
     mpath = os.path.join(args.out_dir, "align-r%d.json" % (len(recs) + 1))
     with open(mpath, "w", encoding="utf-8") as f:
@@ -1488,6 +1540,12 @@ def main(argv=None):
                          "--holding-block）。缺省不切")
     ap.add_argument("--hover-z", type=float, default=ALIGN_HOVER_Z,
                     help="E4b 低悬停高度（tool0，m；缺省 %.3f）" % ALIGN_HOVER_Z)
+    ap.add_argument("--topcam-burst", default=None, metavar="DIR",
+                    help="任意一份**俯视**帧目录（只取 tf 里的外参）：出计划时就判"
+                         "「两指分离轴会不会挡俯视视线」。不给 ⇒ 跳过（量的时候还会"
+                         "再判一次，但那时已经动了臂）")
+    ap.add_argument("--allow-blocking-view", action="store_true",
+                    help="视线闸门红了也照样出计划（读数已知不可信，只用于诊断）")
     ap.add_argument("--no-wrist-survey", action="store_true",
                     help="不在序列末尾加判分机位（只为复现旧计划；"
                          "没有它就没有跑后判分帧，E9 判分不许用）")

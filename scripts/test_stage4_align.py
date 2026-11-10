@@ -386,28 +386,50 @@ def main():
           c_bad['checks'].get('dy_trusted') is False
           and c_bad['converged'] is False, repr(c_bad['checks']))
 
-    # ---- 视线遮挡：两指分离轴（tool y）vs 相机水平视线 ----
+    # ---- 视线遮挡：两指分离轴（tool x = 合拢轴）vs 相机水平视线 ----
     # 存的外参给出的水平视线 ≈ (-0.111, -0.994) ⇒ 相机朝 −y 看。
-    # s10 的姿态：tool y ≈ base x ⇒ 与水平视线近垂直 = 侧向（实测 86.9°）。
-    R_lat = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
-    v = A.view_clearance_deg(R_lat, RCAM)
-    check('俯仰角报得对（仰角 ~41.6°）', v['elevation_deg'] is not None
-          and approx(v['elevation_deg'], 41.6, 1.0), repr(v))
-    check('tool y = base x ⇒ 近垂直 = 侧向（不挡视线）',
-          v['angle_deg'] is not None and v['angle_deg'] >= 70.0
-          and v['lateral'] is True, repr(v))
-    # 反过来：分离轴顺着相机水平视线（一前一后）⇒ 近侧手指的影子盖住块顶。
+    # 2026-11-10 s11 实拍判决：ψ=88.75° 时 tool x ≈ base +y ≈ 视线方向，
+    # 两指尖在俯视里只差 ~20 px（95 mm 开口该有 ~124 px）⇒ 分离轴是 tool x。
     look = RCAM[:, 2]
     h = np.array([look[0], look[1], 0.0])
     h = h / np.linalg.norm(h)
-    xb = np.cross(h, np.array([0.0, 0.0, 1.0]))
-    xb = xb / np.linalg.norm(xb)
-    zb = np.cross(xb, h)
-    R_bad = np.column_stack([xb, h, zb])       # column 1 = tool y = 视线方向
+    # 侧向：tool x = base x ⇒ 与水平视线近垂直。
+    R_lat = np.column_stack([[1.0, 0.0, 0.0],
+                             np.cross(np.array([0.0, 0.0, -1.0]),
+                                      np.array([1.0, 0.0, 0.0])),
+                             [0.0, 0.0, -1.0]])
+    v = A.view_clearance_deg(R_lat, RCAM)
+    check('俯仰角报得对（仰角 ~41.6°）', v['elevation_deg'] is not None
+          and approx(v['elevation_deg'], 41.6, 1.0), repr(v))
+    check('tool x = base x ⇒ 近垂直 = 侧向（不挡视线）',
+          v['angle_deg'] is not None and v['angle_deg'] >= 70.0
+          and v['lateral'] is True, repr(v))
+    # 反过来：分离轴顺着相机水平视线（一前一后）⇒ 近侧手指的影子盖住块顶。
+    R_bad = np.column_stack([h, np.cross(np.array([0.0, 0.0, -1.0]), h),
+                             [0.0, 0.0, -1.0]])   # column 0 = tool x = 视线方向
     v2 = A.view_clearance_deg(R_bad, RCAM)
     check('分离轴顺着视线 ⇒ 挡视线（闸门必须红）',
           v2['angle_deg'] is not None and v2['angle_deg'] < 15.0
           and v2['lateral'] is False, repr(v2))
+    # 回归：s11 那台臂的真实姿态（ψ=88.75°）在闸门下必须是「挡视线」，
+    # 旧写法（tool y）会把它读成 84.9° 的假侧向。
+    psi = math.radians(88.75)
+    R_s11 = np.array([[math.cos(psi), -math.sin(psi), 0.0],
+                      [math.sin(psi), math.cos(psi), 0.0],
+                      [0.0, 0.0, -1.0]])
+    v3 = A.view_clearance_deg(R_s11, RCAM)
+    check('s11 真实姿态（ψ=88.75°）必须判「挡视线」',
+          v3['angle_deg'] is not None and v3['angle_deg'] < 15.0
+          and v3['lateral'] is False, repr(v3))
+    # 同一姿态转 90°（closing=1 ⇒ ψ=178.75°）就该变回侧向。
+    psi2 = math.radians(178.75)
+    R_s11b = np.array([[math.cos(psi2), -math.sin(psi2), 0.0],
+                       [math.sin(psi2), math.cos(psi2), 0.0],
+                       [0.0, 0.0, -1.0]])
+    v4 = A.view_clearance_deg(R_s11b, RCAM)
+    check('ψ 转 90° 后恢复侧向（用户的「转 90°」思路）',
+          v4['angle_deg'] is not None and v4['angle_deg'] >= 70.0
+          and v4['lateral'] is True, repr(v4))
     check('近垂直俯视 ⇒ 没有「水平视线」可言，返回 None 不瞎判',
           A.view_clearance_deg(np.eye(3), np.diag([1.0, -1.0, -1.0]))
           ['angle_deg'] is None,
@@ -680,7 +702,11 @@ def main():
         if f:
             check('B1 指中点 ≈785 px（±3）', approx(f['u_mid'], 785.0, 3.0),
                   'u_mid=%.2f' % f['u_mid'])
-            check('B1 两指间距 ≈55 px（±6）', approx(f['sep_px'], 55.0, 6.0),
+            # 2026-11-10 掩码从「深色」换成「高于台面 90 mm」后，间距从 55 变 70：
+            # 旧掩码只圈住指的**深色内条**（~20 px 宽），每个中心因此被拉向内侧
+            # ~7 px ⇒ 间距系统性偏小 ~15 px。新掩码圈的是整根指（41/36 px 宽），
+            # 中心落回指的真中线，而 u_mid 不变（784）说明两侧对称地外移。
+            check('B1 两指间距 ≈70 px（±6）', approx(f['sep_px'], 70.0, 6.0),
                   'sep=%.2f' % f['sep_px'])
     else:
         print('  (跳过：没有 B1 burst 或 URDF —— 真机帧不随仓库分发)')
@@ -807,6 +833,56 @@ def main():
                       '居然出了数')
             except RuntimeError as e:                            # noqa: BLE001
                 check('H3 变异：整幅 + 严格类过滤 ⇒ 拒（旧行为）', True, str(e))
+
+    # =====================================================================
+    print('\n--- I. 2026-11-10 s11 r2：锚点偏 45 px 仍要找到指 ---')
+    if th is not None:
+        # s11 r2 的实测形态：模型说指尖在 v=610，画面里指尖在 v≈563（外参过期），
+        # 三条固定偏移全落在指尖下面的空台面上 ⇒ 20/20 帧「分不出两指」。
+        # 合成场景里把锚点整体挪开，验证「扫带 + 聚簇」还找得到同一对手指。
+        Fr = render_scene(T_hover, (T_hover[0, 3], T_hover[1, 3]),
+                          block_top=block_top, joints=as_joints(q_hover, th))
+        Kf, Rf, tf = Fr['K'], Fr['R_bc'], Fr['t_bc']
+        tzf = A._table_z_m(Fr['depth'], Kf, Rf, tf) or 0.0
+        jsf = Fr['joints']
+        qf = [float(jsf['position'][jsf['name'].index(n)])
+              for n in th.move_joints]
+        Tf = th.fk(qf)
+        tipf = Tf[:3, 3] + Tf[:3, :3] @ np.array(
+            [0, 0, A.TOOL0_TO_BARE_FINGERTIP])
+        pf = A.project_pt(tipf, Kf, Rf, tf)
+
+        def _det(anchor_shift):
+            return A.detect_fingers(Fr['color'], Fr['depth'], tzf, Kf, Rf, tf,
+                                    pf[0], pf[1] + anchor_shift)
+
+        base = _det(0.0)
+        check('I1 锚点准确时找得到指', base is not None, repr(base))
+        for sh in (-60.0, -45.0, 35.0, 55.0):
+            g = _det(sh)
+            ok = (g is not None
+                  and approx(g['u_mid'], base['u_mid'], 2.0)
+                  and approx(g['sep_px'], base['sep_px'], 2.0))
+            check('I1 锚点偏 %+.0f px 仍找到同一对指（±2 px）' % sh, ok,
+                  'None' if g is None else
+                  'u_mid %.1f→%.1f  sep %.1f→%.1f'
+                  % (base['u_mid'], g['u_mid'], base['sep_px'], g['sep_px']))
+        # 指尖行：实测的两指最下端要对得上 FK 投出来的指尖 v
+        if base is not None and base.get('tip_v') is not None:
+            # 实测行**总是略低于** FK 的指尖 v：看到的是指块底面的近侧棱（相机
+            # 斜俯视，底面本身在像面里摊开十几像素），不是理想指尖平面。
+            # 合成场景实测偏 +6.4 px ⇒ 容差给到 ±12（仍远好于外参过期时的 45 px）。
+            check('I2 实测指尖行 ≈ FK 投影指尖 v（±12 px）',
+                  approx(float(base['tip_v']), pf[1], 12.0),
+                  'tip_v=%s FK v=%.1f' % (base['tip_v'], pf[1]))
+        # 变异：把「高于台面」的门槛抬到指顶之上 ⇒ 一只指都找不到（掩码真的在起作用）
+        old_h = A.FINGER_MIN_ABOVE_M
+        try:
+            A.FINGER_MIN_ABOVE_M = 5.0        # 高于台面 5 m：整幅没有这种像素
+            check('I3 变异：门槛抬到荒谬高度 ⇒ 找不到指', _det(0.0) is None,
+                  repr(_det(0.0)))
+        finally:
+            A.FINGER_MIN_ABOVE_M = old_h
 
     # =====================================================================
     print('\n--- G. E4b 多场汇总 ---')

@@ -175,7 +175,8 @@ def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
 
 def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
                    target, others, table, pool, full_scan=False,
-                   vertical_only=False, other_names=None):
+                   vertical_only=False, other_names=None,
+                   prefer_closing=None):
     """一个块：先试 B 档（竖直向下）4 个位姿，再试其余 20 个；命中即停。
 
     「命中即停」只影响统计粒度（有多少个位姿可行），不影响两个布尔量：
@@ -185,11 +186,19 @@ def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
     ``vertical_only=True`` 只测 B 档的 4 个位姿（E9 的口径：E7 已证明 C 档
     在这套几何下没有额外信息量，清障规划不把它当前提）。
     ``other_names`` 透传给 :func:`evaluate_candidate`，给 E9 做遮挡归因。
+
+    ``prefer_closing``（0/1）：把该合拢轴的候选排到最前 —— 因为「命中即停」，
+    排序就是选择。E9 用它让目标块按**不挡俯视视线**的朝向被抓（2026-11-10）：
+    块是 29.5 mm 立方，两个合拢轴在夹持几何上等价，但夹爪绕 z 差 90° ⇒ 俯视
+    看到的指位完全不同。**注意这只改顺序不改判据**：偏好的候选照样要过 SAT +
+    IK + 状态有效性，过不了会回落到其它候选并由 ``hit`` 如实报出。
     """
     cands = sm.grasp_candidates(block_truth, mp.TABLE_TOP)
     if vertical_only:
         cands = [c for c in cands if c["vertical"]]
-    cands.sort(key=lambda c: (not c["vertical"], c["axis"], -c["sign"],
+    want = None if prefer_closing is None else int(prefer_closing)
+    cands.sort(key=lambda c: (int(want is not None and c["closing"] != want),
+                              not c["vertical"], c["axis"], -c["sign"],
                               c["closing"], c["variant"]))
     reasons = {}
     rows = []
