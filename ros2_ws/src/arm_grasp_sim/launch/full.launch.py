@@ -93,11 +93,19 @@ def generate_launch_description():
     )
 
     # ---- 仿真专属：世界 + 机械臂 + 控制器 + MoveIt ----
+    # ``scene`` 必须**透传**：E1 的 S0 端到端要跑固定布局（S0:0…S0:4）并复现，
+    # 少了它就只能跑 sim.launch 的默认布局，三次"复现"其实是同一张没被固定住的牌。
+    scene_arg = DeclareLaunchArgument(
+        "scene", default_value="S0:0",
+        description="场景批次:布局（透传给 sim.launch.py）")
     sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg, "launch", "sim.launch.py")
         ),
-        launch_arguments={"headless": LaunchConfiguration("headless")}.items(),
+        launch_arguments={
+            "headless": LaunchConfiguration("headless"),
+            "scene": LaunchConfiguration("scene"),
+        }.items(),
     )
 
     # ---- 上层节点：**不在本文件定义**，全部复用主线 ----
@@ -128,6 +136,7 @@ def generate_launch_description():
         table_scene_arg,
         planner_params_arg,
         DeclareLaunchArgument("headless", default_value="false"),
+        scene_arg,
         sim,
         pipeline,
     ])
