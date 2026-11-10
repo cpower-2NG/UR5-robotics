@@ -104,8 +104,8 @@ def _ray_box(o, D, lo, hi, eps=1e-12):
 
 def render_scene(tool0_T, block_xy, block_top=0.0295, block_side=0.050,
                  opening=0.055, finger_thick=0.006, finger_wide=0.012,
-                 block_color=YELLOW, cam=(KCAM, RCAM, TCAM), shape=SHAPE,
-                 joints=None, fingers=True):
+                 body_half=0.0, block_color=YELLOW, cam=(KCAM, RCAM, TCAM),
+                 shape=SHAPE, joints=None, fingers=True):
     """按针孔模型渲染台面 + 方块 + 两根深色指 → 一帧（``load_frame`` 同构）。
 
     ``depth`` 是**相机 z**（米），与 ``gc.backproject`` 的口径一致；没打中的像素
@@ -157,6 +157,18 @@ def render_scene(tool0_T, block_xy, block_top=0.0295, block_side=0.050,
         hit, tt = _ray_box(o, D,
                            np.array([c[0] - ex, c[1] - finger_wide / 2, z_lo]),
                            np.array([c[0] + ex, c[1] + finger_wide / 2, p0[2]]))
+        m = hit & (tt > 0) & (tt < depth)
+        depth[m] = tt[m]
+        color[m] = BLACK
+
+    # 两指之间的**深色本体**（s10 实测：指间还有一条 10 px 的黑色竖条，
+    # 只配对「相邻串」会先碰上它 —— 见 detect_fingers 的配对说明）
+    if body_half > 0.0:
+        hit, tt = _ray_box(o, D,
+                           np.array([p0[0] - body_half, p0[1] - finger_wide / 2,
+                                     z_lo]),
+                           np.array([p0[0] + body_half, p0[1] + finger_wide / 2,
+                                     p0[2]]))
         m = hit & (tt > 0) & (tt < depth)
         depth[m] = tt[m]
         color[m] = BLACK
@@ -596,6 +608,129 @@ def main():
                   'sep=%.2f' % f['sep_px'])
     else:
         print('  (跳过：没有 B1 burst 或 URDF —— 真机帧不随仓库分发)')
+
+    # =====================================================================
+    print('\n--- H. 2026-11-10 s10 真帧暴露的两个坑 ---')
+    if th is not None:
+        xy0 = (tool0[0], tool0[1])
+        fr_plain = render_scene(T_hover, xy0, block_top=block_top,
+                                joints=as_joints(q_hover, th))
+        # 指间再画一条 4 mm 半宽的黑色本体（s10 实测：三串深色，中间那串
+        # 才是本体，两指在外面）
+        fr_body = render_scene(T_hover, xy0, block_top=block_top,
+                               body_half=0.004, joints=as_joints(q_hover, th))
+
+        def _fingers(fr):
+            js = fr['joints']
+            q = [float(js['position'][js['name'].index(n)])
+                 for n in th.move_joints]
+            T = th.fk(q)
+            tip = (T[:3, 3] + T[:3, :3]
+                   @ np.array([0, 0, A.TOOL0_TO_BARE_FINGERTIP]))
+            p = A.project_pt(tip, fr['K'], fr['R_bc'], fr['t_bc'])
+            tz = A._table_z_m(fr['depth'], fr['K'], fr['R_bc'], fr['t_bc'])
+            return A.detect_fingers(fr['color'], fr['depth'], tz or 0.0,
+                                    fr['K'], fr['R_bc'], fr['t_bc'], p[0],
+                                    p[1])
+
+        f_plain = _fingers(fr_plain)
+        f_body = _fingers(fr_body)
+        check('H1 两指（指间无本体）可分辨', f_plain is not None, repr(f_plain))
+        check('H1 指间多一条黑本体仍可分辨', f_body is not None, repr(f_body))
+        if f_plain and f_body:
+            check('H1 取的是最外一对（span），不是相邻串',
+                  f_body.get('pair_mode') == 'span',
+                  'pair_mode=%s n_pairs=%s' % (f_body.get('pair_mode'),
+                                               f_body.get('n_pairs')))
+            check('H1 至少有 2 个候选对（最宽优先真的在做选择）',
+                  int(f_body.get('n_pairs') or 0) >= 2,
+                  'n_pairs=%s' % f_body.get('n_pairs'))
+            check('H1 本体不改变指中点 / 间距（±4 px）',
+                  approx(f_body['u_mid'], f_plain['u_mid'], 4.0)
+                  and approx(f_body['sep_px'], f_plain['sep_px'], 4.0),
+                  'Δmid=%+.1f px  Δsep=%+.1f px' % (
+                      f_body['u_mid'] - f_plain['u_mid'],
+                      f_body['sep_px'] - f_plain['sep_px']))
+
+        # 抓前小窗：v 下界必须压在指尖下方
+        K0, R0, t0 = fr_plain['K'], fr_plain['R_bc'], fr_plain['t_bc']
+        js = fr_plain['joints']
+        qq = [float(js['position'][js['name'].index(n)])
+              for n in th.move_joints]
+        Tt = th.fk(qq)
+        tip3 = (Tt[:3, 3] + Tt[:3, :3]
+                @ np.array([0, 0, A.TOOL0_TO_BARE_FINGERTIP]))
+        p_tip = A.project_pt(tip3, K0, R0, t0)
+        prior = A.project_pt([xy0[0], xy0[1], block_top], K0, R0, t0)
+        tz0 = A._table_z_m(fr_plain['depth'], K0, R0, t0) or 0.0
+        u_rng, v_rng = A.grasp_roi(prior, p_tip[1], fr_plain['depth'].shape[0])
+        check('H2 小窗上界压在指尖下方', v_rng is not None
+              and v_rng[0] > p_tip[1] + 1.0,
+              'v_rng=%s v_tip=%.1f' % (v_rng, p_tip[1]))
+        check('H2 小窗含块顶投影', v_rng is not None
+              and u_rng[0] <= prior[0] <= u_rng[1]
+              and v_rng[0] <= prior[1] <= v_rng[1],
+              'u_rng=%s v_rng=%s prior=(%.1f, %.1f)'
+              % (u_rng, v_rng, prior[0], prior[1]))
+        kw = dict(expect_class='yellow', min_h_mm=10.0, max_h_mm=120.0,
+                  z_expect_mm=block_top * 1e3, z_tol_mm=60.0)
+        blk_ok = A.detect_block(fr_plain, tz0, prior[0], prior[1],
+                                u_range=u_rng, v_range=v_rng, **kw)
+        check('H2 小窗内检出块', blk_ok is not None, repr(blk_ok))
+        # 变异：裁切抬回指尖（= s10 的裁切）⇒ 窗里开始有手指像素。
+        # s10 真帧里这些像素把指、块、台面桥接成一个 145×209 mm 的大簇，
+        # max_h 挡不住、类别投票被非黄的像素冲掉 ⇒ 抓前 20 帧有 13 帧不出块。
+        # 合成场景没有那层低处桥接（真帧才复现），所以这里守卫的是**可判定的
+        # 那一半**：裁切窗必须一点手指像素都不含。
+        def _black_count(vr):
+            img = fr_plain['color']
+            v0, v1 = max(0, int(vr[0])), min(img.shape[0] - 1, int(vr[1]))
+            u0, u1 = max(0, int(u_rng[0])), min(img.shape[1] - 1, int(u_rng[1]))
+            sub = img[v0:v1 + 1, u0:u1 + 1].astype(int)
+            return int((np.abs(sub - BLACK.astype(int)) <= 6).all(-1).sum())
+
+        n_ok = _black_count(v_rng)
+        n_bad = _black_count((p_tip[1] - 30.0, v_rng[1]))
+        check('H2 抓前小窗里一颗手指像素都没有（抬回指尖就有一大片）',
+              n_ok == 0 and n_bad >= 40,
+              '正常 %d px / 变异 %d px' % (n_ok, n_bad))
+
+        # 抓后：块被举高过曝，色相漂到 yellowgreen ⇒ 类别只作核对
+        T_g2, q_g2 = hover_pose(th, z=0.384, yaw=0.0)
+        if T_g2 is None:
+            print('  (跳过 held 过曝检查：位姿 IK 不收敛)')
+        else:
+            BLOWN = np.array([255, 229, 30], np.uint8)   # 色相 ≈53° yellowgreen
+            xyb = (T_g2[0, 3] + 0.002, T_g2[1, 3])
+            frb = render_scene(T_g2, xyb, block_top=0.180, block_side=0.026,
+                               opening=0.0262, block_color=BLOWN,
+                               joints=as_joints(q_g2, th))
+            try:
+                info = A.held_block_uv(frb, 0.0)
+                check('H3 过曝块的读数是非 yellow（前提成立）',
+                      info.get('class') != 'yellow', 'class=%s' % info.get('class'))
+            except RuntimeError as e:                            # noqa: BLE001
+                check('H3 过曝块的读数是非 yellow（前提成立）', False, str(e))
+            try:
+                recb = A.measure_frame(None, 0, th, 180.0, held=True,
+                                       expect_class='yellow', frame=frb)
+                check('H3 类别对不上仍量得出（类名降级为核对）', True,
+                      'class=%s class_src=%s' % (recb.get('block_class'),
+                                                 recb.get('class_src')))
+                check('H3 走的是窄 ROI 分支（class_src=roi-any）',
+                      recb.get('class_src') == 'roi-any',
+                      str(recb.get('class_src')))
+                check('H3 class_match 记 False（不假装对上了）',
+                      recb.get('class_match') is False,
+                      str(recb.get('class_match')))
+            except RuntimeError as e:                            # noqa: BLE001
+                check('H3 类别对不上仍量得出（类名降级为核对）', False, str(e))
+            try:
+                A.held_block_uv(frb, 0.0, expect_class='yellow')
+                check('H3 变异：整幅 + 严格类过滤 ⇒ 拒（旧行为）', False,
+                      '居然出了数')
+            except RuntimeError as e:                            # noqa: BLE001
+                check('H3 变异：整幅 + 严格类过滤 ⇒ 拒（旧行为）', True, str(e))
 
     # =====================================================================
     print('\n--- G. E4b 多场汇总 ---')

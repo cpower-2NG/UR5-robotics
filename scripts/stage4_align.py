@@ -23,8 +23,9 @@
 1. FK（``joint_states_*.json`` + URDF）给出 tool0 与指尖平面，只当**先验**：
    定位指尖所在的像素带、并给出轴在图像里的延伸方向。
 2. 两指在图像里近似竖直、颜色深。在锚点上方取 3 个候选带，按列统计深色像素
-   比例，得到两条「深色列串」= 两指；取满足「间距 20–125 px、中点贴着 FK 预测」
-   的那一对的中点 ``u_mid``。台面用**深度闸门**剔掉（``z_base < 台面+50 mm``
+   比例，得到若干「深色列串」；**取间距 20–125 px、中点贴着 FK 预测、且最宽的那一
+   对**（= 两指外缘）的中点 ``u_mid``。夹爪中央本体也会成串（2026-11-10 s10 实测），
+   只配「相邻两串」会把它当成手。台面用**深度闸门**剔掉（``z_base < 台面+50 mm``
    的像素不算深色指）—— 否则阴影/暗台面会把列串连成一片（2026-11-08 实测）。
 3. 轴的纵向 = 「带中点 v」+ FK/外参给出的**轴向微分**（带 → 块顶高）。等价于
    直接投影轴在块顶高度的 ``v``，拆成两步是为了让 ``u`` 与 ``v`` 分别来自
@@ -81,6 +82,31 @@ DEFAULT_MAX = 10
 MIN_FRAMES = 3
 TOL_MM = 2.0
 TOL_DEG = 2.0
+
+# 两指配对：**先按最宽的一对**（两指外缘），不按「相邻两串」——
+# 2026-11-10 s10 实测：夹爪中央本体在带内也成串，相邻配对只有 15.5/17 px
+# （下限 20 px）全被拒，而真正的两指外缘是 32.5 px，只因为不相邻就没被试。
+PAIR_SEP_MIN = 20.0
+PAIR_SEP_MAX = 125.0
+PAIR_MID_TOL = 25.0                  # 中点离 FK 轴的上限（先紧）
+PAIR_MID_TOL_LOOSE = 40.0            # 挑不到再放宽到原来的 40 px
+
+# 抓后（held）ROI：块被举到 0.17 m、离镜头 ~1.0 m，指与块贴合 ⇒ 只有
+# 「轴左右 ±40 px、块顶投影 v 上下几十 px」里那块是干净的。整幅扫会被
+# 浅青色臂体占满（2026-11-10 实测 cyan 29116 点），块锚点跑出 −526 mm。
+HELD_ROI_HALF_PX = 40.0
+HELD_ROI_DV = (-30.0, 35.0)
+HELD_MIN_POINTS = 60                 # ROI 内彩色点下限（贴合后点数本来就少）
+
+# 抓前 ROI：围着**先验投影**开小窗，不用整幅。
+# 2026-11-10 s10 抓前帧实测：整幅 ROI（u±220 / v−160+340）里 20 帧有 13 帧
+# 找不到块 —— 块被一个 145×209 mm 的橙色大簇吞掉（低处桥接，min_h=10 挡不住），
+# 而大簇顶面取 97 分位后色票判成 orange，`expect_class` 直接拒。同样的帧
+# 换成「先验 ±90 px、v 从块顶上方 110 px 起」就 20/20 都只出一块
+# （u 810–818、v 540–545，互差 ≤3 px）。收窄的第二个好处：邻近块进不来，
+# 「偷偷换成别的块」这条路也堵上了。
+GRASP_ROI_HALF_U_PX = 90.0
+GRASP_ROI_DV = (-110.0, 60.0)
 
 
 # ---------------------------------------------------------------- 纯几何
@@ -232,19 +258,26 @@ def detect_fingers(color, depth, table_z, K, R, t, u_tip, anchor_v,
         runs = _runs(prof, FINGER_RUN_MIN, u0)
         runs = [r for r in runs if (r[1] - r[0]) <= 30]     # 太宽的不是指
         cxs = [(a + b) / 2.0 for a, b in runs]
-        best = None
-        for i in range(len(cxs) - 1):
-            sep = cxs[i + 1] - cxs[i]
-            if not (20.0 <= sep <= 125.0):
-                continue
-            mid = (cxs[i] + cxs[i + 1]) / 2.0
-            if abs(mid - u_tip) > 40.0:
-                continue
-            cost = abs(mid - u_tip) + 0.2 * abs(sep - 55.0)
-            if best is None or cost < best[0]:
-                best = (cost, mid, sep, runs[i], runs[i + 1], va, vb)
-        if best:
-            cands.append(best[1:])
+        pairs = []
+        for mid_tol in (PAIR_MID_TOL, PAIR_MID_TOL_LOOSE):
+            for i in range(len(cxs)):
+                for j in range(i + 1, len(cxs)):
+                    sep = cxs[j] - cxs[i]
+                    if not (PAIR_SEP_MIN <= sep <= PAIR_SEP_MAX):
+                        continue
+                    mid = (cxs[i] + cxs[j]) / 2.0
+                    if abs(mid - u_tip) > mid_tol:
+                        continue
+                    pairs.append((sep, mid, i, j))
+            if pairs:
+                break
+        if pairs:
+            # 最宽的一对 = 两指外缘；同宽时取更贴着 FK 轴的那对。
+            pairs.sort(key=lambda c: (-c[0], abs(c[1] - u_tip)))
+            sep, mid, i, j = pairs[0]
+            n_pair = len(pairs)
+            cands.append((mid, sep, runs[i], runs[j], va, vb,
+                          "span" if j != i + 1 else "adjacent", n_pair))
     if not cands:
         return None
     if len(cands) >= 2:
@@ -256,10 +289,26 @@ def detect_fingers(color, depth, table_z, K, R, t, u_tip, anchor_v,
             best = cands[0]
     else:
         best = cands[0]
-    mid, sep, left, right, va, vb = best
+    mid, sep, left, right, va, vb = best[:6]
     return {"u_mid": float(mid), "sep_px": float(sep),
             "finger_left": list(left), "finger_right": list(right),
-            "band_v": [int(va), int(vb)], "n_bands": len(cands)}
+            "band_v": [int(va), int(vb)], "n_bands": len(cands),
+            "pair_mode": best[6], "n_pairs": int(best[7])}
+
+
+def grasp_roi(p_prior, v_tip, height):
+    """抓前找块的裁切窗 ``(u_rng, v_rng)``；窗太小返回 ``v_rng=None``。
+
+    小窗围着**先验投影**开（见 ``GRASP_ROI_*`` 的说明）：整幅 ROI 会被低处
+    桥接成的大簇吞掉目标块，s10 实测小窗 20/20 帧只出一块。v 的下界还要压在
+    **指尖下方** —— 裁切含手指时 4 mm 网格会把指和块连成一簇，簇高 = 指尖到
+    台面 ⇒ 超 ``max_h`` 被丢掉，块跟着消失。
+    """
+    u_rng = (p_prior[0] - GRASP_ROI_HALF_U_PX,
+             p_prior[0] + GRASP_ROI_HALF_U_PX)
+    v_lo = max(0.0, float(v_tip) + 5.0, float(p_prior[1]) + GRASP_ROI_DV[0])
+    v_hi = min(float(height - 1), float(p_prior[1]) + GRASP_ROI_DV[1])
+    return u_rng, ((v_lo, v_hi) if v_hi - v_lo >= 40 else None)
 
 
 # ---------------------------------------------------------------- 块
@@ -343,7 +392,7 @@ HELD_HIGH_M = 0.080          # 与 measure_held 同值：立着的块最高 35 m
 HELD_TOP_STRATUM = 0.003     # 与 find_blocks 同一把尺子：顶面取最高 3 mm
 
 
-def held_block_uv(frame, table_z, expect_class=None):
+def held_block_uv(frame, table_z, expect_class=None, u_range=None, v_range=None):
     """块被夹着时的顶面 → 像素 ``uv`` + 诊断。失败抛 ``RuntimeError``。
 
     为什么不用 find_blocks：指垫与块在物理上贴在一起，4 mm 网格会把它俩连成
@@ -364,21 +413,43 @@ def held_block_uv(frame, table_z, expect_class=None):
     base = (hp[1] >= mh.S_MIN) & (hp[2] >= mh.V_MIN) \
         & (Pb[:, 2] > table_z + HELD_HIGH_M)
     names = list(block_classes.DEFAULT_CLASSES)
+    if expect_class is not None and expect_class not in names:
+        raise RuntimeError("类别 %r 不在表里（有 %s）" % (expect_class, names))
     idx, _ = mh.class_of_hue_vec(hp[0], names)
-    if base.sum() < 200:
-        raise RuntimeError("台面+80 mm 以上几乎没有彩色点（%d）—— 臂真的停在 lift 吗？"
-                           % int(base.sum()))
-    if expect_class is None:
+    roi = None
+    if u_range is not None or v_range is not None:
+        roi = np.ones(base.shape, bool)
+        if u_range is not None:
+            roi &= ((pix[:, 0] >= float(u_range[0]))
+                    & (pix[:, 0] <= float(u_range[1])))
+        if v_range is not None:
+            roi &= ((pix[:, 1] >= float(v_range[0]))
+                    & (pix[:, 1] <= float(v_range[1])))
+        base = base & roi
+    min_pts = HELD_MIN_POINTS if roi is not None else 200
+    if base.sum() < min_pts:
+        raise RuntimeError("台面+80 mm 以上彩色点太少（%d < %d）—— 臂真的停在 lift 吗？"
+                           % (int(base.sum()), min_pts))
+    if roi is not None:
+        # ROI 内只有块一个彩色物体 ⇒ **不再用类名过滤**，类名降级为核对：
+        # 块被举到离镜头 ~1.0 m 处会过曝，色相从 yellow 漂到 yellowgreen
+        # （2026-11-10 s10 实测 ROI 内 yellowgreen 236 点 / yellow 32 点），
+        # 按类名挑点会把块自己筛掉，只留下一幅里别处的同类物体。
         w = [hp[1][base & (idx == i)].sum() for i in range(len(names))]
         cls = names[int(np.argmax(w))]
+        sel = base
+        class_src = "roi-any"
     else:
-        if expect_class not in names:
-            raise RuntimeError("类别 %r 不在表里（有 %s）" % (expect_class, names))
-        cls = expect_class
-    sel = base & (idx == names.index(cls))
-    if sel.sum() < 200:
-        raise RuntimeError("高位点上没有 %s 的点（%d）—— 夹的是这一块吗？"
-                           % (cls, int(sel.sum())))
+        if expect_class is None:
+            w = [hp[1][base & (idx == i)].sum() for i in range(len(names))]
+            cls = names[int(np.argmax(w))]
+        else:
+            cls = expect_class
+        sel = base & (idx == names.index(cls))
+        class_src = "class"
+    if sel.sum() < min_pts:
+        raise RuntimeError("高位点上没有 %s 的点（%d < %d）—— 夹的是这一块吗？"
+                           % (cls, int(sel.sum()), min_pts))
     Q = Pb[sel]
     ztop = float(np.percentile(Q[:, 2], 97))
     F = Q[Q[:, 2] > ztop - HELD_TOP_STRATUM]
@@ -388,7 +459,10 @@ def held_block_uv(frame, table_z, expect_class=None):
         raise RuntimeError("块顶质心重投影不可用")
     return {"uv": [p[0], p[1]], "class": cls, "n_points": int(sel.sum()),
             "top_depth_mm": round(ztop * 1000.0, 1),
-            "spread_mm": round(float(np.ptp(F[:, :2], axis=0).max()) * 1000.0, 1)}
+            "spread_mm": round(float(np.ptp(F[:, :2], axis=0).max()) * 1000.0, 1),
+            "class_src": class_src,
+            "class_match": (None if expect_class is None
+                            else bool(cls == expect_class))}
 
 
 # ---------------------------------------------------------------- 逐帧
@@ -448,11 +522,19 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
     # 抓后：块被夹在指间，改用颜色类掩码（见 held_block_uv 的说明）。
     held_info = None
     if held:
-        held_info = held_block_uv(frame, table_z, expect_class=expect_class)
+        # ROI 跟着**实测**轴走：两指之间 ±40 px、块顶投影 v 上下几十 px。
+        # 整幅扫会被臂体/背景占满（见 held_block_uv 的说明）。
+        held_roi = {"u": [fingers["u_mid"] - HELD_ROI_HALF_PX,
+                          fingers["u_mid"] + HELD_ROI_HALF_PX],
+                    "v": [p_axis_top[1] + HELD_ROI_DV[0],
+                          p_axis_top[1] + HELD_ROI_DV[1]]}
+        held_info = held_block_uv(frame, table_z, expect_class=expect_class,
+                                  u_range=held_roi["u"], v_range=held_roi["v"])
         blk = {"uv": held_info["uv"], "class": held_info["class"],
                "yaw_trusted": False, "rect_fill": None, "yaw_rect": None,
                "cx": held_info["uv"][0], "cy": held_info["uv"][1],
-               "top": held_info["top_depth_mm"], "class_match": None}
+               "top": held_info["top_depth_mm"],
+               "class_match": held_info["class_match"]}
     else:
         prior_pt = ((prior_xy_mm[0] / 1000.0, prior_xy_mm[1] / 1000.0)
                     if prior_xy_mm else (tool0[0], tool0[1]))
@@ -460,10 +542,12 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
         if p_prior is None:
             raise RuntimeError("块先验投影不可用")
         max_h_mm = (z_block - table_z) * 1000.0 + 60.0
+        u_rng, v_rng = grasp_roi(p_prior, v_tip, frame["depth"].shape[0])
         blk = detect_block(frame, table_z, p_prior[0], p_prior[1],
                            expect_class=expect_class,
                            min_h_mm=10.0, max_h_mm=max(80.0, max_h_mm),
-                           z_expect_mm=z_block * 1000.0, z_tol_mm=60.0)
+                           z_expect_mm=z_block * 1000.0, z_tol_mm=60.0,
+                           u_range=u_rng, v_range=v_rng)
         if blk is None:
             raise RuntimeError("ROI 里没检出块")
 
@@ -517,6 +601,8 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
             "rect_fill": blk.get("rect_fill"),
             "held_n_points": (held_info["n_points"] if held_info else None),
             "held_spread_mm": (held_info["spread_mm"] if held_info else None),
+            "held_roi": (held_roi if held_info else None),
+            "class_src": (held_info.get("class_src") if held_info else None),
             "du_px": round(du, 2), "dv_px": round(dv, 2),
             "dx_mm": round(dx * 1000.0, 2), "dy_mm": round(dy * 1000.0, 2),
             "dyaw_deg": None if dyaw is None else round(dyaw, 3),
