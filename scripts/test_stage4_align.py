@@ -351,6 +351,82 @@ def main():
           'mean=%s' % (None if cm is None else round(cm, 3)))
     check('全零输入不瞎猜', A.circular_mean_deg([]) is None)
 
+    # ---- 外参闸门：垫面重投影残差 ----
+    # 造 12 个「垫面点」：把三维点按**同一组** R,t 投到像素 ⇒ 残差必须为 0；
+    # 再把 t 挪 5 mm，残差必须显著起来（否则闸门是个摆设）。
+    pad_xy = [(0.35 + 0.02 * i, -0.20 + 0.03 * j, 0.0004)
+              for i in range(4) for j in range(3)]
+    imgs = [A.project_pt(p, KCAM, RCAM, TCAM) for p in pad_xy]
+    rms0, du0, dv0, n0 = A.pad_reprojection_rms(pad_xy, imgs, KCAM, RCAM, TCAM)
+    check('垫面残差：同参数自投 ⇒ 0 px', rms0 < 1e-6 and n0 == 12,
+          'rms=%.4f n=%d' % (rms0, n0))
+    # 沿**相机系 y**（像里的竖直方向）挪 5 mm —— 沿 base y 挪主要落在相机 z 上，
+    # 那只是尺度变化，残差小得多，测不出闸门该有的灵敏度。
+    rms1, _du1, _dv1, _n1 = A.pad_reprojection_rms(
+        pad_xy, imgs, KCAM, RCAM, TCAM + RCAM @ np.array([0.0, 0.005, 0.0]))
+    check('垫面残差：平移 5 mm（相机系 y）⇒ 闸门必红',
+          rms1 > A.EXTR_MAX_RMS_PX,
+          'rms=%.2f px（阈值 %.1f）' % (rms1, A.EXTR_MAX_RMS_PX))
+
+    # ---- 视差闸门：逐帧标记 + 共识拦截 ----
+    check('视差闸门常量与判据同量级', 5.0 <= A.PARALLAX_MAX_PX <= 30.0,
+          'PARALLAX_MAX_PX=%.1f（2 mm ≈ 1.5 px ÷ 桥误差 10%%）'
+          % A.PARALLAX_MAX_PX)
+    r_ok = [{'dx_mm': 0.5, 'dy_mm': 0.5, 'u_mid_px': 800.0,
+             'parallax_px': 10.0, 'parallax_mm': 12.0, 'dy_trusted': True}
+            for _ in range(5)]
+    c_ok = A.consensus(r_ok)
+    check('视差小 ⇒ dy_trusted 通过', c_ok['checks'].get('dy_trusted') is True,
+          repr(c_ok['checks']))
+    r_bad = [dict(r) for r in r_ok]
+    r_bad[2]['parallax_px'] = 120.0
+    r_bad[2]['dy_trusted'] = False
+    c_bad = A.consensus(r_bad)
+    check('5 帧里 1 帧视差大 ⇒ 不许报收敛（中位数会抹平）',
+          c_bad['checks'].get('dy_trusted') is False
+          and c_bad['converged'] is False, repr(c_bad['checks']))
+
+    # ---- 视线遮挡：两指分离轴（tool y）vs 相机水平视线 ----
+    # 存的外参给出的水平视线 ≈ (-0.111, -0.994) ⇒ 相机朝 −y 看。
+    # s10 的姿态：tool y ≈ base x ⇒ 与水平视线近垂直 = 侧向（实测 86.9°）。
+    R_lat = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]])
+    v = A.view_clearance_deg(R_lat, RCAM)
+    check('俯仰角报得对（仰角 ~41.6°）', v['elevation_deg'] is not None
+          and approx(v['elevation_deg'], 41.6, 1.0), repr(v))
+    check('tool y = base x ⇒ 近垂直 = 侧向（不挡视线）',
+          v['angle_deg'] is not None and v['angle_deg'] >= 70.0
+          and v['lateral'] is True, repr(v))
+    # 反过来：分离轴顺着相机水平视线（一前一后）⇒ 近侧手指的影子盖住块顶。
+    look = RCAM[:, 2]
+    h = np.array([look[0], look[1], 0.0])
+    h = h / np.linalg.norm(h)
+    xb = np.cross(h, np.array([0.0, 0.0, 1.0]))
+    xb = xb / np.linalg.norm(xb)
+    zb = np.cross(xb, h)
+    R_bad = np.column_stack([xb, h, zb])       # column 1 = tool y = 视线方向
+    v2 = A.view_clearance_deg(R_bad, RCAM)
+    check('分离轴顺着视线 ⇒ 挡视线（闸门必须红）',
+          v2['angle_deg'] is not None and v2['angle_deg'] < 15.0
+          and v2['lateral'] is False, repr(v2))
+    check('近垂直俯视 ⇒ 没有「水平视线」可言，返回 None 不瞎判',
+          A.view_clearance_deg(np.eye(3), np.diag([1.0, -1.0, -1.0]))
+          ['angle_deg'] is None,
+          repr(A.view_clearance_deg(np.eye(3), np.diag([1.0, -1.0, -1.0]))))
+    # 共识：逐帧都侧向才算（同视差的道理）
+    for r in r_ok:
+        r['view_clearance_deg'] = 84.0
+        r['view_lateral'] = True
+    c_v = A.consensus(r_ok)
+    check('视线角全部侧向 ⇒ 通过', c_v['checks'].get('view_lateral') is True,
+          repr(c_v['checks']))
+    r_vbad = [dict(r) for r in r_ok]
+    r_vbad[2]['view_clearance_deg'] = 8.0
+    r_vbad[2]['view_lateral'] = False
+    c_vbad = A.consensus(r_vbad)
+    check('5 帧里 1 帧挡视线 ⇒ 不许报收敛',
+          c_vbad['checks'].get('view_lateral') is False
+          and c_vbad['converged'] is False, repr(c_vbad['checks']))
+
     # =====================================================================
     print('\n--- B. 合成场景：悬停 ---')
     URDF = find_urdf()

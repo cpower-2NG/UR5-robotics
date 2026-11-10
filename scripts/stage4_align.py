@@ -9,11 +9,32 @@
 · 块顶面质心 → ``graspnet_candidates.find_blocks`` 反投影再投影回像素，结果对
   ``(R, t)`` **严格不变**（两者互为逆操作），深度尺度也约掉；
 · 夹爪轴横向 ``u`` → 两指深色列的**像素中点**，不进外参；
-· 夹爪轴纵向 ``v`` → FK 在块顶高度的投影。这不是纯像素量，但 B1 的 20 帧实测
-  里它和图像上指的指尖下沿差 **1 px**（≈1 mm），够用。
+· 夹爪轴纵向 ``v`` → 实测带中点 + FK/外参给出的**轴向微分**（带 → 块顶高）。
 
-所以 ``Δuv = 块 − 轴`` 基本不含平移/尺度偏置，换成毫米时只用到 ``R`` 的旋转。
-倾角误差修不了（入口实验 §7.3 已写明）—— 这正是 E4b 要修的东西。
+**``du`` 与 ``dv`` 不对称 —— 2026-11-10 晚实测推翻「两者都免外参」（第三百零四轮）**
+
+``du`` 是真相对量：块质心与两指中点都在同一幅像里量，外参在差里约掉。
+``dv`` 不是：它的锚点是**投影出来的**那一行，外参平移按 1:1 进 ``dy``
+（t_y +5 mm ⇒ dy +5.4 mm），旋转按 ~29 mm/度进。
+
+更致命的是**视差**：指尖到块顶的高度差（s10 低悬停 96.8 mm）在像里是
+**~100 px**，而判据只有 2 mm ≈ 1.5 px。视差模型差 1 % 就吃光全部容差。
+所以驻留高度决定一切：h=97 mm ⇒ 100 px 视差；h=20 mm ⇒ ~20 px。
+本工具对每帧报 ``parallax_px``，超过 ``PARALLAX_MAX_PX`` 时 ``dy_trusted=false``
+（dx 不受影响）——**这正是「只按比例关系、不用精确数字」的落点**。
+
+外参还另有一道闸门：``check_extrinsic`` 拿腕部权威垫位姿把垫标记的三维点投回来，
+残差超 ``EXTR_MAX_RMS_PX`` 就是外参过期。2026-11-10 实测 **21.7 px RMS**（垫面
+12–16 点；六自由度修正后 0.56 px）。
+
+**但垫面修不了竖直方向**（同日实测）：垫是平面，绕面内轴的转角与沿它的平移在垫上
+等价，离面 156 mm 就发散 —— 修正后的外参把指尖投到 v=408，实测 ~500，比存的外参
+（462.9）更差。所以「用垫面每场现解外参」这条路只对**平面内**（即 ``du``）成立；
+``dv`` 必须靠**同高度观测**，也就是把悬停降到指尖≈块顶，让视差本身消失。
+降到那么低时夹爪会挡住俯视看块顶的视线 ⇒ **抓取朝向要让开视线**（用户 2026-11-10 定）。
+本工具逐帧报 ``view_clearance_deg``（两指分离轴 vs 相机水平视线的夹角，见
+``VIEW_LATERAL_MIN_DEG``）：s10 实测 86.9° = 侧向，那一场的块顶确实看得见；
+夹角小时近侧手指的影子直接盖在块顶上，量到的就不是块 —— 这时 ``view_lateral=false``。
 
 **符号**：``(dx, dy)`` = 块相对轴的位移 ⇒ 把计划目标平移 ``+(dx, dy)``、抓取角
 转 ``+dyaw`` 就是对准。
@@ -108,6 +129,28 @@ HELD_MIN_POINTS = 60                 # ROI 内彩色点下限（贴合后点数�
 GRASP_ROI_HALF_U_PX = 90.0
 GRASP_ROI_DV = (-110.0, 60.0)
 
+# 视差闸门（见模块文档「du 与 dv 不对称」）：轴向锚点是从「带中点」外推出来的，
+# 外推量就是视差。判据 2 mm ≈ 1.5 px，而这座「桥」的相对误差实测在 5–10 %
+# 量级（2026-11-10：垫面残差 21.7 px、块顶/垫面残差斜率 ~0.06 px/mm）⇒
+# 1.5 px ÷ 10 % = 15 px。超过它 ``dy_trusted=false``（dx 照报，du 不进这根桥）。
+PARALLAX_MAX_PX = 15.0
+
+#: 视线遮挡闸门：两指的**分离轴**（tool0 的 y 轴，s10 实测）与俯视相机水平
+#: 视线的夹角。≥60° = 侧向：两列手指落在块的左右两侧，它们沿视线方向投下的
+#: 影子（长度 ≈ 指尖高度 ÷ tan42° ≈ 1.1×高度）只沿像面 v 方向走，压不到块顶面；
+#: 夹角小 = 一前一后，近侧那根手指的影子直接盖在块顶上 —— 那时量到的是指影，
+#: 不是块。90° 最好，60° 是「还分得开」的下限（用户 2026-11-10 定的要求：
+#: 下一次抓取的夹爪朝向不许挡俯视视线）。
+VIEW_LATERAL_MIN_DEG = 60.0
+
+# 外参闸门：腕部垫位姿（0.35 mm 极差）是权威，垫标记三维点因此已知；
+# 用存的外参投回像素，残差 RMS 超过这个数 ⇒ 外参过期。
+# 2026-11-10 实测 21.7 px（而健康时该在 1 px 量级，stage2_pad 的 MAX_RMS_PX 同量级）。
+EXTR_MAX_RMS_PX = 3.0
+EXTR_MIN_POINTS = 8                  # 少于此数 ⇒ 判不了（证据不足，不是通过）
+DEFAULT_MAT = os.path.expanduser(
+    "~/robotics/notes/ur5-vision-grasp/stage2-mat/stage2-mat.json")
+
 
 # ---------------------------------------------------------------- 纯几何
 def project_pt(p_base, K, R, t):
@@ -165,6 +208,124 @@ def uv_to_xy_base(du, dv, zc, K, R):
         return None
     dx, dy = np.linalg.solve(M, np.array([du, dv], float))
     return float(dx), float(dy), float(np.linalg.cond(M))
+
+
+def view_clearance_deg(R_tool, R_cam, min_deg=VIEW_LATERAL_MIN_DEG):
+    """夹爪朝向挡不挡俯视视线：分离轴 vs 相机水平视线的夹角。
+
+    返回 ``{"angle_deg", "elevation_deg", "lateral"}``；``angle_deg`` 是
+    **线**的夹角（折进 0–90°：手指朝左朝右一样侧向）。相机几乎垂直向下
+    （水平分量近零）时夹角没有意义 ⇒ ``angle_deg=None, lateral=None``。
+
+    这是「必要条件」级别的体检，不是遮挡仿真：它只说两指是侧向并排还是前后
+    一条线，具体影子落在哪儿还看块在哪、指有多高（见 ``VIEW_LATERAL_MIN_DEG``）。
+    """
+    Rt = np.asarray(R_tool, float)
+    Rc = np.asarray(R_cam, float)
+    if Rt.shape != (3, 3) or Rc.shape != (3, 3):
+        raise ValueError("R_tool / R_cam 都必须是 3×3")
+    look = Rc[:, 2] / max(float(np.linalg.norm(Rc[:, 2])), 1e-12)  # 光轴 = 视线
+    elev = math.degrees(math.asin(max(-1.0, min(1.0, -look[2]))))
+    h = np.array([look[0], look[1], 0.0], float)
+    nh = float(np.linalg.norm(h))
+    if nh < 0.05:                      # 俯视近垂直：没有「水平视线」可言
+        return {"angle_deg": None, "elevation_deg": round(elev, 1),
+                "lateral": None}
+    a = Rt[:, 1] / max(float(np.linalg.norm(Rt[:, 1])), 1e-12)  # 分离轴 = tool y
+    c = abs(float(a @ (h / nh)))                              # 线夹角 ⇒ 取绝对值
+    ang = math.degrees(math.acos(max(-1.0, min(1.0, c))))
+    return {"angle_deg": round(ang, 1), "elevation_deg": round(elev, 1),
+            "lateral": bool(ang >= min_deg)}
+
+
+
+def pad_reprojection_rms(objs_base, imgs, K, R, t):
+    """垫标记三维点（base 系，米）投到像素 ⇒ 残差统计。
+
+    返回 ``(rms_px, du_med, dv_med, n_used)``；退化成 ``(inf, nan, nan, 0)``。
+    纯函数（无 I/O）—— 自检直接喂合成点。
+    """
+    objs = np.asarray(objs_base, float).reshape(-1, 3)
+    imgs = np.asarray(imgs, float)
+    if imgs.ndim == 1:
+        imgs = imgs.reshape(-1, 2)
+    if imgs.shape[-1] != 2:
+        # ``project_pt`` 返回 (u, v, z)；直接喂进来时把 z 丢掉（别让 reshape
+        # 把三元组按两元组重排 —— 那会静默算出一堆没有意义的残差）。
+        imgs = imgs.reshape(-1, imgs.shape[-1])[:, :2]
+    if len(objs) != len(imgs) or not len(objs):
+        return float("inf"), float("nan"), float("nan"), 0
+    err = []
+    for P, uv in zip(objs, imgs):
+        q = project_pt(P, K, R, t)
+        if q is None:
+            continue
+        err.append([q[0] - uv[0], q[1] - uv[1]])
+    if not err:
+        return float("inf"), float("nan"), float("nan"), 0
+    err = np.asarray(err, float)
+    rms = float(np.sqrt(np.mean(err ** 2)))
+    return (rms, float(np.median(err[:, 0])), float(np.median(err[:, 1])),
+            int(len(err)))
+
+
+def check_extrinsic(frame, T_base_pad, mat=DEFAULT_MAT,
+                    max_rms_px=EXTR_MAX_RMS_PX,
+                    min_points=EXTR_MIN_POINTS):
+    """本帧的俯视外参**还作不作数**：垫标记重投影残差。
+
+    ``T_base_pad`` 由**腕部链**给出（``stage4_pad_from_burst --camera wrist``，
+    极差 0.35 mm，2026-11-09 s8 实测），因此垫上每个标记角点的 base 三维点已知；
+    用存的外参投影回像素，与实测角点比 —— 残差大 = 外参过期。
+
+    返回 ``{"ok": bool|None, "rms_px", "du_med", "dv_med", "n_points",
+    "reason"}``。``ok=None`` = **判不了**（标记太少、或没有 mat）——
+    证据不足既不算通过也不算不通过，调用方自己决定要不要继续。
+    """
+    out = {"ok": None, "rms_px": None, "du_med": None, "dv_med": None,
+           "n_points": 0, "reason": None}
+    if T_base_pad is None:
+        out["reason"] = "没给垫位姿（T_base_pad），判不了外参"
+        return out
+    if not os.path.exists(mat):
+        out["reason"] = "没有标记台账 %s" % mat
+        return out
+    try:
+        import cv2
+        import stage2_pad as sp
+    except ImportError as exc:                       # noqa: BLE001
+        out["reason"] = "缺依赖（%s），判不了外参" % exc
+        return out
+    import json as _json
+    meta = _json.load(open(mat, encoding="utf-8"))
+    K, R, t = frame["K"], frame["R_bc"], frame["t_bc"]
+    gray = cv2.cvtColor(frame["color"], cv2.COLOR_RGB2GRAY)
+    det = sp.detect_pages(gray, meta, K)
+    T_bp = np.asarray(T_base_pad, float)
+    objs, imgs = [], []
+    for page in ("a", "b"):
+        if not det.get(page):
+            continue
+        obj, img, _ids, _miss = sp.corner_pairs(meta, page, det[page])
+        for p in obj:
+            objs.append((T_bp @ np.array([p[0] / 1e3, p[1] / 1e3, 0.0, 1.0]))[:3])
+            imgs.append(None)
+        imgs = [x for x in imgs if x is not None]
+        imgs.extend([np.asarray(c, float) for c in img])
+    rms, du, dv, n = pad_reprojection_rms(objs, imgs, K, R, t)
+    out.update({"rms_px": None if not np.isfinite(rms) else round(rms, 2),
+                "du_med": None if not np.isfinite(du) else round(du, 2),
+                "dv_med": None if not np.isfinite(dv) else round(dv, 2),
+                "n_points": n})
+    if n < min_points:
+        out["reason"] = "垫标记点只有 %d 个（下限 %d）⇒ 判不了" % (n, min_points)
+        return out
+    out["ok"] = bool(rms <= max_rms_px)
+    if not out["ok"]:
+        out["reason"] = ("垫面重投影残差 %.1f px > %.1f px ⇒ 俯视外参已过期"
+                         "（du %+.1f / dv %+.1f）"
+                         % (rms, max_rms_px, du, dv))
+    return out
 
 
 def fold_deg(a, period=90.0):
@@ -494,6 +655,9 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
     T = th.fk(q)
     tool0 = T[:3, 3]
     tip_pt = tool0 + T[:3, :3] @ np.array([0.0, 0.0, TOOL0_TO_BARE_FINGERTIP])
+    # 这一帧的夹爪朝向挡不挡俯视视线（见 VIEW_LATERAL_MIN_DEG）—— 只记录、
+    # 供下一次抓取挑 yaw 用；它不改 dx/dy 的算法。
+    view = view_clearance_deg(T[:3, :3], R)
     p_tip = project_pt(tip_pt, K, R, t)
     if p_tip is None:
         raise RuntimeError("指尖投影落在相机后方")
@@ -577,6 +741,11 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
     if conv is None:
         raise RuntimeError("像素差 → base 位移退化（相机轴与台面近平行？）")
     dx, dy, cond = conv
+    # 视差 = 为了让轴落在块顶高度，纵向锚点被外推了多少像素。dy 的可信度全看它：
+    # 判据 2 mm ≈ 1.5 px，视差 100 px 时模型差 1.5 % 就用光容差。
+    parallax_px = abs(float(shift[1]))
+    p_par = uv_to_xy_base(0.0, parallax_px, p_blk[2], K, R)
+    parallax_mm = float("nan") if p_par is None else abs(p_par[1]) * 1000.0
     dyaw = None
     if grasp_yaw_deg is not None and blk.get("yaw_trusted"):
         dyaw = fold_deg(float(blk["yaw_rect"]) - float(grasp_yaw_deg))
@@ -604,6 +773,13 @@ def measure_frame(frame_dir, idx, th, block_top_mm,
             "held_roi": (held_roi if held_info else None),
             "class_src": (held_info.get("class_src") if held_info else None),
             "du_px": round(du, 2), "dv_px": round(dv, 2),
+            "parallax_px": round(parallax_px, 1),
+            "parallax_mm": None if not np.isfinite(parallax_mm) else round(
+                parallax_mm, 2),
+            "dy_trusted": bool(parallax_px <= PARALLAX_MAX_PX),
+            "view_clearance_deg": view["angle_deg"],
+            "view_elevation_deg": view["elevation_deg"],
+            "view_lateral": view["lateral"],
             "dx_mm": round(dx * 1000.0, 2), "dy_mm": round(dy * 1000.0, 2),
             "dyaw_deg": None if dyaw is None else round(dyaw, 3),
             "depth_block_m": round(p_blk[2], 3),
@@ -645,6 +821,22 @@ def consensus(records, held=False):
     checks = {"within_2mm": bool(math.hypot(dx, dy) <= TOL_MM)}
     if yaws:
         checks["within_2deg"] = bool(abs(dyaw) <= TOL_DEG)
+    # 视差闸门：逐帧都在 PARALLAX_MAX_PX 以内才许认 dy。有一帧超了就不认 ——
+    # 中位数会把「一半帧好、一半帧差」抹平，而那正是要拦的情形。
+    pars = [r["parallax_px"] for r in ok if r.get("parallax_px") is not None]
+    if pars:
+        cons["parallax_px"] = round(float(np.median(pars)), 1)
+        cons["parallax_mm"] = round(float(np.median(
+            [r["parallax_mm"] for r in ok
+             if r.get("parallax_mm") is not None] or [float("nan")])), 2)
+        checks["dy_trusted"] = bool(all(r.get("dy_trusted", False) for r in ok))
+    # 视线遮挡：逐帧都侧向才算 —— 和视差同一条道理，中位数会把一半好一半差抹平。
+    views = [r["view_clearance_deg"] for r in ok
+             if r.get("view_clearance_deg") is not None]
+    if views:
+        cons["view_clearance_deg"] = round(float(np.median(views)), 1)
+        checks["view_lateral"] = bool(all(r.get("view_lateral", False)
+                                          for r in ok))
     # 「稳」不能只看保留下来的内点（那等于自证）：还要求绝大多数帧都是内点。
     # 3 帧里有 1 帧野值时比例 0.67 < 0.8 ⇒ 不稳，不许报收敛。
     checks["stable"] = bool(cons["spread_mm"] <= 2.0
@@ -659,8 +851,13 @@ def consensus(records, held=False):
 def run_burst(burst, urdf, block_top_mm, grasp_yaw_deg=None,
               expect_class=None, prior_xy_mm=None, held=False,
               drop_first=DEFAULT_DROP, max_frames=DEFAULT_MAX,
-              table_z_mm=None):
-    """整组 burst → 结果 dict（不抛：失败写 ``ok=false`` + ``reason``）。"""
+              table_z_mm=None, T_base_pad=None, mat_path=None,
+              allow_stale_extrinsic=False):
+    """整组 burst → 结果 dict（不抛：失败写 ``ok=false`` + ``reason``）。
+
+    ``T_base_pad`` 给定时先跑 ``check_extrinsic``：外参过期 ⇒ 直接 ``ok=false``
+    （``allow_stale_extrinsic`` 可在离线重放里关掉这道闸门，但结果里仍留记账）。
+    """
     out = {"burst": os.path.abspath(burst), "held": bool(held),
            "block_top_mm": block_top_mm,
            "ok": False, "reason": None, "frames": []}
@@ -681,6 +878,16 @@ def run_burst(burst, urdf, block_top_mm, grasp_yaw_deg=None,
                            idx=use[0])
         table_z = _table_z_m(f0["depth"], f0["K"], f0["R_bc"], f0["t_bc"])
     out["table_z_mm"] = None if table_z is None else round(table_z * 1000, 1)
+    if T_base_pad is not None:
+        fr0 = gc.load_frame(burst, tip=gc.TOPCAM_TIP, chain=gc.TOPCAM_CHAIN,
+                            idx=use[0])
+        ext = check_extrinsic(fr0, T_base_pad,
+                              mat=(mat_path or DEFAULT_MAT))
+        out["extrinsic"] = ext
+        if ext["ok"] is False and not allow_stale_extrinsic:
+            out["reason"] = "俯视外参过期（rms %.2f px）：%s；结果不可用"
+            out["reason"] = out["reason"] % (ext["rms_px"], ext["reason"])
+            return out
     errs = []
     for i in use:
         try:
@@ -720,8 +927,26 @@ def _fmt(res):
         s += "  dyaw=%+5.2f° (n=%d, 极差 %.2f°)" % (c["dyaw_deg"],
                                                   c["n_dyaw"],
                                                   c["spread_deg"])
+    if "parallax_px" in c:
+        s += "  视差 %.0f px/%.1f mm" % (c["parallax_px"], c["parallax_mm"])
+    if "view_clearance_deg" in c:
+        s += "  视线角 %.0f°(%s)" % (
+            c["view_clearance_deg"],
+            "侧向" if c["checks"].get("view_lateral") else "**挡视线**")
     chk = c["checks"]
     s += "  " + ("收敛" if c.get("converged") else "**未收敛**")
+    if not chk.get("dy_trusted", True):
+        s += "（dy 不可信：视差超 %.0f px）" % PARALLAX_MAX_PX
+    if not chk.get("view_lateral", True):
+        s += "（两指前后一条线：块顶可能被指影盖住）"
+    ext = res.get("extrinsic")
+    if ext:
+        s += "\n   外参闸门：%s" % (
+            "通过 rms %.2f px" % ext["rms_px"] if ext["ok"] else
+            ("判不了 —— %s" % ext["reason"] if ext["ok"] is None
+             else "**过期** rms %.2f px（du %+.1f / dv %+.1f，%d 点）"
+                  % (ext["rms_px"], ext["du_med"], ext["dv_med"],
+                     ext["n_points"])))
     return s
 
 
@@ -861,6 +1086,11 @@ def main(argv=None):
     ap.add_argument("--max-frames", type=int, default=DEFAULT_MAX)
     ap.add_argument("--table-z-mm", type=float, default=None,
                     help="台面高度（缺省从深度直方图取）")
+    ap.add_argument("--grid", default=None, metavar="grid-pre.json",
+                    help="本场垫位姿（腕部链产出）；给了就开外参闸门")
+    ap.add_argument("--mat", default=DEFAULT_MAT, help="标记台账 JSON")
+    ap.add_argument("--allow-stale-extrinsic", action="store_true",
+                    help="外参闸门不过也照样出数（离线重放/诊断用；结果里留记账）")
     args = ap.parse_args(argv)
 
     if args.summary:
@@ -889,12 +1119,18 @@ def main(argv=None):
 
     if args.block_top_mm is None:
         ap.error("量 burst 要给 --block-top-mm")
+    T_bp = None
+    if args.grid:
+        g = _load_json(args.grid)
+        T_bp = np.asarray(g["T_base_pad"], float)
     res = run_burst(args.burst, args.urdf, args.block_top_mm,
                     grasp_yaw_deg=args.grasp_yaw_deg,
                     expect_class=args.expect_class,
                     prior_xy_mm=prior, held=args.held,
                     drop_first=args.drop_first, max_frames=args.max_frames,
-                    table_z_mm=args.table_z_mm)
+                    table_z_mm=args.table_z_mm,
+                    T_base_pad=T_bp, mat_path=args.mat,
+                    allow_stale_extrinsic=args.allow_stale_extrinsic)
     print(_fmt(res))
     for e in res.get("errors", [])[:6]:
         print("   f%02d 跳过：%s" % (e["idx"], e["error"]))
