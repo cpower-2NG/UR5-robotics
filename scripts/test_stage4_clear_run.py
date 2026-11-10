@@ -642,6 +642,89 @@ def section_step_cap():
         pp.MAX_JOINT_STEP_DEG = real_cap
 
 
+def section_place_yaw_equiv():
+    print('\n[4c] 放置朝向 180° 等价兜底：只对 BranchChainError 生效')
+    truth, att = tower_truth(), tower_attempt()
+    acts, blocks = cr.actions_from_attempt(truth, att, cm.PAD_THICK)
+    ch = chain()
+    q0 = q_start_of(ch)
+    real = pp.build_pick
+    calls = []
+
+    def fake(*a, **kw):
+        yp = kw.get('yaw_place_deg')
+        calls.append(yp)
+        if yp is None:
+            raise pp.BranchChainError(
+                '这些航点的所有 IK 分支组合都过不了高度护栏或单步 170° 上限'
+                '（测试注入）')
+        # 接线验证：等价写法换回默认朝向喂给真规划器（这个夹具换 180° 物理上
+        # 过不了 IK，测的是「试哪个写法、怎么记录」，不是几何）
+        kw = dict(kw, yaw_place_deg=None)
+        return real(*a, **kw)
+
+    try:
+        pp.build_pick = fake
+        out = tempfile.mkdtemp(prefix='e9-equiv-off-')
+        ok, err = raises(cr.plan_sequence, ch, q0, acts, blocks, out)
+        check('缺省不开旗子 ⇒ BranchChainError 原样上抛', ok and '测试注入' in err)
+        check('缺省不开旗子 ⇒ 不换写法（每块只试一次）', calls == [None], calls)
+        check('缺省不开旗子 ⇒ 一份计划都不写',
+              not any(f.endswith('.json') for f in os.listdir(out)), os.listdir(out))
+
+        calls.clear()
+        pp.build_pick = fake
+        out2 = tempfile.mkdtemp(prefix='e9-equiv-on-')
+        plans, layout, q_end = cr.plan_sequence(ch, q0, acts, blocks, out2,
+                                                wrist_survey=False,
+                                                place_yaw_equiv=True)
+        want = [pp.fold_yaw_180(a['grasp_yaw_deg']) - 180.0 for a in acts]
+        check('开了旗子 ⇒ 每个动作都先默认、失败再试 180° 等价写法',
+              calls == [None, want[0], None, want[1]], calls)
+        check('180° 等价写法 = 折叠后的抓取朝向 −180°',
+              all(abs(c - w) < 1e-9 for c, w in zip(calls[1::2], want)), calls)
+        check('等价写法落在计划 meta 里（可追溯）',
+              all(p['place_yaw_equiv180'] for p in plans)
+              and all(json.load(open(p['path']))['meta']['yaw_source']
+                      == 'place-equiv180' for p in plans))
+        check('换写法不影响航点序列与终态布局',
+              all(p['n_waypoints'] == 8 for p in plans)
+              and cr.find_block(layout, '0') is not None)
+
+        # 换写法也救不回来 ⇒ fail-closed，两份都试完才报错
+        calls.clear()
+
+        def both_fail(*a, **kw):
+            calls.append(kw.get('yaw_place_deg'))
+            raise pp.BranchChainError('这些航点的所有 IK 分支组合都被拒（测试注入）')
+
+        pp.build_pick = both_fail
+        out3 = tempfile.mkdtemp(prefix='e9-equiv-dead-')
+        ok, err = raises(cr.plan_sequence, ch, q0, acts, blocks, out3,
+                         place_yaw_equiv=True)
+        check('两种写法都过不了 ⇒ 仍抛 BranchChainError（fail-closed）',
+              ok and '测试注入' in err, err)
+        check('两种写法都过不了 ⇒ 不写计划',
+              not any(f.endswith('.json') for f in os.listdir(out3)),
+              os.listdir(out3))
+
+        # 别的 PlanError（邻块太近/夹持深度…）换朝向救不回来，不许重试
+        calls.clear()
+
+        def plain_fail(*a, **kw):
+            calls.append(kw.get('yaw_place_deg'))
+            raise pp.PlanError('块 #0 离最近邻块只有 30.0 mm（测试注入）')
+
+        pp.build_pick = plain_fail
+        out4 = tempfile.mkdtemp(prefix='e9-equiv-plain-')
+        ok, err = raises(cr.plan_sequence, ch, q0, acts, blocks, out4,
+                         place_yaw_equiv=True)
+        check('非 BranchChainError ⇒ 不重试（只试了默认写法）',
+              ok and calls == [None] and '测试注入' in err, (calls, err))
+    finally:
+        pp.build_pick = real
+
+
 def section_merge_truth():
     print('\n[7c] 多机位跑后真值合并：去重必须带层')
     two = [{'x': 0.4406, 'y': 0.3443, 'top': 0.04425, 'size': 0.0295},
@@ -1143,9 +1226,10 @@ def section_align():
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
-               section_step_cap, section_gap, section_mutation, section_verify,
-               section_fuse, section_merge_truth,
-               section_colour, section_pad_pose, section_align):
+               section_step_cap, section_place_yaw_equiv, section_gap,
+               section_mutation, section_verify, section_fuse,
+               section_merge_truth, section_colour, section_pad_pose,
+               section_align):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

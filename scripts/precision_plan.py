@@ -205,6 +205,22 @@ class PlanError(RuntimeError):
     """预检不过。抛这个而不是 sys.exit，测试里能直接断言。"""
 
 
+class BranchChainError(PlanError):
+    """整条航点串**没有任何一支 IK 分支链**过得了护栏与单步上限。
+
+    与 `JointSwingError` 同一类理由单独成子类：放置朝向换一个**物理等价**的
+    写法（`fold_yaw_180` 的 ±180°：只换手指、不换面），IK 支就整支换掉，
+    链可能过得去。其它 `PlanError`（超限平移、邻块太近、夹持深度对不上）
+    换朝向救不回来，重试只会掩盖真问题。
+
+    2026-11-10 E9 s10 实测：目标块实测 yaw 89.994°（s8 那场是 84.266°），
+    放垫心那一支 wrist_3 要 −211.7°，刚越过 `MAX_WRIST_TURN` 210° 的缠绕帽
+    ⇒ 折算把它甩到 +148.3°，相对 `lift` 的 −159.3° 是 307.4° 单跳，
+    整链被判死。放置朝向取 −90.006°（= 89.994 − 180）后同一串航点换成
+    wrist_3 −31.9° 的分支，最大单跳 127.4°，两个门槛都不用动。
+    """
+
+
 class JointSwingError(PlanError):
     """单个关节跳变超过 `MAX_JOINT_SWING`。
 
@@ -569,7 +585,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
     IK 解，其中一些要「先原地把腕子转半圈」才到得了；只按总行程最小化会挑中它们
     （2026-11-09 E9 第 2 场实测：链里出现 309° / 201° 的单关节跳变，末段
     ``survey_place`` 上真机后被控制器中止 status=6）。超过上限的转移一律不走；
-    整条链都过不了 ⇒ ``PlanError``（fail-closed，宁可不写计划也不发怪姿态）。
+    整条链都过不了 ⇒ ``BranchChainError``（fail-closed，宁可不写计划也不发怪姿态）。
     """
     if max_step_deg is None:            # 运行时读，便于自检/复现时改档对比
         max_step_deg = MAX_JOINT_STEP_DEG
@@ -611,7 +627,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
                     prev[i][j] = k
     ends = [(c, j) for j, c in enumerate(cost[-1]) if np.isfinite(c)]
     if not ends:
-        raise PlanError(
+        raise BranchChainError(
             "这些航点的所有 IK 分支组合都过不了高度护栏或单步 %.0f° 上限"
             "（同一末端位姿换分支会要求先原地转半圈）：%s"
             % (float(max_step_deg or 0.0),

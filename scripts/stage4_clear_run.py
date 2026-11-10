@@ -450,7 +450,7 @@ def plan_views(chain, q_start, views, out_dir, start=0):
 
 def plan_sequence(chain, q_start, actions, blocks, out_dir,
                   survey_tool0=E9_SURVEY_TOOL0, place_clearance=None,
-                  wrist_survey=True, views=None):
+                  wrist_survey=True, views=None, place_yaw_equiv=False):
     """逐步生成计划；任何一步预检失败就抛 ``pp.PlanError``，不写半份序列。
 
     ``wrist_survey=True``（缺省）在序列末尾依次平动到 ``views`` 里的每个
@@ -459,6 +459,11 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
     上拍（2026-11-09 用户定：规划与判分都走腕部），所以这些机位写进本场
     ``run.sh``，由执行链末端自动完成。任何一个机位过不了预检就抛错 ⇒
     ``run.sh`` 不写、整场不执行（fail-closed），不许跑完才发现拍不了判分帧。
+
+    ``place_yaw_equiv=True``：某个动作按「放置朝向 = 抓取朝向」过不了预检时，
+    再试 180° 等价写法（``fold_yaw_180`` 的物理等价：只换手指、不换面，
+    方块/矩形块的落点与朝向逐字节相同）。**只对 `pp.BranchChainError` 重试**，
+    其它拒绝换朝向救不回来。用的是哪个写法逐条记进计划 meta 与 manifest。
     """
     layout = [dict(b) for b in blocks]
     q = [float(v) for v in q_start]
@@ -479,16 +484,42 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                 "dist_mm": 0.0,
                 "angle_deg": float(act["grasp_yaw_deg"]),
                 "seed": None}
-        wps, checks, meta = pp.build_pick(
-            chain, q, cand, to_pp_block(blk), pp_blocks, act["slot"],
-            yaw_grasp_deg=act["grasp_yaw_deg"], grasp_at="block_center",
-            surface_z=act["surface_z"], survey_tool0=tuple(survey_tool0),
-            place_clearance=place_clearance,
-            # 压在目标上的块：`h`（块顶离台面）≠ 物理块高，必须显式给
-            # 物理块高，否则抓取高度按两个块高算（= 2026-11-02 拆塔事故）。
-            block_h_m=float(blk["size"]),
-            # 见模块头：探针已用 OBB 判过间隙，这里的 60 mm 粗判据必须让位。
-            min_block_gap=0.0)
+        yaw_grasp = pp.fold_yaw_180(float(act["grasp_yaw_deg"]))
+        # 放置朝向的候选写法：默认（= 抓取朝向）先试，旗子开了才加 180° 等价。
+        yaw_places = [None]
+        if place_yaw_equiv:
+            yaw_places.append(yaw_grasp - 180.0)
+        wps = checks = meta = None
+        yaw_used = None
+        first_err = None
+        for yaw_place in yaw_places:
+            try:
+                wps, checks, meta = pp.build_pick(
+                    chain, q, cand, to_pp_block(blk), pp_blocks, act["slot"],
+                    yaw_grasp_deg=act["grasp_yaw_deg"], grasp_at="block_center",
+                    surface_z=act["surface_z"], survey_tool0=tuple(survey_tool0),
+                    place_clearance=place_clearance,
+                    yaw_place_deg=yaw_place,
+                    yaw_source=("place-equiv180" if yaw_place is not None
+                                else "zero"),
+                    # 压在目标上的块：`h`（块顶离台面）≠ 物理块高，必须显式给
+                    # 物理块高，否则抓取高度按两个块高算（= 2026-11-02 拆塔事故）。
+                    block_h_m=float(blk["size"]),
+                    # 见模块头：探针已用 OBB 判过间隙，这里的 60 mm 粗判据必须让位。
+                    min_block_gap=0.0)
+            except pp.BranchChainError as e:
+                first_err = first_err or e
+                continue
+            yaw_used = yaw_place
+            break
+        if wps is None:
+            # 所有等价写法都被分支链/单步上限拒了 ⇒ 抛第一次（默认朝向）的原始
+            # 报错：它才是「按实测朝向根本走不通」这件事本身。
+            raise first_err
+        if yaw_used is not None:
+            log("  !! 块 %s：默认放置朝向过不了分支链/单步上限，改用 180° 等价"
+                "写法（只换手指、不换面）：ψ_place %.3f° → %.3f°"
+                % (act["block"], yaw_grasp, yaw_grasp - 180.0))
         plan = {"version": 2,
                 "meta": dict(meta,
                              e9={"kind": act["kind"], "block": act["block"],
@@ -496,6 +527,7 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                                  "from_xy": list(act["from_xy"]),
                                  "grasp_yaw_deg": round(
                                      float(act["grasp_yaw_deg"]), 3),
+                                 "place_yaw_equiv180": yaw_used is not None,
                                  "gap_check": "probe_verified",
                                  "checks": checks}),
                 "q_start": list(q),
@@ -508,6 +540,7 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                       "kind": act["kind"], "block": act["block"],
                       "slot": act["slot"], "from_xy": act["from_xy"],
                       "grasp_yaw_deg": act["grasp_yaw_deg"],
+                      "place_yaw_equiv180": yaw_used is not None,
                       "n_waypoints": len(wps)})
         q = [float(v) for v in wps[-1]["q"]]
         move_in_layout(layout, act["block"], act["slot"][0], act["slot"][1],
@@ -1458,6 +1491,10 @@ def main(argv=None):
     ap.add_argument("--no-wrist-survey", action="store_true",
                     help="不在序列末尾加判分机位（只为复现旧计划；"
                          "没有它就没有跑后判分帧，E9 判分不许用）")
+    ap.add_argument("--place-yaw-equiv180", action="store_true",
+                    help="放置朝向按实测过不了分支链/单步上限时，改用 180° "
+                         "等价写法（只换手指、不换面；方块/矩形块落点相同）。"
+                         "缺省不开 ⇒ 照旧 fail-closed")
     args = ap.parse_args(argv)
 
     if args.verify or args.view_truth:
@@ -1506,7 +1543,8 @@ def main(argv=None):
         plans, final_layout, q_end = plan_sequence(
             chain, q_start, actions, blocks, args.out_dir,
             survey_tool0=survey, place_clearance=args.place_clearance,
-            wrist_survey=not args.no_wrist_survey)
+            wrist_survey=not args.no_wrist_survey,
+            place_yaw_equiv=args.place_yaw_equiv180)
     except pp.PlanError as e:
         log("!! 预检不过：%s" % e)
         log("   计划**没有**写出完整序列 —— 不要执行。")
@@ -1530,6 +1568,7 @@ def main(argv=None):
         "pad_thick": pad_thick,
         "survey_tool0": list(survey),
         "gap_check": "probe_verified",
+        "place_yaw_equiv180": bool(args.place_yaw_equiv180),
         "actions": actions,
         "plans": plans,
         "q_start": q_start,
@@ -1568,6 +1607,9 @@ def main(argv=None):
             % (p["name"], p["kind"], p["block"],
                p["from_xy"][0], p["from_xy"][1], p["slot"][0], p["slot"][1],
                p["grasp_yaw_deg"], p["n_waypoints"]))
+        if p.get("place_yaw_equiv180"):
+            log("    放置朝向用了 180° 等价写法（ψ_place 与 ψ_grasp 差 180°，"
+                "只换手指、不换面；见计划 meta.e9.place_yaw_equiv180）")
     for r in align_recs:
         log("  对中修正 d=(%+.2f, %+.2f) mm  dψ=%+.2f°  %s"
             % (r["dx_mm"], r["dy_mm"], r["dyaw_deg"],
