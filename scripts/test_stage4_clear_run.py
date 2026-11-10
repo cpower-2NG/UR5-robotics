@@ -935,12 +935,217 @@ def section_pad_pose():
           '未实测' in cm.PAD_POSE_SOURCE)
 
 
+# ----------------------------------------------------------------- [11]
+def _align_rec(dx=3.0, dy=-2.0, dyaw=1.5, n=8, ok=True, spread=0.8,
+               reason=None):
+    return {'ok': ok, 'reason': reason, 'burst': '/tmp/burst',
+            'consensus': {'dx_mm': dx, 'dy_mm': dy, 'dyaw_deg': dyaw,
+                          'n_used': n, 'spread_mm': spread}}
+
+
+def _write_json(d, name, obj):
+    p = os.path.join(d, name)
+    with open(p, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, ensure_ascii=False)
+    return p
+
+
+class _A(object):
+    """align_plan_main 用到的那几个属性。"""
+    def __init__(self, **kw):
+        self.probe_report = kw['probe_report']
+        self.scene_index = kw.get('scene_index', 0)
+        self.truth = kw.get('truth')
+        self.target = kw.get('target')
+        self.pad_thick = kw.get('pad_thick')
+        self.out_dir = kw['out_dir']
+        self.align_json = kw.get('align_json')
+        self.hover_z = kw.get('hover_z', cr.ALIGN_HOVER_Z)
+        self.align_burst_dir = kw.get('align_burst_dir')
+        self.board_dir = kw.get('board_dir', '$HOME/precision/plans/e9')
+        self.board_log_dir = kw.get('board_log_dir', '$HOME/precision/logs/e9')
+        self.from_frame = kw.get('from_frame')
+        self.q_start = kw.get('q_start')
+        self.urdf = kw.get('urdf', URDF)
+
+
+def section_align():
+    print('\n[11] E4b 对中接线：折进目标块 / 低悬停计划 / 脚本切开')
+    truth, att = tower_truth(), tower_attempt()
+    acts, blocks = cr.actions_from_attempt(truth, att, cm.PAD_THICK)
+
+    # ---- 1) 应用修正
+    rec = cr.apply_align(truth, acts, _align_rec(3.0, -2.0, 1.5), 0)
+    b0 = cr.find_block(truth['blocks'], '0')
+    check('修正折进块心：x +3 mm、y −2 mm、yaw +1.5°',
+          abs(b0['x'] - 0.403) < 1e-9 and abs(b0['y'] - 0.298) < 1e-9
+          and abs(b0['yaw'] - 148.13) < 1e-6, str(b0))
+    tgt = [a for a in acts if a['kind'] == 'target'][0]
+    check('修正同时折进目标动作（from_xy / 抓取角）',
+          abs(tgt['from_xy'][0] - 0.403) < 1e-9
+          and abs(tgt['grasp_yaw_deg'] - (146.63 + 1.5)) < 1e-6, str(tgt))
+    check('清障动作**不动**（它的位姿由探针定，与俯视相对量无关）',
+          acts[0]['from_xy'] == [0.40, 0.30])
+    check('记录里写明 e_before / 帧数 / 前后位姿',
+          abs(rec['e_before_mm'] - 3.6056) < 0.01 and rec['n_frames'] == 8
+          and rec['block_xy_before_mm'] == [400.0, 300.0]
+          and rec['block_xy_after_mm'] == [403.0, 298.0], str(rec))
+
+    # ---- 2) fail-closed
+    for nm, bad in (('ok=false', _align_rec(ok=False, reason='no_fingers')),
+                    ('只用上 2 帧', _align_rec(n=2)),
+                    ('单次要挪 80 mm', _align_rec(80.0, 0.0))):
+        t2, a2 = tower_truth(), cr.actions_from_attempt(
+            tower_truth(), tower_attempt(), cm.PAD_THICK)[0]
+        ok, why = raises(cr.apply_align, t2, a2, bad, 0)
+        check('拒绝 %s（fail-closed）' % nm, ok, why)
+
+    # ---- 3) 已在容差内 ⇒ 不发运动
+    t3 = tower_truth()
+    a3 = cr.actions_from_attempt(tower_truth(), tower_attempt(),
+                                 cm.PAD_THICK)[0]
+    r3 = cr.apply_align(t3, a3, _align_rec(1.2, -0.5, 0.4), 0)
+    check('残差已在 ≤2 mm / ≤2° 内 ⇒ applied=False，且**不改**任何位姿',
+          r3['applied'] is False and r3['reason'] == 'already_in_tol'
+          and cr.find_block(t3['blocks'], '0')['x'] == 0.40
+          and a3[0]['from_xy'] == [0.40, 0.30], str(r3))
+
+    # ---- 4) 多轮累加 + 轮数上限
+    tmp = tempfile.mkdtemp(prefix='cr-align-')
+    j1 = _write_json(tmp, 'r1.json', _align_rec(3.0, 0.0, 0.0))
+    j2 = _write_json(tmp, 'r2.json', _align_rec(0.0, 2.5, 0.0))
+    t4 = tower_truth()
+    a4 = cr.actions_from_attempt(tower_truth(), tower_attempt(),
+                                 cm.PAD_THICK)[0]
+    rs = cr.apply_align_jsons(t4, a4, [j1, j2], 0)
+    check('两轮按顺序累加（+3 mm 与 +2.5 mm 都进)',
+          len(rs) == 2
+          and abs(cr.find_block(t4['blocks'], '0')['x'] - 0.403) < 1e-9
+          and abs(cr.find_block(t4['blocks'], '0')['y'] - 0.3025) < 1e-9)
+    t5 = tower_truth()
+    a5 = cr.actions_from_attempt(tower_truth(), tower_attempt(),
+                                 cm.PAD_THICK)[0]
+    ok, why = raises(cr.apply_align_jsons, t5, a5, [j1, j2, j1], 0)
+    check('超过 %d 轮 ⇒ 拒绝（没收敛要查，不接着掰）'
+          % cr.MAX_ALIGN_ROUNDS, ok, why)
+    check('没给 align json ⇒ 空记录（不等于「已对准」）',
+          cr.apply_align_jsons(tower_truth(),
+                               cr.actions_from_attempt(
+                                   tower_truth(), tower_attempt(),
+                                   cm.PAD_THICK)[0], None, 0) == [])
+
+    # ---- 5) 低悬停计划
+    ch = chain()
+    q0 = q_start_of(ch)
+    out = tempfile.mkdtemp(prefix='cr-align-plan-')
+    prec, plan = cr.plan_align_hover(ch, q0, acts[1], out, hover_z=0.360,
+                                     name='00-align-hover-r1.json')
+    path = os.path.join(out, '00-align-hover-r1.json')
+    check('写出 00-align-hover-r1.json', os.path.exists(path))
+    on_disk = json.load(open(path, encoding='utf-8'))
+    wps = on_disk['waypoints']
+    check('两个航点：先抬到 460 mm，再落到悬停 360 mm',
+          [w['name'] for w in wps] == ['align_transit', 'align']
+          and len(wps) == 2, str([w['name'] for w in wps]))
+    zs = [float(ch.fk([float(v) for v in w['q']])[2, 3]) for w in wps]
+    check('FK 落点 z = 460 / 360 mm（±1 mm）',
+          abs(zs[0] - 0.460) < 1e-3 and abs(zs[1] - 0.360) < 1e-3, str(zs))
+    xs = [float(ch.fk([float(v) for v in w['q']])[0, 3]) for w in wps]
+    check('落点在目标块正上方（x ±2 mm）',
+          all(abs(x - acts[1]['from_xy'][0]) < 2e-3 for x in xs), str(xs))
+    check('**张爪**只在第一个航点前（量到的两指才对得上抓取那一刻）',
+          wps[0].get('before', {}).get('gripper') == 'open'
+          and 'before' not in wps[1], str(wps))
+    check('plan 记录 kind/q_start/n_waypoints 齐全',
+          prec['kind'] == 'align_hover' and prec['n_waypoints'] == 2
+          and on_disk['q_start'] == q0, str(prec))
+    ok, why = raises(cr.plan_align_hover, ch, q0, acts[1], out,
+                     hover_z=3.0)
+    check('悬停高度离谱 ⇒ IK 不过、不写计划', ok, why)
+
+    # ---- 6) 执行脚本：对中 burst / 抓后切开
+    plans = [{'name': '00-align-hover-r1.json', 'kind': 'align_hover',
+              'n_waypoints': 2},
+             {'name': '01-clear-block-8.json', 'kind': 'clear'},
+             {'name': '02-target-block-0.json', 'kind': 'target'},
+             {'name': '03-view-pick.json', 'kind': 'view', 'view': 'pick'}]
+    txt = cr.run_script_text(plans, '$BD', '$LD',
+                             burst_dirs={'pick': '$W/pick'},
+                             align_burst_dir='$T/r1',
+                             held_burst_dir='$T/held')
+    i_align = txt.index('--camera topcam --burst 20 $T/r1')
+    i_held = txt.index('--camera topcam --burst 20 $T/held')
+    i_upto = txt.index('--upto lift')
+    i_from = txt.index('--from to_slot --holding-block')
+    check('对中 burst 在悬停计划之后、清障之前',
+          txt.index('--plan $BD/00-align-hover-r1.json') < i_align < i_held)
+    check('目标计划被切开：--upto lift → 拍 → --from to_slot --holding-block',
+          i_upto < i_held < i_from, '%d/%d/%d' % (i_upto, i_held, i_from))
+    exec_lines = [ln for ln in txt.splitlines()
+                  if 'precision_exec.py' in ln]
+    check('切开只发生在目标计划上（清障计划照常整条跑）',
+          sum('--upto lift' in ln for ln in exec_lines) == 1
+          and sum('--holding-block' in ln for ln in exec_lines) == 1
+          and sum('--upto lift' not in ln and '--from to_slot' not in ln
+                  for ln in exec_lines) == 3, str(exec_lines))
+    check('切开后的续跑仍带同一枚令牌（被 --require-auth 管住）',
+          all('--require-auth "$TOKEN"' in ln
+              for ln in txt.splitlines() if 'precision_exec.py' in ln))
+    check('任一 burst 失败 ⇒ 整条停（fail-closed）',
+          txt.count('[ $rc -eq 0 ] || fail') >= 6)
+
+    txt2 = cr.run_script_text(plans, '$BD', '$LD')
+    check('不给对中/偏心目录 ⇒ 老行为（不切开、不拍俯视）',
+          '--upto lift' not in txt2 and '--camera topcam' not in txt2)
+
+    # ---- 7) align_plan_main 端到端（写 json + sh）
+    rep = tempfile.mkdtemp(prefix='cr-align-main-')
+    tp = _write_json(rep, 'truth.json', tower_truth())
+    rp = _write_json(rep, 'probe.json',
+                     {'cell': 'T', 'scenes': [{'truth': tp,
+                                               'attempts': [tower_attempt()]}]})
+    outp = os.path.join(rep, 'plan')
+    a = _A(probe_report=rp, out_dir=outp, q_start=','.join(str(v) for v in q0))
+    rc = cr.align_plan_main(None, a)
+    check('align_plan_main 成功返回 0', rc == 0, str(rc))
+    check('写出 00-align-hover-r1.json / align-r1.sh / align-r1.json',
+          all(os.path.exists(os.path.join(outp, f)) for f in
+              ('00-align-hover-r1.json', 'align-r1.sh', 'align-r1.json')))
+    man = json.load(open(os.path.join(outp, 'align-r1.json'), encoding='utf-8'))
+    check('align-r1.json 记 round=1、target、burst 目录',
+          man['round'] == 1 and str(man['target']) == '0'
+          and 'topcam-align/r1' in man['align_burst_dir'], str(man))
+    a2 = _A(probe_report=rp, out_dir=outp,
+            q_start=','.join(str(v) for v in q0), align_json=[j1])
+    rc = cr.align_plan_main(None, a2)
+    man2 = json.load(open(os.path.join(outp, 'align-r2.json'),
+                          encoding='utf-8'))
+    check('带 --align-json ⇒ 出**第 2 轮**（r2），并把修正记进去',
+          rc == 0 and man2['round'] == 2
+          and man2['align_applied'][0]['applied'] is True
+          and 'topcam-align/r2' in man2['align_burst_dir'], str(man2))
+    a3 = _A(probe_report=rp, out_dir=outp,
+            q_start=','.join(str(v) for v in q0),
+            align_json=[_write_json(rep, 'bad.json', _align_rec(ok=False))])
+    lines = []
+    real_log = cr.log
+    cr.log = lambda *x: lines.append(' '.join(str(v) for v in x))
+    try:
+        rc = cr.align_plan_main(None, a3)
+    finally:
+        cr.log = real_log
+    check('对中结果不可用 ⇒ 返回 1、不写计划、明说不要执行',
+          rc == 1 and not os.path.exists(os.path.join(
+              outp, '00-align-hover-r3.json'))
+          and any('不要执行' in ln for ln in lines), str(lines))
+
+
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
                section_step_cap, section_gap, section_mutation, section_verify,
                section_fuse, section_merge_truth,
-               section_colour, section_pad_pose):
+               section_colour, section_pad_pose, section_align):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

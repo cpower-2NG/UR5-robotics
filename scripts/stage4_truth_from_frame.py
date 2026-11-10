@@ -470,11 +470,14 @@ def survey(frame_dir, split=True, table_top=0.0, yaw_method="colour",
               % (idx, table_z * 1000.0, len(t["blocks"]),
                  t["dropped_out_of_zone"], t["dropped_not_block"]))
         for b in t["blocks"]:
-            print("      #%d %-11s x=%7.1f y=%7.1f yaw=%6.1f  "
-                  "（深度口径 x=%7.1f y=%7.1f）"
+            # 塔的下层是 coaxial 推定的，没有实测深度点 —— 直接下标会 KeyError
+            # （2026-11-10 E1 复验时在 E9 真机腕部帧上踩到，塔一出现必崩）。
+            dxy = b["meas"].get("depth_xy_mm")
+            extra = ("" if not dxy else
+                     "（深度口径 x=%7.1f y=%7.1f）" % (dxy[0], dxy[1]))
+            print("      #%d %-11s x=%7.1f y=%7.1f yaw=%6.1f%s"
                   % (b["id"], b["color"], b["x"] * 1000, b["y"] * 1000,
-                     b["yaw"], b["meas"]["depth_xy_mm"][0],
-                     b["meas"]["depth_xy_mm"][1]))
+                     b["yaw"], extra))
 
 
 def main(argv=None):

@@ -71,6 +71,24 @@ import urkin                                                      # noqa: E402
 #: tool0 z=0.40 ⇒ 指尖 0.196 m，高过任何 29.5 mm 块；x/y 在拾取区上方。
 E9_SURVEY_TOOL0 = (0.520, 0.300, 0.400)
 
+#: E4b 低悬停高度（tool0，m）。取 360：俯视在同一帧里能同时看清**块顶面**与
+#: **两根指**，且指在块上方有 30–40 px 的干净段（2026-11-08 B1 实测）。低于
+#: 300 指尖进画面下缘，高于 420 指与块的像素都缩得太小。
+ALIGN_HOVER_Z = 0.360
+
+#: 单次修正量的上限（mm）。E4b 的判据是 ≤2 mm 残差、≤2 次修正；一次要求挪
+#: 50 mm 以上的只能是量错了（选错块/外参被碰），不是没对准 ⇒ 拒绝应用。
+ALIGN_MAX_CORR_MM = 50.0
+
+#: E4b 允许的修正轮数（判据「≤2 次修正」）。第 3 轮还想改 = 没收敛，停下来查
+#: 量具是在漂还是块被碰了，**不许**接着掰。
+MAX_ALIGN_ROUNDS = 2
+
+#: 收敛判据。与 ``stage4_align`` 的 TOL_MM/TOL_DEG 同源：残差已经在这个量级
+#: 以内就不再发一次运动（量具自己也分辨不到更好）。
+ALIGN_TOL_MM = 2.0
+ALIGN_TOL_DEG = 2.0
+
 #: 跑前/跑后**判分机位**（base 系，m）：一个量具、三个机位，全部由**腕部相机**拍。
 #:
 #: 为什么是三个（2026-11-09 用户拍板「规划与判分都走腕部，俯视不给绝对坐标」）：
@@ -238,6 +256,139 @@ def actions_from_attempt(truth, attempt, pad_thick):
                       ("axis", "sign", "closing", "variant", "verdict")},
     })
     return actions, blocks
+
+
+# ---------------------------------------------------------------- E4b 对中
+def apply_align(truth, actions, align, target, max_corr_mm=ALIGN_MAX_CORR_MM):
+    """把 E4b 的 ``(dx, dy, dyaw)`` 折进目标块。返回写进 manifest 的记录。
+
+    ``(dx, dy)`` 的定义见 ``stage4_align.py``：**块相对夹爪轴**的位移，所以
+    修正就是把目标点加上它。只改目标块，清障块不动（它们的位姿由探针定，
+    与俯视的相对量无关）。
+
+    fail-closed 三条：``ok=false`` / 共识帧 <3 / 单次修正 >``max_corr_mm``
+    ⇒ 抛 ``ValueError``，不应用。量错了比没对上更危险 —— 那会把臂送去抓
+    旁边的块。
+    """
+    if not align.get("ok"):
+        raise ValueError("对中结果 ok=false（%s）" % (align.get("reason") or "?"))
+    cons = align.get("consensus") or {}
+    if int(cons.get("n_used") or 0) < 3:
+        raise ValueError("对中只用上 %s 帧（下限 3）—— 这不是共识"
+                         % cons.get("n_used"))
+    dx, dy = float(cons["dx_mm"]), float(cons["dy_mm"])
+    dyaw = float(cons.get("dyaw_deg") or 0.0)
+    mag = math.hypot(dx, dy)
+    if mag > max_corr_mm:
+        raise ValueError("修正量 %.1f mm，单次上限 %.0f mm —— 先查量具"
+                         "（选块/外参），不要硬掰" % (mag, max_corr_mm))
+    if mag <= ALIGN_TOL_MM and abs(dyaw) <= ALIGN_TOL_DEG:
+        # 已经对准了：残差在量具自身分辨率以内，再发一次运动只是白跑。
+        return {"applied": False, "reason": "already_in_tol",
+                "target": str(target),
+                "dx_mm": round(dx, 2), "dy_mm": round(dy, 2),
+                "dyaw_deg": round(dyaw, 3), "e_before_mm": round(mag, 2),
+                "n_frames": int(cons["n_used"]),
+                "spread_mm": cons.get("spread_mm"),
+                "source": align.get("burst")}
+    tid = str(target)
+    blk = find_block(truth["blocks"], tid)
+    if blk is None:
+        raise ValueError("真值里没有目标块 %r" % (tid,))
+    act = next((a for a in actions
+                if a["kind"] == "target" and str(a["block"]) == tid), None)
+    if act is None:
+        raise ValueError("动作表里没有目标块 %r" % (tid,))
+    before = [round(float(blk["x"]) * 1000.0, 1),
+              round(float(blk["y"]) * 1000.0, 1)]
+    blk["x"] = float(blk["x"]) + dx / 1000.0
+    blk["y"] = float(blk["y"]) + dy / 1000.0
+    blk["yaw"] = float(blk.get("yaw", 0.0)) + dyaw
+    act["from_xy"] = [act["from_xy"][0] + dx / 1000.0,
+                      act["from_xy"][1] + dy / 1000.0]
+    act["grasp_yaw_deg"] = float(act["grasp_yaw_deg"]) + dyaw
+    return {"applied": True, "target": tid,
+            "dx_mm": round(dx, 2), "dy_mm": round(dy, 2),
+            "dyaw_deg": round(dyaw, 3),
+            "e_before_mm": round(mag, 2),
+            "n_frames": int(cons["n_used"]),
+            "spread_mm": cons.get("spread_mm"),
+            "source": align.get("burst"),
+            "block_xy_before_mm": before,
+            "block_xy_after_mm": [round(float(blk["x"]) * 1000.0, 1),
+                                  round(float(blk["y"]) * 1000.0, 1)]}
+
+
+def apply_align_jsons(truth, actions, paths, target):
+    """按顺序折进多轮 ``(dx, dy, dyaw)``。返回每轮记录（manifest 用）。
+
+    轮数是**累计**的：第 2 轮量的是「悬停在已修正位置上」的残差，所以两次
+    增量相加才对得上真值。超过 ``MAX_ALIGN_ROUNDS`` 直接拒绝 —— 那不是还没
+    对准，是量具/场景出了问题。
+    """
+    paths = list(paths or [])
+    if len(paths) > MAX_ALIGN_ROUNDS:
+        raise ValueError("对中修正给了 %d 轮，上限 %d —— 先查为什么没收敛"
+                         % (len(paths), MAX_ALIGN_ROUNDS))
+    recs = []
+    for p in paths:
+        with open(p, encoding="utf-8") as f:
+            align = json.load(f)
+        recs.append(apply_align(truth, actions, align, target))
+    return recs
+
+
+def plan_align_hover(chain, q_start, action, out_dir, hover_z=ALIGN_HOVER_Z,
+                     transit_dz=0.10, name="00-align-hover.json"):
+    """E4b 低悬停计划：tool0 停在目标块正上方 ``hover_z``，姿态 = 计划抓取角。
+
+    两个航点：先竖直抬到 ``hover_z+transit_dz``（跨过任何塔顶），再落到
+    ``hover_z``。不带走位：这一段只负责「臂停住，让俯视拍同一帧」。
+    张爪（``before.gripper=open``）与真正抓取前的状态一致 —— 量到的两指像素
+    位置才对应抓取那一刻。**张爪要写寄存器，属当次授权范围。**
+    """
+    x, y = float(action["from_xy"][0]), float(action["from_xy"][1])
+    yaw = float(action["grasp_yaw_deg"])
+    q = [float(v) for v in q_start]
+    wps = []
+    for i, (nm, z) in enumerate((("align_transit", hover_z + transit_dz),
+                                 ("align", hover_z))):
+        T = pp.target_matrix([x, y, z], yaw)
+        qn, err_mm, err_deg, _it = chain.ik(T, q)
+        if qn is None or err_mm > 2.0 or err_deg > 1.0:
+            raise pp.PlanError(
+                "对中悬停航点 %s IK 不过：err=%.2f mm / %.2f°"
+                % (nm, 0.0 if qn is None else err_mm,
+                   0.0 if qn is None else err_deg))
+        wp = {"name": nm, "q": [float(v) for v in qn],
+              "duration": pp.duration_for(q, qn)}
+        if i == 0:
+            wp["before"] = {"gripper": "open"}
+        wps.append(wp)
+        q = [float(v) for v in qn]
+    plan = {"version": 2,
+            "meta": {"kind": "align_hover",
+                     "block_idx": str(action["block"]),
+                     "block_xy_mm": [round(x * 1000.0, 1),
+                                     round(y * 1000.0, 1)],
+                     "hover_z_mm": round(hover_z * 1000.0, 1),
+                     "yaw_grasp_deg": round(yaw, 3),
+                     "e9": {"kind": "align_hover", "block": action["block"],
+                            "purpose": "E4b 低悬停：俯视同一帧量 (dx,dy,dyaw)"}},
+            "q_start": [float(v) for v in q_start],
+            "waypoints": wps}
+    path = os.path.join(out_dir, name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(plan, f, ensure_ascii=False, indent=1)
+    return {"index": 0, "name": name, "path": path, "kind": "align_hover",
+            "block": action["block"], "slot": None,
+            "from_xy": [x, y], "grasp_yaw_deg": yaw,
+            "n_waypoints": len(wps)}, plan
+
+
+def align_burst_needed(plans):
+    """哪些计划后面要拍对中/偏心 burst —— 只回报，不改计划。"""
+    return [p["name"] for p in plans if p.get("kind") == "align_hover"]
 
 
 # ---------------------------------------------------------------- 计划
@@ -1022,12 +1173,31 @@ def verify_main(args):
     return 0 if rep["ok"] else 1
 
 
-def run_script_text(plans, board_dir, log_dir, burst_dirs=None):
+def _exec_cmd(board_dir, log_dir, name, extra=""):
+    return ('~/precision/run.sh ~/precision/precision_exec.py '
+            '--plan %s/%s --go --require-auth "$TOKEN" %s'
+            '--log %s/%s.jsonl' % (board_dir, name, extra, log_dir, name))
+
+
+def _burst_cmd(camera, out_dir, n=20):
+    return ('~/precision/run.sh ~/precision/precision_capture.py '
+            '--camera %s --burst %d %s' % (camera, n, out_dir))
+
+
+def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
+                    align_burst_dir=None, held_burst_dir=None):
     """计划序列 → 板端 ``.sh`` 文本。
 
     ``burst_dirs``：``{机位名: 板上目录}``。某个机位计划执行完就**当场**拍一组
     腕部 burst —— 臂必须停在该机位上拍，不能等全部跑完再补（那时臂在最后一个
     机位）。拍不到就 fail：没有跑后帧就没有判分，不许把「没拍」混成「没跑红」。
+
+    ``align_burst_dir``（E4b 抓前对中）：``align_hover`` 计划跑完停住，拍一组
+    **俯视** burst。
+
+    ``held_burst_dir``（E4b 抓后偏心）：目标计划在 ``lift`` 处**切开** ——
+    ``--upto lift`` → 拍俯视 burst → ``--from to_slot --holding-block`` 接着跑。
+    切开是为了让块**还夹在爪里、臂静止**时拍；跑完整条就没块了。
     """
     burst_dirs = burst_dirs or {}
     lines = ["#!/bin/bash",
@@ -1039,24 +1209,111 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None):
              'fail() { echo "!!!!! STOP: $*"; exit 9; }']
     for p in plans:
         lines.append('echo "===== %s : exec"' % p["name"])
-        lines.append(
-            '~/precision/run.sh ~/precision/precision_exec.py '
-            '--plan %s/%s --go --require-auth "$TOKEN" '
-            '--log %s/%s.jsonl' % (board_dir, p["name"], log_dir, p["name"]))
-        lines.append('rc=$?')
-        lines.append('[ $rc -eq 0 ] || fail "%s rc=$rc"' % p["name"])
+        split = (held_burst_dir is not None and p.get("kind") == "target")
+        if split:
+            lines.append(_exec_cmd(board_dir, log_dir, p["name"],
+                                   "--upto lift "))
+            lines.append('rc=$?')
+            lines.append('[ $rc -eq 0 ] || fail "%s --upto lift rc=$rc"'
+                         % p["name"])
+            lines.append('sleep 1')
+            lines.append('echo "===== 抓后偏心 %s : 俯视 burst 20"' % p["name"])
+            lines.append(_burst_cmd("topcam", held_burst_dir))
+            lines.append('rc=$?')
+            lines.append('[ $rc -eq 0 ] || fail "抓后偏心 burst rc=$rc"')
+            lines.append('sleep 1')
+            lines.append('echo "===== %s : 续跑 to_slot 之后"' % p["name"])
+            lines.append(_exec_cmd(board_dir, log_dir, p["name"],
+                                   "--from to_slot --holding-block "))
+            lines.append('rc=$?')
+            lines.append('[ $rc -eq 0 ] || fail "%s --from to_slot rc=$rc"'
+                         % p["name"])
+        else:
+            lines.append(_exec_cmd(board_dir, log_dir, p["name"]))
+            lines.append('rc=$?')
+            lines.append('[ $rc -eq 0 ] || fail "%s rc=$rc"' % p["name"])
         lines.append('sleep 1')
         view = p.get("view")
         if p.get("kind") == "view" and view in burst_dirs:
             # 判分帧：臂刚停在这个机位上，就地拍（换机位就拍不到了）。
             lines.append('echo "===== 判分机位 %s : burst 20"' % view)
-            lines.append(
-                '~/precision/run.sh ~/precision/precision_capture.py '
-                '--camera wrist --burst 20 %s' % burst_dirs[view])
+            lines.append(_burst_cmd("wrist", burst_dirs[view]))
             lines.append('rc=$?')
             lines.append('[ $rc -eq 0 ] || fail "机位 %s burst rc=$rc"' % view)
+        elif p.get("kind") == "align_hover" and align_burst_dir:
+            lines.append('echo "===== 对中悬停 : 俯视 burst 20"')
+            lines.append(_burst_cmd("topcam", align_burst_dir))
+            lines.append('rc=$?')
+            lines.append('[ $rc -eq 0 ] || fail "对中 burst rc=$rc"')
     lines.append('echo "ALL DONE"')
     return "\n".join(lines) + "\n"
+
+
+def align_plan_main(ap, args):
+    """E4b 一轮：出低悬停计划 ``00-align-hover.json`` + ``align.sh``。
+
+    ``align.sh`` = 执行悬停计划 → **停住**拍一组俯视 burst（``--camera topcam
+    --burst 20``）。它同样要当次运动令牌（动臂）。拍完把 burst 拉回开发机，
+    用 ``stage4_align.py --burst <dir> --held 否 --block-top-mm ...`` 量
+    ``(dx, dy, dyaw)``，再带着 ``--align-json`` 回来出下一轮（或主计划）。
+    """
+    with open(args.probe_report, encoding="utf-8") as f:
+        report = json.load(f)
+    scene, truth = load_scene(report, args.scene_index, args.truth)
+    attempt = pick_attempt(scene, args.target)
+    pad_thick = (cm.PAD_THICK if args.pad_thick is None
+                 else float(args.pad_thick))
+    actions, _blocks = actions_from_attempt(truth, attempt, pad_thick)
+    os.makedirs(args.out_dir, exist_ok=True)
+    try:
+        recs = apply_align_jsons(truth, actions, args.align_json, attempt["id"])
+    except ValueError as e:
+        log("!! 对中结果不可用：%s" % e)
+        log("   计划**没有**写出 —— 不要执行。")
+        return 1
+    act = next((a for a in actions
+                if a["kind"] == "target" and str(a["block"]) == str(attempt["id"])),
+               None)
+    if act is None:
+        log("!! 动作表里没有目标块 %s" % attempt["id"])
+        return 1
+    chain, q_start = q_start_of_args(ap, args)
+    try:
+        rec, _plan = plan_align_hover(chain, q_start, act, args.out_dir,
+                                      hover_z=args.hover_z,
+                                      name="00-align-hover-r%d.json"
+                                           % (len(recs) + 1))
+    except pp.PlanError as e:
+        log("!! 对中悬停预检不过：%s" % e)
+        log("   计划**没有**写出 —— 不要执行。")
+        return 1
+    burst = args.align_burst_dir
+    if burst is None:
+        burst = "$HOME/precision/e9/%s/topcam-align/r%d" % (
+            os.path.basename(os.path.abspath(args.out_dir)), len(recs) + 1)
+    sh = run_script_text([rec], args.board_dir, args.board_log_dir,
+                         align_burst_dir=burst)
+    spath = os.path.join(args.out_dir, "align-r%d.sh" % (len(recs) + 1))
+    with open(spath, "w", encoding="utf-8") as f:
+        f.write(sh)
+    os.chmod(spath, 0o755)
+    man = {"round": len(recs) + 1, "target": attempt["id"],
+           "align_applied": recs, "align_burst_dir": burst,
+           "plan": rec, "q_start": [float(v) for v in q_start]}
+    mpath = os.path.join(args.out_dir, "align-r%d.json" % (len(recs) + 1))
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(man, f, ensure_ascii=False, indent=1)
+    for r in recs:
+        log("  已折进修正 r: d=(%.2f, %.2f) mm  dψ=%.2f°  (%s)"
+            % (r["dx_mm"], r["dy_mm"], r["dyaw_deg"],
+               r.get("reason") or "applied"))
+    log("  悬停 tool0 = (%.3f, %.3f, %.3f)  ψ=%6.1f°"
+        % (rec["from_xy"][0], rec["from_xy"][1], args.hover_z,
+           rec["grasp_yaw_deg"]))
+    log("  对中 burst → %s" % burst)
+    log("→ %s" % spath)
+    log("→ %s" % mpath)
+    return 0
 
 
 def q_start_of_args(ap, args):
@@ -1181,6 +1438,23 @@ def main(argv=None):
     ap.add_argument("--board-wrist-burst-dir", default=None,
                     help="板上腕部 burst 的**根**目录（写进 run.sh）；缺省 "
                          "$HOME/precision/e9/<本场目录名>/wrist-post，每个机位一个子目录")
+    ap.add_argument("--align-plan", action="store_true",
+                    help="只出 E4b **一轮**低悬停计划（00-align-hover-r<N>.json）"
+                         "与 align.sh（执行后停住拍俯视 burst）；不动主序列")
+    ap.add_argument("--align-json", action="append", default=None,
+                    metavar="ALIGN.json",
+                    help="stage4_align.py 的对中结果（可重复，最多 %d 轮）；"
+                         "按顺序折进目标块再出计划。与 --align-plan 合用即下一轮"
+                         % MAX_ALIGN_ROUNDS)
+    ap.add_argument("--align-burst-dir", default=None,
+                    help="板上对中俯视 burst 目录（写进 align.sh / run.sh）；"
+                         "缺省 $HOME/precision/e9/<本场>/topcam-align/r<N>")
+    ap.add_argument("--held-burst-dir", default=None,
+                    help="板上**抓后偏心**俯视 burst 目录；给了就把目标计划在 "
+                         "lift 处切开（--upto lift → 拍 → --from to_slot "
+                         "--holding-block）。缺省不切")
+    ap.add_argument("--hover-z", type=float, default=ALIGN_HOVER_Z,
+                    help="E4b 低悬停高度（tool0，m；缺省 %.3f）" % ALIGN_HOVER_Z)
     ap.add_argument("--no-wrist-survey", action="store_true",
                     help="不在序列末尾加判分机位（只为复现旧计划；"
                          "没有它就没有跑后判分帧，E9 判分不许用）")
@@ -1200,6 +1474,9 @@ def main(argv=None):
     if not args.probe_report:
         ap.error("生成计划要给 --probe-report（核验请用 --verify）")
 
+    if args.align_plan:
+        return align_plan_main(ap, args)
+
     with open(args.probe_report, encoding="utf-8") as f:
         report = json.load(f)
     scene, truth = load_scene(report, args.scene_index, args.truth)
@@ -1208,6 +1485,13 @@ def main(argv=None):
     grid_path = apply_pad_pose(args, args.out_dir)
     pad_thick = cm.PAD_THICK if args.pad_thick is None else float(args.pad_thick)
     actions, blocks = actions_from_attempt(truth, attempt, pad_thick)
+    try:
+        align_recs = apply_align_jsons(truth, actions, args.align_json,
+                                       attempt["id"])
+    except ValueError as e:
+        log("!! 对中结果不可用：%s" % e)
+        log("   计划**没有**写出 —— 不要执行。")
+        return 1
 
     chain, q_start = q_start_of_args(ap, args)
 
@@ -1257,13 +1541,18 @@ def main(argv=None):
                           ("id", "x", "y", "z", "yaw", "size")}
                          for b in final_layout],
         "terminal": attempt.get("terminal"),
+        "align": align_recs,
+        "align_burst_dir": args.align_burst_dir,
+        "held_burst_dir": args.held_burst_dir,
     }
     mpath = os.path.join(args.out_dir, "manifest.json")
     with open(mpath, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=1)
 
     sh = run_script_text(plans, args.board_dir, args.board_log_dir,
-                         burst_dirs=burst_dirs)
+                         burst_dirs=burst_dirs,
+                         align_burst_dir=args.align_burst_dir,
+                         held_burst_dir=args.held_burst_dir)
     spath = os.path.join(args.out_dir, "run.sh")
     with open(spath, "w", encoding="utf-8") as f:
         f.write(sh)
@@ -1279,10 +1568,17 @@ def main(argv=None):
             % (p["name"], p["kind"], p["block"],
                p["from_xy"][0], p["from_xy"][1], p["slot"][0], p["slot"][1],
                p["grasp_yaw_deg"], p["n_waypoints"]))
+    for r in align_recs:
+        log("  对中修正 d=(%+.2f, %+.2f) mm  dψ=%+.2f°  %s"
+            % (r["dx_mm"], r["dy_mm"], r["dyaw_deg"],
+               r.get("reason") or "已应用"))
     for k in ("pick", "free", "pad"):
         if k in burst_dirs:
             log("  跑后 burst %-5s → %s（判分时 --view-truth %s=… 用它）"
                 % (k, burst_dirs[k], k))
+    if args.held_burst_dir:
+        log("  抓后偏心 burst → %s（目标计划在 lift 处切开拍）"
+            % args.held_burst_dir)
     log("→ %s" % mpath)
     log("→ %s" % spath)
     return 0
