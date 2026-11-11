@@ -216,6 +216,29 @@ def check_token(token, auth_dir=None, now=None):
     return True, '', now - float(doc['play_at'])
 
 
+def token_remaining(token, auth_dir=None, now=None):
+    """令牌**还剩多少秒**（用板/本机当前时间判）。返回 ``(seconds, 原因)``。
+
+    与 ``check_token`` 的分工：它只回答「成不成立」；整轮编排器要回答的是
+    「够不够跑完剩下的段」（R1/R2）与执行脚本首行的 ``--min-remaining`` 守卫，
+    所以这里把剩余秒数直接给出来。令牌不成立时 ``seconds=None``、``原因`` 说明
+    是哪一种（没有 / 不匹配 / 过期 / 缺两步记录）。只读，不改文件。
+    """
+    now = time.time() if now is None else float(now)
+    try:
+        doc = json.load(open(token_path(auth_dir), encoding='utf-8'))
+    except (OSError, ValueError):
+        return None, '没有授权令牌（先做 STOP→PLAY 两步握手）'
+    if doc.get('token') != token:
+        return None, '令牌不匹配（令牌来自另一次握手）'
+    if not doc.get('play_at') or not doc.get('stop_at'):
+        return None, '令牌缺少 STOP/PLAY 两步记录'
+    rem = float(doc.get('expires') or 0) - now
+    if rem <= 0:
+        return None, '令牌已过期（超过 %.0f 秒）' % TOKEN_TTL_S
+    return rem, ''
+
+
 # ---------------------------------------------------------------- CLI
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -224,6 +247,9 @@ def main(argv=None):
     g.add_argument('--step', choices=('stop', 'play'))
     g.add_argument('--check-token', default=None,
                    help='只校验令牌（不动控制柜）')
+    ap.add_argument('--min-remaining', type=float, default=0.0,
+                    help='配合 --check-token：剩余秒数低于它就算不成立（退出 2）。'
+                         '执行脚本首行用它，别让令牌在跑到一半时过期')
     ap.add_argument('--robot-ip', default=os.environ.get('UR_ROBOT_IP'),
                     help='控制柜 IP（默认环境变量 UR_ROBOT_IP）')
     ap.add_argument('--timeout', type=float, default=120.0)
@@ -232,9 +258,17 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.check_token:
-        ok, why, age = check_token(args.check_token, args.auth_dir)
-        print(('OK：握手在 %.0f 秒前完成' % age) if ok else ('不成立：%s' % why))
-        return 0 if ok else 2
+        rem, why = token_remaining(args.check_token, args.auth_dir)
+        if rem is None:
+            print('不成立：%s' % why)
+            return 2
+        if rem < float(args.min_remaining):
+            print('不成立：令牌只剩 %.0f 秒（要求 ≥ %.0f 秒）—— 现在发会让它'
+                  '跑到一半过期' % (rem, args.min_remaining))
+            return 2
+        print('OK：握手在 %.0f 秒前完成，剩 %.0f 秒'
+              % (TOKEN_TTL_S - rem, rem))
+        return 0
 
     if not args.robot_ip:
         print('!! 缺 --robot-ip（环境变量 UR_ROBOT_IP 也没设）')

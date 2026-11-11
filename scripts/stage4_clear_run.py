@@ -17,13 +17,16 @@
 ------------------
 ``build_pick`` 有一条粗判据「被抓块离最近邻块中心距 ≥60 mm」。E9 的目标
 恰恰是**贴面/邻块**场景：探针已经用 OBB 判过「这个候选位姿夹爪不碰」，
-它比中心距细（贴面块只要在合拢轴方向让开就能抓）。所以这里显式给
-``min_block_gap=0.0``，并在 manifest 里写 ``gap_check: probe_verified``。
-**没有探针判决的调用方不许这样放宽。**
+它比中心距细（贴面块只要在合拢轴方向让开就能抓）。所以探针判过的调用方显式给
+``min_block_gap=0.0`` 并在 manifest 里写 ``gap_check: probe_verified``；
+**没探针判决的（S0 这种无接触布局）走默认 60 mm 粗判据，manifest 记
+``gap_check: layout_gap``** —— 不许无判决地放宽。
 
-跑前/跑后各拍**三个腕部机位**（``E9_VIEWS``：拾取区 / 北侧自由区 / 垫面），
-全部走腕部几何链，俯视不参与任何绝对坐标（2026-11-09 用户拍板：规划与判分都
-用腕部相机）。跑后核验（``--view-truth``）读这三份机位真值合并成一份终态。
+阶段 4 正式轮（2026-11-11 起）的机位分两段：**跑前**只拍 pick / pad 两个机位
+（解垫位姿、量目标块、看拾取区；S0 无清障，不需要 free），**跑后**三个机位
+（``E9_VIEWS``：拾取区 / 北侧自由区 / 垫面）齐全。全部走腕部几何链，俯视不参与
+任何绝对坐标（2026-11-09 用户拍板：规划与判分都用腕部相机）。跑后核验
+（``--view-truth``）读这三份机位真值合并成一份终态。
 目标块「落在指定格」用**彩色顶面质心**量 —— 垫面在深度里分辨不出 29.5 mm 台阶
 （2026-11-08 实测，见 ``measure_target_colour``）；其余判据仍用深度真值。
 仍不 import ROS。
@@ -205,13 +208,70 @@ def surface_of(to_z, size, where, pad_thick=None):
                      "既不是台面也不是垫面）" % (where, float(to_z), z))
 
 
-def actions_from_attempt(truth, attempt, pad_thick):
+def _bias_xy_mm(bias_mm):
+    """``bias_mm`` → ``(bx, by)`` 毫米；``None`` ⇒ ``(0, 0)``（不补）。"""
+    if bias_mm is None:
+        return 0.0, 0.0
+    return float(bias_mm[0]), float(bias_mm[1])
+
+
+def _target_xy_action(kind, tid, from_xy, from_top, desired_xy_m,
+                      surface_z, grasp_yaw, grasp_hit, bias_mm):
+    """目标动作的落点三坐标：**期望**（格心）/ **命令**（期望 − b̂）/ 所用 b̂。"""
+    bx, by = _bias_xy_mm(bias_mm)
+    desired_mm = [float(desired_xy_m[0]) * 1000.0,
+                  float(desired_xy_m[1]) * 1000.0]
+    commanded_mm = [desired_mm[0] - bx, desired_mm[1] - by]
+    return {
+        "kind": kind,
+        "block": str(tid),
+        "from_xy": [float(from_xy[0]), float(from_xy[1])],
+        "from_top": float(from_top),
+        "slot": [commanded_mm[0] / 1000.0, commanded_mm[1] / 1000.0],
+        "surface_z": float(surface_z),
+        "grasp_yaw_deg": grasp_yaw,
+        "grasp_hit": grasp_hit,
+        # 三份坐标分开记（阶段三 planned.desired/commanded/applied_bias 同构）：
+        # 判分永远比 desired，臂收到的是 commanded，差出来的就是 b̂。
+        "desired_center_mm": [round(v, 3) for v in desired_mm],
+        "commanded_center_mm": [round(v, 3) for v in commanded_mm],
+        "applied_bias_mm": ([round(bx, 3), round(by, 3)]
+                            if bias_mm is not None else None),
+    }
+
+
+def build_target_action(block, grasp_hit, cell, pad_thick, bias_mm=None):
+    """按**实测宫格**现算目标动作（不依赖探针的 ``final_blocks``）。
+
+    这是「探针前置」后备路径的入口：探针在授权前按旧布局跑（只读、不动臂），
+    授权后解出新垫，就用本函数以 ``cm.cell_center(cell)`` 重算落点 —— 探针的
+    place 合法性只说明「那个位姿在旧垫上合法」，落点必须按新垫给。
+    默认路径仍走 ``actions_from_attempt``（探针结果 + 实测格心断言）。
+
+    ``bias_mm`` 是 b̂（毫米）；命令落点 = 格心 − b̂，期望仍是格心。
+    """
+    cx, cy = cm.cell_center(int(cell))
+    return _target_xy_action(
+        "target", block["id"], [block["x"], block["y"]], block["top"],
+        [cx, cy], float(pad_thick),
+        grasp_yaw_deg(grasp_hit, block.get("yaw", 0.0)),
+        {k: (grasp_hit or {}).get(k) for k in
+         ("axis", "sign", "closing", "variant", "verdict")},
+        bias_mm)
+
+
+def actions_from_attempt(truth, attempt, pad_thick, bias_mm=None):
     """探针的一次成功尝试 → 有序动作表（清障在前，目标在最后）。
 
     返回的 ``blocks`` 是**原始布局**（不预先搬运）：搬运由
     ``plan_sequence`` 在**算完那一步之后**才施加 —— 否则清障那一步会按
     「块已经躺在落点」去算，臂会跑去错的地方。
     起点用探针记录的 ``step["from"]``（那一刻的实测位姿），不用布局推算。
+
+    ``attempt["cell"]``（``--cells`` 逐目标格位）给了就**钉住**：探针终态块心
+    必须落在 ``cell_center(cell)`` 1 mm 内、yaw 与真值一致，否则抛错 ——
+    否则探针可能读的是模型垫、计划按实测垫放，两边各自自洽却差 87 mm。
+    ``bias_mm``（b̂，毫米）：目标格心的**命令**落点 = 格心 − b̂（阶段三 §4.1）。
     """
     blocks = [dict(b) for b in truth["blocks"]]
     actions = []
@@ -250,18 +310,30 @@ def actions_from_attempt(truth, attempt, pad_thick):
         raise ValueError("目标块 %r 的落点支撑面 %.4f m 不是垫面 %.4f m —— "
                          "探针与执行器对放置面的理解不一致"
                          % (tid, surf, float(pad_thick)))
-    actions.append({
-        "kind": "target",
-        "block": tid,
-        "from_xy": [float(tgt["x"]), float(tgt["y"])],
-        "from_top": float(tgt["top"]),
-        "slot": [float(final["x"]), float(final["y"])],
-        "surface_z": surf,                  # 目标放到垫上
-        "grasp_yaw_deg": grasp_yaw_deg(attempt.get("grasp_hit"),
-                                       tgt.get("yaw", 0.0)),
-        "grasp_hit": {k: attempt["grasp_hit"].get(k) for k in
-                      ("axis", "sign", "closing", "variant", "verdict")},
-    })
+    cell = attempt.get("cell")
+    if cell is not None:
+        cx, cy = cm.cell_center(int(cell))
+        d = math.hypot(float(final["x"]) - cx, float(final["y"]) - cy)
+        if d > 1e-3:
+            raise ValueError(
+                "目标块 %r 的探针终态 (%.1f, %.1f) mm 离实测格 %d 的格心 "
+                "(%.1f, %.1f) mm 有 %.2f mm（上限 1）—— 探针与计划不是同一份"
+                "垫位姿，停下来查，不要套格"
+                % (tid, final["x"] * 1000, final["y"] * 1000, int(cell),
+                   cx * 1000, cy * 1000, d * 1000.0))
+        dyaw = abs(float(final.get("yaw", 0.0)) - float(tgt.get("yaw", 0.0)))
+        if dyaw > 1e-6:
+            raise ValueError("目标块 %r 的探针终态 yaw %.3f° ≠ 真值 %.3f°"
+                             % (tid, final.get("yaw", 0.0), tgt.get("yaw", 0.0)))
+        desired = [cx, cy]
+    else:
+        desired = [float(final["x"]), float(final["y"])]
+    actions.append(_target_xy_action(
+        "target", tid, [tgt["x"], tgt["y"]], tgt["top"], desired, surf,
+        grasp_yaw_deg(attempt.get("grasp_hit"), tgt.get("yaw", 0.0)),
+        {k: (attempt.get("grasp_hit") or {}).get(k) for k in
+         ("axis", "sign", "closing", "variant", "verdict")},
+        bias_mm))
     return actions, blocks
 
 
@@ -487,7 +559,8 @@ def plan_views(chain, q_start, views, out_dir, start=0):
 
 def plan_sequence(chain, q_start, actions, blocks, out_dir,
                   survey_tool0=E9_SURVEY_TOOL0, place_clearance=None,
-                  wrist_survey=True, views=None, place_yaw_equiv=False):
+                  wrist_survey=True, views=None, place_yaw_equiv=False,
+                  start=0, min_block_gap=0.0, gap_check="probe_verified"):
     """逐步生成计划；任何一步预检失败就抛 ``pp.PlanError``，不写半份序列。
 
     ``wrist_survey=True``（缺省）在序列末尾依次平动到 ``views`` 里的每个
@@ -501,6 +574,14 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
     再试 180° 等价写法（``fold_yaw_180`` 的物理等价：只换手指、不换面，
     方块/矩形块的落点与朝向逐字节相同）。**只对 `pp.BranchChainError` 重试**，
     其它拒绝换朝向救不回来。用的是哪个写法逐条记进计划 meta 与 manifest。
+
+    ``start``：计划名的 ``%02d`` 前缀与 ``index`` 的起点（整轮编排器把 5 个
+    目标接在同一个 ``plan/`` 目录里，名字必须错开，否则后一份覆盖前一份、
+    执行日志也跟着串名）。旧调用不传 ⇒ 从 1 开始，行为不变。
+
+    ``min_block_gap`` / ``gap_check``：``build_pick`` 的邻块粗判据与它的**判决
+    来源**。缺省 ``0.0 / probe_verified`` 是 E9 贴面场景；S0 这类无接触布局
+    **必须**用 ``60 mm / layout_gap`` —— 放宽要有判决，判决来源要落盘。
     """
     layout = [dict(b) for b in blocks]
     q = [float(v) for v in q_start]
@@ -542,8 +623,9 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                     # 压在目标上的块：`h`（块顶离台面）≠ 物理块高，必须显式给
                     # 物理块高，否则抓取高度按两个块高算（= 2026-11-02 拆塔事故）。
                     block_h_m=float(blk["size"]),
-                    # 见模块头：探针已用 OBB 判过间隙，这里的 60 mm 粗判据必须让位。
-                    min_block_gap=0.0)
+                    # 见模块头：探针已用 OBB 判过间隙才允许放宽；S0 无接触布局
+                    # 仍走 60 mm 粗判据（gap_check=layout_gap）。
+                    min_block_gap=float(min_block_gap))
             except pp.BranchChainError as e:
                 first_err = first_err or e
                 continue
@@ -565,19 +647,29 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                                  "grasp_yaw_deg": round(
                                      float(act["grasp_yaw_deg"]), 3),
                                  "place_yaw_equiv180": yaw_used is not None,
-                                 "gap_check": "probe_verified",
+                                 "gap_check": gap_check,
+                                 "desired_center_mm": act.get(
+                                     "desired_center_mm"),
+                                 "commanded_center_mm": act.get(
+                                     "commanded_center_mm"),
+                                 "applied_bias_mm": act.get("applied_bias_mm"),
                                  "checks": checks}),
                 "q_start": list(q),
                 "waypoints": wps}
-        name = "%02d-%s-block-%s.json" % (i, act["kind"], act["block"])
+        name = "%02d-%s-block-%s.json" % (int(start) + i, act["kind"],
+                                          act["block"])
         path = os.path.join(out_dir, name)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=1)
-        plans.append({"index": i, "name": name, "path": path,
+        plans.append({"index": int(start) + i, "name": name, "path": path,
                       "kind": act["kind"], "block": act["block"],
                       "slot": act["slot"], "from_xy": act["from_xy"],
                       "grasp_yaw_deg": act["grasp_yaw_deg"],
                       "place_yaw_equiv180": yaw_used is not None,
+                      "desired_center_mm": act.get("desired_center_mm"),
+                      "commanded_center_mm": act.get("commanded_center_mm"),
+                      "applied_bias_mm": act.get("applied_bias_mm"),
+                      "gap_check": gap_check,
                       "n_waypoints": len(wps)})
         q = [float(v) for v in wps[-1]["q"]]
         move_in_layout(layout, act["block"], act["slot"][0], act["slot"][1],
@@ -585,7 +677,7 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
     if wrist_survey:
         vplans, q = plan_views(
             chain, q, E9_VIEWS if views is None else views, out_dir,
-            start=len(plans))
+            start=int(start) + len(plans))
         plans.extend(vplans)
     return plans, layout, q
 
@@ -840,8 +932,9 @@ COLOUR_CAMERAS = {"topcam": (gc.TOPCAM_TIP, gc.TOPCAM_CHAIN),
                   "wrist": (gc.TIP, gc.CHAIN)}
 
 
-def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=60.0,
-                          max_frames=10, min_frames=5, camera="wrist"):
+def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=25.0,
+                          max_frames=10, min_frames=5, camera="wrist",
+                          expect_hue_deg=None, expect_class=None):
     """跑后某一路相机的 burst → 目标块顶面质心（台面 mm，中位）与可复现性。
 
     **为什么目标块要换彩色量**（2026-11-08 用户拍板）：垫面在俯视深度里
@@ -857,6 +950,14 @@ def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=60.0,
     返回 ``{"ok", "xy_mm", "hue_deg", "n_frames", "n_missed", "miss_reasons",
     "per_frame", "search_mm", "top_z"}``。漏帧不静默：每一帧漏的原因都写下来
     （缺静态 TF / 窗内没看见 / 投不到像面），``ok`` 只看看得见的帧数够不够。
+
+    **默认窗 25 mm**（正式轮）：格心彼此 ≥84.85 mm、邻块最近角 45.25 mm，
+    60 mm 窗会把对角邻块的角罩进来 —— 彩色量一旦抓到邻块，质心偏一个格距的
+    分量，落格判分跟着错，而且看起来「有数」。
+
+    ``expect_hue_deg`` / ``expect_class``：交叉核对（**只告警，不改 ``ok``**）。
+    ``class_match`` 走 ``block_classes.nearest_class_by_hue``（真机实测色相表）
+    —— 量出来的色相若会被判成**另一种颜色**，说明窗里抓错了块或光变了。
     """
     if camera not in COLOUR_CAMERAS:
         raise ValueError("camera 只能是 %s，收到 %r"
@@ -916,6 +1017,20 @@ def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=60.0,
         sn = sum(math.sin(math.radians(r["hue_deg"])) for r in rows)
         cs = sum(math.cos(math.radians(r["hue_deg"])) for r in rows)
         out["hue_deg"] = round(math.degrees(math.atan2(sn, cs)) % 360.0, 1)
+        if expect_hue_deg is not None or expect_class is not None:
+            import block_classes as bc     # 惰性 import：多数调用不需要色表
+            hue = float(out["hue_deg"])
+            out["expected_hue_deg"] = (None if expect_hue_deg is None
+                                       else round(float(expect_hue_deg), 1))
+            if expect_hue_deg is not None:
+                out["hue_delta_deg"] = round(
+                    bc.hue_distance(hue, float(expect_hue_deg)), 1)
+            if expect_class is not None:
+                got, dist = bc.nearest_class_by_hue(hue)
+                out["expected_class"] = str(expect_class)
+                out["measured_class"] = got
+                out["class_match"] = bool(got == str(expect_class))
+                out.setdefault("hue_delta_deg", round(float(dist), 1))
     return out
 
 
@@ -1291,7 +1406,8 @@ def _burst_cmd(camera, out_dir, n=20):
 
 
 def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
-                    align_burst_dir=None, held_burst_dir=None):
+                    align_burst_dir=None, held_burst_dir=None,
+                    token_min_remaining=None):
     """计划序列 → 板端 ``.sh`` 文本。
 
     ``burst_dirs``：``{机位名: 板上目录}``。某个机位计划执行完就**当场**拍一组
@@ -1304,6 +1420,12 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
     ``held_burst_dir``（E4b 抓后偏心）：目标计划在 ``lift`` 处**切开** ——
     ``--upto lift`` → 拍俯视 burst → ``--from to_slot --holding-block`` 接着跑。
     切开是为了让块**还夹在爪里、臂静止**时拍；跑完整条就没块了。
+
+    ``token_min_remaining``（秒）：非 ``None`` 时在脚本**开头**插一行板端守卫
+    —— 令牌剩余不够就把整份脚本判失败（rc 9），一条轨迹都不发。600 s 令牌从
+    STOP→PLAY 起算，观察/解垫/探针/规划都在里面耗；执行起手时剩多少，只有板子
+    自己知道。最后一道仍是 ``precision_exec --require-auth``（逐条计划前查），
+    但它过期发生在**跑到一半**，那时块可能已经夹在爪里 —— 所以先拦一道。
     """
     burst_dirs = burst_dirs or {}
     lines = ["#!/bin/bash",
@@ -1313,6 +1435,20 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
              'TOKEN="$1"',
              '[ -n "${TOKEN:-}" ] || { echo "用法: $0 <token>"; exit 2; }',
              'fail() { echo "!!!!! STOP: $*"; exit 9; }']
+    if token_min_remaining is not None:
+        lines.append(
+            'echo "===== 令牌剩余时间守卫（要求 ≥ %.0f s）"'
+            % float(token_min_remaining))
+        lines.append(
+            '~/precision/run.sh ~/precision/real_motion_authorize.py '
+            '--check-token "$TOKEN" --min-remaining %.0f'
+            % float(token_min_remaining))
+        lines.append(
+            'rc=$?')
+        lines.append(
+            '[ $rc -eq 0 ] || fail "令牌剩余不足 %.0f 秒（rc=$rc）—— 先重做 '
+            'STOP→PLAY；本轮 void（aborted_token），不算抓取失败"'
+            % float(token_min_remaining))
     for p in plans:
         lines.append('echo "===== %s : exec"' % p["name"])
         split = (held_burst_dir is not None and p.get("kind") == "target")
@@ -1529,8 +1665,9 @@ def main(argv=None):
     ap.add_argument("--views-only", action="store_true",
                     help="只出**跑前机位计划**（E9_VIEWS 三个机位 + 各自 burst），"
                          "不生成抓放序列；写 <out-dir>/pre.sh")
-    ap.add_argument("--colour-search-mm", type=float, default=60.0,
-                    help="彩色量的搜索窗半径（mm，围绕计划宫格；缺省 60）")
+    ap.add_argument("--colour-search-mm", type=float, default=25.0,
+                    help="彩色量的搜索窗半径（mm，围绕计划宫格；缺省 25）。"
+                         "60 mm 会罩进对角邻块的角（邻块最近角 45.25 mm）")
     ap.add_argument("--wrist-truth", default=None,
                     help="跑后**腕部** burst 的共识真值 json；给了就按区融合"
                          "（区内腕部权威、区外补俯视）。E9 真机判分必须给")
@@ -1674,7 +1811,10 @@ def main(argv=None):
         "batch": truth.get("batch"), "index": truth.get("index"),
         "target": attempt["id"],
         "scene_index": args.scene_index,
-        "cell": report.get("cell"),
+        # 逐目标格位（--cells）优先；旧单格探针报告只有 report["cell"]。
+        "cell": (attempt.get("cell") if attempt.get("cell") is not None
+                 else report.get("cell")),
+        "bias_mm": None,          # 单目标入口不补 b̂；整轮编排器传参
         "pad_pose": pad_pose_record(grid_path),
         "pad_thick": pad_thick,
         "survey_tool0": list(survey),

@@ -99,6 +99,62 @@ def section_cells():
     check('70 mm 的大块放格心 → 压格（半边长 35 > 30）', not inside)
 
 
+# ------------------------------------------------------------------ [2b]
+def section_cell_plan():
+    print('\n[2b] 轮级格位映射：默认 8,6,4,2,0、id 升序、奇偶一致、两两 ≥84.85 mm')
+    check('DEFAULT_CELLS = 8,6,4,2,0', tuple(cm.DEFAULT_CELLS) == (8, 6, 4, 2, 0))
+    check('parse_cells: 半角 / 中文逗号都收',
+          cm.parse_cells('8,6,4,2,0') == [8, 6, 4, 2, 0] and
+          cm.parse_cells('8，6，4，2，0') == [8, 6, 4, 2, 0])
+    check('parse_cells: 空 ⇒ 默认', cm.parse_cells(None) == [8, 6, 4, 2, 0] and
+          cm.parse_cells('  ') == [8, 6, 4, 2, 0])
+    ok = False
+    try:
+        cm.parse_cells('8,6,4', n=5)
+    except ValueError:
+        ok = True
+    check('parse_cells: 个数与目标数不符 ⇒ 报错（不许少一个格）', ok)
+    ok = False
+    try:
+        cm.parse_cells('8,6,6,2,0')
+    except ValueError:
+        ok = True
+    check('parse_cells: 重复格号 ⇒ 报错', ok)
+    ok = False
+    try:
+        cm.parse_cells('8,6,9,2,0')
+    except ValueError:
+        ok = True
+    check('parse_cells: 越界格号 ⇒ 报错', ok)
+
+    ids = ['03', '01', '05', '02', '04']          # 故意乱序
+    mapping = cm.assign_cells(ids)
+    check('assign_cells: id 升序 → 8,6,4,2,0',
+          mapping == {'01': 8, '02': 6, '03': 4, '04': 2, '05': 0},
+          str(mapping))
+    check('assign_cells: 数字 id 也按数值排（不是字典序）',
+          cm.assign_cells([2, 10, 1], [8, 6, 4]) == {'1': 8, '2': 6, '10': 4})
+    check('assign_cells: 显式格位照用',
+          cm.assign_cells(['a', 'b'], [0, 8]) == {'a': 0, 'b': 8})
+    ok = False
+    try:
+        cm.assign_cells(['01', '02'], [8])
+    except ValueError:
+        ok = True
+    check('assign_cells: 格比目标少 ⇒ 报错', ok)
+
+    # 几何约束：同一组格奇偶一致（同一组斜线）、两两格心 ≥ 60·√2 mm。
+    # 每块半对角 20.9 mm ⇒ 相邻斜格也放得下，但轮级映射只选这四个角 + 心。
+    parity = {((c // 3) + (c % 3)) % 2 for c in cm.DEFAULT_CELLS}
+    check('默认格奇偶一致（同一组斜线）', parity == {0}, str(parity))
+    dmin = min(math.hypot(cm.cell_center(a)[0] - cm.cell_center(b)[0],
+                          cm.cell_center(a)[1] - cm.cell_center(b)[1])
+               for i, a in enumerate(cm.DEFAULT_CELLS)
+               for b in cm.DEFAULT_CELLS[i + 1:])
+    check('默认格两两 ≥ 84.85 mm', dmin >= 60e-3 * math.sqrt(2) - 1e-12,
+          '%.2f mm' % (dmin * 1000.0))
+
+
 # ------------------------------------------------------------------ [3]
 def section_free():
     print('\n[3] 自由区：不碰拾取区、不压垫、在桌上')
@@ -419,6 +475,7 @@ def main():
     print('=' * 68)
     section_gen_scene_sync()
     section_cells()
+    section_cell_plan()
     section_free()
     section_blocks()
     section_terminal()

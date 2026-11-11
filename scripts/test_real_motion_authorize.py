@@ -235,6 +235,31 @@ with tempfile.TemporaryDirectory() as td:
     ok, why, _ = rma.check_token(tok, auth_dir=td, now=doc['expires'] + 1)
     check('变异：过期一秒 ⇒ 不成立', not ok and '过期' in why, why)
 
+    # token_remaining：整轮编排器的 R1/R2 闸门与执行脚本首行守卫都读它。
+    rem, why = rma.token_remaining(tok, auth_dir=td, now=doc['play_at'] + 5)
+    check('token_remaining: 正常 ⇒ TTL−5 秒',
+          rem is not None and abs(rem - (rma.TOKEN_TTL_S - 5.0)) < 1e-6,
+          repr((rem, why)))
+    rem, why = rma.token_remaining(tok, auth_dir=td, now=doc['expires'] - 30)
+    check('token_remaining: 恰好剩 30 秒', rem is not None and abs(rem - 30) < 1e-6,
+          repr((rem, why)))
+    rem, why = rma.token_remaining(tok, auth_dir=td, now=doc['expires'] + 1)
+    check('token_remaining: 过期一秒 ⇒ None + 原因',
+          rem is None and '过期' in why, repr((rem, why)))
+    rem, why = rma.token_remaining('0' * 32, auth_dir=td, now=doc['play_at'] + 5)
+    check('token_remaining: 错令牌 ⇒ None', rem is None and '不匹配' in why,
+          repr((rem, why)))
+
+    # CLI 的 --min-remaining：剩余不够就在**发执行之前**退 2。
+    rc0, out0 = quiet(rma.main, ['--check-token', tok, '--auth-dir', td,
+                                 '--min-remaining', '500'])
+    check('CLI --min-remaining 500（剩 ≈600）⇒ 0', rc0 == 0, repr(out0))
+    rc2, out2 = quiet(rma.main, ['--check-token', tok, '--auth-dir', td,
+                                 '--min-remaining', '700'])
+    check('CLI --min-remaining 700 ⇒ 2（不让它跑到一半过期）', rc2 == 2,
+          repr(out2))
+    check('不足时提示写清还剩多少', '只剩' in out2 and '700' in out2, repr(out2))
+
     doc2 = dict(doc)
     doc2.pop('stop_at')
     json.dump(doc2, open(p, 'w', encoding='utf-8'))

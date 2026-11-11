@@ -130,6 +130,30 @@ python3 ~/simlink/sim_board_agent.py home
 仍会报 `action_ready:true`（2026-11-07 实测），`sim_live` 按 `/joint_states`
 新鲜度（<2 s）判。
 
+### 阶段 4 正式轮（真机，整轮编排）
+
+一轮 = 一个布局的全部指定块，**一次授权**跑完「观察 → 计算 → 执行 → 判分」。
+入口只有 `scripts/stage4_round_run.py`（开发机跑，经 SSH 驱动板子）；完整动作序列
+（摆场景 / Round 0 计时干跑 / STOP→PLAY 授权 / R1·R2 时间闸门 / 失败处理 / 连续判分）
+**只在** [`docs/真机起栈runbook.md`](docs/真机起栈runbook.md)「第六步」一节，别另抄。
+
+```bash
+# 摆位图（A3，1:1，打印后先用 100 mm 比例尺核对）
+python3 scripts/stage4_layout_sheet.py --batch S0 --layouts 1,2,3 --out <A3.pdf>
+
+# 正式轮（Round 0 干跑把 --dry-run 加上，并把 --run 记 0）
+python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 1 \
+  --out-dir <run-dir> --urdf <robot.urdf> --board <ssh-alias> \
+  --board-repo ~/yolo_ros_original --expect <preflight-expect.json> \
+  --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json --bias-seed -2.791,-0.248
+```
+
+退出码：0 全绿 / 2 输入证据缺失 / 3 授权或时间闸门 / 4 计划生成失败 /
+5 执行失败 / 6 判分不完整；**执行阶段不自动重试**。跑后摆位偏差
+（`placement-deviation.json`）只归档、不 void。
+自检：`test_stage4_round_run.py` / `test_stage4_layout_sheet.py` /
+`test_stage4_placement_deviation.py` / `test_grasp_bias.py`。
+
 ### `gz_ros2_control` 前置（仿真必需，真机不需要）
 
 apt 上的 `ros-humble-gz-ros2-control` **依赖 Fortress（gz-sim6）**，与 Harmonic

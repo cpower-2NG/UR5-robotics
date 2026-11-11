@@ -166,6 +166,59 @@ FREE_ANCHOR = (0.515, 0.54)   # 落点排序锚点（带中央）
 
 
 # ---------------------------------------------------------------- 垫宫格
+#: 正式轮默认用哪几个格（块 id 升序 → 依次取）。四个角 + 垫心：奇偶性一致
+#: （同一组斜线，互不挤格），两两格心 ≥ 84.85 mm（= 60·√2）。S0 的 5 块按
+#: id 升序落 8、6、4、2、0 —— 远格先填，后来的块进垫通道不被挡。
+#: 这是**轮级决定**，不由探针或布局各自现编（同一布局两次重复要能逐格对照）。
+DEFAULT_CELLS = (8, 6, 4, 2, 0)
+
+
+def parse_cells(spec, n=None):
+    """``"8,6,4,2,0"``（允许中文逗号）→ ``[8, 6, 4, 2, 0]``。
+
+    ``spec`` 为空 ⇒ 取 ``DEFAULT_CELLS``；``n`` 给了就要求个数正好等于 ``n``
+    （少一个格＝有一个目标无处可放，宁可现在停）。格号重复 / 越界一律报错。
+    """
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        cells = list(DEFAULT_CELLS[:n] if n is not None else DEFAULT_CELLS)
+    else:
+        text = str(spec).strip().replace("，", ",")
+        try:
+            cells = [int(p.strip()) for p in text.split(",")]
+        except ValueError:
+            raise ValueError("--cells 只收整数格号，实得 %r" % (spec,))
+    if n is not None and len(cells) != int(n):
+        raise ValueError("--cells 给了 %d 个格（%s），但有 %d 个目标 —— "
+                         "个数必须一致" % (len(cells), cells, int(n)))
+    for c in cells:
+        if not 0 <= c < 9:
+            raise ValueError("宫格下标 0–8，收到 %r" % (c,))
+    if len(set(cells)) != len(cells):
+        raise ValueError("--cells 有重复格号：%s" % (cells,))
+    return cells
+
+
+def assign_cells(ids, cells=None):
+    """块 id 列表 → ``{str(id): 格号}``：**id 升序**依次配 ``cells``。
+
+    ``cells`` 缺省 = ``DEFAULT_CELLS``（8,6,4,2,0）。这是「哪个块进哪个格」的
+    唯一出处 —— 探针、计划、判分三处都读它，免得各自排序排得不一样。
+    """
+    cells = list(cells) if cells is not None else list(DEFAULT_CELLS)
+    if len(cells) < len(ids):
+        raise ValueError("%d 个目标只有 %d 个格（%s）"
+                         % (len(ids), len(cells), cells))
+    for c in cells[:len(ids)]:
+        if not 0 <= int(c) < 9:
+            raise ValueError("宫格下标 0–8，收到 %r" % (c,))
+
+    def _key(v):
+        s = str(v)
+        return (0, int(s), s) if s.isdigit() else (1, 0, s)
+
+    return {str(bid): int(cells[i]) for i, bid in enumerate(sorted(ids, key=_key))}
+
+
 def cell_center(index):
     """宫格 ``index``（0–8，行主序）的世界坐标 (x, y)。与 gen_scene 的
     ``_pad_grid_sdf`` 同一个式子：局部 ((c−1)·pitch, (1−r)·pitch) 再按垫偏航旋转。"""

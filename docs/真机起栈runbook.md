@@ -138,6 +138,81 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 开跑前的四条通用前置见本文件第三步与 `待执行命令.md` 顶部表；`--go` 前的当次授权
 按 `AGENTS.md` §1 红线 6。
 
+## 第六步：阶段 4 正式轮（S0，整轮编排）
+
+**一轮 = 一个布局的全部指定块，一次授权跑完「观察 → 计算 → 执行 → 判分」**。
+唯一执行入口是 `scripts/stage4_round_run.py`（开发机跑，经 SSH 驱动板子）；
+它不复制运动几何，只做阶段编排与闸门。契约见
+[`阶段/阶段4-杂乱指定抓取/契约.md`](阶段/阶段4-杂乱指定抓取/契约.md) §4.3–§4.7。
+
+### 1. 桌面布置（人）
+
+- 定稿布局与块位（base 毫米 / yaw）：唯一出处是 `scripts/stage4_layouts.py`
+  的 `S0_SELECTED`；**别抄文档里的表**（会漂）。
+- 用 `python3 scripts/stage4_layout_sheet.py --batch S0 --out <A3.pdf> --layouts 1,2,3`
+  出 **A3 1:1 摆位图**；打印后先用 100 mm 比例尺核对（缩放 >5 mm 会让整盘系统性偏）。
+  图纸只作转移模板：按已有胶带边界对齐、用胶带/铅笔在块心留点，
+  **收走图纸再摆块** —— 纸或胶带压在块下会污染深度与彩色。
+- 手摆目标 **±3–5 mm / ±10°**；**不跑前实测、不阻断**，偏差跑后由
+  `stage4_placement_deviation.py` 用跑前 pick burst 真值量、只归档。
+- 摆好退开、手离开台面，再说「摆好了」；摆场景不算人工干预。
+
+### 2. 每轮预检（编排器阶段 0，只读）
+
+板子身份（模组序列号）/ 板上全树哈希 / 栈（驱动、MoveIt、腕部相机 USB3）/
+夹爪 `0x0200 == 1` / 急停与顶灯。任一红 ⇒ 编排器不授权、不运动。
+预检期望值由人先写一份 JSON（`--expect`），不给就判红 —— fail-closed。
+
+### 3. Round 0 计时干跑（S0 六轮之前，只做一次，不计入六轮）
+
+授权后**只跑到阶段 4**（观察 / 解垫 / 探针 / 规划），**不执行**：
+
+```bash
+python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 0 \
+  --out-dir ~/robotics/notes/ur5-vision-grasp/runs/<date>-stage4-s0/round0 \
+  --urdf <robot.urdf> --board jetson-hotspot --board-repo ~/yolo_ros_original \
+  --expect <preflight-expect.json> --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json \
+  --bias-seed -2.791,-0.248 --dry-run
+```
+
+产物 `timing.json` 给出 `T_observe / T_pad / T_probe / T_plan / T_exec_est`；
+后续轮用 `--timing-prior <round0>/timing.json` 标定 R1/R2。
+
+### 4. 授权（人，一轮一次）
+
+编排器阶段 2 打印本轮摘要（布局 / 5 个目标 / 5 个格位 / 跑前两机位 / 跑后三机位 /
+预计时长）后：
+
+> **>>> 需要人动手：确认两指整个行程内无手无遮挡、急停在手，然后示教器 STOP → PLAY**
+
+AI 只读核验两步（Dashboard 29999），都看到才写 600 s 令牌；没看到 ⇒ 不发（fail-closed）。
+授权的范围覆盖本轮**观察 → 执行 → 终态评分**三段；轮内任何偏离（重规划 / 重试 /
+换目标）⇒ 停、重新授权。
+
+### 5. 两道时间闸门（600 s 硬窗口）
+
+- **R1**（观察后、探针前）：`剩余 ≥ C_est + T_exec_est + 60 s`；
+- **R2**（执行起手）：`剩余 ≥ T_exec_est + max(45 s, 15%·T_exec_est)`；
+- 板端 `run.sh` 首行 `--min-remaining` 守卫；执行中过期 ⇒ `aborted_token`
+  （本轮 void、不计 streak、不记抓取失败）。
+- 不过闸门 ⇒ 停在执行前，`timing.json` 落盘，重做 STOP→PLAY。**不自行改 TTL**。
+
+### 6. 执行与失败处理
+
+`run.sh` 一条脚本跑完全部目标 + 跑后三机位 burst，Agent 不介入、**不自动重试**。
+任一 rc≠0 / 碰撞 / 掉落 / 指定块丢失 / 夹爪未初始化 / 程序自停 ⇒ 停轮。
+执行后编排器自动判分并归档：`round.json` / `round-verify.json` / `score.json/md` /
+`bias.json` / `placement-deviation.json`。缺证据 ⇒ `complete=false` + 退出码 2。
+
+### 7. 连续判分
+
+S0 六轮全部落盘后，只喂 S0 的 `round.json`（`aborted_token` 的轮先剔除），
+按时间顺序算连续 3 轮：
+
+```bash
+python3 scripts/stage4_score.py --exit --need 3 <s0-*-r*/round.json ...>
+```
+
 ---
 
 ## 已知坑速查（详细证据在台账）

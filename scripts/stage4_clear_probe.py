@@ -338,7 +338,12 @@ def main(argv=None):
                     help="scene_truth.json（可重复，一次起栈连测多场）")
     ap.add_argument("--report", default=None)
     ap.add_argument("--cell", type=int, default=4,
-                    help="目标块放进哪个宫格（0–8，默认 4 = 垫心）")
+                    help="目标块放进哪个宫格（0–8，默认 4 = 垫心）；"
+                         "给了 --cells 时这是缺省回退值")
+    ap.add_argument("--cells", default=None, metavar="8,6,4,2,0",
+                    help="逐目标格位：按 **truth 块 id 升序**依次配（见 "
+                         "stage4_clear_model.assign_cells）。正式轮用它一次把 "
+                         "5 个目标都探完；每个 attempt 记自己的 cell。")
     ap.add_argument("--gate", type=float, default=GATE)
     ap.add_argument("--max-targets", type=int, default=0,
                     help="每场只测前 N 个目标块（冒烟用）")
@@ -424,32 +429,45 @@ def main(argv=None):
     pool = [mp.open_fingers(start_js)]
 
     scenes = []
+    cells_report = {}
     for path in args.truth:
         with open(path, encoding="utf-8") as f:
             truth = json.load(f)
         ids = [b["id"] for b in truth["blocks"]]
         if args.max_targets:
             ids = ids[:args.max_targets]
+        cell_map = (cm.assign_cells(ids, cm.parse_cells(args.cells))
+                    if args.cells else None)
         log("\n== %s（%s:%s，%d 块 / 测 %d 个目标）=="
             % (path, truth.get("batch"), truth.get("index"),
                len(truth["blocks"]), len(ids)))
+        if cell_map:
+            log("   格位：%s"
+                % "  ".join("%s→%d" % kv for kv in sorted(cell_map.items())))
         attempts = []
         for tid in ids:
-            a = run_attempt(node, clients, truth, tid, args.cell, pool,
+            cell = (cell_map or {}).get(str(tid), args.cell)
+            t0 = time.time()
+            a = run_attempt(node, clients, truth, tid, cell, pool,
                             prefer_closing=args.prefer_closing)
+            a["cell"] = cell
+            a["seconds"] = round(time.time() - t0, 2)
             attempts.append(a)
             steps = len(a.get("clearing_steps") or [])
             if a["ok"]:
-                log("  target-%-2s OK   清障 %d 步  终态合法"
-                    % (tid, steps))
+                log("  target-%-2s OK   格 %d  清障 %d 步  %.1f s  终态合法"
+                    % (tid, cell, steps, a["seconds"]))
             else:
-                log("  target-%-2s FAIL %s（清障 %d 步）"
-                    % (tid, a.get("reason"), steps))
+                log("  target-%-2s FAIL %s（格 %d，清障 %d 步，%.1f s）"
+                    % (tid, a.get("reason"), cell, steps, a["seconds"]))
         n_ok = len([a for a in attempts if a["ok"]])
         log("  本场：%d/%d = %.1f%%" % (n_ok, len(attempts),
                                         100.0 * n_ok / max(1, len(attempts))))
+        if cell_map:
+            cells_report.update(cell_map)
         scenes.append({"truth": path, "batch": truth.get("batch"),
-                       "index": truth.get("index"), "attempts": attempts})
+                       "index": truth.get("index"), "cells": cell_map,
+                       "attempts": attempts})
 
     # 清理：把探针放进 MoveIt 的块/垫/桌面撤掉（规划场景残留会跟着栈活下去）。
     cleanup = None
@@ -482,6 +500,7 @@ def main(argv=None):
 
     passed = bool(n and ratio >= args.gate)
     report = {"truths": args.truth, "cell": args.cell,
+              "cells": cells_report or None,
               "prefer_closing": args.prefer_closing,
               "group": mp.GROUP, "table_top": mp.TABLE_TOP,
               "model_joints": mp.MODEL_JOINTS,

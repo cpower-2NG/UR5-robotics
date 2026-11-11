@@ -107,6 +107,24 @@ def tower_truth():
                        blk(3, 0.60, 0.30, yaw=20.0)]}
 
 
+def solo_truth():
+    """S0 形状：两块相隔 ~283 mm（无接触 ⇒ 60 mm 邻块粗判据应放行）。"""
+    return {'batch': 'T', 'index': 0,
+            'blocks': [blk(0, 0.40, 0.30, yaw=146.63),
+                       blk(3, 0.60, 0.50, yaw=20.0)]}
+
+
+def solo_attempt():
+    return {'id': 0, 'ok': True,
+            'grasp_hit': {'axis': 2, 'sign': -1, 'closing': 0,
+                          'variant': 0, 'vertical': True, 'verdict': 'ok'},
+            'clearing_steps': [],
+            'final_blocks': [{'id': 0, 'x': 0.4242, 'y': -0.11224,
+                              'z': PAD_TOP_Z, 'yaw': 146.63, 'size': 0.0295},
+                             {'id': 3, 'x': 0.60, 'y': 0.50, 'z': 0.01475,
+                              'yaw': 20.0, 'size': 0.0295}]}
+
+
 def tower_attempt():
     return {'id': 0, 'ok': True,
             'grasp_hit': {'axis': 2, 'sign': -1, 'closing': 0,
@@ -187,6 +205,67 @@ def section_actions():
     bad['final_blocks'][0]['z'] = 0.01475          # 目标被当成放在台面
     ok, why = raises(cr.actions_from_attempt, truth, bad, cm.PAD_THICK)
     check('目标落点不在垫上 ⇒ 拒绝（与探针理解不一致）', ok, why)
+
+
+# ------------------------------------------------------------------ [3b]
+def section_bias():
+    print('\n[3b] b̂ 接线：命令 = 格心 − b̂、三份坐标分开记、格位断言')
+    truth, att = tower_truth(), tower_attempt()
+    tgt_yaw = cr.find_block(truth['blocks'], 0)['yaw']
+    att4 = json.loads(json.dumps(att))
+    att4['cell'] = 4
+    att4['final_blocks'][0]['yaw'] = tgt_yaw      # 探针按 place_in_cell 保块 yaw
+    b = [-2.791, -0.248]
+    acts, _ = cr.actions_from_attempt(truth, att4, cm.PAD_THICK, bias_mm=b)
+    a = acts[-1]
+    cx, cy = cm.cell_center(4)
+    # 三份坐标落盘时 round(., 3)（卡尺精度就够），这里按同一精度比。
+    check('期望仍是格心（判分口径不动）',
+          abs(a['desired_center_mm'][0] - round(cx * 1000.0, 3)) < 1e-9 and
+          abs(a['desired_center_mm'][1] - round(cy * 1000.0, 3)) < 1e-9,
+          repr(a['desired_center_mm']))
+    check('命令 = 格心 − b̂（符号：b̂ 负 ⇒ 命令往正方向推）',
+          abs(a['commanded_center_mm'][0]
+              - round(cx * 1000.0 + 2.791, 3)) < 1e-9 and
+          abs(a['commanded_center_mm'][1]
+              - round(cy * 1000.0 + 0.248, 3)) < 1e-9,
+          repr(a['commanded_center_mm']))
+    check('臂收到的 slot = 命令落点（不是期望）',
+          abs(a['slot'][0] * 1000.0 - a['commanded_center_mm'][0]) < 1e-3)
+    check('applied_bias_mm 原样记下', a['applied_bias_mm'] == [-2.791, -0.248],
+          repr(a.get('applied_bias_mm')))
+    check('清障块不补 b̂（自由区落点不是垫面）',
+          'applied_bias_mm' not in acts[0])
+    nb, _ = cr.actions_from_attempt(truth, att4, cm.PAD_THICK)
+    check('不给 b̂ ⇒ 命令 = 期望、applied_bias_mm 为空',
+          abs(nb[-1]['slot'][0] - cx) < 1e-12
+          and abs(nb[-1]['slot'][1] - cy) < 1e-12
+          and nb[-1]['applied_bias_mm'] is None,
+          repr((nb[-1]['slot'], nb[-1]['applied_bias_mm'])))
+
+    # 同一轮 5 个目标必须用**同一个** b̂（fixed 语义）
+    blk0 = cr.find_block(truth['blocks'], 0)
+    a8 = cr.build_target_action(blk0, att['grasp_hit'], 8, cm.PAD_THICK,
+                                bias_mm=b)
+    a0 = cr.build_target_action(blk0, att['grasp_hit'], 0, cm.PAD_THICK,
+                                bias_mm=b)
+    check('build_target_action：5 格同一 b̂、期望 = 各自格心',
+          a8['applied_bias_mm'] == a0['applied_bias_mm'] == b and
+          abs(a8['desired_center_mm'][0]
+              - round(cm.cell_center(8)[0] * 1000.0, 3)) < 1e-9 and
+          abs(a0['desired_center_mm'][0]
+              - round(cm.cell_center(0)[0] * 1000.0, 3)) < 1e-9,
+          repr((a8['applied_bias_mm'], a8['desired_center_mm'])))
+
+    # 格位断言：探针终态必须落在实测格心 1 mm 内（否则计划按 A 垫、探针按 B 垫）
+    off = json.loads(json.dumps(att4))
+    off['final_blocks'][0]['x'] += 0.003
+    ok, why = raises(cr.actions_from_attempt, truth, off, cm.PAD_THICK)
+    check('探针终态离格心 3 mm ⇒ 拒绝（两份垫位姿不一致）', ok, why)
+    dy = json.loads(json.dumps(att4))
+    dy['final_blocks'][0]['yaw'] = tgt_yaw + 5.0
+    ok, why = raises(cr.actions_from_attempt, truth, dy, cm.PAD_THICK)
+    check('探针终态 yaw 与真值不一致 ⇒ 拒绝', ok, why)
 
 
 # ------------------------------------------------------------------ [4]
@@ -270,6 +349,81 @@ def section_plans():
     last2 = json.load(open(plans2[-1]['path'], encoding='utf-8'))
     check('--no-wrist-survey ⇒ 只有 2 份、q_end 回到第二次搬运终点',
           len(plans2) == 2 and q2 == last2['waypoints'][-1]['q'])
+
+
+# ------------------------------------------------------------------ [4b]
+def section_multitarget():
+    print('\n[4b] 整轮形状：计划名错开、机位只追加一次、令牌守卫')
+    import inspect
+    truth, att = tower_truth(), tower_attempt()
+    acts, blocks = cr.actions_from_attempt(truth, att, cm.PAD_THICK)
+    ch = chain()
+    q0 = q_start_of(ch)
+    out = tempfile.mkdtemp(prefix='e9-plan-multi-')
+    # 编排器的形状：每目标一次 plan_sequence（start 递增，不拍机位），
+    # 最后统一 plan_views(start=5)。5 个目标共用同一个 plan/ 目录。
+    names, idxs = [], []
+    q = q0
+    start = 0
+    for _k in range(2):                       # 用 2 个目标代表 5 个
+        plans, _lay, q = cr.plan_sequence(ch, q, acts, blocks, out,
+                                          wrist_survey=False, start=start)
+        names += [p['name'] for p in plans]
+        idxs += [p['index'] for p in plans]
+        start += len(plans)
+    vplans, _q = cr.plan_views(ch, q, cr.E9_VIEWS, out, start=start)
+    names += [p['name'] for p in vplans]
+    idxs += [p['index'] for p in vplans]
+    check('两轮调用 + 机位：计划名全不重复（执行日志跟着不串）',
+          len(names) == len(set(names)) == 7, str(names))
+    check('index 连续 1..7（%=%02d 前缀与 index 同步偏移）',
+          idxs == list(range(1, 8)), str(idxs))
+    check('start 偏移真的写进了文件名',
+          names[0].startswith('01-') and names[2].startswith('03-')
+          and names[-1].startswith('07-'), str(names))
+    check('wrist_survey=False ⇒ 本次调用不带机位',
+          all(p['kind'] != 'view' for p in plans))
+    check('机位只追加一次（三份，不互相覆盖）',
+          [p['view'] for p in vplans] == ['pick', 'free', 'pad'])
+    check('跑前默认机位只剩 pick / pad（正式轮：观察不解 free）',
+          [v['name'] for v in cr.E9_VIEWS] == ['pick', 'free', 'pad'])
+
+    # gap_check 判决来源随参数落盘；S0 无接触布局走 60 mm 粗判据。
+    # 夹具必须**无接触**（上面的塔夹具里块 0/8 中心距 0.0 mm，60 mm 判据本就该拒）。
+    s_truth, s_att = solo_truth(), solo_attempt()
+    s_acts, s_blocks = cr.actions_from_attempt(s_truth, s_att, cm.PAD_THICK)
+    out2 = tempfile.mkdtemp(prefix='e9-plan-gapchk-')
+    plans3, _, _ = cr.plan_sequence(ch, q0, s_acts, s_blocks, out2,
+                                    wrist_survey=False, min_block_gap=0.06,
+                                    gap_check='layout_gap')
+    m3 = json.load(open(plans3[0]['path'], encoding='utf-8'))
+    check('manifest/meta 记 gap_check=layout_gap（不是一律 probe_verified）',
+          m3['meta']['e9']['gap_check'] == 'layout_gap')
+    check('S0 形状（无清障、60 mm 粗判据）下计划只有 1 份', len(plans3) == 1)
+    ok, why = raises(cr.plan_sequence, ch, q0, acts, blocks,
+                     tempfile.mkdtemp(prefix='e9-plan-gaprej-'),
+                     wrist_survey=False, min_block_gap=0.06)
+    check('塔夹具（块心重合）在 60 mm 判据下 ⇒ 拒绝（判据真的生效）',
+          ok, why)
+
+    # 令牌守卫：执行脚本第一件事就是查剩余时间。
+    mk = [{'name': '01-target-block-0.json', 'kind': 'target'}]
+    sh = cr.run_script_text(mk, '$HOME/precision/e9/x',
+                            '$HOME/precision/e9/x/exec',
+                            token_min_remaining=120)
+    check('run.sh 含板端 --min-remaining 守卫', '--min-remaining 120' in sh)
+    check('守卫在第一条执行之前',
+          sh.index('--min-remaining 120') < sh.index('01-target-block-0.json'))
+    check('过期时写 aborted_token（本轮 void，不算抓取失败）',
+          'aborted_token' in sh)
+    sh0 = cr.run_script_text(mk, '$HOME/precision/e9/x',
+                             '$HOME/precision/e9/x/exec')
+    check('不传 token_min_remaining ⇒ 脚本与旧版一致（没有守卫行）',
+          'real_motion_authorize.py --check-token' not in sh0)
+
+    check('彩色量默认搜索窗 25 mm（60 mm 会罩进对角邻块角）',
+          inspect.signature(cr.measure_target_colour)
+          .parameters['search_mm'].default == 25.0)
 
 
 # ------------------------------------------------------------------ [5]
@@ -356,7 +510,8 @@ def section_mutation():
     except pp.PlanError:
         adj_ok = False
     check('贴面块（中心距 40 mm）能出计划', adj_ok)
-    mut2 = _mut('min_block_gap=0.0)', 'min_block_gap=None)')
+    mut2 = _mut('min_block_gap=float(min_block_gap))',
+                'min_block_gap=0.06)')
     ok, why = raises(mut2['plan_sequence'], ch, q0, a_acts,
                      [dict(b) for b in a_blocks], out)
     check('变异「不放宽 60 mm」：贴面场景必须红', ok, why)
@@ -1379,7 +1534,8 @@ def section_finish():
 
 def main():
     print('=' * 68)
-    for fn in (section_yaw, section_surface, section_actions, section_plans,
+    for fn in (section_yaw, section_surface, section_actions, section_bias,
+               section_plans, section_multitarget,
                section_step_cap, section_place_yaw_equiv, section_gap,
                section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
