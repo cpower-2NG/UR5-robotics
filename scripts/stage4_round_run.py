@@ -266,6 +266,11 @@ def validate_pad_doc(doc, min_frames=20, max_spread_mm=2.0, max_spread_deg=0.5):
     return probs
 
 
+def serial_fp(serial):
+    """模组序列号的短指纹 —— 日志/问题文本只许打这个，不许打真值（红线 3）。"""
+    return hashlib.sha256(str(serial).encode("utf-8")).hexdigest()[:12]
+
+
 def evaluate_preflight(got, expect):
     """板端预检事实 vs 期望值 → 问题列表（空 = 全绿）。
 
@@ -282,10 +287,15 @@ def evaluate_preflight(got, expect):
     if not serial:
         probs.append("读不到模组序列号（/proc/device-tree/serial-number）")
     elif expect.get("serial") and serial != expect["serial"]:
-        probs.append("模组序列号不匹配（板上 %r，期望 %r）"
-                     % (serial, expect["serial"]))
+        # 只打指纹：序列号是硬件真值，不许贴进对话/日志（AGENTS.md 红线 3）
+        probs.append("模组序列号不匹配（板上指纹 %s，期望指纹 %s）"
+                     % (serial_fp(serial), serial_fp(expect["serial"])))
 
     tree = got.get("tree") or {}
+    if not tree.get("files"):
+        # 空树 = 路径不存在/为空，哈希会退化成空串的 sha256（e3b0c442…）。
+        # 这种情况绝不能靠「期望值恰好没填 tree_files」蒙过去。
+        probs.append("板上代码树扫到 0 个文件（board_repo 路径对不上？）")
     if expect.get("tree_sha256"):
         if tree.get("sha256") != expect["tree_sha256"]:
             probs.append("板上代码树哈希不一致（板上 %s，期望 %s）—— "
@@ -373,7 +383,11 @@ import os
 import subprocess
 import sys
 
-repo = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/yolo_ros_original")
+repo = sys.argv[1] if len(sys.argv) > 1 else "~/yolo_ros_original"
+# 参数是 shell 引号过的（shlex.quote），``~`` 不会被远端 shell 展开 ⇒ 自己展开。
+# 2026-11-11 实测：传 ``~/yolo_ros_original`` 而这里不展开 ⇒ os.walk 走空
+# ⇒ 树哈希 = e3b0c442…（空串的 sha256）、文件数 0。
+repo = os.path.expanduser(repo)
 out = {}
 
 try:
@@ -441,6 +455,18 @@ print(json.dumps(out))
 '''
 
 
+def default_board_dir(out_dir):
+    """板上本轮镜像目录缺省值：``~/precision/e9/<run>/<round>``。
+
+    **只有一个来源**：``Round`` 与 ``main()`` 都调它。2026-11-11 实测过不一致的
+    后果 —— ``main()`` 曾把未解析的 ``None`` 直接交给 ``RoundBoard``，不给
+    ``--board-dir`` 就崩在 ``None.rstrip``。
+    """
+    out = os.path.abspath(out_dir)
+    return "~/precision/e9/%s/%s" % (os.path.basename(os.path.dirname(out)),
+                                     os.path.basename(out))
+
+
 class RoundBoard:
     """板子适配器：SSH / 推文件（md5 核对）/ 取关节 / 跑脚本 / 令牌剩余。
 
@@ -450,6 +476,8 @@ class RoundBoard:
 
     def __init__(self, alias, board_dir, exp_dir):
         self.alias = alias
+        if not board_dir:
+            raise RoundError(EXIT_MISSING, "board", "板上镜像目录为空")
         self.board_dir = board_dir.rstrip("/")
         self.exp_dir = exp_dir
         self._b = pr.Board(alias, exp_dir)
@@ -644,10 +672,7 @@ class Round:
         if deps:
             self.deps.update(deps)
         self.out = os.path.abspath(args.out_dir)
-        self.board_dir = (args.board_dir or
-                          "~/precision/e9/%s/%s"
-                          % (os.path.basename(os.path.dirname(self.out)),
-                             os.path.basename(self.out)))
+        self.board_dir = (args.board_dir or default_board_dir(self.out))
         self.round_id = (args.round_id or
                          "%s-%d-r%d" % (args.batch, int(args.layout),
                                         int(args.run)))
@@ -731,7 +756,13 @@ class Round:
                    {"at": self.deps["now"](), "board_repo": self.args.board_repo,
                     "got": got, "expect": expect, "problems": probs})
         for k in ("serial", "tree", "gripper", "realsense", "stack"):
-            log("  %-9s %s" % (k, json.dumps(got.get(k), ensure_ascii=False)))
+            v = got.get(k)
+            if k == "serial" and v:
+                # 指纹 + 是否匹配期望；序列号真值绝不进对话/日志（红线 3）
+                v = {"fp": serial_fp(v),
+                     "match": None if not (expect or {}).get("serial")
+                     else v == expect["serial"]}
+            log("  %-9s %s" % (k, json.dumps(v, ensure_ascii=False)))
         if probs:
             raise RoundError(EXIT_MISSING, "preflight",
                              "；".join(probs) + " —— 任一红即停，不授权、不运动")
@@ -1509,8 +1540,9 @@ def parse_cli(ap, argv=None):
 def main(argv=None):
     ap = build_parser()
     args = prepare(ap, parse_cli(ap, argv))
-    board = RoundBoard(args.board, args.board_dir, os.path.dirname(
-        os.path.abspath(args.out_dir)))
+    board = RoundBoard(args.board,
+                       args.board_dir or default_board_dir(args.out_dir),
+                       os.path.dirname(os.path.abspath(args.out_dir)))
     return Round(args, board).run()
 
 

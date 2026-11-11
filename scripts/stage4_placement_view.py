@@ -90,6 +90,13 @@ def pick_pil_font(size_px):
 
 
 # ------------------------------------------------------------------ 几何
+# 方块高 29.5 mm（立方体，与边长同值）。足迹框画在**块顶面**而不是台面：
+# 相机 500 mm 高，顶面在 470 mm，同一 (x, y) 在像面上被放大 500/470 ≈ 1.06 倍。
+# 若框画在台面，人把**看得见的顶面**塞进框里，真实块心会朝像面中心偏 ~6% 半径
+# （外圈块 ≈10 mm，2026-11-11 实测偏差方向吻合）。画在顶面 ⇒ 看到的边就是该对的线。
+BLOCK_TOP_MM = 29.5
+
+
 def project_mm(xy_mm, z_mm, K, R, t):
     """base 毫米 + 台面高度 → 像素（相机后方/投不到返回 None）。"""
     return cr._base_to_uv((float(xy_mm[0]) / 1000.0, float(xy_mm[1]) / 1000.0,
@@ -167,9 +174,14 @@ def zone_lines(zone_mm, step_mm=100.0):
 
 def build_doc(blocks, zone_mm, K, R, t, burst=None, frame=None,
               batch=None, layout_id=None, width=None, height=None,
-              z_mm=0.0):
-    """标注文档（纯函数；画图与测试都吃它）。"""
-    recs = block_targets(blocks, K, R, t, z_mm=z_mm, width=width,
+              z_mm=0.0, block_z_mm=None):
+    """标注文档（纯函数；画图与测试都吃它）。
+
+    ``z_mm`` 是台面（网格/边框所在平面）；``block_z_mm`` 是块**顶面**高度，
+    只用于块的足迹框（缺省 = 台面高度，即旧行为）。
+    """
+    bz = z_mm if block_z_mm is None else block_z_mm
+    recs = block_targets(blocks, K, R, t, z_mm=bz, width=width,
                          height=height)
     grid = []
     for p0, p1, kind in zone_lines(zone_mm):
@@ -190,6 +202,7 @@ def build_doc(blocks, zone_mm, K, R, t, burst=None, frame=None,
         "frame": frame,
         "image_wh": [width, height],
         "table_z_mm": z_mm,
+        "block_z_mm": bz,
         "zone_mm": [float(v) for v in zone_mm],
         "camera": {"K": [[float(v) for v in row] if hasattr(row, "__len__")
                          else float(row) for row in np.asarray(K, float)],
@@ -249,7 +262,7 @@ def draw_doc(img, doc, cjk=True, title=None):
 
     # ---- 图例先算好尺寸，挑一个**不压目标**的角（左上优先）。
     lines = [title or "%s 摆位引导" % (doc.get("layout") or "")]
-    lines.append("网格 100 mm · 彩色框 = 目标足迹 · 白线 = 朝向")
+    lines.append("网格 100 mm · 彩色框 = 目标足迹 · 白线+箭头 = 一条边的方向")
     for rec in doc["blocks"]:
         if cjk:
             name = ls.COLOR_ZH.get(rec["color"], rec["color"])
@@ -291,10 +304,21 @@ def draw_doc(img, doc, cjk=True, title=None):
         if len(poly) >= 3:
             d.polygon(poly + [poly[0]], fill=rgb + (80,))
             d.line(poly + [poly[0]], fill=rgb + (255,), width=4)
-        dg = rec["diag_uv"]
-        if all(u is not None for u in dg):
-            d.line([tuple(dg[0]), tuple(dg[1])], fill=(255, 255, 255, 230),
-                   width=2)
+        # 朝向标在**一条边**上（不是对角线）：2026-11-11 实测，画对角线时人会把
+        # 块的边对着对角线摆，正好偏 45°（两块实测偏 36° / 42°）。边 + 箭头没有歧义。
+        e0, e1 = rec["corners_uv"][0], rec["corners_uv"][1]
+        if e0 is not None and e1 is not None:
+            d.line([tuple(e0), tuple(e1)], fill=(255, 255, 255, 235), width=4)
+            ex, ey = e1[0] - e0[0], e1[1] - e0[1]
+            norm = math.hypot(ex, ey) or 1.0
+            ex, ey = ex / norm, ey / norm
+            tip = (e1[0], e1[1])
+            for s in (+1.0, -1.0):
+                ca, sa = math.cos(math.radians(150.0)), math.sin(math.radians(150.0))
+                dx = ex * ca - s * ey * sa
+                dy = ex * sa + s * ey * ca
+                d.line([tip, (tip[0] + dx * 14.0, tip[1] + dy * 14.0)],
+                       fill=(255, 255, 255, 235), width=4)
         ctr = rec["center_uv"]
         if ctr is not None:
             cx, cy = ctr
@@ -495,7 +519,8 @@ def annotate_main(args):
         doc = build_doc([dict(b) for b in blocks], zone_mm, K, R, t,
                         burst=args.burst or args.image, frame=idx,
                         batch=batch, layout_id=layout_id,
-                        width=W, height=H, z_mm=float(args.table_z_mm))
+                        width=W, height=H, z_mm=float(args.table_z_mm),
+                        block_z_mm=float(args.block_top_mm))
     except (ValueError, KeyError, OSError) as exc:
         print("!! %s" % exc)
         return 2
@@ -554,6 +579,9 @@ def build_parser():
     ap.add_argument("--zone", default=None, metavar="X0,X1,Y0,Y1")
     ap.add_argument("--table-z-mm", type=float, default=0.0,
                     help="足迹所在高度（台面 = 0；给垫上就填垫厚）")
+    ap.add_argument("--block-top-mm", type=float, default=BLOCK_TOP_MM,
+                    help="块顶面高度：方形足迹框画在这一层，让人对着看得见的顶面"
+                         "摆放（默认 %(default)s mm；给 0 = 画在台面，旧行为）")
     ap.add_argument("--out", default=None, help="标注图输出（PNG）")
     ap.add_argument("--json", default=None, help="标注文档输出（缺省与 PNG 同名）")
     return ap

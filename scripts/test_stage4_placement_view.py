@@ -160,6 +160,24 @@ def main():
     doc2 = pv.build_doc(blocks, zone, K, R, T)     # 不给宽高
     check('D6 不给宽高就不标出画幅', doc2['clipped'] == [], repr(doc2['clipped']))
 
+    # 足迹框必须画在**块顶面**：块高 29.5 mm ⇒ 像面上放大 500/470.5，
+    # 同一 (x, y) 的像素位置朝像心收 ~5.9% 半径。画在台面会让人摆偏（外圈 ~10 mm）。
+    doc3 = pv.build_doc(blocks, zone, K, R, T, width=W, height=H,
+                        block_z_mm=pv.BLOCK_TOP_MM)
+    check('D7 缺省 block_z 沿用台面（旧行为不变）',
+          close(doc['block_z_mm'], doc['table_z_mm']) and
+          close(doc2['block_z_mm'], doc2['table_z_mm']))
+    c0 = doc['blocks'][1]['center_uv']
+    c3 = doc3['blocks'][1]['center_uv']
+    r0 = math.hypot(c0[0] - CX, c0[1] - CY)
+    r3 = math.hypot(c3[0] - CX, c3[1] - CY)
+    check('D8 顶面框比台面框更远离像心 %.2f→%.2f px（比例 500/470.5）'
+          % (r0, r3),
+          close(r3 / r0, CAM_H / (CAM_H - pv.BLOCK_TOP_MM / 1000.0), tol=1e-3))
+    check('D9 顶面框不与网格混层',
+          close(doc3['grid'][0]['p0_uv'][0], doc['grid'][0]['p0_uv'][0]) and
+          not close(c3[0], c0[0], tol=1.0))
+
     # ------------------------------------------------------------------
     section('E. 回原位计划（survey → 原起点）')
     qs = [0.1, -1.0, 1.2, -1.5, -1.5, -3.9]

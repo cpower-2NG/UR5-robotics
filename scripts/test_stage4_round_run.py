@@ -177,6 +177,15 @@ check("预检：腕部相机在 USB2 ⇒ 红",
           dict(GOT, realsense=[{"dev": "1-1", "speed": "480"}]), EXPECT)))
 check("预检：栈里没驱动 ⇒ 红",
       bool(r.evaluate_preflight(dict(GOT, stack={}), EXPECT)))
+# 序列号真值不许出现在问题文本/日志里（AGENTS.md 红线 3）
+_msg = "；".join(r.evaluate_preflight(dict(GOT, serial="SN-2"), EXPECT))
+check("预检：序列号不符只打指纹（真值不进文本）",
+      "SN-2" not in _msg and "SN-1" not in _msg and
+      r.serial_fp("SN-2") in _msg, _msg)
+check("预检：空树（路径对不上）⇒ 红，不靠期望值蒙过去",
+      any("0 个文件" in x for x in r.evaluate_preflight(
+          dict(GOT, tree={"sha256": "e3b0c442", "files": 0}),
+          {"serial": "SN-1", "stack": {"ur_robot_driver": True}})))
 
 facts = r.build_facts("S0-1-r1", "S0", 1, lay.layout_blocks("S0", 1),
                       {"mode": "none", "applied_mm": [0, 0]})
@@ -419,6 +428,27 @@ def make_args(td, **over):
 def write_expect(td):
     with open(os.path.join(td, "expect.json"), "w") as f:
         json.dump(EXPECT, f)
+
+
+# 板上镜像目录缺省值：Round 与 main() 必须同源（2026-11-11 不给 --board-dir
+# 时 main() 曾把 None 交给 RoundBoard，崩在 None.rstrip）
+_td_bb = tempfile.mkdtemp()
+_out_bb = os.path.join(_td_bb, "s0-1-r0")
+os.makedirs(_out_bb, exist_ok=True)
+_dflt = r.default_board_dir(_out_bb)
+check("default_board_dir = ~/precision/e9/<run>/<round>",
+      _dflt == "~/precision/e9/%s/s0-1-r0" % os.path.basename(_td_bb), repr(_dflt))
+write_expect(_td_bb)
+_a_bb = make_args(_td_bb, run=0, out_dir=_out_bb)
+_a_bb.board_dir = ""            # 真实情形：命令行没给 --board-dir
+_rd_bb = r.Round(_a_bb, types.SimpleNamespace(alias="x", exp_dir=_td_bb))
+check("Round 解析的 board_dir 与 default_board_dir 一致",
+      _rd_bb.board_dir == _dflt, repr(_rd_bb.board_dir))
+try:
+    r.RoundBoard("x", "", _td_bb)
+    check("RoundBoard 空目录 ⇒ 明确报错（不是 None.rstrip）", False)
+except r.RoundError:
+    check("RoundBoard 空目录 ⇒ 明确报错（不是 None.rstrip）", True)
 
 
 def patched(deps):
