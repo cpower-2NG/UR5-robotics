@@ -152,6 +152,23 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 - **摆位引导 = 腕部相机高位照片**（2026-11-11 用户定，不再打印 1:1 图 —— 现场只有 A4，
   1:1 放不下 325×250 mm 的拾取区）。分两步，都在摆块**之前**：
 
+  > ⚠️ **腕部 TF 要单独起**：阶段 4 的起栈脚本 `~/precision/restart_stack3.sh` 传
+  > `publish_camera_tf:=false`，**不发布** `tool0 → camera_link`；不起它，
+  > `precision_capture --burst` 会 fail-closed 报 `TF 链缺 ['tool0:camera_link']`
+  > （2026-11-11 实测，臂已到位但 burst 失败，臂停在观察位）。
+  > 板上常驻 + 验收（只读，不碰臂）：
+  >
+  > ```bash
+  > setsid nohup ~/precision/run.sh ~/stage4-entry/scripts/wrist_tf_publish.py \
+  >   > ~/stage4-entry/wrist-tf.log 2>&1 < /dev/null &
+  > ~/precision/run.sh ~/stage4-entry/scripts/wrist_tf_publish.py --verify   # rc=0 才算
+  > ```
+  >
+  > `--verify` 会逐位比对 `tool0 → camera_link` 与仓内标定
+  > `docs/calib/wrist_eih_camlink-2026-10-24.json`，并确认 `base_link →
+  > camera_color_optical_frame` 可达。**别**另起 `publish_camera_tf:=true` 或
+  > easy_handeye2 的 handeye_publisher —— `camera_link` 会有两个父节点。
+
   ```bash
   # ① 臂到拾取区上方的 survey 机位、拍一组腕部 burst、回原位（真机运动，要当次授权）
   python3 scripts/stage4_placement_view.py --plan \
@@ -251,4 +268,5 @@ python3 scripts/stage4_score.py --exit --need 3 <s0-*-r*/round.json ...>
 | 话题列表是空的 | `ROS_DOMAIN_ID` 没设成 99（查询侧问题） |
 | 候选落到臂够不到的地方、检测却高分 | 相机外参照抄了旧数字 / 用了 `extrinsics-2026-10-03` 那份的 `q`（⛔ 不可用，见当前状态 §3） |
 | 相机没数据、日志 30 秒刷 7 万行 | 有孤儿进程占着相机（`ros2 topic info --verbose` 看 Publishers，别信「话题还在」） |
+| burst 报 `TF 链缺 ['tool0:camera_link']` | 腕部 TF 发布者没起（`pgrep -af wrist_tf_publish`）；板上起 `~/stage4-entry/scripts/wrist_tf_publish.py`，`--verify` rc=0 再重拍 |
 | `programState` 时通时不通（`Failed to send request to dashboard server`） | `pgrep -cf dashboard_client` 是不是 >1 —— 孤儿与新节点同名抢服务（2026-11-06 实测） |
