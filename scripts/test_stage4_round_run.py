@@ -33,6 +33,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -187,6 +188,35 @@ check("预检：空树（路径对不上）⇒ 红，不靠期望值蒙过去",
           dict(GOT, tree={"sha256": "e3b0c442", "files": 0}),
           {"serial": "SN-1", "stack": {"ur_robot_driver": True}})))
 
+# 树哈希只覆盖源码：板子上跑一次 import 就多个 .pyc、跑一次构建就变一堆产物，
+# 这些都不该让「这棵树是哪棵」变味（2026-11-11 实测：`--help` 跑一次，
+# 文件数 1129→1130、哈希全变 ⇒ 预检假红，把「部署变了」和「有人 import 过」混淆）
+def _run_preflight(repo):
+    p = subprocess.run([sys.executable, "-c", r.PREFLIGHT_PY, repo],
+                       capture_output=True, text=True)
+    return json.loads(p.stdout)
+
+
+with tempfile.TemporaryDirectory() as _tt:
+    os.makedirs(os.path.join(_tt, "scripts"))
+    with open(os.path.join(_tt, "scripts", "a.py"), "w") as _f:
+        _f.write("x = 1\n")
+    _p1 = _run_preflight(_tt)
+    os.makedirs(os.path.join(_tt, "scripts", "__pycache__"))
+    with open(os.path.join(_tt, "scripts", "__pycache__", "a.pyc"), "wb") as _f:
+        _f.write(b"\x00junk")
+    os.makedirs(os.path.join(_tt, "ros2_ws", "build", "pkg"))
+    with open(os.path.join(_tt, "ros2_ws", "build", "pkg", "o.o"), "wb") as _f:
+        _f.write(b"obj")
+    os.makedirs(os.path.join(_tt, "scripts.bak-20260101"))
+    with open(os.path.join(_tt, "scripts.bak-20260101", "old.py"), "w") as _f:
+        _f.write("y = 2\n")
+    _p2 = _run_preflight(_tt)
+    check("树哈希只数源码：.pyc / 构建产物 / .bak 目录都不进（否则假红）",
+          _p1["tree"] == _p2["tree"], repr((_p1["tree"], _p2["tree"])))
+    check("树哈希：源码 1 个文件就数 1", _p1["tree"]["files"] == 1,
+          repr(_p1["tree"]))
+
 facts = r.build_facts("S0-1-r1", "S0", 1, lay.layout_blocks("S0", 1),
                       {"mode": "none", "applied_mm": [0, 0]})
 check("facts：人没给安全数字 ⇒ 不伪造（不写 safety 键）",
@@ -302,6 +332,31 @@ class Rc:
         self.stderr = err
 
 
+# pull_dir 必须走 rsync：``scp -r host:path/. local`` 在新版 OpenSSH（SFTP 后端）
+# 上直接报 ``error: unexpected filename: .`` 却返回 0 ⇒ 静默 0 帧。
+# 2026-11-11 Round 0 实测踩到：板上 20 帧齐全，拉回 0 帧，烧掉一次真机授权。
+_saved_run = r.subprocess.run
+try:
+    _calls = []
+    r.subprocess.run = lambda cmd, **kw: (_calls.append(cmd), Rc())[1]
+    _rd = object.__new__(r.RoundBoard)
+    _rd.alias = "fake"
+    with tempfile.TemporaryDirectory() as _td:
+        _rd.pull_dir("~/x/y", _td)
+        check("pull_dir 用 rsync 且远端路径以 / 结尾",
+              _calls[0][0] == "rsync" and _calls[0][-1].endswith("/"),
+              repr(_calls[0]))
+        r.subprocess.run = lambda cmd, **kw: Rc(23, err="boom")
+        try:
+            _rd.pull_dir("~/x/y", _td)
+            check("pull_dir 拉失败 ⇒ 抛错（不静默 0 帧）", False)
+        except r.RoundError as e:
+            check("pull_dir 拉失败 ⇒ 抛错（不静默 0 帧）",
+                  e.code == r.EXIT_MISSING)
+finally:
+    r.subprocess.run = _saved_run
+
+
 class FakeBoard:
     def __init__(self):
         self.calls = []
@@ -330,6 +385,9 @@ class FakeBoard:
         self.calls.append(("preflight", repo))
         return self.preflight_doc
 
+    def mkdir(self, remote):
+        self.calls.append(("mkdir", remote))
+
     def joints(self, dest):
         self.calls.append(("joints", dest))
         os.makedirs(dest, exist_ok=True)
@@ -346,8 +404,9 @@ class FakeBoard:
         self.calls.append(("token_state", rem))
         return tok, rem, why
 
-    def wait_token(self, timeout_s, poll_s, now=None, sleep=None, out=None):
-        self.calls.append(("wait_token", timeout_s))
+    def wait_token(self, timeout_s, poll_s, now=None, sleep=None, out=None,
+                   fresh_min=None):
+        self.calls.append(("wait_token", timeout_s, fresh_min))
         return ("t" * 32, 780.0)
 
     def push(self, local, remote, label=None):
@@ -390,7 +449,7 @@ class FakeBoard:
                      "clearing_steps": [], "reason": None,
                      "terminal": {"ok": True}}
                     for i in ids]
-        return {"scenes": [{"attempts": attempts}],
+        return {"scenes": [{"attempts": attempts}], "group": "ur_manipulator",
                 "scene_cleanup": {"ok": True, "world": [], "attached": []}}
 
     def run_script(self, remote, token):
@@ -415,7 +474,10 @@ def make_args(td, **over):
     for key, val in over.items():
         if val is False:
             continue
-        flag = "--" + key.replace("_", "-")
+        # ``from_`` 是 Python 侧的名字，命令行旗标叫 ``--from``；照着
+        # ``key.replace("_", "-")`` 机械转换会造出 ``--from-``（argparse 直接
+        # SystemExit(2)，连汇总行都不打 —— 2026-11-11 踩过）。
+        flag = "--from" if key == "from_" else "--" + key.replace("_", "-")
         if val is True:
             argv.append(flag)
         else:
@@ -449,6 +511,83 @@ try:
     check("RoundBoard 空目录 ⇒ 明确报错（不是 None.rstrip）", False)
 except r.RoundError:
     check("RoundBoard 空目录 ⇒ 明确报错（不是 None.rstrip）", True)
+
+# 令牌新鲜度：没过期 ≠ 这一次授权（红线 6 逐次授权；2026-11-11 Round 0 实测
+# 沿用上一道令牌 479 s，人根本没按 STOP/PLAY）
+_rb = object.__new__(r.RoundBoard)
+_seq = [("a" * 32, 479.0, ""), ("b" * 32, 598.0, "")]
+
+
+def _tok_state():
+    return _seq.pop(0) if _seq else ("b" * 32, 598.0, "")
+
+
+_rb.token_state = _tok_state
+_clock = [0.0]
+_rc, _out = quiet(_rb.wait_token, 30, 1, now=lambda: _clock[0],
+                  sleep=lambda s: _clock.__setitem__(0, _clock[0] + s),
+                  fresh_min=540.0)
+check("等待授权：旧的未过期令牌不算，等到新签发的才成立",
+      _rc == ("b" * 32, 598.0), repr(_rc))
+check("等待授权：说明写着「不是这一次签发的」",
+      "不是这一次签发" in _out, _out[-200:])
+
+_rb2 = object.__new__(r.RoundBoard)
+_rb2.token_state = lambda: ("a" * 32, 479.0, "")
+_c2 = [0.0]
+
+
+def _now2():
+    _c2[0] += 1.0
+    return _c2[0]
+
+
+try:
+    quiet(_rb2.wait_token, 3, 1, now=_now2, sleep=lambda s: None,
+          fresh_min=540.0)
+    check("等待授权：只有旧令牌 ⇒ 超时停（RoundError 3）", False)
+except r.RoundError as e:
+    check("等待授权：只有旧令牌 ⇒ 超时停（RoundError 3）",
+          e.code == r.EXIT_GATE)
+
+
+# 板上探针命令：``~/precision/run.sh`` 自己就是 ``exec python3 "$@"``，
+# 后面再写一个 python3 会被当成「要打开的脚本名」（2026-11-11 Round 0 实测
+# rc=2、`can't open file '<repo>/python3'`，白烧一次真机授权）
+class _SshLog:
+    def __init__(self):
+        self.cmds = []
+
+    def ssh(self, cmd, quiet=True, check=False):
+        self.cmds.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def _probe_cmd(repo="~/yolo_ros_original"):
+    rb = object.__new__(r.RoundBoard)
+    rb._b = _SshLog()
+    rb.probe(repo, "8,6,4,2,0", "ur_manipulator",
+             "~/precision/e9/x/round0/truth/layout.json",
+             "~/precision/e9/x/round0/grid-pre.json",
+             "~/precision/e9/x/round0/probe.json")
+    return rb._b.cmds[-1]
+
+
+_pcmd = _probe_cmd()
+check("探针命令：&& 之后直接是 run.sh + 脚本（不再传 python3）",
+      _pcmd.split("&&", 1)[1].strip().startswith(
+          "~/precision/run.sh scripts/stage4_clear_probe.py"), _pcmd)
+check("探针命令：仓库路径只出现在 cd 里",
+      _pcmd.count("~/yolo_ros_original") == 1 and
+      _pcmd.startswith("cd ~/yolo_ros_original && "), _pcmd)
+check("探针命令：~ 路径没被单引号焊死（否则板端不展开）",
+      "'~" not in _pcmd and '"~' not in _pcmd, _pcmd)
+try:
+    _probe_cmd(repo="~/repo with space")
+    check("探针命令：路径含空格 ⇒ 明确报错（不静默拼错命令）", False)
+except r.RoundError as e:
+    check("探针命令：路径含空格 ⇒ 明确报错（不静默拼错命令）",
+          e.code == r.EXIT_MISSING)
 
 
 def patched(deps):
@@ -623,6 +762,26 @@ with tempfile.TemporaryDirectory() as td:
     check("R1 不足 ⇒ 写 timing.json 供重标",
           json.load(open(rd.p("timing.json")))["r1"]["ok"] is False)
 
+# ---- C3b 干跑：R1 不预留执行时间（否则用**还没测出来的** T_exec_est 拦死
+# 量 T_probe/T_plan 的那一步；缺省 210+450+60=720 s > 600 s TTL，永远过不去）
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    b.tokens = [(("t" * 32), 450.0, "")]
+    rc, out, rd = run(td, b, dry_run=True)
+    timing = json.load(open(rd.p("timing.json")))
+    check("干跑：令牌 450 s 也能过 R1（不用未测的执行估时拦自己）",
+          rc == 0 and timing["r1"]["ok"] and
+          timing["r1"]["gate_exec_est_s"] == 0.0, repr(timing.get("r1")))
+    check("干跑：exec_est 仍按先验记下来（供标定，不是丢弃）",
+          timing["r1"]["exec_est_s"] > 0, repr(timing.get("r1")))
+
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    b.tokens = [(("t" * 32), 450.0, "")]
+    rc, out, rd = run(td, b)
+    check("同一条令牌 450 s：正式轮 R1 不过（干跑的豁免不泄漏）",
+          rc == r.EXIT_GATE, repr(rc))
+
 # ---- C4 R2 不足
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
@@ -689,6 +848,29 @@ with tempfile.TemporaryDirectory() as td:
           row.get("void") is True, repr(row))
     check("aborted_token 的提示写明不算抓取失败", "不算抓取失败" in out)
 
+# ---- C8b 观察段缺目录之类的普通失败 ≠ 令牌问题（2026-11-11 Round 0 误诊）
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    b.pre_results = [(9, "===== 令牌剩余时间守卫（要求 ≥ 30 s）\n"
+                         "Traceback (most recent call last):\n"
+                         "FileNotFoundError: [Errno 2] No such file or dir")]
+    rc, out, rd = run(td, b)
+    check("观察段普通失败（输出里只是守卫说明）⇒ rc 5，不误报令牌",
+          rc == r.EXIT_EXEC, repr(rc))
+    check("观察段普通失败不写 aborted_token/void",
+          "void" not in out and "aborted_token" not in out, out[-200:])
+
+# ---- C8c 板上只写不推的目录必须显式建（pre/exec、exec）
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    run(td, b)
+    made = [c[1] for c in b.calls if c[0] == "mkdir"]
+    check("观察段建了 pre/exec（precision_exec 写执行日志要用）",
+          any(p.endswith("/pre/exec") for p in made), repr(made))
+    check("执行段建了 exec", any(p.endswith("/exec") and
+                                 not p.endswith("/pre/exec") for p in made),
+          repr(made))
+
 # ---- C9 判分不完整
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
@@ -697,17 +879,35 @@ with tempfile.TemporaryDirectory() as td:
           phases_of(rd)[-1] == "score", repr((rc, phases_of(rd))))
 
 # ---- C10 探针问题
+
+
+def patch_probe(board, mutate):
+    """换掉 ``board.probe_report``，返回一份改过的报告。
+
+    **必须先抓住原方法再替换**：在补丁函数里直接写 ``b.probe_report()`` 会调到
+    它自己。2026-11-11 实测：RecursionError 被 compute 的兜底 ``except`` 接住，
+    照样以 rc 4 停在 compute ⇒「要求清障 / 格不符 / 幽灵块」三条**因为错的原因
+    变绿**（只有断言了报文文本的那条才暴露）。
+    """
+    orig = board.probe_report
+
+    def patched():
+        doc = orig()
+        mutate(doc)
+        return doc
+    board.probe_report = patched
+
+
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
 
-    def with_clearing():
-        doc = b.probe_report()
+    def _clearing(doc):
         doc["scenes"][0]["attempts"][2]["clearing_steps"] = [{"block": 0}]
-        return doc
-    b.probe_report = with_clearing
+    patch_probe(b, _clearing)
     rc, out, rd = run(td, b)
     check("探针要求清障 ⇒ rc 4（累积清障未实现，不假装能跑）",
-          rc == r.EXIT_PLAN and phases_of(rd)[-1] == "compute", repr(rc))
+          rc == r.EXIT_PLAN and phases_of(rd)[-1] == "compute"
+          and "清障" in out, repr((rc, out[-300:])))
     check("探针报清障 ⇒ 不发执行",
           not any(c[0] == "run_script" and c[1].endswith("run.sh")
                   for c in b.calls))
@@ -715,25 +915,115 @@ with tempfile.TemporaryDirectory() as td:
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
 
-    def bad_cell():
-        doc = b.probe_report()
+    def _bad_cell(doc):
         doc["scenes"][0]["attempts"][0]["cell"] = 7
-        return doc
-    b.probe_report = bad_cell
+    patch_probe(b, _bad_cell)
     rc, out, rd = run(td, b)
-    check("探针格与本轮格不符 ⇒ rc 4", rc == r.EXIT_PLAN, repr(rc))
+    check("探针格与本轮格不符 ⇒ rc 4",
+          rc == r.EXIT_PLAN and "探针格" in out, repr((rc, out[-300:])))
 
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
 
-    def dirty():
-        doc = b.probe_report()
+    def _dirty(doc):
         doc["scene_cleanup"] = {"ok": False, "world": ["block-0"],
                                 "attached": []}
-        return doc
-    b.probe_report = dirty
+    patch_probe(b, _dirty)
     rc, out, rd = run(td, b)
-    check("探针留下幽灵块 ⇒ rc 4（先清场景）", rc == r.EXIT_PLAN, repr(rc))
+    check("探针留下幽灵块 ⇒ rc 4（先清场景）",
+          rc == r.EXIT_PLAN and "幽灵块" in out, repr((rc, out[-300:])))
+
+# 规划组写错**不报错**，只是每个目标 0.4 s 秒失败（2026-11-11 Round 0：缺省是
+# 仿真组 ur5_manipulator，真机上白烧一次授权）
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+
+    def _sim_group(doc):
+        doc["group"] = "ur5_manipulator"
+    patch_probe(b, _sim_group)
+    rc, out, rd = run(td, b)
+    check("探针用了仿真规划组 ⇒ rc 4（不是当成场景无解）",
+          rc == r.EXIT_PLAN and "仿真" in out, repr((rc, out[-300:])))
+
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+
+    def _other_group(doc):
+        doc["group"] = "some_other_group"
+    patch_probe(b, _other_group)
+    rc, out, rd = run(td, b)
+    check("探针规划组与 --probe-group 不符 ⇒ rc 4",
+          rc == r.EXIT_PLAN and "规划组" in out, repr((rc, out[-300:])))
+
+# --probe-report：复用一份已跑过的报告 ⇒ 本轮不碰板端探针（只读、不占令牌）
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    reuse = os.path.join(td, "probe-reuse.json")
+    with open(reuse, "w") as f:
+        json.dump(b.probe_report(), f)
+    rc, out, rd = run(td, b, probe_report=reuse)
+    check("--probe-report 复用 ⇒ 不调板端探针",
+          not any(c[0] == "probe" for c in b.calls), repr(b.calls[:6]))
+    check("--probe-report 复用 ⇒ 照常出计划并跑完干跑", rc == 0, repr(rc))
+
+# ---- C10c 干跑不要求令牌（2026-11-11 用户定调：先离线把计算链跑通）
+# 干跑只到 compute、从不发轨迹 ⇒ R1/R2 没有保护对象。反过来，要求令牌就会逼人
+# 为一次纯计算按 STOP→PLAY，而且机械臂关机时连代码都验不了。
+def _seed_then(td, **over):
+    """先整跑一遍干跑把 ``pre/`` 产物铺好，再清空调用记录跑 ``--from compute``。
+
+    只想验 compute 段，但 compute 要读观察段落的 ``q_after_observe.json`` 与
+    burst 目录 —— 这是 ``--from compute`` 的真实前置，不能靠桩假装。
+    """
+    b = FakeBoard()
+    run(td, b, dry_run=True)
+    reuse = os.path.join(td, "probe-reuse.json")
+    with open(reuse, "w") as f:
+        json.dump(b.probe_report(), f)
+    b.calls = []
+    b.tokens = [(None, None, "没有令牌（机械臂关机）")]
+    rc, out, rd = run(td, b, dry_run=True, from_="compute", to="compute",
+                      probe_report=reuse, **over)
+    return b, rc, out, rd, reuse
+
+
+with tempfile.TemporaryDirectory() as td:
+    b, rc, out, rd, _reuse = _seed_then(td)
+    check("干跑 + 没有令牌 ⇒ 仍跑到 compute 收尾（rc 0）", rc == 0, repr(rc))
+    tj = json.load(open(rd.p("timing.json")))
+    check("干跑 + 没有令牌 ⇒ timing 记 skipped=dry_run（不是假装通过）",
+          tj["r1"].get("skipped") == "dry_run"
+          and tj["r1"].get("ok") is True, repr(tj.get("r1")))
+
+# 干跑 + 复用探针报告 ⇒ **纯离线**：一次板子调用都不许有（机械臂关机也能验）
+with tempfile.TemporaryDirectory() as td:
+    b, rc, out, rd, _reuse = _seed_then(td)
+    check("干跑 + 复用探针 ⇒ 完全离线（无任何板子调用）",
+          rc == 0 and not b.calls, repr((rc, b.calls[:6])))
+
+# 非干跑同一条没有令牌 ⇒ 仍然 fail-closed（干跑的豁免不许泄漏）
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    run(td, b, dry_run=True)
+    reuse = os.path.join(td, "probe-reuse.json")
+    with open(reuse, "w") as f:
+        json.dump(b.probe_report(), f)
+    b.calls = []
+    b.tokens = [(None, None, "没有令牌（机械臂关机）")]
+    rc, out, rd = run(td, b, from_="compute", to="compute", probe_report=reuse)
+    check("非干跑 + 没有令牌 ⇒ rc 3（跳过的只有干跑）",
+          rc == r.EXIT_GATE, repr((rc, out[-200:])))
+
+# --from 重跑单段 ⇒ 前几段的证据**不许被覆盖**（2026-11-11 Round 0 实测丢过）
+with tempfile.TemporaryDirectory() as td:
+    b, rc, out, rd, _reuse = _seed_then(td)
+    names = [p["phase"] for p in rd.phases]
+    check("--from compute：phases.json 保留前四段与新 compute 段",
+          names == ["preflight", "views", "authorize", "observe", "compute"],
+          repr(names))
+    tj = json.load(open(rd.p("timing.json")))
+    check("--from compute：timing 保留观察段秒数（不丢证据）",
+          tj.get("observe_s") is not None, repr(tj))
 
 # ---- C11 --from/--to
 with tempfile.TemporaryDirectory() as td:
@@ -759,8 +1049,9 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         undo()
         cm.reset_pad()
-    check("--from/--to archive：只跑归档一段",
-          [p["phase"] for p in rd2.phases] == ["archive"] and rc2 == 0,
+    before = [p["phase"] for p in rd.phases]
+    check("--from/--to archive：只跑归档一段（前几段保留不重跑）",
+          [p["phase"] for p in rd2.phases] == before + ["archive"] and rc2 == 0,
           repr((rc2, [p["phase"] for p in rd2.phases])))
 
 # ---- C12 |b̂|>15 mm 记失败、不当偏置

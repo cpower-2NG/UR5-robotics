@@ -210,18 +210,38 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 
 ### 3. Round 0 计时干跑（S0 六轮之前，只做一次，不计入六轮）
 
-授权后**只跑到阶段 4**（观察 / 解垫 / 探针 / 规划），**不执行**：
+**先离线排练（不碰板子、不碰臂、不要授权）** —— 机械臂关机也能跑，用的是上一轮
+观察段落的 burst 与一份已跑过的探针报告：
 
 ```bash
 python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 0 \
   --out-dir ~/robotics/notes/ur5-vision-grasp/runs/<date>-stage4-s0/round0 \
-  --urdf <robot.urdf> --board jetson-hotspot --board-repo ~/yolo_ros_original \
+  --urdf <robot.urdf> --board jetson-hotspot --board-repo '~/stage4-entry' \
+  --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json \
+  --bias-seed -2.791,-0.248 \
+  --probe-report <round>/probe.json \
+  --dry-run --from compute --to compute
+```
+
+判据：`解出 20/20 帧`、五个目标各出一份计划、8 份计划（5 目标 + 3 机位）、
+`timing.json` 落盘。**干跑不执行、不动臂 ⇒ 不要令牌**（`timing.r1.skipped = "dry_run"`）；
+带 `--probe-report` 时连板子都不碰。先在这一步把代码缺陷修干净，再去要真机授权。
+
+真机计时（**要授权**：观察段会让臂走到 pick / pad 机位）—— 授权后只跑到阶段 4
+（观察 / 解垫 / 探针 / 规划），**不执行**：
+
+```bash
+python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 0 \
+  --out-dir ~/robotics/notes/ur5-vision-grasp/runs/<date>-stage4-s0/round0 \
+  --urdf <robot.urdf> --board jetson-hotspot --board-repo '~/stage4-entry' \
   --expect <preflight-expect.json> --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json \
   --bias-seed -2.791,-0.248 --dry-run
 ```
 
 产物 `timing.json` 给出 `T_observe / T_pad / T_probe / T_plan / T_exec_est`；
 后续轮用 `--timing-prior <round0>/timing.json` 标定 R1/R2。
+**2026-11-11 离线实测**（S0:1，复用同一批 burst 与探针报告）：解垫 0.8 s、规划 8.5 s、
+整段 compute 9.3 s、`T_exec_est` 206 s；探针单独一趟 6.1 s。
 
 ### 4. 授权（人，一轮一次）
 

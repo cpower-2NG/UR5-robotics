@@ -48,7 +48,7 @@ b̂ 偏置补偿（契约 §4.7，继承阶段三）
     python3 scripts/stage4_round_run.py \
         --batch S0 --layout 1 --run 1 \
         --out-dir ~/robotics/notes/ur5-vision-grasp/runs/<date>-stage4-s0/s0-1-r1 \
-        --urdf <robot.urdf> --board <ssh-alias> --board-repo ~/yolo_ros_original \
+        --urdf <robot.urdf> --board <ssh-alias> --board-repo ~/stage4-entry \
         --expect <preflight-expect.json> --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json \
         --bias-seed -2.791,-0.248
 
@@ -61,6 +61,7 @@ import json
 import math
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -383,9 +384,9 @@ import os
 import subprocess
 import sys
 
-repo = sys.argv[1] if len(sys.argv) > 1 else "~/yolo_ros_original"
+repo = sys.argv[1] if len(sys.argv) > 1 else "~/stage4-entry"
 # 参数是 shell 引号过的（shlex.quote），``~`` 不会被远端 shell 展开 ⇒ 自己展开。
-# 2026-11-11 实测：传 ``~/yolo_ros_original`` 而这里不展开 ⇒ os.walk 走空
+# 2026-11-11 实测：传 ``~/<repo>`` 而这里不展开 ⇒ os.walk 走空
 # ⇒ 树哈希 = e3b0c442…（空串的 sha256）、文件数 0。
 repo = os.path.expanduser(repo)
 out = {}
@@ -397,11 +398,27 @@ except OSError as exc:
     out["serial"] = None
     out["serial_error"] = str(exc)
 
+# 树哈希**只覆盖源码**：`__pycache__` / `*.pyc` / 构建产物 / 备份目录每次跑都会
+# 变（2026-11-11 实测：跑一次 `--help` 就让文件数 1129→1130、哈希全变 ⇒ 预检
+# 假红，把「部署变了」和「有人 import 过一次」混为一谈）。`.git` 也不进。
+_SKIP_DIRNAMES = {".git", "__pycache__"}
+_SKIP_PREFIX = ("ros2_ws/build", "ros2_ws/install", "ros2_ws/log")
 h = hashlib.sha256()
 n = 0
 for root, dirs, files in os.walk(repo):
-    dirs[:] = sorted(d for d in dirs if d != ".git")
+    rel_root = os.path.relpath(root, repo).replace(os.sep, "/")
+    keep = []
+    for d in sorted(dirs):
+        rel = d if rel_root == "." else rel_root + "/" + d
+        if d in _SKIP_DIRNAMES or d.startswith("scripts.bak"):
+            continue
+        if any(rel == p or rel.startswith(p + "/") for p in _SKIP_PREFIX):
+            continue
+        keep.append(d)
+    dirs[:] = keep
     for name in sorted(files):
+        if name.endswith((".pyc", ".pyo")) or ".bak-" in name:
+            continue
         path = os.path.join(root, name)
         rel = os.path.relpath(path, repo)
         h.update(rel.encode("utf-8") + b"\x00")
@@ -487,12 +504,33 @@ class RoundBoard:
         return self._b.ssh(cmd, quiet=quiet, check=check)
 
     def _scp(self, src, dst):
-        r = subprocess.run(["scp", "-q", src, "%s:%s" % (self.alias, dst)],
+        """本地 → 板上（**只管这一个方向**）。"""
+        r = subprocess.run(["scp", "-o", "LogLevel=ERROR", src,
+                            "%s:%s" % (self.alias, dst)],
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise RoundError(EXIT_MISSING, "board",
-                             "scp %s → %s 失败：%s"
-                             % (src, dst, (r.stderr or "").strip()[:200]))
+                             "scp %s → %s 失败（rc=%d）：%s"
+                             % (src, dst, r.returncode,
+                                (r.stderr or "").strip()[:200]))
+        return r
+
+    def _scp_from(self, src_remote, dst_local):
+        """板上 → 本地。
+
+        **不能复用 ``_scp``**：它无条件给**目标**加 ``<alias>:`` 前缀，用反方向
+        就是把本地路径当板上路径 ⇒ ``scp -q host:remote host:/local/x``。
+        2026-11-11 Round 0 实测：探针报告明明在板上（1493 B），编排器却报
+        「拉不回来」，而且 ``-q`` 把原因也吞了（错误文本是空的）。
+        """
+        r = subprocess.run(["scp", "-o", "LogLevel=ERROR",
+                            "%s:%s" % (self.alias, src_remote), dst_local],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RoundError(EXIT_MISSING, "board",
+                             "scp %s:%s → %s 失败（rc=%d）：%s"
+                             % (self.alias, src_remote, dst_local,
+                                r.returncode, (r.stderr or "").strip()[:200]))
         return r
 
     def push(self, local, remote, label=None):
@@ -515,15 +553,39 @@ class RoundBoard:
         for local, remote in pairs:
             self.push(local, remote)
 
+    def mkdir(self, remote):
+        """板上建目录（幂等）。
+
+        ``push`` 只建**被推文件所在**的目录；像 ``pre/exec/`` 这种只写 jsonl、
+        从不推文件的目录不会自己出现。2026-11-11 Round 0 实测：``precision_exec``
+        发轨迹前写执行日志 ⇒ ``FileNotFoundError`` ⇒ 观察段 rc=9 停轮。
+        """
+        if not remote:
+            raise RoundError(EXIT_MISSING, "board", "板上目录为空")
+        self.ssh("mkdir -p %s" % remote)
+
     def pull_file(self, remote, local):
         os.makedirs(os.path.dirname(os.path.abspath(local)) or ".", exist_ok=True)
-        return self._scp("%s:%s" % (self.alias, remote), local)
+        return self._scp_from(remote, local)
 
     def pull_dir(self, remote, local):
+        """把板上目录的**内容**拉到 local。
+
+        用 ``rsync`` 而不是 ``scp -r host:path/. local``：新版 OpenSSH 的 scp 走
+        SFTP，末尾的 ``/.`` 直接报 ``error: unexpected filename: .`` 且**退出码
+        仍是 0**、一个文件都不拷。2026-11-11 Round 0 实测：观察段跑完 20 帧
+        好端端躺在板上，拉回来却是 0 帧，白白烧掉一次真机授权。
+        拉失败一律抛错，不许「静默 0 帧」。
+        """
         os.makedirs(local, exist_ok=True)
-        r = subprocess.run(["scp", "-q", "-r",
-                            "%s:%s/." % (self.alias, remote), local],
+        r = subprocess.run(["rsync", "-a", "%s:%s/" % (self.alias, remote),
+                            local.rstrip("/") + "/"],
                            capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RoundError(EXIT_MISSING, "board",
+                             "rsync 拉目录失败（%s → %s，rc=%d）：%s"
+                             % (remote, local, r.returncode,
+                                (r.stderr or "").strip()[:200]))
         return r
 
     # ---- 板上动作
@@ -569,15 +631,25 @@ class RoundBoard:
         return tok, rem, ""
 
     def wait_token(self, timeout_s, poll_s, now=time.time, sleep=time.sleep,
-                   out=log):
-        """在板上轮询到「两步握手写完令牌」为止；超时 ⇒ ``RoundError(3)``。"""
+                   out=log, fresh_min=None):
+        """在板上轮询到「**这一次**两步握手写完令牌」为止；超时 ⇒ ``RoundError(3)``。
+
+        ``fresh_min``：令牌剩余秒数下限。**不给下限就会捡到上一轮/上一次尝试
+        留下的令牌**——它还没过期，``wait_token`` 立刻「授权成立」，等于沿用
+        旧授权。2026-11-11 Round 0 重跑时就发生过一次（令牌还剩 479 s，而这一
+        次人还没按 STOP/PLAY）。红线 6 要求逐次授权 ⇒ 缺省要求令牌几乎是新
+        签发的（600 s TTL 留 60 s 余量）。
+        """
         deadline = float(now()) + float(timeout_s)
         last = None
         while float(now()) < deadline:
             tok, rem, why = self.token_state()
-            if tok:
+            if tok and (fresh_min is None or float(rem) >= float(fresh_min)):
                 log("授权成立：按板上时钟令牌还剩 %.0f 秒" % rem)
                 return tok, rem
+            if tok:
+                why = ("令牌只剩 %.0f 秒（< %.0f）—— 不是这一次签发的，继续等"
+                       "新的 STOP→PLAY" % (float(rem), float(fresh_min)))
             if why != last:
                 log("等待授权：%s" % why)
                 last = why
@@ -603,7 +675,24 @@ class RoundBoard:
 
     def probe(self, repo, cells, group, truth_remote, grid_remote,
               report_remote):
-        cmd = ("cd %s && %s/run.sh python3 scripts/stage4_clear_probe.py "
+        """板上跑一轮只读探针（MoveIt 服务，不发轨迹）。
+
+        ``~/precision/run.sh`` **本身就是解释器包装器**（``exec python3 "$@"``），
+        所以 ``run.sh`` 后面直接接脚本路径；再写一个 ``python3`` 会被当成
+        「要打开的脚本名」——2026-11-11 Round 0 实测报
+        ``python3: can't open file '<repo>/python3'``（rc=2），干跑停在探针这一步、
+        白烧一次授权。``cd <repo>`` 保留：探针按仓库内的相对路径找脚本。
+
+        **路径不能过 ``shlex.quote``**：板端路径一律以 ``~`` 开头，单引号会把
+        波浪号焊死、不展开。改为直接要求不含空白/引号（本仓生成的都是这种）。
+        """
+        parts = [repo, truth_remote, str(cells), group, grid_remote,
+                 report_remote]
+        for p in parts:
+            if not p or " " in p or "'" in p or '"' in p:
+                raise RoundError(EXIT_MISSING, "board",
+                                 "探针参数含空白/引号：%r" % p)
+        cmd = ("cd %s && %s/run.sh scripts/stage4_clear_probe.py "
                "--truth %s --grid %s --cells %s --group %s --report %s"
                % (repo, pr.BOARD_DIR, truth_remote, grid_remote, cells,
                   group, report_remote))
@@ -703,6 +792,35 @@ class Round:
         write_json(self.p("phases.json"), self.phases)
         return row
 
+    def _merge_prior(self, start, end):
+        """``--from/--to`` 单步重跑时**不许丢前几段的证据**。
+
+        2026-11-11 Round 0 实测：只重跑 compute 会把 ``phases.json`` /
+        ``timing.json`` 整个覆盖 —— 观察段、授权的记录就此消失，而它们正是
+        归档与「令牌还剩多少」要看的证据。规则：本次要跑的段落一律重测重写，
+        范围外的旧行原样保留。
+        """
+        run_names = set(PHASES[start:end + 1])
+        ppath = self.p("phases.json")
+        if os.path.exists(ppath):
+            try:
+                prior = read_json(ppath)
+            except Exception:                                   # noqa: BLE001
+                prior = []
+            self.phases = [r for r in prior
+                           if isinstance(r, dict)
+                           and r.get("phase") not in run_names]
+        tpath = self.p("timing.json")
+        if os.path.exists(tpath):
+            try:
+                tprior = read_json(tpath)
+            except Exception:                                   # noqa: BLE001
+                tprior = {}
+            if isinstance(tprior, dict):
+                merged = dict(tprior)
+                merged.update(self.timing)
+                self.timing = merged
+
     def run(self):
         """跑 ``--from`` → ``--to``；第一个非 0 就停并返回它的退出码。"""
         start = PHASES.index(self.args.from_) if self.args.from_ else 0
@@ -714,6 +832,8 @@ class Round:
             end = PHASES.index("compute")
             log("干跑：只到阶段 4（compute），不执行、不判分")
         os.makedirs(self.out, exist_ok=True)
+        if start > 0 or end < len(PHASES) - 1:
+            self._merge_prior(start, end)
         for i in range(start, end + 1):
             name = PHASES[i]
             self._t0()
@@ -826,7 +946,8 @@ class Round:
         tok, rem = self.board.wait_token(self.args.auth_timeout,
                                          self.args.auth_poll,
                                          now=self.deps["now"],
-                                         sleep=self.deps["sleep"])
+                                         sleep=self.deps["sleep"],
+                                         fresh_min=self.args.auth_fresh_min)
         write_json(self.p("motion-auth.json"),
                    {"at": self.deps["now"](), "token_remaining_s": round(rem, 1),
                     "source": "板上 %s（STOP→PLAY 两步握手）"
@@ -844,6 +965,8 @@ class Round:
                   self.b("pre", "plan", p["name"])) for p in plans]
         self.board.push_many(files)
         self.board.push(self.p("pre.sh"), self.b("pre.sh"), "pre.sh")
+        # 执行日志目录：只写不推，必须显式建（见 Board.mkdir 的说明）
+        self.board.mkdir(self.b("pre", "exec"))
         rc, out = self.board.run_script(self.b("pre.sh"), tok)
         os.makedirs(self.p("pre"), exist_ok=True)
         with open(self.p("pre", "stdout.txt"), "w", encoding="utf-8") as f:
@@ -852,7 +975,10 @@ class Round:
         for line in out.strip().splitlines()[-6:]:
             log("  | " + line)
         if rc != 0:
-            if "令牌" in out or "aborted_token" in out:
+            # 只认守卫**失败**那句（``!!!!! STOP: 令牌剩余不足 …``）：脚本第一行
+            # 就有「令牌剩余时间守卫」的说明，按裸「令牌」判会把任何失败都误诊成
+            # 授问题（2026-11-11 Round 0：真因是板上缺 exec 目录）。
+            if "aborted_token" in out or "令牌剩余不足" in out:
                 raise RoundError(EXIT_GATE, "observe",
                                  "观察段被令牌守卫拦下（rc=%d）—— 重做 "
                                  "STOP→PLAY 后再跑本轮" % rc)
@@ -893,17 +1019,39 @@ class Round:
         compute_est = float(prior.get("compute_est_s")
                             or self.args.compute_est)
         exec_est_prior = float(prior.get("exec_est_s") or self.args.exec_est)
+        # 干跑（Round 0）不执行 ⇒ R1 里不该再预留执行时间。否则就是死结：
+        # R1 用**还没测出来**的 T_exec_est 判闸门，把量 T_probe/T_plan 的那一步
+        # 本身拦住（2026-11-11 实测：缺省 210+450+60=720 s > 600 s TTL，永远过不去）。
+        gate_exec_est = 0.0 if self.args.dry_run else exec_est_prior
 
         # ---- R1：观察后、探针前
-        tok, rem, why = self.board.token_state()
-        if not tok:
-            raise RoundError(EXIT_GATE, "compute",
-                             "令牌已失效：%s —— 重做 STOP→PLAY" % why)
-        ok, msg = r1_gate(rem, compute_est, exec_est_prior)
+        #
+        # **干跑（Round 0 / 离线排练）不要求令牌**：干跑只到 compute 就返回，
+        # 从不发轨迹，令牌闸门在这里没有保护对象；反过来，要求令牌就会逼人为
+        # 一次纯计算做 STOP→PLAY，而且板子关机时连代码都验不了。
+        # 2026-11-11 用户定调：先把计算链离线跑通，再拿真机授权去跑执行。
+        # 带 ``--probe-report`` 时连板子都不碰（纯离线）；否则只**读**一次剩余秒数。
+        if self.args.dry_run:
+            rem = None
+            if not self.args.probe_report:
+                _tok, rem, _why = self.board.token_state()
+            ok, msg = True, ("干跑：跳过 R1（不执行、不动臂%s）"
+                             % ("，也不碰板子" if self.args.probe_report
+                                else ""))
+        else:
+            tok, rem, why = self.board.token_state()
+            if not tok:
+                raise RoundError(EXIT_GATE, "compute",
+                                 "令牌已失效：%s —— 重做 STOP→PLAY" % why)
+            ok, msg = r1_gate(rem, compute_est, gate_exec_est)
         log(msg)
-        self.timing["r1"] = {"remaining_s": round(rem, 1),
+        self.timing["r1"] = {"remaining_s": (None if rem is None
+                                             else round(rem, 1)),
                              "compute_est_s": compute_est,
                              "exec_est_s": exec_est_prior,
+                             "gate_exec_est_s": gate_exec_est,
+                             "dry_run": bool(self.args.dry_run),
+                             "skipped": "dry_run" if self.args.dry_run else None,
                              "ok": bool(ok)}
         if not ok:
             write_json(self.p("timing.json"), self.timing)
@@ -960,26 +1108,34 @@ class Round:
         cells = cm.parse_cells(self.args.cells, len(ids))
         cell_map = cm.assign_cells(ids, cells)
 
-        # ---- 探针（板上一趟，只读）
-        t_probe = float(self.deps["now"]())
-        self.board.push(truth_path, self.b("truth", "layout.json"), "truth")
-        self.board.push(grid_path, self.b("grid-pre.json"), "grid-pre.json")
-        r = self.board.probe(self.args.board_repo, self.args.cells,
-                             self.args.probe_group,
-                             self.b("truth", "layout.json"),
-                             self.b("grid-pre.json"),
-                             self.b("probe.json"))
-        self.timing["probe_s"] = round(float(self.deps["now"]()) - t_probe, 1)
-        if r.returncode not in (0, 1):
-            raise RoundError(EXIT_PLAN, "compute",
-                             "探针跑不起来（rc=%d）：%s"
-                             % (r.returncode,
-                                (r.stderr or "").strip()[:300]))
+        # ---- 探针（板上一趟，只读）。``--probe-report``：复用一份**已经跑过**
+        # 的探针报告（只读规划服务，不动臂、不占令牌；§5 超预算时的杠杆 1）。
+        # 复用时必须核对报告里的格位/规划组与本轮一致（``_check_probe`` 干这事）。
         probe_path = self.p("probe.json")
-        try:
-            self.board.pull_file(self.b("probe.json"), probe_path)
-        except RoundError as e:
-            raise RoundError(EXIT_PLAN, "compute", "探针报告没拉回来：%s" % e)
+        if self.args.probe_report:
+            shutil.copyfile(self.args.probe_report, probe_path)
+            self.timing["probe_s"] = None
+            self.timing["probe_source"] = "复用 %s" % self.args.probe_report
+            log("探针：复用 %s（本轮不重跑）" % self.args.probe_report)
+        else:
+            t_probe = float(self.deps["now"]())
+            self.board.push(truth_path, self.b("truth", "layout.json"), "truth")
+            self.board.push(grid_path, self.b("grid-pre.json"), "grid-pre.json")
+            r = self.board.probe(self.args.board_repo, self.args.cells,
+                                 self.args.probe_group,
+                                 self.b("truth", "layout.json"),
+                                 self.b("grid-pre.json"),
+                                 self.b("probe.json"))
+            self.timing["probe_s"] = round(float(self.deps["now"]()) - t_probe, 1)
+            if r.returncode not in (0, 1):
+                raise RoundError(EXIT_PLAN, "compute",
+                                 "探针跑不起来（rc=%d）：%s"
+                                 % (r.returncode,
+                                    (r.stderr or "").strip()[:300]))
+            try:
+                self.board.pull_file(self.b("probe.json"), probe_path)
+            except RoundError as e:
+                raise RoundError(EXIT_PLAN, "compute", "探针报告没拉回来：%s" % e)
         report = read_json(probe_path)
         self._check_probe(report, ids, cell_map)
 
@@ -1028,12 +1184,20 @@ class Round:
                   for v in cr.E9_VIEWS}
         t_exec = exec_estimate(all_plans)
         self.timing["exec_est_s"] = t_exec
-        tok, rem, why = self.board.token_state()
-        ok, msg = r2_gate(rem, t_exec)
+        if self.args.dry_run:
+            rem = None
+            if not self.args.probe_report:
+                _tok, rem, _why = self.board.token_state()
+            ok, msg = True, "干跑：跳过 R2（不写执行、不动臂）"
+        else:
+            tok, rem, why = self.board.token_state()
+            ok, msg = r2_gate(rem, t_exec)
         log(msg)
         self.timing["r2"] = {"remaining_s": (None if rem is None
                                              else round(rem, 1)),
-                             "exec_est_s": t_exec, "ok": bool(ok)}
+                             "exec_est_s": t_exec,
+                             "skipped": "dry_run" if self.args.dry_run else None,
+                             "ok": bool(ok)}
         if not ok:
             write_json(self.p("timing.json"), self.timing)
             raise RoundError(EXIT_GATE, "compute", msg + " —— 停，重做 STOP→PLAY")
@@ -1048,13 +1212,19 @@ class Round:
         write_json(self.p("plan", "final_layout.json"),
                    [{k: b.get(k) for k in ("id", "x", "y", "z", "yaw", "size")}
                     for b in layout])
-        self._push_run(all_plans, rpath)
+        # 纯离线排练（干跑 + 复用探针报告）不碰板子：机械臂关机时也能验整条
+        # 计算链，别为了推文件再要一次上板。
+        if self.args.dry_run and self.args.probe_report:
+            log("纯离线排练：计划只写本地，不推板子")
+        else:
+            self._push_run(all_plans, rpath)
         self.timing["observe_s"] = self._phase_seconds_of("observe")
         self.timing["compute_s"] = round(float(self.deps["now"]()) - t_start, 1)
         self.timing["compute_est_s"] = self.args.compute_est
         write_json(self.p("timing.json"), self.timing)
-        log("执行计划 %d 份（含跑后三机位），估时 %.0f s；令牌剩 %.0f s"
-            % (len(all_plans), t_exec, rem))
+        log("执行计划 %d 份（含跑后三机位），估时 %.0f s；令牌%s"
+            % (len(all_plans), t_exec,
+               ("剩 %.0f s" % rem) if rem is not None else "：干跑未查"))
         return EXIT_OK
 
     def _phase_seconds_of(self, name):
@@ -1080,6 +1250,18 @@ class Round:
                 "source": os.path.basename(grid_path), "measured": True}
 
     def _check_probe(self, report, ids, cell_map):
+        # 规划组名先查：用错组**不会报错**，只会让每个目标 0.4 s 内
+        # `no_clearing_plan`（2026-11-11 Round 0：缺省写成了仿真组
+        # `ur5_manipulator`）。别把它当成「场景无解」。
+        grp = report.get("group")
+        if grp == "ur5_manipulator":
+            raise RoundError(EXIT_PLAN, "compute",
+                             "探针用的是**仿真**规划组 ur5_manipulator（真机是 "
+                             "ur_manipulator）—— 全部目标会秒失败，停")
+        if grp and self.args.probe_group and grp != self.args.probe_group:
+            raise RoundError(EXIT_PLAN, "compute",
+                             "探针报告里的规划组 %r ≠ 本次 --probe-group %r"
+                             % (grp, self.args.probe_group))
         scenes = report.get("scenes") or []
         if not scenes:
             raise RoundError(EXIT_PLAN, "compute", "探针报告里没有 scenes")
@@ -1163,6 +1345,7 @@ class Round:
                              % why)
         plans = read_json(self.p("plan", "plans.json"))
         log("执行 %d 份计划（一条 run.sh，Agent 不介入）" % len(plans))
+        self.board.mkdir(self.b("exec"))     # 只写不推，必须显式建
         rc, out = self.board.run_script(self.b("run.sh"), tok)
         os.makedirs(self.p("exec"), exist_ok=True)
         with open(self.p("exec", "stdout.txt"), "w", encoding="utf-8") as f:
@@ -1176,7 +1359,7 @@ class Round:
                 raise RoundError(EXIT_EXEC, "execute",
                                  "run.sh 返回 0 但没有 ALL DONE —— 不认")
             return EXIT_OK
-        if "令牌" in out or "aborted_token" in out or "min-remaining" in out:
+        if "aborted_token" in out or "令牌剩余不足" in out:
             raise RoundError(EXIT_GATE, "execute",
                              "执行中令牌过期 / 不足（rc=%d）—— 本轮 void"
                              "（aborted_token），不计连续 streak，不记抓取失败"
@@ -1445,7 +1628,9 @@ def build_parser():
     ap.add_argument("--urdf", default=None, help="真机 robot.urdf（规划用）")
     ap.add_argument("--board", default=None, help="SSH 别名 / 主机")
     ap.add_argument("--board-repo", default=None,
-                    help="板上本仓检出路径（探针与预检在里面跑）")
+                    help="板上本仓检出路径（探针与预检在里面跑）。阶段 4 是 "
+                         "~/stage4-entry —— 探针脚本在 <repo>/scripts/ 下，"
+                         "~/yolo_ros_original 里没有 stage4 脚本（2026-11-11 实测）")
     ap.add_argument("--board-dir", default=None,
                     help="板上本轮镜像目录（缺省 ~/precision/e9/<run>/<round>）")
     ap.add_argument("--cells", default=None, help="块 id 升序 → 格：8,6,4,2,0")
@@ -1459,7 +1644,14 @@ def build_parser():
     ap.add_argument("--pad-thick", type=float, default=None)
     ap.add_argument("--place-clearance", type=float, default=None)
     ap.add_argument("--place-yaw-equiv180", action="store_true")
-    ap.add_argument("--probe-group", default="ur5_manipulator")
+    ap.add_argument("--probe-report", default=None,
+                    help="复用一份已经跑过的探针报告（本地 JSON），本轮不重跑"
+                         "板端探针；只读、不动臂，格位与规划组仍逐项核对")
+    ap.add_argument("--probe-group", default="ur_manipulator",
+                    help="MoveIt 规划组：真机 ur_manipulator（缺省）/ 仿真 "
+                         "ur5_manipulator。**仿真组名在真机上不报错**：每个 "
+                         "attempt ~0.4 s 就失败成 no_clearing_plan —— 2026-11-11 "
+                         "Round 0 实测，白烧一次授权")
 
     ap.add_argument("--bias-comp", default="fixed", choices=("fixed", "none"))
     ap.add_argument("--bias-seed", default=None, help="\"bx,by\" 毫米")
@@ -1468,8 +1660,11 @@ def build_parser():
 
     ap.add_argument("--timing-prior", default=None,
                     help="Round 0 实测的 timing.json（标定 R1/R2）")
-    ap.add_argument("--compute-est", type=float, default=210.0,
-                    help="R1 用的轮内计算估时（秒；Round 0 后按实测）")
+    # 2026-11-11 Round 0 实测：解垫 0.9 s + 规划 8.6 s（5 目标 + 3 机位）
+    # + 探针 6.1 s（板上一趟）≈ 16 s。缺省从 210 s 收到 90 s（约 5× 余量）；
+    # 估时只影响 R1 保守程度，不是判分阈值 —— 但改了就记在台账里。
+    ap.add_argument("--compute-est", type=float, default=90.0,
+                    help="R1 用的轮内计算估时（秒；缺省 90 = Round 0 实测 16 s 的 ~5×）")
     ap.add_argument("--exec-est", type=float, default=450.0,
                     help="无 timing-prior 时的执行估时（秒）")
 
@@ -1479,6 +1674,10 @@ def build_parser():
     ap.add_argument("--colour-search-mm", type=float, default=25.0)
     ap.add_argument("--auth-timeout", type=float, default=1800.0)
     ap.add_argument("--auth-poll", type=float, default=2.0)
+    ap.add_argument("--auth-fresh-min", type=float, default=540.0,
+                    help="令牌剩余秒数下限：低于它就算「不是这一次签发的」，"
+                         "继续等新的 STOP→PLAY（600 s TTL 留 60 s 余量；"
+                         "缺省挡住沿用上一次授权，红线 6）")
 
     ap.add_argument("--from", dest="from_", default=None, choices=PHASES,
                     help="从哪个阶段开始（单步重跑）")
