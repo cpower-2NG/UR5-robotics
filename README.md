@@ -138,8 +138,13 @@ python3 ~/simlink/sim_board_agent.py home
 **只在** [`docs/真机起栈runbook.md`](docs/真机起栈runbook.md)「第六步」一节，别另抄。
 
 ```bash
-# 摆位图（A3，1:1，打印后先用 100 mm 比例尺核对）
-python3 scripts/stage4_layout_sheet.py --batch S0 --layouts 1,2,3 --out <A3.pdf>
+# 摆位引导：腕部相机高位拍一张空台面，把本轮目标足迹叠到照片上（不打印纸图）
+python3 scripts/stage4_placement_view.py --plan --urdf <robot.urdf> \
+  --from-frame <run>/joints-now --out-dir <run>/setup-view \
+  --board-dir ~/precision/plans/e9/setup-view \
+  --board-log-dir ~/precision/logs/e9/setup-view   # 执行要当次 STOP→PLAY 授权
+python3 scripts/stage4_placement_view.py --batch S0 --layout 1 \
+  --burst <run>/setup-view/wrist-pick --out <run>/setup-view/s0-1.png
 
 # 正式轮（Round 0 干跑把 --dry-run 加上，并把 --run 记 0）
 python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 1 \
@@ -150,9 +155,11 @@ python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 1 \
 
 退出码：0 全绿 / 2 输入证据缺失 / 3 授权或时间闸门 / 4 计划生成失败 /
 5 执行失败 / 6 判分不完整；**执行阶段不自动重试**。跑后摆位偏差
-（`placement-deviation.json`）只归档、不 void。
-自检：`test_stage4_round_run.py` / `test_stage4_layout_sheet.py` /
-`test_stage4_placement_deviation.py` / `test_grasp_bias.py`。
+（`placement-deviation.json`）只归档、不 void。摆位照片那步 rc=1 = 有目标投出画幅
+（照片引导不了那一块，先查机位/拾取区参数）。
+自检：`test_stage4_round_run.py` / `test_stage4_placement_view.py` /
+`test_stage4_layout_sheet.py` / `test_stage4_placement_deviation.py` /
+`test_grasp_bias.py`。`stage4_layout_sheet.py`（A3 1:1 图）保留，仅在有 A3 打印机时可用。
 
 ### `gz_ros2_control` 前置（仿真必需，真机不需要）
 

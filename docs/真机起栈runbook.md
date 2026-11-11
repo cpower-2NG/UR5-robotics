@@ -149,10 +149,38 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 
 - 定稿布局与块位（base 毫米 / yaw）：唯一出处是 `scripts/stage4_layouts.py`
   的 `S0_SELECTED`；**别抄文档里的表**（会漂）。
-- 用 `python3 scripts/stage4_layout_sheet.py --batch S0 --out <A3.pdf> --layouts 1,2,3`
-  出 **A3 1:1 摆位图**；打印后先用 100 mm 比例尺核对（缩放 >5 mm 会让整盘系统性偏）。
-  图纸只作转移模板：按已有胶带边界对齐、用胶带/铅笔在块心留点，
-  **收走图纸再摆块** —— 纸或胶带压在块下会污染深度与彩色。
+- **摆位引导 = 腕部相机高位照片**（2026-11-11 用户定，不再打印 1:1 图 —— 现场只有 A4，
+  1:1 放不下 325×250 mm 的拾取区）。分两步，都在摆块**之前**：
+
+  ```bash
+  # ① 臂到拾取区上方的 survey 机位、拍一组腕部 burst、回原位（真机运动，要当次授权）
+  python3 scripts/stage4_placement_view.py --plan \
+    --urdf ~/robotics/notes/ur5-vision-grasp/runs/2026-10-25-precision/robot.urdf \
+    --from-frame <run>/joints-now --out-dir <run>/setup-view \
+    --board-dir ~/precision/plans/e9/setup-view \
+    --board-log-dir ~/precision/logs/e9/setup-view
+  #   然后单独做一次 STOP → PLAY 授权（这一步也是真机运动，红线 6 逐次有效）：
+  python3 scripts/real_motion_authorize.py --step stop
+  #      >>> 需要人动手：示教器 STOP
+  python3 scripts/real_motion_authorize.py --step play
+  #      >>> 需要人动手：示教器 PLAY（两步都核验到才写令牌）
+  ssh jetson-hotspot 'bash ~/precision/plans/e9/setup-view/setup-view.sh <token>'
+  #   setup-view.sh = 到机位 → burst 20 帧 → 回原起点；令牌剩余 <120 s 在开头就停
+  #   把 burst 拉回开发机（照片叠加在离线跑）：
+  rsync -a jetson-hotspot:precision/e9/setup-view/wrist-pick/ <run>/setup-view/wrist-pick/
+
+  # ② 把本轮布局的目标足迹叠到那张照片上（离线，不动臂）
+  python3 scripts/stage4_placement_view.py --batch S0 --layout 1 \
+    --burst <run>/setup-view/wrist-pick --out <run>/setup-view/s0-1.png
+  ```
+
+  PNG 上：青线 = 拾取区边框、白线 = 100 mm 网格、彩色框 + 对角线 = 目标块足迹与朝向、
+  白色十字 = 块心、左下 = 50 mm 比例尺。人**照着屏幕**把块摆到框里即可。
+  照片是**引导不是量具**（500 mm 高、约 1.82 px/mm，肉眼对位就够）：手摆目标本来就是
+  ±3–5 mm / ±10°，不需要 1:1。
+- 某块出画幅（照片上打 `!! 目标出画幅`、命令 rc=1）⇒ 那张照片引导不了它，先查相机位姿 /
+  拾取区参数，别照着猜。
+- 照片拍的是**空台面**；标完不留任何纸/胶带在块下（会污染深度与彩色）。
 - 手摆目标 **±3–5 mm / ±10°**；**不跑前实测、不阻断**，偏差跑后由
   `stage4_placement_deviation.py` 用跑前 pick burst 真值量、只归档。
 - 摆好退开、手离开台面，再说「摆好了」；摆场景不算人工干预。
