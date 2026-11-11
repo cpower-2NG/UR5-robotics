@@ -58,6 +58,30 @@ def section_geom():
     check('两个机位的 tool0 不同', np.linalg.norm(pick[0] - free[0]) > 0.05)
 
 
+def section_vantages():
+    print('\n[1b] 同区三视点（A1：三个 vantage，不是三个区域）')
+    import stage4_wrist_survey as ws
+    center = np.array([0.5 * (0.25 + 0.575), 0.5 * (0.17 + 0.42), 0.500])
+    check('默认三视点就是 pick/pick-out/pick-in',
+          v1.VANTAGE_VIEWS == ("pick", "pick-out", "pick-in"),
+          v1.VANTAGE_VIEWS)
+    seen = {}
+    for name, shift in (("pick", (0.0, 0.0)),
+                        ("pick-out", (-0.100, +0.030)),
+                        ("pick-in", (+0.100, -0.030))):
+        tool0, cam, R = v1.view_pose(name)
+        seen[name] = (tool0, cam, R)
+        want = center + np.array([shift[0], shift[1], 0.0])
+        check('%s 相机 = 区心 + %s' % (name, shift),
+              np.allclose(cam, want, atol=1e-9), cam)
+        check('%s 仍竖直朝下' % name,
+              np.allclose(R, ws.pp.down_rotation(0.0)), R)
+        marg = ws.coverage_pose(v1.PICK_ZONE_M, cam, R)
+        check('%s 拾取区八角余量 > 30 px' % name, min(marg) > 30.0, marg)
+    check('三个机位互不相同',
+          len({tuple(np.round(s[0], 4)) for s in seen.values()}) == 3)
+
+
 def section_nearest():
     print('\n[2] 最近实例')
     pool = [inst(0, 100.0, 100.0), inst(1, 140.0, 100.0)]
@@ -106,6 +130,21 @@ def section_merge():
     far = next(b for b in got if abs(b["cy"] - 420.0) < 5)
     check('单机位块 n_view=1', far["n_view"] == 1, far["views"])
 
+    # 叠放块：同一 xy、顶面差 29.5 mm ⇒ 必须留成两个（否则遮挡块被吞掉）
+    stacked = v1.merge_pools([
+        ("pick", [inst(0, 300.0, 300.0, n=800, top=30.0)]),
+        ("pick-out", [inst(0, 303.0, 301.0, n=500, top=59.5)])])
+    check('叠放上下两块不合并', len(stacked) == 2,
+          [(b["cx"], b["cy"], b["top"]) for b in stacked])
+    check('叠放两块各记 1 个机位',
+          sorted(b["views"] for b in stacked) == ["pick", "pick-out"],
+          [b["views"] for b in stacked])
+    # 同一块跨机位：顶面高差几毫米（深度噪声）仍要合并
+    noisy = v1.merge_pools([
+        ("pick", [inst(0, 300.0, 300.0, n=800, top=30.0)]),
+        ("pick-out", [inst(0, 303.0, 301.0, n=500, top=34.0)])])
+    check('同一块顶面差 4 mm 仍合并', len(noisy) == 1, len(noisy))
+
 
 def section_specify():
     print('\n[6] 指定 top-1')
@@ -149,9 +188,9 @@ def section_stale_sim():
 
 
 def main():
-    for fn in (section_geom, section_nearest, section_usable,
-               section_coverage, section_merge, section_specify,
-               section_scene, section_stale_sim):
+    for fn in (section_geom, section_vantages, section_nearest,
+               section_usable, section_coverage, section_merge,
+               section_specify, section_scene, section_stale_sim):
         fn()
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:

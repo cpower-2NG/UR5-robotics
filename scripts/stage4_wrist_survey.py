@@ -70,22 +70,31 @@ def survey_tool0(zone=PICK_ZONE_M, height=SURVEY_H_M, yaw_deg=0.0):
     return cam - R @ T_TOOL0_CAM_M, cam, R
 
 
-def coverage(zone=PICK_ZONE_M, height=SURVEY_H_M, yaw_deg=0.0,
-             block_h_m=0.060):
-    """拾取区八个角点投到腕部画面的四边余量（像素）；负 = 出画幅。"""
-    tool0, cam, R = survey_tool0(zone, height, yaw_deg)
-    # optical 系与 tool0 系只差 0.57°（R_tc 非对角元 ≤0.0097）⇒ 直接用 R。
-    Rc = R
+def coverage_pose(zone, cam, R, block_h_m=0.060):
+    """任意腕部位姿（相机光心 + 朝向）下，区域八角的四边余量（像素）。
+
+    这个函数是 ``coverage`` 的泛化：偏移/倾斜视点（V1 同区多机位、正式轮
+    多视点观察）不能再用「区域中心正上方的竖直朝下」那一条公式核验。
+    ``R`` 是**相机**在 base 系的朝向；optical 系与 tool0 系只差 0.57°
+    （R_tc 非对角元 ≤0.0097）⇒ 两者可互换。
+    """
     fx, fy, cx, cy = K_1280x720
     w, h = SIZE
     us, vs = [], []
     for x in (zone[0], zone[1]):
         for y in (zone[2], zone[3]):
             for z in (0.0, block_h_m):
-                pc = Rc.T @ (np.array([x, y, z]) - cam)
+                pc = R.T @ (np.array([x, y, z]) - np.asarray(cam, float))
                 us.append(fx * pc[0] / pc[2] + cx)
                 vs.append(fy * pc[1] / pc[2] + cy)
-    return (min(us), w - max(us), min(vs), h - max(vs)), tool0, cam
+    return (min(us), w - max(us), min(vs), h - max(vs))
+
+
+def coverage(zone=PICK_ZONE_M, height=SURVEY_H_M, yaw_deg=0.0,
+             block_h_m=0.060):
+    """拾取区八个角点投到腕部画面的四边余量（像素）；负 = 出画幅。"""
+    tool0, cam, R = survey_tool0(zone, height, yaw_deg)
+    return coverage_pose(zone, cam, R, block_h_m), tool0, cam
 
 
 def project_block(cam, R, block_xy, z_top):

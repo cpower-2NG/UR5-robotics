@@ -7,12 +7,12 @@
 
 本工具跑**感知级**那一半（不执行抓放）：
 
-- 在同一个仿真场景里，把腕部相机依次摆到 E9 的三个机位
-  （``pick`` 拾取区 / ``free`` 北侧自由区 / ``pad`` 垫面；位姿唯一来源
-  ``stage4_wrist_survey.survey_tool0``），每个机位抓一帧;
+- 在同一个仿真场景里，把腕部相机依次摆到**同一拾取区的三个视点**
+  （``pick`` 中心 / ``pick-out`` / ``pick-in``；见下「机位定义」，位姿唯一来源
+  ``stage4_wrist_survey.survey_tool0``），每个视点抓一帧;
 - 每帧独立跑生产分割 ``graspnet_candidates.find_blocks(split=True)``；
-- **单机位**池 = 只看 ``pick`` 那一帧；**三机位**池 = 三帧实例在 base 系里
-  按块心去重合并（同一块可能出现多次，保留顶面像素最多的那个）；
+- **单机位**池 = 只看 ``pick`` 那一帧；**多机位**池 = 三帧实例在 base 系里
+  按块心 + 顶面高度去重合并（同一块可能出现多次，保留顶面像素最多的那个）；
 - 对每个真值块问「池里有没有一个实例落在它 15 mm 内」= **检出**；
 - 指定 top-1 用 E5 同一套命令集（``stage4_e5_eval.gen_commands``，只留真值上
   唯一指向该块的说法），在两种池上跑同一个解析器 ``stage4_specify.select``，
@@ -23,7 +23,7 @@
 
 判据（先定，再看数）
 ====================
-- **遮挡漏块率** = 真值块里「池中 15 mm 内无实例」的比例，pick 机位 vs 三机位
+- **遮挡漏块率** = 真值块里「池中 15 mm 内无实例」的比例，pick 机位 vs 多机位
   各报一次；差 = V1 的收益。
 - **指定 top-1**：分母 = 全部命令；误选（status=ok 但选错块）单独计数。
 - 样本量：契约 §11.4 要求每格 ≥15 个块级尝试；不足只报描述统计。
@@ -57,14 +57,28 @@ import numpy as np                                                # noqa: E402
 MATCH_MM = 15.0
 #: 跨机位去重半径（mm）。同一个块从不同机位看，块心差通常在几毫米内。
 DEDUPE_MM = 20.0
+#: 去重的第二把尺：顶面高度差超过它就不当同一块（mm）。叠放的两块块心可能
+#: 只差几毫米，只按 xy 去重会把上下两块合掉 —— 那正好抹平了 V1 要量的漏块。
+DEDUPE_TOP_MM = 15.0
 
-#: E9 的三个腕部机位（与 ``stage4_clear_run.E9_VIEWS`` 同源；这里只写 zone/
-#: height，位姿由 ``stage4_wrist_survey.survey_tool0`` 唯一算出来）。
+#: **机位定义（2026-11-11 用户拍板，A1）**：V1 的三机位 = **同一拾取区的三个
+#: 视点**，不是三个区域。旧定义（pick/free/pad 各看一块区域）合并后零收益，
+#: 因为它根本不是对同一块区域的第二视角。腕部相机与夹爪刚性同体 ⇒ 相机平移
+#: 时夹爪的遮挡影子在台面上跟着平移，对侧偏移给出互补的可见集。
+#: ``shift`` = **相机**相对拾取区中心的平移（米）；位姿仍由
+#: ``stage4_wrist_survey.survey_tool0`` 唯一算出。偏移量有离线探针（2026-11-11）：
+#: 拾取区八角余量 ≥37 px、IK 从中心位可达；再大就压到 0.5 m 高度下的画幅边。
 VIEWS = (
     {"name": "pick", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500},
+    {"name": "pick-out", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500,
+     "shift": (-0.100, +0.030)},
+    {"name": "pick-in", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500,
+     "shift": (+0.100, -0.030)},
     {"name": "free", "zone": (0.280, 0.750, 0.460, 0.620), "height": 0.450},
     {"name": "pad", "zone": (0.310, 0.610, -0.300, 0.000), "height": 0.500},
 )
+#: 同区三视点（V1 的默认口径）；free/pad 是跑后判分的分区机位，留作别用。
+VANTAGE_VIEWS = ("pick", "pick-out", "pick-in")
 PICK_VIEW = "pick"
 #: 真值块参与 V1 的空间范围 = 拾取区（与 ``stage4_specify.ZONE_M`` 一致）。
 PICK_ZONE_M = (0.25, 0.575, 0.17, 0.42)
@@ -75,7 +89,10 @@ def view_pose(name):
     import stage4_wrist_survey as ws
     for v in VIEWS:
         if v["name"] == name:
-            return ws.survey_tool0(v["zone"], v["height"])
+            dx, dy = v.get("shift", (0.0, 0.0))
+            z = v["zone"]
+            zone = (z[0] + dx, z[1] + dx, z[2] + dy, z[3] + dy)
+            return ws.survey_tool0(zone, v["height"])
     raise KeyError(name)
 
 
@@ -94,11 +111,16 @@ def usable(insts, zone_m=PICK_ZONE_M):
             if not b.get("low") and x0 <= b["cx"] <= x1 and y0 <= b["cy"] <= y1]
 
 
-def merge_pools(named_pools, dedupe_mm=DEDUPE_MM):
-    """多机位实例合并：块心 20 mm 内视为同一块，保留像素最多的那个。
+def merge_pools(named_pools, dedupe_mm=DEDUPE_MM,
+                dedupe_top_mm=DEDUPE_TOP_MM):
+    """多机位实例合并：块心 20 mm 内且顶面高差 ≤15 mm 视为同一块。
 
     ``named_pools`` = [(view_name, [inst, ...]), ...]。返回新列表（idx 重排），
     每个实例带 ``views``（看到它的机位名，升序）与 ``n_view``。
+
+    第二个条件（顶面高差）是 2026-11-11 加的：叠放块的水平投影可能只差几毫米，
+    只按 xy 去重会把上下两块合成一块，合并池看起来「补齐」了、其实把要量的
+    遮挡块吞掉了。块顶高度 ``top`` 由深度直接给出，差 29.5 mm 远大于阈值。
     """
     cand = []
     for view, insts in named_pools:
@@ -111,7 +133,9 @@ def merge_pools(named_pools, dedupe_mm=DEDUPE_MM):
     for b in cand:
         hit = None
         for k in kept:
-            if np.hypot(b["cx"] - k["cx"], b["cy"] - k["cy"]) <= dedupe_mm:
+            if (np.hypot(b["cx"] - k["cx"], b["cy"] - k["cy"]) <= dedupe_mm
+                    and abs(float(b.get("top", 0.0))
+                            - float(k.get("top", 0.0))) <= dedupe_top_mm):
                 hit = k
                 break
         if hit is None:
@@ -593,7 +617,9 @@ def main(argv=None):
     ap.add_argument("--urdf", default="/tmp/ur5.urdf")
     ap.add_argument("--timeout", type=float, default=180.0,
                     help="单帧抓取超时（仿真彩色流很慢，默认 180 s）")
-    ap.add_argument("--views", default="pick,free,pad")
+    ap.add_argument("--views", default=",".join(VANTAGE_VIEWS),
+                    help="逗号分隔的机位名；默认 %s（同区三视点）"
+                         % ",".join(VANTAGE_VIEWS))
     ap.add_argument("--attach", action="store_true",
                     help="栈已起，不自己 launch（同一场景）")
     ap.add_argument("--from-frames", action="store_true",

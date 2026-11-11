@@ -342,6 +342,30 @@ def section_pad_constant():
           '%s：%s' % (res['verdict'], res.get('reason')))
 
 
+# ------------------------------------------------------------------ [4b]
+def section_pad_thickness_unmeasured():
+    print('\n[4b] 垫厚不卡尺实测：用 pad solve 的垫面 z，不算缺失')
+    with tempfile.TemporaryDirectory() as d:
+        fx = _stage(d)
+        spec = _write(os.path.join(d, 'pad-spec.json'),
+                      {'footprint_m': [0.30, 0.30]})
+        pad, missing = rr.load_pad(fx['grid'], spec)
+    check('spec 缺 thickness_m 不报缺', missing == [], missing)
+    check('厚度取垫面 z（0.16842 mm）',
+          pad is not None and abs(pad['thickness_m'] - 0.00016842) < 1e-12, pad)
+    check('来源写明 surface_z',
+          'surface_z' in (pad or {}).get('thickness_source', ''), pad)
+    with tempfile.TemporaryDirectory() as d:
+        fx = _stage(d)
+        spec = _write(os.path.join(d, 'pad-spec.json'),
+                      {'thickness_m': 0.002, 'footprint_m': [0.30, 0.30]})
+        pad2, missing2 = rr.load_pad(fx['grid'], spec)
+    check('显式 thickness_m 优先', missing2 == []
+          and abs(pad2['thickness_m'] - 0.002) < 1e-12, pad2)
+    check('显式厚度的来源 = pad-spec',
+          pad2.get('thickness_source') == 'pad-spec', pad2)
+
+
 # ------------------------------------------------------------------ [5]
 def section_void_and_class():
     print('\n[5] void 与失败七类')
@@ -441,7 +465,8 @@ def section_s11_replay():
 def main():
     print('=' * 68)
     for fn in (section_exec_evidence, section_happy, section_missing,
-               section_pad_constant, section_void_and_class,
+               section_pad_constant, section_pad_thickness_unmeasured,
+               section_void_and_class,
                section_s11_replay):
         try:
             fn()

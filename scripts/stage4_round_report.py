@@ -237,9 +237,15 @@ def _find_at(blocks, pos):
 
 # ---------------------------------------------------------------- 垫参数
 def load_pad(grid_path, spec_path, thickness_override=None):
-    """``grid-pre.json``（实测垫位姿）+ 实测垫厚/足迹 → ``obs.pad``。
+    """``grid-pre.json``（垫面 z）+ 垫足迹（+可选垫厚）→ ``obs.pad``。
 
-    缺任何一项都返回 ``(None, [缺失说明])``：判分器不接受模型常量（§20.5）。
+    垫厚**不要求卡尺实测**（2026-11-11 用户决定：垫是两张 A4 叠放，厚度远低于
+    相机与夹爪的机械误差）。没给 ``thickness_m`` 就用 pad solve 的垫面 z ——
+    base 原点在台面上，垫面 z 就是垫厚；这仍来自当轮实测（grid-pre），
+    不是模型常量。足迹仍必须给：``--pad-spec`` 的 ``footprint_m``（卷尺或
+    A4 规格值都行）。
+
+    缺必需项都返回 ``(None, [缺失说明])``：判分器不接受模型常量（§20.5）。
     """
     missing, pad = [], {}
     if not grid_path:
@@ -256,22 +262,30 @@ def load_pad(grid_path, spec_path, thickness_override=None):
         except (OSError, ValueError, KeyError, IndexError) as e:
             missing.append("读不了 pad solve %s：%s" % (grid_path, e))
     thick = thickness_override
+    if thick is not None:
+        pad["thickness_source"] = "--pad-thick（显式覆盖）"
     fp = None
     if spec_path:
         try:
             s = _load_json(spec_path)
-            thick = float(s["thickness_m"]) if thick is None else thick
+            if thick is None and s.get("thickness_m") is not None:
+                thick = float(s["thickness_m"])
+                pad["thickness_source"] = "pad-spec"
             fp = [float(v) for v in s["footprint_m"]]
         except (OSError, ValueError, KeyError, TypeError) as e:
             missing.append("读不了 --pad-spec %s：%s" % (spec_path, e))
-    elif thick is None:
-        missing.append("垫厚无实测值：给 --pad-spec（recommended）或 --pad-thick")
+    if thick is None and "surface_z_m" in pad:
+        thick = pad["surface_z_m"]
+        pad["thickness_source"] = ("surface_z（未卡尺实测：A4 叠放厚度低于"
+                                   "相机/夹爪机械误差，用户 2026-11-11 决定）")
     if thick is not None:
         pad["thickness_m"] = float(thick)
     if fp is not None:
         pad["footprint_m"] = fp
     else:
         missing.append("垫足迹无实测值：--pad-spec 需含 footprint_m")
+    if thick is None:
+        missing.append("垫厚无来源：给 --pad-spec 或 --pad-thick")
     if missing:
         return None, missing
     pad["measured"] = True
@@ -557,7 +571,8 @@ def main(argv=None):
                          "与 --manifest 一一对应（可重复）")
     ap.add_argument("--pad", default=None, help="grid-pre.json（实测垫位姿）")
     ap.add_argument("--pad-spec", default=None,
-                    help="实测垫厚/足迹 JSON：{thickness_m, footprint_m}")
+                    help="垫参数 JSON：{footprint_m, thickness_m(可选)}；"
+                         "不给厚度就用 pad solve 的垫面 z")
     ap.add_argument("--pad-thick", type=float, default=None,
                     help="覆盖垫厚（米）；足迹仍需 --pad-spec")
     ap.add_argument("--round-id", default=None)

@@ -88,9 +88,28 @@ def section_check_blocks():
           not (0.0 <= u < ws.SIZE[0] and 0.0 <= v < ws.SIZE[1]), (u, v))
 
 
+def section_coverage_pose():
+    print("\n[2b] 任意位姿的覆盖核验（偏移视点用）")
+    tool0, cam, R = ws.survey_tool0()
+    base = ws.coverage()
+    generic = ws.coverage_pose(ws.PICK_ZONE_M, cam, R)
+    check("coverage_pose 与 coverage 逐位一致", base[0] == generic,
+          (base[0], generic))
+    off_cam = cam + np.array([-0.100, 0.030, 0.0])
+    off = ws.coverage_pose(ws.PICK_ZONE_M, off_cam, R)
+    check("偏移 100/30 mm 后仍有 >30 px 余量", min(off) > 30.0, off)
+    check("偏移后左右余量不再对称", abs(off[0] - off[1]) > 200.0, off)
+    # 相机平移 ⇒ tool0 同量平移（手眼刚体），位姿来源仍唯一
+    off_tool0 = off_cam - R @ ws.T_TOOL0_CAM_M
+    check("tool0 与相机同量平移",
+          np.allclose(off_tool0 - tool0, [-0.100, 0.030, 0.0], atol=1e-9),
+          off_tool0 - tool0)
+
+
 def main():
     section_offset()
     section_coverage()
+    section_coverage_pose()
     section_check_blocks()
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:

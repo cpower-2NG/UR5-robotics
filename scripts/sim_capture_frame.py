@@ -48,6 +48,8 @@ def main():
     ap.add_argument("out", help="帧目录（会新建）")
     ap.add_argument("--camera", choices=sorted(CAMERAS), default="topcam")
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--tf-timeout", type=float, default=10.0,
+                    help="话题帧到齐后最多再等多久 TF 链（秒）")
     ap.add_argument("--truth", default=None,
                     help="scene_truth.json 路径；给了就拷进帧目录 truth.json")
     args = ap.parse_args()
@@ -91,13 +93,33 @@ def main():
     color_m, depth_m, info = got["color"], got["depth"], got["info"]
     # TF 取图像时间戳上的；拿不到就退到最新可用（仿真静止时两者等价，
     # 但把用了哪一种记进 view.json，别静默）。
+    # 话题帧通常比 TF 先到：仿真里 TF 由 robot_state_publisher 发布，
+    # 抓帧进程往往只活几百毫秒，**只试一次 lookup 会撞上「TF 还没到」**
+    # （2026-11-11 S3:2 两次失败：一次两棵不相连的树、一次 source_frame
+    # 不存在）。改为在 tf-timeout 内边 spin 边重试。
     stamp = Time.from_msg(color_m.header.stamp)
     exact = True
-    try:
-        tf = buf.lookup_transform("base_link", optical, stamp)
-    except Exception:
-        exact = False
-        tf = buf.lookup_transform("base_link", optical, Time())
+    tf = None
+    err = None
+    t1 = time.time()
+    while time.time() - t1 < args.tf_timeout:
+        try:
+            tf = buf.lookup_transform("base_link", optical, stamp)
+            break
+        except Exception as e:
+            err, exact = e, False
+        try:
+            tf = buf.lookup_transform("base_link", optical, Time())
+            break
+        except Exception as e:
+            err, tf = e, None
+        rclpy.spin_once(node, timeout_sec=0.1)
+    if tf is None:
+        print("!! 抓帧失败：%.0f s 内等不到 TF 链 base_link→%s（最后错误：%s）"
+              % (args.tf_timeout, optical, err), file=sys.stderr)
+        node.destroy_node()
+        rclpy.shutdown()
+        return 4
     tr = tf.transform
 
     def to_array(m):
