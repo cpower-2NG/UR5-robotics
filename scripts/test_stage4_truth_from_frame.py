@@ -437,12 +437,12 @@ def section_camera():
                   == (want[0], want[1], 7), seen)
         seen.clear()
         try:
-            tf.measure_dir("x", index=7)        # 缺省 = topcam
+            tf.measure_dir("x", index=7)        # 缺省 = wrist（v0.6）
         except _Stop:
             pass
-        check("缺省相机 = topcam",
+        check("缺省相机 = wrist",
               (seen.get("tip"), seen.get("chain"))
-              == (tf.gc.TOPCAM_TIP, tf.gc.TOPCAM_CHAIN), seen)
+              == (tf.gc.TIP, tf.gc.CHAIN), seen)
     finally:
         tf.gc.load_frame = real
 
@@ -453,6 +453,45 @@ def section_camera():
         raised = str(e)
     check("未知相机名报错而不是静默用俯视",
           raised is not None and "lidar" in raised, raised)
+
+
+def section_s11_free_colour_split():
+    """s11 ``wrist-post/free`` 原始帧重放：两块不同色的接触块必须量出两块。
+
+    这条是 §20.4 的现场回归 —— 修之前 ``split_top_face`` 的尺寸先验拒绝切
+    （短边被边缘侵蚀压到 20.3 mm），两块量成一块、中心落在中间，判分报「缺块」。
+    帧在仓外，没有就 SKIP（不假装通过）。
+    """
+    print('\n[13] s11 free 机位重放：6.5 mm 缝的不同色接触块')
+    d = os.path.expanduser(
+        '~/robotics/notes/ur5-vision-grasp/runs/2026-11-10-stage4-entry/'
+        'e9-s11/wrist-post/free')
+    if not os.path.isdir(d):
+        print('  SKIP：缺帧 %s' % d)
+        return
+    frame, rows, _ = tf.measure_dir(d, index=0, camera='wrist')
+    cut = [r for r in rows if r.get('split_src') == 'colour']
+    check("拆出 2 个颜色块", len(cut) == 2,
+          [(r.get('class'), r.get('split_src')) for r in rows])
+    check("按长边顺序编号 split_i=0,1",
+          sorted(r.get('split_i') for r in cut) == [0, 1],
+          [r.get('split_i') for r in cut])
+    t = tf.build_truth(rows, frame, keep_outside=True)
+    blocks = t['blocks']
+    check("真值 2 块（低分诊断簇不算块）", len(blocks) == 2,
+          [(b['color'], round(b['x'], 4), round(b['y'], 4)) for b in blocks])
+    if len(blocks) != 2:
+        return
+    want = {'orange': (0.47821, 0.53862), 'yellow': (0.51411, 0.53637)}
+    err = max(max(abs(b['x'] - want[b['color']][0]),
+                  abs(b['y'] - want[b['color']][1])) for b in blocks)
+    # 3 mm 是口径差（彩色窗口质心 vs 顶面射线），不是量具误差；5 mm 留余量。
+    check("与彩色窗口测量差 ≤ 5 mm", err <= 0.005, round(err * 1000.0, 2))
+    if len(blocks) >= 2:
+        sep = np.hypot(blocks[0]['x'] - blocks[1]['x'],
+                       blocks[0]['y'] - blocks[1]['y'])
+        check("两块中心距 35.5–37.5 mm（现场 35.97）",
+              0.0355 <= sep <= 0.0375, round(sep * 1000.0, 2))
 
 
 def main():
@@ -468,6 +507,7 @@ def main():
     section_colour_yaw()
     section_consensus_yaw()
     section_camera()
+    section_s11_free_colour_split()
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('失败项：' + ', '.join(FAILS))

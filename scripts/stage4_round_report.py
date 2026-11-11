@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""阶段 4「一轮」的归档件 ``round.json`` —— **脚本写、永不手写**（契约 §4.5 / v0.6 §20.3）。
+
+一轮 = 一个场景布局里对**全部指定块**的块级尝试。本脚本只做**装配**：
+把机器证据（执行日志 / 跑后三机位真值 / 彩色量 / pad solve）与人提供的
+**观察事实**（安全计数 / 干预 / 人眼复核 / 指定说法）拼成固定 schema 的
+``round.json``，然后交给 ``stage4_score.py`` 判。
+
+固定 schema（字段名不要改，判分器按这些键读）::
+
+    round_id, scene{batch,layout,seed}, n_targets,
+    terminal{blocks,overlaps,off_table,out_of_bounds,source},
+    safety{collisions,drops,unexpected_motion,estop},
+    interventions{count}, human_review{required,approved},
+    pad{source,measured,thickness_m,footprint_m,surface_z_m},
+    attempts[]{
+      target{block_id}, spec,
+      selected{instance_id,auto_top1},
+      truth{instance_id,truth_source},
+      grasp{lifted,dropped,wrong_block,exec_rc,readback{gripped},slip,
+            postrun{target_left_origin,arrived}},
+      place{in_slot,over_line,out_of_bounds},
+      failure{class}, void{reason},
+    }
+
+**缺失字段不填默认值**（§20.3）：拿不到的证据就不写这个键，同时把
+``complete=false`` 与 ``missing=[...]`` 写进文件、进程返回 **2**。判分器看到
+``complete=false`` 直接判数据缺失（退出码 2），不会把「没证据」算成「系统差」。
+
+证据各从哪来（一个事实一个家）：
+
+| 字段 | 来源 |
+|---|---|
+| 执行 rc / 闭合回读 / 滑移 | 板端 ``precision_exec.py`` 的 ``<plan>.jsonl``（``event=gripper/grasp_check/gate/traj``） |
+| 目标块离位 / 到位 | 跑后**腕部三机位**真值（``stage4_truth_from_frame.py`` 产出）+ 垫面彩色量 |
+| 放置格 / 压线 / 越界 | 垫面彩色顶面质心（``measure_target_colour`` 的输出）+ 实测 pad 位姿 |
+| 全桌终态 | 三机位真值合并后 ``stage4_clear_model.terminal_report`` |
+| 安全 / 干预 / 人眼复核 / 指定说法 / 真值来源 | ``--facts`` 文件（**人的观察**，不是判决） |
+
+``--facts`` 只放人看得到、机器量不出的事实，**不放结论**::
+
+    {
+      "round_id": "S1-L2-r1",
+      "scene": {"batch": "S1", "layout": "L2", "seed": 11},
+      "truth_source": "postrun-wrist-3view",
+      "specs": {"2": "橙色、靠北那块"},
+      "auto_top1": {"2": true},
+      "failure_class": {"2": "execution"},
+      "voids": {"3": "相机掉线"},
+      "safety": {"collisions": 0, "drops": 0, "unexpected_motion": 0, "estop": 0},
+      "interventions": {"count": 0},
+      "human_review": {"required": false, "approved": true}
+    }
+
+用法::
+
+    python3 scripts/stage4_round_report.py \\
+        --manifest runs/.../plan/manifest.json \\
+        --exec-log runs/.../board-log \\
+        --view-truth pick=runs/.../truth-pick.json \\
+        --view-truth free=runs/.../truth-free.json \\
+        --view-truth pad=runs/.../truth-pad.json \\
+        --colour runs/.../verify.json \\
+        --pad runs/.../grid-pre.json \\
+        --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json \\
+        --facts runs/.../round-facts.json \\
+        --out runs/.../round.json
+
+退出码：0 = 字段齐全；2 = 有证据缺失（文件照写，``complete=false``）。
+"""
+import argparse
+import json
+import math
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import stage4_clear_model as cm                              # noqa: E402
+import stage4_clear_run as cr                                # noqa: E402
+
+#: AG-95 空夹阈值：闭合回读 ≤ 5 mm = 手指合到头 = 没夹住（与 precision_exec 同源）。
+EMPTY_TOL_MM = 5.0
+
+#: 目标块「离开原位 / 到达放置格」的位移容差（米）。与 ``compare_layout`` 同口径。
+MOVE_TOL_M = 0.040
+
+#: 合并三机位真值时的去重口径（米）。同 ``merge_truth_blocks`` 缺省。
+DEDUP_M = 0.040
+
+SAFETY_KEYS = ("collisions", "drops", "unexpected_motion", "estop")
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+# ---------------------------------------------------------------- 读文件
+def _load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _looks_like_json(s):
+    s = s.strip()
+    return s.startswith("{") or s.startswith("[")
+
+
+def read_events(path):
+    """``precision_exec.py`` 的 jsonl → 事件 dict 列表（轨迹采样行跳过）。"""
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or not _looks_like_json(line):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("event"):
+                out.append(rec)
+    return out
+
+
+def find_exec_log(log_dir, plan_name):
+    """板端日志名 = 计划名 + ``.jsonl``（计划名本身已带 ``.json`` ⇒ 双后缀）。"""
+    if not log_dir:
+        return None
+    for name in (plan_name + ".jsonl", plan_name,
+                 os.path.splitext(plan_name)[0] + ".jsonl"):
+        p = os.path.join(log_dir, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# ---------------------------------------------------------------- 执行证据
+def exec_evidence(events):
+    """一串执行事件 → 尝试级执行证据。
+
+    返回的键只在**有证据**时出现；没有的键留给上层判「数据缺失」：
+
+    * ``exec_rc``：gate/traj 任一步 ok=false ⇒ 2/1；否则 0。这是从日志
+      复原的**执行结论**，不是文件里抄来的；日志没归档 ⇒ 不出现。
+    * ``closed_mm``：``where=grasp.after`` 的 close 回读（空夹判据的原料）。
+    * ``slipped``：``grasp_check.slipped``（抬升后 |lift−closed| > 1 mm）。
+    * ``lifted``：出现 ``grasp_check`` 才说明抬升航点真跑了、且两次回读都在。
+    """
+    out = {"events": len(events)}
+    rc = 0
+    for ev in events:
+        kind = ev.get("event")
+        if kind == "gate" and ev.get("ok") is False:
+            rc = max(rc, 2)
+        elif kind in ("traj", "gripper_fail", "gripper_selftest"):
+            if ev.get("event") == "gripper_fail":
+                rc = max(rc, 1)
+            elif ev.get("ok") is False:
+                rc = max(rc, 1)
+        elif kind == "grasp_check":
+            out["lifted"] = True
+            out["slipped"] = bool(ev.get("slipped"))
+            out["closed_mm"] = ev.get("closed_mm")
+            out["lifted_mm"] = ev.get("lifted_mm")
+    for ev in events:
+        if ev.get("event") == "gripper" and ev.get("action") == "close" \
+                and str(ev.get("where", "")).endswith(".after"):
+            pos = ev.get("position_mm")
+            if pos is not None:
+                out["closed_mm"] = float(pos)
+    out["exec_rc"] = rc
+    if out.get("closed_mm") is None:
+        out.pop("closed_mm", None)
+    return out
+
+
+def _target_plan(manifest):
+    """manifest 里 kind=target 的那份计划（E9 每条指令一份计划）。"""
+    for p in manifest.get("plans") or []:
+        if p.get("kind") == "target":
+            return p
+    return None
+
+
+def _plan_meta(plan):
+    try:
+        return _load_json(plan["path"]).get("meta") or {}
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+# ---------------------------------------------------------------- 真值 / 终态
+def merge_views(view_truths):
+    """``[(机位名, 真值文件), ...]`` → (合并块, 溯源)。"""
+    truths, prov = [], {"views": []}
+    for name, path in view_truths:
+        doc = _load_json(path)
+        blocks = doc.get("blocks") or []
+        truths.append((name, blocks))
+        prov["views"].append({"view": name, "path": path, "n_blocks": len(blocks)})
+    merged, fusion = cr.merge_truth_blocks(truths, dedup_m=DEDUP_M)
+    prov.update(fusion)
+    return merged, prov
+
+
+def terminal_from_blocks(blocks, truth_source):
+    rep = cm.terminal_report(blocks)
+    return {
+        "blocks": [{"id": b.get("id"), "zone": b.get("zone"),
+                   "in_bounds": b.get("in_bounds"), "legal": b.get("legal"),
+                   "cell": b.get("cell")} for b in rep.get("blocks") or []],
+        "overlaps": len(rep.get("overlaps") or []),
+        "off_table": rep.get("off_table"),
+        "out_of_bounds": rep.get("out_of_bounds"),
+        "source": truth_source,
+    }
+
+
+def _near(a, b):
+    return math.sqrt((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2
+                     + (a["z"] - b["z"]) ** 2) <= MOVE_TOL_M
+
+
+def _find_at(blocks, pos):
+    best = None
+    for b in blocks:
+        d = math.sqrt((b["x"] - pos["x"]) ** 2 + (b["y"] - pos["y"]) ** 2
+                      + (b["z"] - pos["z"]) ** 2)
+        if d <= MOVE_TOL_M and (best is None or d < best[0]):
+            best = (d, b)
+    return best[1] if best else None
+
+
+# ---------------------------------------------------------------- 垫参数
+def load_pad(grid_path, spec_path, thickness_override=None):
+    """``grid-pre.json``（实测垫位姿）+ 实测垫厚/足迹 → ``obs.pad``。
+
+    缺任何一项都返回 ``(None, [缺失说明])``：判分器不接受模型常量（§20.5）。
+    """
+    missing, pad = [], {}
+    if not grid_path:
+        missing.append("--pad（grid-pre.json）未给：垫面 z 无实测值")
+    else:
+        try:
+            g = _load_json(grid_path)
+            center = [float(v) for v in g["grid_center_base_mm"]]
+            yaw = float(g["grid_yaw_base_deg"])
+            pad["surface_z_m"] = center[2] / 1000.0
+            pad["source"] = os.path.basename(grid_path)
+            # 放置格 / 压线判定都走 cm 的实测垫位姿（不是模型常量）
+            cm.configure_pad(center[:2], yaw, source=pad["source"])
+        except (OSError, ValueError, KeyError, IndexError) as e:
+            missing.append("读不了 pad solve %s：%s" % (grid_path, e))
+    thick = thickness_override
+    fp = None
+    if spec_path:
+        try:
+            s = _load_json(spec_path)
+            thick = float(s["thickness_m"]) if thick is None else thick
+            fp = [float(v) for v in s["footprint_m"]]
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            missing.append("读不了 --pad-spec %s：%s" % (spec_path, e))
+    elif thick is None:
+        missing.append("垫厚无实测值：给 --pad-spec（recommended）或 --pad-thick")
+    if thick is not None:
+        pad["thickness_m"] = float(thick)
+    if fp is not None:
+        pad["footprint_m"] = fp
+    else:
+        missing.append("垫足迹无实测值：--pad-spec 需含 footprint_m")
+    if missing:
+        return None, missing
+    pad["measured"] = True
+    # 判分器的反模型常量闸门：来源里不许出现 model/gen_scene/constant
+    if spec_path:
+        pad["source"] += "+" + os.path.basename(spec_path)
+    return pad, []
+
+
+# ---------------------------------------------------------------- 放置判定
+def place_verdict(colour, cell, size, pad):
+    """彩色顶面质心 → ``place{in_slot, over_line, out_of_bounds}`` 或 ``(None, 缺失)``。"""
+    if not isinstance(pad, dict):
+        return None, ["垫参数缺失（--pad + --pad-spec）：放置格判不了"]
+    if not isinstance(colour, dict):
+        return None, ["缺垫面彩色量（--colour）：放置格判不了"]
+    if colour.get("ok") is not True:
+        return None, ["彩色量不够帧（%d 帧 / 缺 %d）—— 判不了放置"
+                      % (colour.get("n_frames") or 0, colour.get("n_missed") or 0)]
+    xy = colour.get("xy_mm")
+    if not (isinstance(xy, (list, tuple)) and len(xy) == 2):
+        return None, ["彩色量没有 xy_mm"]
+    x, y = float(xy[0]) / 1000.0, float(xy[1]) / 1000.0
+    got = cm.cell_index_of(x, y)
+    inside, _ = cm.cell_contains(x, y, 0.0, size)
+    hu, hv = pad["footprint_m"][0] / 2.0, pad["footprint_m"][1] / 2.0
+    u, v = cm.to_pad_frame(x, y)
+    half = size / 2.0
+    out = (abs(u) + half > hu) or (abs(v) + half > hv)
+    return {"in_slot": (got is not None and cell is not None
+                        and int(got) == int(cell)),
+            "over_line": not inside,
+            "out_of_bounds": bool(out)}, []
+
+
+def _failure_class(attempt, facts_cls):
+    """失败分类（契约 §4.1 七类）。facts 给了就用人给的，否则按观测轴推。"""
+    classes = ("perception", "candidate", "ik", "planning", "execution",
+               "placement", "human")
+    if facts_cls in classes:
+        return facts_cls
+    if attempt.get("void"):
+        return None
+    g = attempt.get("grasp") or {}
+    p = attempt.get("place")
+    sel = (attempt.get("selected") or {}).get("instance_id")
+    tru = (attempt.get("truth") or {}).get("instance_id")
+    if sel is not None and tru is not None and int(sel) != int(tru):
+        return "perception"
+    if g:
+        rb = (g.get("readback") or {}).get("gripped")
+        if g.get("lifted") is False or rb is False:
+            return "candidate"
+        if g.get("dropped") or g.get("wrong_block") or g.get("exec_rc") != 0:
+            return "execution"
+    if p is not None and p.get("in_slot") is False:
+        return "placement"
+    return None
+
+
+# ---------------------------------------------------------------- 尝试装配
+def build_attempt(manifest, facts, log_dir, post_blocks, colour, pad):
+    """一条块级尝试 → (attempt, missing 列表)。只写有证据的键。"""
+    miss = []
+    target = str(manifest.get("target"))
+    attempt = {"target": {"block_id": target}}
+
+    spec = (facts.get("specs") or {}).get(target)
+    if spec is not None:
+        attempt["spec"] = spec
+
+    # ---- 系统选了哪一块（当前 E9 链按指定 id 直接执行；同源问题见 docstring）
+    plan = _target_plan(manifest)
+    if plan is None:
+        miss.append("manifest 里没有 kind=target 的计划 ⇒ selected 未知")
+        meta = {}
+    else:
+        meta = _plan_meta(plan)
+    if meta.get("block_idx") is not None:
+        auto = (facts.get("auto_top1") or {}).get(target)
+        sel = {"instance_id": int(meta["block_idx"])}
+        if isinstance(auto, bool):
+            sel["auto_top1"] = auto
+        sel["source"] = "plan.meta.block_idx"
+        attempt["selected"] = sel
+
+    # ---- 独立真值（身份由试验布局清单给；来源必须由人声明并在白名单里）
+    src = facts.get("truth_source")
+    attempt["truth"] = {"instance_id": manifest.get("target"),
+                        "truth_source": src}
+
+    # ---- 执行证据
+    ev = None
+    if log_dir and plan is not None:
+        lp = find_exec_log(log_dir, plan.get("name") or
+                           os.path.basename(plan.get("path", "")))
+        if lp is None:
+            miss.append("执行日志缺 %s.jsonl" % (plan.get("name") or "?"))
+        else:
+            ev = exec_evidence(read_events(lp))
+    elif not log_dir:
+        miss.append("没给 --exec-log ⇒ 执行 rc / 回读 / 滑移无证据")
+    else:
+        miss.append("没找到 target 计划 ⇒ 执行证据无主")
+
+    grasp = {}
+    if ev is not None:
+        grasp["exec_rc"] = ev["exec_rc"]
+        if "lifted" in ev:
+            grasp["lifted"] = bool(ev["lifted"])
+        elif ev["exec_rc"] != 0:
+            # 执行在抬升前就判红了（闸门不过 / traj 失败）：日志完整到失败点，
+            # 「没抬起」是读得出来的结论，不是缺证据。
+            grasp["lifted"] = False
+        else:
+            miss.append("执行日志里没有 grasp_check（抬升后复读）事件")
+        if "slipped" in ev:
+            grasp["slip"] = bool(ev["slipped"])
+        if "closed_mm" in ev:
+            grasp["readback"] = {"gripped": ev["closed_mm"] > EMPTY_TOL_MM,
+                                 "closed_mm": ev["closed_mm"]}
+
+    # ---- 目标块现在在哪（跑后三机位真值）
+    truth_doc = manifest.get("truth")
+    origin = None
+    if truth_doc and os.path.exists(truth_doc):
+        try:
+            for b in _load_json(truth_doc).get("blocks") or []:
+                if str(b.get("id")) == target:
+                    origin = b
+                    break
+        except (OSError, ValueError):
+            origin = None
+    if origin is None:
+        miss.append("布局真值 %s 里找不到目标块 #%s" % (truth_doc, target))
+    post = None
+    if post_blocks is not None and origin is not None:
+        post = _find_at(post_blocks, origin)
+        grasp["postrun"] = {"target_left_origin": post is None
+                            or not _near(post, origin)}
+        if post is None:
+            grasp["postrun"]["note"] = "跑后三机位里原点附近没有目标块"
+
+    sel_id = (attempt.get("selected") or {}).get("instance_id")
+    if sel_id is not None:
+        grasp["wrong_block"] = (int(sel_id) != int(manifest.get("target")))
+
+    # ---- 放置（彩色量：垫面深度看不出 29.5 mm 台阶）
+    size = None
+    if origin is not None:
+        size = float(origin.get("size") or cm.PAD_PITCH)
+    if size is None:
+        size = cm.PAD_PITCH
+    cell = manifest.get("cell")
+    pl, pl_miss = place_verdict(colour, cell, size, pad)
+    arrived = None
+    if pl is None:
+        miss.extend(pl_miss)
+    else:
+        attempt["place"] = pl
+        arrived = pl["in_slot"] and not pl["over_line"] and not pl["out_of_bounds"]
+        if grasp.get("postrun") is not None:
+            grasp["postrun"]["arrived"] = arrived
+        elif post is not None:
+            grasp["postrun"] = {"target_left_origin": not _near(post, origin),
+                                "arrived": arrived}
+
+    # ---- 掉块：只在**有证据**时下结论（§20.3 不填默认值）。
+    # 「抬起来了」+「既不在原点、也没到格」才算掉；放置判不了就不写这个键，
+    # 让判分器按缺数据处理，而不是把「没测」算成「没掉」。
+    if "lifted" in grasp:
+        if not grasp["lifted"]:
+            grasp["dropped"] = False
+        elif arrived is not None and origin is not None and post_blocks is not None:
+            still = post is not None and _near(post, origin)
+            grasp["dropped"] = bool(not arrived and not still)
+
+    if grasp:
+        # 三机位确认不全（例如没有 readback 或 postrun）⇒ 判分器会进 person_review
+        attempt["grasp"] = grasp
+
+    void_reason = (facts.get("voids") or {}).get(target)
+    if void_reason:
+        attempt = {"target": {"block_id": target}, "spec": attempt.get("spec"),
+                   "void": {"reason": void_reason}}
+    else:
+        attempt["failure"] = {"class": _failure_class(
+            attempt, (facts.get("failure_class") or {}).get(target))}
+    return attempt, miss
+
+
+def build_round(manifests, facts, log_dir, view_truths, colours, pad,
+                pad_missing, round_id=None):
+    """整轮装配 → (round.json dict, missing 列表)。"""
+    miss = list(pad_missing or [])
+    scene = facts.get("scene") or {}
+    if not (round_id or facts.get("round_id")):
+        miss.append("round_id 缺失（--round-id 或 facts.round_id）")
+
+    post_blocks, prov = None, None
+    if view_truths:
+        post_blocks, prov = merge_views(view_truths)
+        log("  跑后真值：%d 机位 → %d 块" % (len(view_truths), len(post_blocks)))
+    else:
+        miss.append("没给 --view-truth ⇒ 终态 / 目标块离位判不了")
+
+    src = facts.get("truth_source")
+    if src is None:
+        miss.append("facts.truth_source 缺失（必须声明独立真值来源）")
+    attempts = []
+    for i, man in enumerate(manifests):
+        colour = colours[i] if i < len(colours) else None
+        att, amiss = build_attempt(man, facts, log_dir, post_blocks, colour, pad)
+        attempts.append(att)
+        miss.extend("块 %s：%s" % (man.get("target"), m) for m in amiss)
+
+    # ---- 轮级人观察事实（缺了就是缺证据，不给默认 0）
+    def _int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    safety = facts.get("safety")
+    if not isinstance(safety, dict) or any(
+            not _int(safety.get(k)) for k in SAFETY_KEYS):
+        miss.append("facts.safety 缺 %s 的整数计数" % "/".join(SAFETY_KEYS))
+        safety = None
+    iv = facts.get("interventions")
+    if not isinstance(iv, dict) or not _int(iv.get("count")):
+        miss.append("facts.interventions.count 缺整数")
+        iv = None
+    hr = facts.get("human_review")
+    if not isinstance(hr, dict) or not isinstance(hr.get("required"), bool):
+        miss.append("facts.human_review.required 缺布尔")
+        hr = None
+
+    terminal = None
+    if post_blocks is not None:
+        terminal = terminal_from_blocks(post_blocks, src)
+
+    doc = {
+        "version": 1, "kind": "stage4-round",
+        "round_id": round_id or facts.get("round_id"),
+        "scene": {"batch": scene.get("batch"), "layout": scene.get("layout"),
+                  "seed": scene.get("seed")},
+        "n_targets": len(manifests),
+        "terminal": terminal,
+        "safety": safety,
+        "interventions": iv,
+        "human_review": hr,
+        "pad": pad,
+        "attempts": attempts,
+        "truth_provenance": prov,
+        "complete": not miss,
+        "missing": miss,
+    }
+    return doc, miss
+
+
+# ---------------------------------------------------------------- CLI
+def _view_specs(specs):
+    out = []
+    for s in specs or []:
+        if "=" in s:
+            name, path = s.split("=", 1)
+        else:
+            name, path = os.path.splitext(os.path.basename(s))[0], s
+        out.append((name, path))
+    return out
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="阶段 4 round.json 自动产出器（脚本写、永不手写）")
+    ap.add_argument("--manifest", action="append", required=True,
+                    help="一份块级尝试的 manifest.json（可重复，顺序 = 尝试顺序）")
+    ap.add_argument("--facts", default=None,
+                    help="人的观察事实（安全/干预/人眼复核/说法/真值来源）")
+    ap.add_argument("--exec-log", default=None,
+                    help="板端执行日志目录（<plan>.jsonl）")
+    ap.add_argument("--view-truth", action="append", default=[],
+                    help="跑后机位真值：name=path（可重复）")
+    ap.add_argument("--colour", action="append", default=[],
+                    help="垫面彩色量（measure_target_colour 输出或含 colour 的 verify.json），"
+                         "与 --manifest 一一对应（可重复）")
+    ap.add_argument("--pad", default=None, help="grid-pre.json（实测垫位姿）")
+    ap.add_argument("--pad-spec", default=None,
+                    help="实测垫厚/足迹 JSON：{thickness_m, footprint_m}")
+    ap.add_argument("--pad-thick", type=float, default=None,
+                    help="覆盖垫厚（米）；足迹仍需 --pad-spec")
+    ap.add_argument("--round-id", default=None)
+    ap.add_argument("--out", required=True, help="输出 round.json 路径")
+    args = ap.parse_args(argv)
+
+    facts = {}
+    if args.facts:
+        try:
+            facts = _load_json(args.facts)
+        except (OSError, ValueError) as e:
+            log("!! 读不了 --facts %s：%s" % (args.facts, e))
+            return 2
+    else:
+        log("!! 没给 --facts：安全 / 干预 / 人眼复核 / 真值来源都无来源")
+
+    manifests = []
+    for p in args.manifest:
+        try:
+            manifests.append(_load_json(p))
+        except (OSError, ValueError) as e:
+            log("!! 读不了 --manifest %s：%s" % (p, e))
+            return 2
+
+    colours = []
+    for p in args.colour:
+        try:
+            d = _load_json(p)
+            colours.append(d.get("colour", d))
+        except (OSError, ValueError) as e:
+            log("!! 读不了 --colour %s：%s" % (p, e))
+            colours.append(None)
+
+    pad, pad_missing = load_pad(args.pad, args.pad_spec, args.pad_thick)
+
+    if not facts:
+        pad_missing = list(pad_missing) + ["没给 --facts（安全/干预/人眼/来源）"]
+        facts = {}
+
+    try:
+        doc, miss = build_round(manifests, facts, args.exec_log,
+                                _view_specs(args.view_truth), colours,
+                                pad, pad_missing, round_id=args.round_id)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        log("!! 装配失败：%s" % e)
+        return 2
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".",
+                exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+    log("→ %s（%s）" % (args.out,
+                        "字段齐全" if doc["complete"] else "不完整"))
+    for m in miss:
+        log("   ! %s" % m)
+    return 0 if doc["complete"] else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

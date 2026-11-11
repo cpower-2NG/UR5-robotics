@@ -45,15 +45,17 @@ def _merge(base, over):
 
 
 def att(**kw):
-    """一次「全绿」的块级尝试，按需覆盖字段。"""
+    """一次「全绿」的块级尝试，按需覆盖字段（v0.6 三元组口径）。"""
     base = {
         "target": {"block_id": "b0"},
         "spec": "red right",
         "selected": {"instance_id": 0, "auto_top1": True},
-        "truth": {"instance_id": 0, "truth_source": "topcam-independent"},
+        "truth": {"instance_id": 0, "truth_source": "postrun-wrist-3view"},
         "grasp": {"exec_rc": 0, "lifted": True, "dropped": False,
                   "wrong_block": False,
-                  "confirm": {"topcam": True, "wrist": True, "human": True}},
+                  "readback": {"gripped": True},
+                  "slip": False,
+                  "postrun": {"target_left_origin": True, "arrived": True}},
         "place": {"in_slot": True, "over_line": False, "out_of_bounds": False},
         "failure": {"class": None},
     }
@@ -67,11 +69,14 @@ def obs(atts, **kw):
         "terminal": {"blocks": [{"id": 0, "zone": "slot",
                                  "in_bounds": True, "legal": True}],
                      "overlaps": 0, "off_table": 0, "out_of_bounds": 0,
-                     "source": "topcam"},
+                     "source": "postrun-wrist-3view"},
+        "pad": {"source": "grid-pre.json", "measured": True,
+                "thickness_m": 0.00017, "footprint_m": [0.300, 0.300],
+                "surface_z_m": 0.00017},
         "safety": {"collisions": 0, "drops": 0, "unexpected_motion": 0,
                    "estop": 0},
         "interventions": {"count": 0},
-        "human_review": {"approved": True},
+        "human_review": {"required": False, "approved": False},
     }
     if "n_targets" in kw:
         base["n_targets"] = kw.pop("n_targets")
@@ -98,9 +103,19 @@ def section_const():
     check('失败分类覆盖契约七类',
           set(sc.FAIL_CLASSES) == {"perception", "candidate", "ik", "planning",
                                    "execution", "placement", "human"})
-    check('独立真值白名单里没有控制链来源',
-          not any('perception' in s or 'planner' in s or 'grasp' in s
-                  for s in sc.TRUTH_SOURCES), str(sc.TRUTH_SOURCES))
+    check('独立真值白名单 = v0.6 四条（无控制链、无俯视）',
+          set(sc.TRUTH_SOURCES) == {"sim-truth", "postrun-wrist-3view",
+                                    "layout-manifest+postrun-wrist",
+                                    "human-annotation"}
+          and not any('perception' in s or 'planner' in s or 'grasp' in s
+                      or 'topcam' in s for s in sc.TRUTH_SOURCES),
+          str(sc.TRUTH_SOURCES))
+    check('抓取确认三元组 = 回读 / 滑动 / 跑后三机位',
+          sc.CONFIRMS == ("readback", "slip", "postrun-wrist-3view"),
+          str(sc.CONFIRMS))
+    check('垫参数三键齐全（厚度/足迹/垫面 z）',
+          sc.PAD_KEYS == ("thickness_m", "footprint_m", "surface_z_m"),
+          str(sc.PAD_KEYS))
     check('退出码映射 0/1/1/2',
           [sc.exit_code({"verdict": v})
            for v in ("ok", "fail", "person_review", "missing_data")]
@@ -129,6 +144,13 @@ def section_attempt():
           r["status"] == "missing_data"
           and any('白名单' in x for x in r["reasons"]), str(r["reasons"]))
 
+    r = sc.score_attempt(att(truth={"truth_source": "topcam-independent"}))
+    check('俯视来源已退出白名单 → missing_data',
+          r["status"] == "missing_data", str(r["reasons"]))
+
+    r = sc.score_attempt(att(truth={"truth_source": "sim-truth"}))
+    check('仿真真值来源被接受', r["status"] == "ok", str(r["reasons"]))
+
     r = sc.score_attempt(att(truth={"truth_source": None}))
     check('真值没写来源 → missing_data', r["status"] == "missing_data")
 
@@ -148,14 +170,57 @@ def section_attempt():
                                     "failure": {"class": "execution"}}))
     check('中途掉了 → 失败', r["grasp_ok"] is False)
 
-    r = sc.score_attempt(att(grasp={"confirm": {"wrist": False}}))
-    check('三路确认缺腕部 → person_review，不算成功也不算失败',
+    r = sc.score_attempt(att(grasp={"postrun": None}))
+    check('抬起来了但缺跑后三机位 → person_review，不算成功也不算失败',
           r["status"] == "person_review" and r["grasp_ok"] is None,
+          str(r))
+
+    r = sc.score_attempt(att(grasp={"readback": {"gripped": False}},
+                             failure={"class": "execution"}))
+    check('回读空夹 → 抓取失败（不是待人评）', r["grasp_ok"] is False
+          and r["status"] == "fail", str(r))
+
+    r = sc.score_attempt(att(grasp={"slip": True},
+                             failure={"class": "execution"}))
+    check('抬升后检出滑移 → 抓取失败', r["grasp_ok"] is False
+          and r["status"] == "fail", str(r))
+
+    r = sc.score_attempt(att(grasp={"postrun": {"target_left_origin": False,
+                                               "arrived": True}},
+                             failure={"class": "execution"}))
+    check('跑后目标块未离开原处 → 抓取失败', r["grasp_ok"] is False
+          and r["status"] == "fail", str(r))
+
+    r = sc.score_attempt(att(grasp={"postrun": {"arrived": False}},
+                             failure={"class": "execution"}))
+    check('跑后目标块未到放置区 → 抓取失败', r["grasp_ok"] is False)
+
+    r = sc.score_attempt(att(grasp={"confirm": {"readback": True,
+                                               "slip": False},
+                                   "readback": None, "slip": None,
+                                   "postrun": {"target_left_origin": True,
+                                               "arrived": True}}))
+    check('紧凑写法 grasp.confirm.readback/slip 也认', r["grasp_ok"] is True,
           str(r))
 
     r = sc.score_attempt(att(place={"over_line": True},
                              failure={"class": "placement"}))
     check('压线 → 放置不算中', r["place_ok"] is False and r["status"] == "fail")
+
+    a = att()
+    del a["grasp"]["exec_rc"]
+    r = sc.score_attempt(a)
+    check('执行日志没归档（缺 exec_rc）→ missing_data，不算抓取失败',
+          r["status"] == "missing_data" and r["grasp_ok"] is None, str(r))
+
+    r = sc.score_attempt(att(grasp=None))
+    check('整个 grasp 段缺失 → missing_data', r["status"] == "missing_data")
+
+    a = att()
+    del a["place"]["over_line"]
+    r = sc.score_attempt(a)
+    check('缺压线判定 → missing_data（缺键不许当「没压线」）',
+          r["status"] == "missing_data", str(r))
 
     r = sc.score_attempt(att(void={"reason": "camera_fault"}))
     check('void → 状态 void 且不进任何统计',
@@ -245,15 +310,53 @@ def section_round():
     check('终态缺失 → missing_data（不是判失败）',
           res["verdict"] == "missing_data", str(res["reason"]))
 
-    res = sc.score_round(obs([att(), att()], human_review={"approved": False}))
-    check('人眼复核未批准 → person_review',
+    res = sc.score_round(obs([att(), att()],
+                             human_review={"required": True,
+                                           "approved": False}))
+    check('显式 required 且未批准 → person_review',
           res["verdict"] == "person_review", str(res["reason"]))
 
     o = obs([att(), att()])
     del o["human_review"]
     res = sc.score_round(o)
-    check('人眼复核缺失 → person_review（不能默认绿）',
+    check('判分器自己能判 → 人眼复核缺失也 ok（v0.6：不再无条件要签字）',
+          res["verdict"] == "ok", str(res["reason"]))
+
+    review_atts = ([att() for _ in range(8)]
+                   + [att(grasp={"postrun": None},
+                          failure={"class": "execution"})])
+    res = sc.score_round(obs(review_atts))
+    check('有待复核尝试 + 未批准 → person_review',
           res["verdict"] == "person_review", str(res["reason"]))
+
+    res = sc.score_round(obs(review_atts,
+                             human_review={"required": True,
+                                           "approved": True}))
+    check('有待复核尝试 + 人眼批准 → ok（人眼是放行人）',
+          res["verdict"] == "ok", str(res["reason"]))
+
+    # ---- 垫参数：实测为准（§20.5）
+    o = obs([att(), att()])
+    del o["pad"]
+    res = sc.score_round(o)
+    check('缺实测垫参数 → missing_data（不许回退仿真常量）',
+          res["verdict"] == "missing_data" and 'pad' in res["reason"],
+          str(res["reason"]))
+
+    res = sc.score_round(obs([att(), att()], pad={
+        "source": "gen_scene 模型常量", "measured": False,
+        "thickness_m": 0.00017, "footprint_m": [0.420, 0.297],
+        "surface_z_m": 0.0}))
+    check('垫参数来源是模型常量 → missing_data',
+          res["verdict"] == "missing_data" and 'pad' in res["reason"],
+          str(res["reason"]))
+
+    res = sc.score_round(obs([att(), att()], pad={
+        "source": "grid-pre.json", "measured": True,
+        "thickness_m": 0.00017, "footprint_m": [0.300, 0.300],
+        "surface_z_m": None}))
+    check('垫面 z 缺失 → missing_data', res["verdict"] == "missing_data",
+          str(res["reason"]))
 
     res = sc.score_round(obs([att(selected={"auto_top1": False}) for _ in range(4)]))
     check('自主 top-1 全否 → 仍 ok，只报不设门',
@@ -353,14 +456,14 @@ def section_mutation():
           real["grasp_ok"] is False and bad["grasp_ok"] is True,
           '%s → %s' % (real["grasp_ok"], bad["grasp_ok"]))
 
-    # D. 人眼复核缺失默认绿
-    o = obs([att(), att()])
-    del o["human_review"]
+    # D. 待人评的尝试被默认放绿
+    o = obs([att() for _ in range(8)]
+            + [att(grasp={"postrun": None}, failure={"class": "execution"})])
     real = sc.score_round(o)
-    mut = _mut('        if review.get("approved") is not True:',
+    mut = _mut('        if needs_review and review.get("approved") is not True:',
                '        if False:')
     bad = mut["score_round"](o)
-    check('变异「复核缺失默认绿」：真实 person_review，改坏后 ok',
+    check('变异「待人评默认绿」：真实 person_review，改坏后 ok',
           real["verdict"] == "person_review" and bad["verdict"] == "ok",
           '%s → %s' % (real["verdict"], bad["verdict"]))
 

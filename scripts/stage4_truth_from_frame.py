@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """把一次 burst（俯视或**腕部**）量成 E8/E9 探针能吃的 ``scene_truth.json``。
 
-两路相机只用 ``--camera`` 区分（2026-11-09 用户拍板）：
+两路相机只用 ``--camera`` 区分（2026-11-11 v0.6 起俯视退出阶段 4）：
 
-    ``--camera wrist``    规划感知（E9 起默认走这条）：手眼外参定位置，毫米级
-    ``--camera topcam``   跑后判分器（``--verify --colour-burst``），默认值
+    ``--camera wrist``    规划感知 + 跑后三机位判分（**默认**）：手眼外参定位，毫米级
+    ``--camera topcam``   已退出阶段 4；只用于复现旧证据，CLI 必须再加 ``--allow-topcam``
 
 两者**只差 tf 链与内参** —— 下面的几何（射线 ∩ 平面、分层、颜色、yaw）一层不动。
 
@@ -309,11 +309,12 @@ CAMERAS = {
 
 
 def measure_dir(frame_dir, index=None, split=True, yaw_method="colour",
-                camera="topcam"):
+                camera="wrist"):
     """一帧 → (frame, find_blocks 行, 台面 z)。
 
-    ``camera``：``'topcam'``（默认，判分器）或 ``'wrist'``（规划感知）。两者
-    只差 tf 链与 K —— 腕部链经过 ``tool0``，位置随当帧关节走。
+    ``camera``：``'wrist'``（默认，规划感知 + 跑后三机位判分）或
+    ``'topcam'``（已退出阶段 4，只用于复现旧证据；CLI 要 --allow-topcam）。
+    两者只差 tf 链与 K —— 腕部链经过 ``tool0``，位置随当帧关节走。
 
     ``yaw_method='colour'``（默认）把每行的 yaw 换成彩色像素掩码矩形
     （见 ``colour_yaw_rows``）；``'depth'`` 是旧口径（PCA），只为复现旧证据。
@@ -514,14 +515,25 @@ def main(argv=None):
     ap.add_argument("--yaw-depth", action="store_true",
                     help="yaw 退回 find_blocks 的深度 PCA 长边（旧口径，只为"
                          "复现旧证据；默认用彩色像素掩码矩形）")
-    ap.add_argument("--camera", choices=sorted(CAMERAS), default="topcam",
-                    help="用哪路相机：topcam=俯视判分器（默认）、wrist=腕部"
-                         "规划感知（要当帧关节在帧目录里，burst 自带）")
+    ap.add_argument("--camera", choices=sorted(CAMERAS), default="wrist",
+                    help="用哪路相机：wrist=腕部（默认，规划感知 + 跑后三机位"
+                         "判分；要当帧关节在帧目录里）；topcam=已退出阶段 4，"
+                         "只用于复现旧证据，必须同时给 --allow-topcam")
+    ap.add_argument("--allow-topcam", action="store_true",
+                    help="显式允许用俯视相机复现旧证据（不给它却传 "
+                         "--camera topcam ⇒ 退出码 2）")
     ap.add_argument("--zone", default=None, metavar="X0,X1,Y0,Y1",
                     help="真值保留区（base 系米）。缺省 = 拾取区 ZONE_M。"
                          "E9 真机半段要覆盖垫面与北侧自由区，例如 "
                          "0.20,0.80,-0.30,0.65")
     args = ap.parse_args(argv)
+
+    # 俯视已退出阶段 4（v0.6）：默认腕部；显式 topcam 必须再过一道开关。
+    if args.camera == "topcam" and not args.allow_topcam:
+        print("!! --camera topcam 已退出阶段 4 正式流程。\n"
+              "   正式轮用缺省 wrist；确需复现旧证据请同时给 --allow-topcam。",
+              file=sys.stderr)
+        return 2
 
     zone = None
     if args.zone:

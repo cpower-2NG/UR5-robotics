@@ -56,8 +56,9 @@ PAD_CENTER = (float(_GS.PAD_CENTER_MM[0]) / 1000.0,
               float(_GS.PAD_CENTER_MM[1]) / 1000.0)
 PAD_YAW_RAD = math.radians(_GS.PAD_YAW_DEG)
 PAD_PITCH = float(_GS.PAD_PITCH_MM) / 1000.0        # 宫格 60 mm
-PAD_THICK = float(_GS.PAD_THICK_M)                  # 垫厚 2.88 mm
-PAD_HALF = 0.15                                     # 垫 300×300 mm
+PAD_THICK = float(_GS.PAD_THICK_M)                  # 垫厚（真机实测值，见 gen_scene）
+PAD_FOOTPRINT = tuple(float(v) for v in _GS.PAD_FOOTPRINT_M)   # 垫外框 (x, y) 米
+PAD_HALF = 0.15                                     # 兼容旧调用：正方形半边长
 
 # ── 垫位姿：真机每场开跑实测，不许沿用常量 ──────────────────────────
 # 上面 ``PAD_CENTER`` / ``PAD_YAW_RAD`` 是**模型默认值**（= gen_scene 的仿真
@@ -73,25 +74,39 @@ PAD_POSE_SOURCE = 'gen_scene 模型常量（未实测）'
 
 _DEFAULT_PAD_CENTER = PAD_CENTER
 _DEFAULT_PAD_YAW_RAD = PAD_YAW_RAD
+_DEFAULT_PAD_THICK = PAD_THICK
+_DEFAULT_PAD_FOOTPRINT = PAD_FOOTPRINT
 
 
-def configure_pad(center_mm=None, yaw_deg=None, source=None):
-    """把宫格参考换成实测垫位姿。``center_mm`` 是 base 系**毫米**。"""
-    global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE
+def configure_pad(center_mm=None, yaw_deg=None, source=None,
+                  thickness_m=None, footprint_m=None):
+    """把宫格参考换成实测垫位姿 / 垫厚 / 外框。
+
+    ``center_mm`` 是 base 系**毫米**；``thickness_m``、``footprint_m``（``(x, y)``
+    米）来自真机实测（v0.6 §20.5：仿真跟真机，不反过来）。旧调用只给位姿时，
+    厚度/外框保持原值。
+    """
+    global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE, PAD_THICK, PAD_FOOTPRINT
     if center_mm is not None:
         PAD_CENTER = (float(center_mm[0]) / 1000.0,
                       float(center_mm[1]) / 1000.0)
     if yaw_deg is not None:
         PAD_YAW_RAD = math.radians(float(yaw_deg))
+    if thickness_m is not None:
+        PAD_THICK = float(thickness_m)
+    if footprint_m is not None:
+        PAD_FOOTPRINT = (float(footprint_m[0]), float(footprint_m[1]))
     if source is not None:
         PAD_POSE_SOURCE = str(source)
 
 
 def reset_pad():
-    """回到模型默认垫位姿（自检用；真机运行不该调用它）。"""
-    global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE
+    """回到模型默认垫参数（自检用；真机运行不该调用它）。"""
+    global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE, PAD_THICK, PAD_FOOTPRINT
     PAD_CENTER = _DEFAULT_PAD_CENTER
     PAD_YAW_RAD = _DEFAULT_PAD_YAW_RAD
+    PAD_THICK = _DEFAULT_PAD_THICK
+    PAD_FOOTPRINT = _DEFAULT_PAD_FOOTPRINT
     PAD_POSE_SOURCE = 'gen_scene 模型常量（未实测）'
 
 
@@ -275,9 +290,16 @@ def terminal_report(blocks, pen_tol=PEN_TOL):
                         TABLE_YMIN <= y <= TABLE_YMAX for x, y in corners)
 
         on_table = abs(z_bottom) <= 0.001
-        on_pad = (abs(z_bottom - PAD_THICK) <= 0.001
-                  and abs(b["x"] - PAD_CENTER[0]) <= PAD_HALF
-                  and abs(b["y"] - PAD_CENTER[1]) <= PAD_HALF)
+        # 垫面判据用**实测**厚度与外框（§20.5），不是模型常量；坐标转垫系判矩形。
+        # 高度容差**必须小于垫厚的一半**：垫厚 0.17 mm 时，±1 mm 会把「块就在
+        # 台面上、只是落在垫的外框内」也算成「在垫上」（两者高度只差 0.17 mm），
+        # 于是拿台面上的位置去判宫格 → 假「压格」。实测垫厚下容差 0.085 mm，
+        # 只有真的垫在垫面上（仿真真值精确到 0.1 µm）才成立。
+        pad_tol = min(0.001, PAD_THICK / 2.0)
+        pu, pv = to_pad_frame(b["x"], b["y"])
+        on_pad = (abs(z_bottom - PAD_THICK) <= pad_tol
+                  and abs(pu) <= PAD_FOOTPRINT[0] / 2.0
+                  and abs(pv) <= PAD_FOOTPRINT[1] / 2.0)
         on_block = False
         if not (on_table or on_pad):
             for j, other in enumerate(blocks):

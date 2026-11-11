@@ -13,6 +13,7 @@
 
 跑法：python3 scripts/test_stage4_clear_run.py
 """
+import argparse
 import inspect
 import json
 import math
@@ -34,6 +35,11 @@ import urkin                                                    # noqa: E402
 
 N_PASS = N_FAIL = 0
 FAILS = []
+
+# 垫面上静止块心的 z。**不许写死**：以前这里写死「0.01763」（= 旧 2.88 mm 垫厚
+# + 半块高），§20.5 把垫厚改成真机实测 0.17 mm 后，写死的值会让
+# `surface_of` 推出 0.00288 m 而判「既不是台面也不是垫面」。
+PAD_TOP_Z = cm.PAD_THICK + cm.BLOCK_M / 2.0
 
 
 def check(name, cond, detail=''):
@@ -112,7 +118,7 @@ def tower_attempt():
                 'grasp': {'axis': 2, 'sign': -1, 'closing': 1,
                           'variant': 1, 'vertical': True, 'verdict': 'ok'}}],
             'final_blocks': [{'id': 0, 'x': 0.4242, 'y': -0.11224,
-                              'z': 0.01763, 'yaw': 0.0, 'size': 0.0295},
+                              'z': PAD_TOP_Z, 'yaw': 0.0, 'size': 0.0295},
                              {'id': 8, 'x': 0.52, 'y': 0.54, 'z': 0.01475,
                               'yaw': 0.0, 'size': 0.0295},
                              {'id': 3, 'x': 0.60, 'y': 0.30, 'z': 0.01475,
@@ -340,7 +346,7 @@ def section_mutation():
                              'variant': 0, 'vertical': True, 'verdict': 'ok'},
                'clearing_steps': [],
                'final_blocks': [{'id': 0, 'x': 0.4242, 'y': -0.11224,
-                                 'z': 0.01763, 'yaw': 0.0, 'size': 0.0295},
+                                 'z': PAD_TOP_Z, 'yaw': 0.0, 'size': 0.0295},
                                 {'id': 1, 'x': 0.44, 'y': 0.30,
                                  'z': 0.01475, 'yaw': 0.0, 'size': 0.0295}]}
     a_acts, a_blocks = cr.actions_from_attempt(adj, adj_att, cm.PAD_THICK)
@@ -374,7 +380,7 @@ def section_verify():
     print('\n[7] 跑后核验：不丢指定块 / 不掉块 / 不撞')
     final = [
         # 目标：垫心（宫格 4）
-        {'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+        {'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': PAD_TOP_Z, 'yaw': 0.0,
          'size': 0.0295},
         # 清障块：自由区落点
         {'id': 8, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 10.0,
@@ -546,7 +552,7 @@ def section_fuse():
 
     # 融合结果直接喂现有判据：块数守恒、目标落格仍按彩色量
     final = [
-        {'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+        {'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': PAD_TOP_Z, 'yaw': 0.0,
          'size': 0.0295},
         {'id': 1, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 86.0,
          'size': 0.0295},
@@ -563,7 +569,7 @@ def section_fuse():
             'final_layout': [dict(b) for b in final]}
     # 跑后实况：区内 4 块来自腕部；垫面 / 自由区 2 块来自俯视
     fused, _ = cr.fuse_post_blocks(
-        [{'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+        [{'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': PAD_TOP_Z, 'yaw': 0.0,
           'size': 0.0295},
          {'id': 1, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 86.0,
           'size': 0.0295}],
@@ -733,6 +739,16 @@ def section_merge_truth():
     check('同一机位两层塔：XY 完全重合也保留 2 块（只按 XY 去重的回归）',
           len(blocks) == 2 and not prov['duplicates'], str(blocks))
 
+    # s11 自由区现场（2026-11-11 重放）：两块**同层不同色**，中心距 37.0 mm
+    # < 去重半径 40 mm。同机位内部不是重复 —— 相机一次共识已经聚过类，
+    # 一块真缝 6.5 mm 的两块被去重吃掉 ⇒ 判「缺块」（块数一致红）。
+    free2 = [{'x': 0.4785, 'y': 0.5360, 'top': 0.0295, 'size': 0.0295},
+             {'x': 0.5154, 'y': 0.5328, 'top': 0.0295, 'size': 0.0295}]
+    blocks, prov = cr.merge_truth_blocks([('free', free2)])
+    check('同一机位两块相距 37 mm ⇒ 保留 2 块、不算重复',
+          len(blocks) == 2 and not prov['duplicates'],
+          [len(blocks), prov['duplicates']])
+
     towers = [{'x': x, 'y': y, 'top': t, 'size': 0.0295}
               for (x, y) in ((0.4406, 0.3443), (0.5350, 0.1737),
                              (0.4100, 0.2500))
@@ -849,7 +865,7 @@ def section_colour():
           r['ok'] is False and not r['per_frame'])
 
     # ---- 接进 compare_layout -------------------------------------------
-    final = [{'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': 0.01763, 'yaw': 0.0,
+    final = [{'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': PAD_TOP_Z, 'yaw': 0.0,
               'size': 0.0295},
              {'id': 8, 'x': 0.52, 'y': 0.54, 'z': 0.01475, 'yaw': 10.0,
               'size': 0.0295},
@@ -941,7 +957,7 @@ def section_pad_pose():
         # 一个都没有 ⇒ SystemExit（fail-closed）
         empty = os.path.join(tmp, 'empty')
         ok, err = system_exits(cr.apply_pad_pose, _Args(), empty)
-        check('一处都找不到 ⇒ 报错停下（fail-closed）', ok and 'stage2_pad' in err)
+        check('一处都找不到 ⇒ 报错停下（fail-closed）', ok and 'stage4_pad_from_burst' in err)
         ok, _ = system_exits(cr.apply_pad_pose, _Args(), empty, 'missing.json')
         check('manifest 记录的路径也不在、目录里也没有 ⇒ 停', ok)
 
@@ -965,7 +981,7 @@ def section_pad_pose():
             cr.apply_pad_pose, _Args(), empty,
             {'source': 'model', 'measured': False})
         check('manifest 记的是模型常量 ⇒ 不装，仍 fail-closed 停下',
-              ok and 'stage2_pad' in err, err)
+              ok and 'stage4_pad_from_burst' in err, err)
         ok, _ = system_exits(
             cr.apply_pad_pose, _Args(), empty,
             {'measured': True, 'center_mm': [461.3, -158.2]})   # 缺 yaw
@@ -1315,13 +1331,59 @@ def section_view_gate():
           str(p2['meta']['yaw_grasp_deg']))
 
 
+def section_finish():
+    print('\n[13] 收尾闸门：没有 round.json 不得给 0（§20.3）')
+    final = [{'id': 0, 'x': 0.4242, 'y': -0.11224, 'z': PAD_TOP_Z, 'yaw': 0.0,
+              'size': 0.0295},
+             {'id': 3, 'x': 0.60, 'y': 0.30, 'z': 0.01475, 'yaw': 20.0,
+              'size': 0.0295}]
+    mani = {'target': 0, 'cell': 4, 'actions': [{'block': '0'}],
+            'final_layout': [dict(b) for b in final]}
+
+    def _args(d):
+        return argparse.Namespace(
+            manifest=os.path.join(d, 'manifest.json'),
+            out_dir=d, verify=os.path.join(d, 'post.json'),
+            view_truth=[], wrist_truth=None, wrist_zone=None,
+            merge_dedup_mm=40.0, colour_burst=None, colour_search_mm=60.0,
+            colour_camera='wrist', untouched_mm=5.0, untouched_deg=3.0,
+            moved_mm=40.0, grid=None, allow_model_pad=True)
+
+    def _stage(d):
+        with open(os.path.join(d, 'manifest.json'), 'w') as f:
+            json.dump(mani, f)
+        with open(os.path.join(d, 'post.json'), 'w') as f:
+            json.dump({'blocks': final}, f)
+
+    with tempfile.TemporaryDirectory() as d:
+        _stage(d)
+        rc = cr.verify_main(_args(d))
+        check('终态 PASS 但没 round.json ⇒ 收尾返回 2（不是 0）', rc == 2,
+              'rc=%r' % rc)
+        check('verify.json 仍写出（判决能复盘）',
+              os.path.exists(os.path.join(d, 'verify.json')))
+
+        with open(os.path.join(d, 'round.json'), 'w') as f:
+            json.dump({'kind': 'stage4-round', 'complete': False,
+                       'missing': ['执行日志缺 target.jsonl']}, f)
+        rc = cr.verify_main(_args(d))
+        check('round.json 标 complete=false ⇒ 收尾返回 2', rc == 2,
+              'rc=%r' % rc)
+
+        with open(os.path.join(d, 'round.json'), 'w') as f:
+            json.dump({'kind': 'stage4-round', 'complete': True,
+                       'missing': []}, f)
+        rc = cr.verify_main(_args(d))
+        check('round.json 完整 ⇒ 收尾按终态给 0', rc == 0, 'rc=%r' % rc)
+
+
 def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_plans,
                section_step_cap, section_place_yaw_equiv, section_gap,
                section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
-               section_align, section_view_gate):
+               section_align, section_view_gate, section_finish):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

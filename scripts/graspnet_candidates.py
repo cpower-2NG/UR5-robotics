@@ -386,6 +386,104 @@ def split_top_face(F, rect, block_mm=29.5, tol=0.22):
     return pieces
 
 
+def _hsv_arrays(px):
+    """RGB(0-255) 的 N×3 数组 → (H 度, S 0-255, V 0-255)，与 rgb_to_hsv255 同定义。"""
+    px = np.asarray(px, dtype=np.float64)
+    r, g, b = px[:, 0], px[:, 1], px[:, 2]
+    mx = px.max(axis=1)
+    mn = px.min(axis=1)
+    d = mx - mn
+    idx = np.argmax(px, axis=1)
+    dsafe = np.where(d > 0, d, 1.0)        # d=0 的像素色相无定义，别让 0/0 污染
+    h = np.where(
+        idx == 0, ((g - b) / dsafe) % 6.0,
+        np.where(idx == 1, (b - r) / dsafe + 2.0, (r - g) / dsafe + 4.0)) * 60.0
+    h = np.where(d > 0, h % 360.0, 0.0)
+    s = np.where(mx > 0, d / np.maximum(mx, 1e-9) * 255.0, 0.0)
+    return h, s, mx
+
+
+def split_top_face_by_colour(F, qpix, color, rect, block_mm=29.5,
+                             min_share=0.25, min_points=50, sep_frac=0.45,
+                             hue_table=None):
+    """``split_top_face`` 的第二候选：尺寸先验切不动时，**按顶面颜色类**拆。
+
+    为什么需要它（s11 free 机位实测）：两块 6.5 mm 真缝、同高、不同色，深度
+    顶面仍连成一片，且边缘侵蚀把外接矩形短边压到 20.3 mm（< 29.5 mm − 22%），
+    ``split_top_face`` 的尺寸先验拒绝硬切 ⇒ 两块被量成一块，中心落在中间
+    （「假缺块」）。颜色在这里是**合法**判据：两块不同色；契约 §2 禁止的是
+    用颜色分裂**同色**接触块 —— 那种情况这里找不到第二类，会原样返回。
+
+    条件（任一不满足就整份返回，绝不硬切）：
+      · 外接矩形长边 ≥ 1.5 块边（尺寸上确实不止一块）；
+      · 至少两类颜色的饱和度权重份额 ≥ ``min_share``（同色块只有一类）；
+      · 每份点数 ≥ ``min_points``；
+      · 沿长边方向，各类的重心彼此分开 ≥ ``sep_frac`` 块边（单块内的颜色
+        噪声分不出这么远）。
+
+    返回行下标列表（按长边方向排序）。
+    """
+    F = np.asarray(F, dtype=np.float64)
+    n = len(F)
+    if n < 2 * min_points:
+        return [np.arange(n)]
+    long_mm, _short_mm = rect["ext_mm"]
+    if long_mm < 1.5 * block_mm:
+        return [np.arange(n)]
+    qpix = np.asarray(qpix, dtype=np.int64)
+    if len(qpix) != n:
+        return [np.arange(n)]
+    px = np.asarray(color)[qpix[:, 1], qpix[:, 0]].astype(float)
+    hue, sat, val = _hsv_arrays(px)
+    ok = (sat >= 60) & (val >= 40)          # 与 find_blocks 的投票阈值同值
+    if ok.sum() < 200:
+        return [np.arange(n)]
+    table = block_classes.MEASURED_HUE_DEG if hue_table is None else hue_table
+    names = [c for c in block_classes.DEFAULT_CLASSES if c in table]
+    if len(names) < 2:
+        return [np.arange(n)]
+    ref = np.array([table[c] for c in names], float)
+    dev = np.abs(hue[ok][:, None] - ref[None, :])
+    dev = np.minimum(dev, 360.0 - dev)
+    cls = np.argmin(dev, axis=1)
+    weight = np.zeros(len(names))
+    np.add.at(weight, cls, sat[ok])
+    if weight.sum() <= 0:
+        return [np.arange(n)]
+    share = weight / weight.sum()
+    keep = [j for j in range(len(names)) if share[j] >= min_share]
+    if len(keep) < 2:
+        return [np.arange(n)]
+
+    # 高饱和点按最近类归组；低饱和点（边/木纹）按沿长边方向的**空间**归属，
+    # 色相在低饱和处是纯噪声，不参与投票。
+    a = math.radians(rect["yaw_deg"])
+    t = F[:, 0] * math.cos(a) + F[:, 1] * math.sin(a)
+    ref_keep = np.array([table[names[j]] for j in keep], float)
+    dev_all = np.abs(hue[:, None] - ref_keep[None, :])
+    dev_all = np.minimum(dev_all, 360.0 - dev_all)
+    lab = np.full(n, -1, dtype=np.int64)
+    lab[ok] = np.argmin(dev_all[ok], axis=1)
+    cen = []
+    for j in range(len(keep)):
+        sel = lab == j
+        if sel.sum() < min_points:
+            return [np.arange(n)]
+        cen.append(float(np.median(t[sel])))
+    low = lab < 0
+    if low.any():
+        dist = np.abs(t[low][:, None] - np.array(cen)[None, :])
+        lab[low] = np.argmin(dist, axis=1)
+    pieces = [np.where(lab == j)[0] for j in range(len(keep))]
+    if min(len(p_) for p_ in pieces) < min_points:
+        return [np.arange(n)]
+    cen = sorted(float(np.median(t[p_])) for p_ in pieces)
+    if np.min(np.diff(cen)) < sep_frac * block_mm / 1000.0:
+        return [np.arange(n)]
+    order = np.argsort([float(np.median(t[p_])) for p_ in pieces])
+    return [pieces[i] for i in order]
+
+
 def fold_mod90(deg):
     """把任意角度折到 [0,90)：判分/重复性都用它，避免 90° 翻转被当误差。"""
     return float(deg % 90.0)
@@ -428,7 +526,8 @@ def circular_median_deg(angles):
 
 
 def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
-                max_h_mm=70.0, legacy=False, split=False, hue_table=None):
+                max_h_mm=70.0, legacy=False, split=False, hue_table=None,
+                return_masks=False):
     """把「立在台面上的块」逐块量出来：顶面中心/高度/尺寸/yaw/颜色。
 
     与 ``find_blocks.py``（临时脚本）的区别：颜色取**顶面那 3 mm**的像素，
@@ -500,6 +599,16 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
             rows_all = np.where(sel)[0][top_sel]
             pieces = (split_top_face(Q[rows_all], rect_all) if split
                       else [np.arange(len(rows_all))])
+            split_src = "size" if split else "none"
+            # 尺寸先验切不动、但外接矩形明显超过一块 ⇒ 再按颜色类试一次。
+            # 同色接触块在这里找不到第二类，会原样返回（契约 §2）。
+            if (split and len(pieces) == 1
+                    and rect_all["ext_mm"][0] >= 1.5 * 29.5):
+                by_colour = split_top_face_by_colour(
+                    Q[rows_all], qpix[rows_all], color, rect_all,
+                    hue_table=hue_table)
+                if len(by_colour) > 1:
+                    pieces, split_src = by_colour, "colour"
             for piece_i, piece_rows in enumerate(pieces):
                 rows = rows_all[piece_rows]
                 F = Q[rows]
@@ -552,7 +661,7 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                 u_px, v_px = ((float(uv[0] / uv[2]), float(uv[1] / uv[2]))
                               if uv[2] > 1e-6 else (0.0, 0.0))
 
-                got.append({
+                rec = {
                     "cx": float(c[0] * 1000), "cy": float(c[1] * 1000),
                     "top": float(ztop * 1000), "h": float((ztop - table_z) * 1000),
                     "uv": [round(u_px, 1), round(v_px, 1)],
@@ -572,9 +681,15 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                     "low": bool(low),
                     # 切分溯源：split_n=1 表示这一簇没切过（大多数帧都是这样）
                     "split_n": len(pieces), "split_i": piece_i,
+                    "split_src": split_src,
                     "parent_ext_rect": [round(v, 1)
                                         for v in rect_all["ext_mm"]],
-                })
+                }
+                # O1 离线评估用：顶面像素集（图像坐标，u,v）。默认不生成，生产
+                # 路径的返回结构不变；评估器用同一份分割结果算实例 IoU。
+                if return_masks:
+                    rec["mask_uv"] = qpix[rows].astype(np.int32)
+                got.append(rec)
         return got
 
     # 顶面：高于台面 min_h_mm 的格子。低处桥接被排除，大簇不再出现。

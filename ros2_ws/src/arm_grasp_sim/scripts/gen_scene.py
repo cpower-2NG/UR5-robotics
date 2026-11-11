@@ -31,29 +31,55 @@ MIN_GAP_ISOLATED_M = 0.060           # S0 的非接触安全间距
 PAD_CENTER_MM = (424.2, -112.24)     # 阶段 3 重解的垫位（**未实测**；真机请用 --grid）
 PAD_YAW_DEG = -179.778
 PAD_PITCH_MM = 60.0
-PAD_THICK_M = 0.00288
+# 真机实测（v0.6 §20.5）：垫 = 两张 A4 叠放，垫面 z 由 grid-pre 的
+# grid_center_base_mm[2] 读出 ≈ 0.168 mm。仿真跟真机，不反过来。
+PAD_THICK_M = 0.00017
+PAD_FOOTPRINT_M = (0.30, 0.30)       # 垫外框 (x, y) 米；真机实测后 --pad-spec 覆盖
 
 PAD_POSE_SOURCE = "模型常量（未实测）"
 _DEFAULT_PAD_CENTER_MM = PAD_CENTER_MM
 _DEFAULT_PAD_YAW_DEG = PAD_YAW_DEG
+_DEFAULT_PAD_THICK_M = PAD_THICK_M
+_DEFAULT_PAD_FOOTPRINT_M = PAD_FOOTPRINT_M
 
 
-def configure_pad(center_mm=None, yaw_deg=None, source=None):
-    """换成**实测**垫位姿（base 系毫米 / 度）。垫一动就重配，别沿用常量。"""
+def configure_pad(center_mm=None, yaw_deg=None, source=None,
+                  thickness_m=None, footprint_m=None):
+    """换成**实测**垫位姿（base 系毫米 / 度）与实测垫厚 / 外框（米）。
+
+    垫一动就重配，别沿用常量；厚度/外框只在显式给出时覆盖。
+    """
     global PAD_CENTER_MM, PAD_YAW_DEG, PAD_POSE_SOURCE
+    global PAD_THICK_M, PAD_FOOTPRINT_M
     if center_mm is not None:
         PAD_CENTER_MM = (float(center_mm[0]), float(center_mm[1]))
     if yaw_deg is not None:
         PAD_YAW_DEG = float(yaw_deg)
+    if thickness_m is not None:
+        PAD_THICK_M = float(thickness_m)
+    if footprint_m is not None:
+        PAD_FOOTPRINT_M = (float(footprint_m[0]), float(footprint_m[1]))
     if source is not None:
         PAD_POSE_SOURCE = str(source)
 
 
+def apply_pad_spec(path):
+    """读实测垫参数 JSON ``{thickness_m, footprint_m}``（仓外，见 §20.6）。"""
+    with open(path, encoding="utf-8") as f:
+        spec = json.load(f)
+    configure_pad(thickness_m=spec["thickness_m"],
+                  footprint_m=spec["footprint_m"],
+                  source="pad-spec:%s" % os.path.basename(path))
+
+
 def reset_pad():
-    """回到模型默认垫位姿（自检用；真机运行不该调用它）。"""
+    """回到默认垫参数（自检用；真机运行不该调用它）。"""
     global PAD_CENTER_MM, PAD_YAW_DEG, PAD_POSE_SOURCE
+    global PAD_THICK_M, PAD_FOOTPRINT_M
     PAD_CENTER_MM = _DEFAULT_PAD_CENTER_MM
     PAD_YAW_DEG = _DEFAULT_PAD_YAW_DEG
+    PAD_THICK_M = _DEFAULT_PAD_THICK_M
+    PAD_FOOTPRINT_M = _DEFAULT_PAD_FOOTPRINT_M
     PAD_POSE_SOURCE = "模型常量（未实测）"
 
 
@@ -430,12 +456,12 @@ def build_world(blocks):
       <link name="surface">
         <collision name="collision">
           <pose>0 0 {PAD_THICK_M/2:.6f} 0 0 0</pose>
-          <geometry><box><size>0.30 0.30 {PAD_THICK_M}</size></box></geometry>
+          <geometry><box><size>{PAD_FOOTPRINT_M[0]} {PAD_FOOTPRINT_M[1]} {PAD_THICK_M}</size></box></geometry>
           <surface><friction><ode><mu>0.95</mu><mu2>0.95</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <pose>0 0 {PAD_THICK_M/2:.6f} 0 0 0</pose>
-          <geometry><box><size>0.30 0.30 {PAD_THICK_M}</size></box></geometry>
+          <geometry><box><size>{PAD_FOOTPRINT_M[0]} {PAD_FOOTPRINT_M[1]} {PAD_THICK_M}</size></box></geometry>
           <material><ambient>0.10 0.10 0.12 1</ambient><diffuse>0.14 0.14 0.16 1</diffuse></material>
         </visual>{grid}
 
@@ -531,12 +557,19 @@ def main(argv=None):
     ap.add_argument("--grid", default=None, metavar="GRID.json",
                     help="本场**实测**垫位姿（stage2_pad.py 产出）。给这一项，"
                          "计划落点才与真垫对齐；不给就用模块常量（未实测）")
+    ap.add_argument("--pad-spec", default=None, metavar="PAD-SPEC.json",
+                    help="实测垫厚/外框 {thickness_m, footprint_m}（仓外）。"
+                         "不给就用模块常量（真机实测值）")
     args = ap.parse_args(argv)
 
     if args.grid:
         load_grid(args.grid)
         print("垫位姿（实测）: %.2f, %.2f mm / %.3f°  ← %s"
               % (PAD_CENTER_MM[0], PAD_CENTER_MM[1], PAD_YAW_DEG, args.grid))
+    if args.pad_spec:
+        apply_pad_spec(args.pad_spec)
+        print("垫厚/外框（实测）: %.5f m / %s  ← %s"
+              % (PAD_THICK_M, list(PAD_FOOTPRINT_M), args.pad_spec))
 
     if args.list:
         for b, n in BATCH_COUNTS.items():

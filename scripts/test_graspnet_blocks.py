@@ -454,6 +454,120 @@ def test_side_highlight_fragment_is_not_a_block():
     assert not gc.block_plausible({"h": 30.0, "ext": [14.9, 40.0]})
 
 
+# ------------------------------------------------- 颜色分裂（s11 并簇假缺块）
+# s11 ``wrist-post/free`` 现场：两块 6.5 mm 真缝、同高、不同色，深度顶面仍连成
+# 一片；边缘侵蚀把外接矩形短边压到 20.3 mm（< 29.5 × (1−22%)），
+# ``split_top_face`` 的尺寸先验拒绝硬切 ⇒ 两块被量成一块、中心落在中间，判分
+# 直接报「缺块」。颜色在这里是合法判据（两块不同色）；契约 §2 禁止的是按颜色
+# 分裂**同色**接触块 —— 下面 ``refuses_same_colour`` 钉住这条。
+_MODEL_RGB = {"orange": (255, 87, 0),      # H≈20.5°，MEASURED_HUE_DEG
+              "yellow": (255, 170, 0)}      # H≈40.0°
+
+
+def _two_block_scene(axis_deg=0.0, colours=("orange", "yellow"),
+                     gap=0.0065, block=0.0295, per=40, img_hw=(240, 480)):
+    """两块同高、沿长边并排、中间留 ``gap`` 的合成顶面（深度学习点 + 像素色）。
+
+    深度上连成一片正是 s11 的现场；``F`` 的位置与像素只通过 ``qpix`` 对应颜色，
+    几何口径由 ``rect`` 给（与 ``split_top_face`` 的调用方式一致）。
+    """
+    lins = np.linspace(-block / 2.0, block / 2.0, per)
+    step = block + gap
+    pts = []
+    ink = []
+    for j, name in enumerate(colours):
+        cx = (j - 0.5) * step
+        for x in lins:
+            for y in lins:
+                pts.append([cx + x, y, 0.0])
+                ink.append(_MODEL_RGB[name])
+    F = np.asarray(pts, float)
+    if axis_deg:
+        a = math.radians(axis_deg)
+        R = np.array([[math.cos(a), -math.sin(a)],
+                      [math.sin(a), math.cos(a)]])
+        F[:, :2] = F[:, :2] @ R.T
+    idx = np.arange(len(F))
+    qpix = np.column_stack([idx % img_hw[1], idx // img_hw[1]])
+    color = np.zeros((img_hw[0], img_hw[1], 3), np.uint8)
+    color[qpix[:, 1], qpix[:, 0]] = np.asarray(ink, np.uint8)
+    long_mm = (2.0 * (0.5 * step + 0.5 * block)) * 1000.0
+    rect = {"ext_mm": [long_mm, block * 1000.0], "yaw_deg": axis_deg}
+    return F, qpix, color, rect
+
+
+@case
+def test_colour_split_two_contact_blocks():
+    F, qp, color, rect = _two_block_scene()
+    pieces = gc.split_top_face_by_colour(F, qp, color, rect)
+    assert len(pieces) == 2, [len(p) for p in pieces]
+    left, right = pieces
+    assert F[left, 0].max() < 0.0 < F[right, 0].min(), "两块没按长边切开"
+    assert len(left) == len(right) == 40 * 40, [len(left), len(right)]
+    # 顺序沿长边升序：调用方拿它对齐 ``split_i`` 编号
+    assert F[left, 0].mean() < F[right, 0].mean()
+
+
+@case
+def test_colour_split_uses_rect_yaw():
+    """长边不沿 base x 时，必须按 ``rect['yaw_deg']`` 的轴向投影再分组。"""
+    F, qp, color, rect = _two_block_scene(axis_deg=30.0)
+    pieces = gc.split_top_face_by_colour(F, qp, color, rect)
+    assert len(pieces) == 2, [len(p) for p in pieces]
+    a = math.radians(30.0)
+    t = F[:, 0] * math.cos(a) + F[:, 1] * math.sin(a)
+    assert t[pieces[0]].max() < t[pieces[1]].min()
+
+
+@case
+def test_colour_split_refuses_same_colour():
+    """契约 §2：同色接触块找不到第二类 ⇒ 原样返回，绝不按颜色硬切。"""
+    F, qp, color, rect = _two_block_scene(colours=("orange", "orange"))
+    pieces = gc.split_top_face_by_colour(F, qp, color, rect)
+    assert len(pieces) == 1 and len(pieces[0]) == len(F), \
+        [len(p) for p in pieces]
+
+
+@case
+def test_colour_split_refuses_single_block_size():
+    """外接矩形长边 < 1.5 块边 ⇒ 尺寸上就是一块，颜色噪声不许切。"""
+    F, qp, color, rect = _two_block_scene()
+    rect = dict(rect, ext_mm=[40.0, 29.5])
+    assert len(gc.split_top_face_by_colour(F, qp, color, rect)) == 1
+
+
+@case
+def test_colour_split_refuses_colour_noise():
+    """单块上的盐噪声（两类各半、重心没分开）不能被当成两块。"""
+    rng = np.random.default_rng(1)
+    n = 2400
+    F = np.column_stack([rng.uniform(-0.030, 0.030, n),
+                         rng.uniform(-0.0147, 0.0147, n),
+                         np.zeros(n)])
+    qp = np.column_stack([np.arange(n) % 480, np.arange(n) // 480])
+    pick = rng.integers(0, 2, n)
+    color = np.zeros((240, 480, 3), np.uint8)
+    color[qp[:, 1], qp[:, 0]] = np.where(
+        pick[:, None] == 0,
+        np.array(_MODEL_RGB["orange"], np.uint8),
+        np.array(_MODEL_RGB["yellow"], np.uint8))
+    rect = {"ext_mm": [60.0, 29.4], "yaw_deg": 0.0}
+    assert len(gc.split_top_face_by_colour(F, qp, color, rect)) == 1
+
+
+@case
+def test_colour_split_low_saturation_goes_by_position():
+    """低饱和像素（边/木纹）色相是纯噪声 ⇒ 按长边方向的空间归属，不许丢点。"""
+    F, qp, color, rect = _two_block_scene(gap=0.0005)   # 贴住但不重叠
+    seam = np.abs(F[:, 0]) <= 0.002
+    assert seam.sum() > 0
+    color[qp[seam, 1], qp[seam, 0]] = (128, 128, 128)   # 无色彩，只有亮度
+    pieces = gc.split_top_face_by_colour(F, qp, color, rect)
+    assert len(pieces) == 2, [len(p) for p in pieces]
+    assert sum(len(p) for p in pieces) == len(F), "低饱和点被丢了"
+    assert F[pieces[0], 0].max() < 0.0 < F[pieces[1], 0].min()
+
+
 # ---------------------------------------------------------------- runner
 def main():
     npass = nfail = 0

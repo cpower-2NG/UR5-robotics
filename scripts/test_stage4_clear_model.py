@@ -119,7 +119,7 @@ def section_free():
 
 # ------------------------------------------------------------------ [4]
 def section_blocks():
-    print('\n[4] 块位：ghost 保持身份、放垫上抬 2.88 mm')
+    print('\n[4] 块位：ghost 保持身份、放垫上抬实测垫厚')
     b = s4_blocks(0)[0]
     g = cm.ghost(b, 0.5, 0.55)
     check('ghost：id / size / yaw 不变、只动 xyz',
@@ -130,7 +130,7 @@ def section_blocks():
     cx, cy = cm.cell_center(7)
     check('放宫格：块心 = 格心', abs(p['x'] - cx) < 1e-12
           and abs(p['y'] - cy) < 1e-12)
-    check('放宫格：块底 = 垫厚 2.88 mm',
+    check('放宫格：块底 = 实测垫厚 %.3f mm' % (cm.PAD_THICK * 1000.0),
           abs(p['z'] - (cm.PAD_THICK + cm.BLOCK_M / 2.0)) < 1e-12, str(p['z']))
 
 

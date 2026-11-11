@@ -190,10 +190,15 @@ def move_in_layout(blocks, bid, x, y, z_bottom):
     return b
 
 
-def surface_of(to_z, size, where):
-    """落点块心 z → 支撑面高度；只认台面与垫面两种（多认就是把错当真）。"""
+def surface_of(to_z, size, where, pad_thick=None):
+    """落点块心 z → 支撑面高度；只认台面与**本轮实测**垫面（多认就是把错当真）。
+
+    ``pad_thick`` 缺省 = ``cm.PAD_THICK``（真机实测常量）；带 ``--pad-thick``
+    的轮必须把它传进来，否则计划与执行对垫面的理解会各说各话。
+    """
     z = float(to_z) - float(size) / 2.0
-    for cand in (0.0, float(cm.PAD_THICK)):
+    pad = float(cm.PAD_THICK if pad_thick is None else pad_thick)
+    for cand in (0.0, pad):
         if abs(z - cand) <= 1e-4:
             return cand
     raise ValueError("%s 的落点块心 z=%.4f 推不出支撑面（得到 %.4f m，"
@@ -216,7 +221,8 @@ def actions_from_attempt(truth, attempt, pad_thick):
         if blk is None:
             raise ValueError("清障步骤引用了不存在的块 %r" % (bid,))
         src, to = step["from"], step["to"]
-        surf = surface_of(to[2], blk["size"], "清障块 %r" % (bid,))
+        surf = surface_of(to[2], blk["size"], "清障块 %r" % (bid,),
+                          pad_thick=pad_thick)
         actions.append({
             "kind": "clear",
             "block": str(bid),
@@ -238,7 +244,8 @@ def actions_from_attempt(truth, attempt, pad_thick):
     final = find_block(attempt.get("final_blocks") or [], tid)
     if final is None:
         raise ValueError("尝试记录里没有目标块 %r 的终态位姿" % (tid,))
-    surf = surface_of(final["z"], tgt["size"], "目标块 %r" % (tid,))
+    surf = surface_of(final["z"], tgt["size"], "目标块 %r" % (tid,),
+                      pad_thick=pad_thick)
     if abs(surf - float(pad_thick)) > 1e-4:
         raise ValueError("目标块 %r 的落点支撑面 %.4f m 不是垫面 %.4f m —— "
                          "探针与执行器对放置面的理解不一致"
@@ -641,6 +648,10 @@ def merge_truth_blocks(truths, dedup_m=0.040, layer_m=0.015):
     都到 y≈0.46–0.49）同一块可能被两个机位各报一次 —— 那时按 ``dedup_m`` 距离
     判重复，只留先报的，并列进 ``duplicates`` 供追溯。
 
+    ⚠ **同一机位内部不做去重**：相机一次共识已经把同一块的多次观测聚过了；
+    机位内两块再近也是两块真块（2026-11-11 s11 重放：自由区两块中心距 37.0 mm
+    < 40 mm，被同机位去重吃掉一块 ⇒ 判「缺块」）。去重只在**跨机位**做。
+
     ⚠ 去重必须**带层**：塔的两层 XY 完全重合、只差 29.5 mm 高。只按 XY 去重会把
     上层当重复吃掉（2026-11-09 实测：3 根两层塔 6 块被合掉 2 块，判成「缺块」）。
     ⇒ 只有 XY ≤ ``dedup_m`` **且** 顶面高度差 ≤ ``layer_m`` 才算同一块。
@@ -663,9 +674,10 @@ def merge_truth_blocks(truths, dedup_m=0.040, layer_m=0.015):
 
     for name, blocks in truths:
         kept = 0
+        prev = list(out)          # 只跟**先前机位**比；同机位内永远不是重复
         for b in blocks:
             x, y = float(b["x"]), float(b["y"])
-            near = [o for o in out if _same(o, b, x, y)]
+            near = [o for o in prev if _same(o, b, x, y)]
             if near:
                 dup.append({"view": str(name),
                             "x_mm": round(x * 1000.0, 1),
@@ -829,7 +841,7 @@ COLOUR_CAMERAS = {"topcam": (gc.TOPCAM_TIP, gc.TOPCAM_CHAIN),
 
 
 def measure_target_colour(burst_dir, slot_xy, top_z, search_mm=60.0,
-                          max_frames=10, min_frames=5, camera="topcam"):
+                          max_frames=10, min_frames=5, camera="wrist"):
     """跑后某一路相机的 burst → 目标块顶面质心（台面 mm，中位）与可复现性。
 
     **为什么目标块要换彩色量**（2026-11-08 用户拍板）：垫面在俯视深度里
@@ -1082,8 +1094,8 @@ def apply_pad_pose(args, hint_dir, recorded=None):
         return None
     raise SystemExit(
         "没有实测垫位姿（grid.json）：%s\n"
-        "  每场开跑前必须先解：python3 scripts/stage2_pad.py --camera topcam "
-        "--frame <跑前俯视帧> --mat <stage2-mat.json> --out %s/grid-pre.json\n"
+        "  每场开跑前必须先解：python3 scripts/stage4_pad_from_burst.py "
+        "<跑前腕部 pad 机位 burst> --out %s/grid-pre.json\n"
         "  （或用 --grid 指定；只做仿真复现时才加 --allow-model-pad）"
         % (cm.PAD_POSE_SOURCE, hint_dir or "<out-dir>"))
 
@@ -1124,6 +1136,33 @@ def warn_pad_pose_mismatch(manifest, tol_mm=5.0, tol_deg=1.0):
             % (posed["center_mm"][0], posed["center_mm"][1], posed["yaw_deg"],
                cm.PAD_CENTER[0] * 1000.0, cm.PAD_CENTER[1] * 1000.0,
                math.degrees(cm.PAD_YAW_RAD), d_mm, d_deg))
+
+
+def round_gate(out_dir):
+    """收尾闸门（§20.3）：没有脚本写出的完整 ``round.json``，这一轮不算通过。
+
+    返回 ``(rc, notes)``：rc=0 = 可以出判决；2 = 缺文件或不完整。
+
+    为什么单独一条：``verify.json`` 只回答「全桌终态对不对」，而抓取三元组
+    （回读 / 滑移 / 跑后三机位）、安全计数、干预、人眼复核都只在
+    ``round.json`` 里。缺它就给 0，等于把「没归档的一轮」算成绿灯 —— 这正是
+    s11 暴露的问题：结论有，证据链没有。
+    """
+    path = os.path.join(out_dir or "", "round.json")
+    if not os.path.exists(path):
+        return 2, ["缺 round.json（先用 scripts/stage4_round_report.py 生成）"]
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        return 2, ["round.json 读不了：%s" % e]
+    miss = []
+    if doc.get("kind") != "stage4-round":
+        miss.append("kind=%r（应为 stage4-round）" % doc.get("kind"))
+    if doc.get("complete") is not True:
+        miss.append("complete!=true：%s"
+                    % "；".join(doc.get("missing") or ["未标原因"]))
+    return (2 if miss else 0), miss
 
 
 def verify_main(args):
@@ -1233,6 +1272,10 @@ def verify_main(args):
                b.get("d_mm"), b.get("dyaw_deg"), b.get("dz_mm")))
     log("→ %s" % vpath)
     log("结论：%s" % ("PASS" if rep["ok"] else "FAIL"))
+    rrc, rmiss = round_gate(out_dir)
+    if rrc != 0:
+        log("!! 收尾不通过（§20.3）：%s" % "；".join(rmiss))
+        return 2
     return 0 if rep["ok"] else 1
 
 
@@ -1473,9 +1516,12 @@ def main(argv=None):
                          "落格（垫面深度分辨不出 29.5 mm 台阶；缺省 None = 用深度"
                          "真值）。E9 从 2026-11-09 起给腕部的 pad 机位")
     ap.add_argument("--colour-camera", choices=sorted(COLOUR_CAMERAS),
-                    default="topcam",
-                    help="彩色量用哪一路相机（缺省 topcam = 旧证据口径；"
-                         "E9 现在用 wrist）")
+                    default="wrist",
+                    help="彩色量用哪一路相机（缺省 wrist；topcam 已退出正式"
+                         "流程，只用于复现旧证据，必须同时给 --allow-topcam）")
+    ap.add_argument("--allow-topcam", action="store_true",
+                    help="显式允许误用俯视相机（只用于诊断/复现旧证据；"
+                         "不给它却传 --colour-camera topcam ⇒ 非 0 退出）")
     ap.add_argument("--view-truth", action="append", default=None,
                     metavar="机位=JSON",
                     help="跑后某个**机位**的共识真值（可重复；E9 用 pick/free/pad "
@@ -1554,6 +1600,13 @@ def main(argv=None):
                          "等价写法（只换手指、不换面；方块/矩形块落点相同）。"
                          "缺省不开 ⇒ 照旧 fail-closed")
     args = ap.parse_args(argv)
+
+    # 俯视已退出阶段 4（v0.6）：彩色量默认腕部。显式要用俯视必须再加
+    # --allow-topcam；只传 topcam 不给开关 ⇒ fail-closed，防止旧命令静默沿用。
+    if args.colour_camera == "topcam" and not args.allow_topcam:
+        log("!! --colour-camera topcam 已退出阶段 4 正式流程。")
+        log("   正式轮用缺省 wrist；确需复现旧证据请同时给 --allow-topcam。")
+        return 2
 
     if args.verify or args.view_truth:
         return verify_main(args)

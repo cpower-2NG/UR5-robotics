@@ -77,7 +77,7 @@ def log(*a):
 
 # ---------------------------------------------------------------- 场景物件
 def make_pad_object(frame=mp.BASE):
-    """放置垫的碰撞代理（0.30×0.30×2.88 mm，按 gen_scene 的垫位姿）。
+    """放置垫的碰撞代理（外框 × 实测垫厚，按 gen_scene 的垫位姿）。
 
     仿真世界里有这块垫，但 E7 的 ``make_table_object`` 只是个 2×2 的桌面代理，
     规划场景里**没有垫** —— 放置位姿要把垫算进去，否则「贴垫放置」会和现实分家。
@@ -87,7 +87,7 @@ def make_pad_object(frame=mp.BASE):
     obj.id = PAD_ID
     box = SolidPrimitive()
     box.type = SolidPrimitive.BOX
-    box.dimensions = [2.0 * cm.PAD_HALF, 2.0 * cm.PAD_HALF, cm.PAD_THICK]
+    box.dimensions = [cm.PAD_FOOTPRINT[0], cm.PAD_FOOTPRINT[1], cm.PAD_THICK]
     pose = Pose()
     pose.position.x, pose.position.y = cm.PAD_CENTER
     pose.position.z = cm.PAD_THICK / 2.0
@@ -102,7 +102,7 @@ def make_pad_object(frame=mp.BASE):
 def pad_obb():
     return sm.Obb.from_pose(
         [cm.PAD_CENTER[0], cm.PAD_CENTER[1], cm.PAD_THICK / 2.0],
-        [2.0 * cm.PAD_HALF, 2.0 * cm.PAD_HALF, cm.PAD_THICK],
+        [cm.PAD_FOOTPRINT[0], cm.PAD_FOOTPRINT[1], cm.PAD_THICK],
         (0.0, 0.0, math.sin(cm.PAD_YAW_RAD / 2.0),
          math.cos(cm.PAD_YAW_RAD / 2.0)),
         name=PAD_ID)

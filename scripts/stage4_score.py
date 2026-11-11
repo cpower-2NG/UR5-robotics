@@ -17,13 +17,18 @@
 
 1. **分母 = 该轮全部指定块**（块级尝试），不剔除失败块；只有 ``void``
    （外部原因未完成）不进分母，且要记原因。**同一判据连续 3 次 void ⇒ 停**。
-2. **``rc=0`` 不算成功**。抓取成功必须由**俯视 + 腕部 + 人眼**三方确认
-   （见 ``CONFIRMS``）；缺任何一路 ⇒ 这条尝试进 ``person_review``，不能算绿。
+2. **``rc=0`` 不算成功**。抓取成功由**回读 + 抬升滑动 + 跑后腕部三机位**
+   三元组确认（见 ``CONFIRMS``，v0.6 起）；缺任何一路 ⇒ 这条尝试进
+   ``person_review``，不能算绿。人眼不再是抓取成功的与门：它只在
+   ``verdict=person_review`` 时充当放行人（契约 §12.1）。
 3. **测量来源不得复用控制感知**（E13 的存在理由）。真值必须带
    ``truth_source``，且只认 ``TRUTH_SOURCES`` 里的独立来源；控制链自己的读数
    写进来当"真值" ⇒ 直接 ``missing_data``。**这条是判分器的死穴**：如果真值和
    系统选择同源，判分器只是在给自己盖章 —— 阶段 4 的 E5 评估器已经栽过一次
    （台账第二百七十七轮，独立复核揪出 289 条分歧）。
+4. **垫参数用实测值**（v0.6）：``obs.pad`` 必须来自每轮 pad solve
+   （垫面 z + 足迹 + 实测厚度），``measured=true``；沿用 ``gen_scene`` 的
+   2.88 mm / 300×300 常量 ⇒ ``missing_data``。仿真跟真机，不反过来。
 
 退出码：0 = 该轮全过；1 = 有不过 / 待人评；2 = 数据缺失或坏。
 
@@ -59,15 +64,20 @@ DEFAULT_THRESHOLDS = {
 FAIL_CLASSES = ("perception", "candidate", "ik", "planning",
                 "execution", "placement", "human")
 
-# 契约 §4.2.1：抓取成功要三路确认。
-CONFIRMS = ("topcam", "wrist", "human")
+# 契约 §12.1（v0.6）：抓取成功 = 回读 + 抬升滑动 + 跑后腕部三机位。
+# 人眼不在与门里；它只在 person_review 时当放行人。
+CONFIRMS = ("readback", "slip", "postrun-wrist-3view")
 
-# 允许当"独立真值"的来源。控制链（perception_3d / grasp_planner / 规划器）
-# 的读数**不在这个名单里**，写进来即判数据坏。
-TRUTH_SOURCES = ("topcam-independent", "human-annotation",
-                 "layout-manifest+topcam")
+# 允许当"独立真值"的来源（契约 §12.1 白名单，v0.6）。控制链
+# （perception_3d / grasp_planner / 规划器）的读数**不在这个名单里**，
+# 写进来即判数据坏。俯视来源已随 E4b 取消退出阶段 4。
+TRUTH_SOURCES = ("sim-truth", "postrun-wrist-3view",
+                 "layout-manifest+postrun-wrist", "human-annotation")
 
 SAFETY_KEYS = ("collisions", "drops", "unexpected_motion", "estop")
+
+# 实测垫参数（契约 §12.1 / §20.5）。仿真也填真机实测值，不填 gen_scene 常量。
+PAD_KEYS = ("thickness_m", "footprint_m", "surface_z_m")
 
 # 尝试级状态
 A_OK, A_FAIL, A_REVIEW, A_VOID, A_MISSING = (
@@ -100,6 +110,89 @@ def _truth_instance(rec):
 def _selected_instance(rec):
     s = rec.get("selected") or {}
     return s.get("instance_id")
+
+
+def _bool(v):
+    """严格布尔：只认 True/False；字符串/数字一律 None（不许靠 truthiness）。"""
+    return v if isinstance(v, bool) else None
+
+
+def _grasp_triplet(gr):
+    """契约 §12.1 抓取三元组 → ``(verdict, reasons)``。
+
+    ``verdict`` ∈ ``pass`` / ``fail`` / ``review``：
+    * ``readback.gripped``：闭合回读，False = 空夹 ⇒ 定性失败；
+    * ``slip``：抬升后 ``|lift−closed| > 1 mm``，True = 滑了 ⇒ 定性失败；
+    * ``postrun.target_left_origin`` / ``arrived``：跑后腕部三机位。
+    缺字段 ⇒ ``review``（交人，**不默认通过**）。
+    """
+    reasons, verdict = [], "pass"
+
+    def note(level, msg):
+        nonlocal verdict
+        reasons.append(msg)
+        if level == "fail":
+            verdict = "fail"
+        elif verdict != "fail":
+            verdict = "review"
+
+    rb = gr.get("readback")
+    gripped = (_bool(rb.get("gripped")) if isinstance(rb, dict) else _bool(rb))
+    if gripped is None:
+        # round.json §20.3 的紧凑写法：grasp.confirm.readback
+        gripped = _bool((gr.get("confirm") or {}).get("readback"))
+    if gripped is None:
+        note("review", "缺闭合回读 readback.gripped")
+    elif gripped is False:
+        note("fail", "闭合回读=空夹")
+
+    slip = _bool(gr.get("slip"))
+    if slip is None:
+        slip = _bool((gr.get("confirm") or {}).get("slip"))
+    if slip is None:
+        note("review", "缺抬升滑动判定 slip")
+    elif slip is True:
+        note("fail", "抬升后检出滑移")
+
+    pr = gr.get("postrun")
+    if not isinstance(pr, dict):
+        note("review", "缺跑后腕部三机位确认 postrun")
+    else:
+        left = _bool(pr.get("target_left_origin"))
+        arrived = _bool(pr.get("arrived"))
+        if left is None:
+            note("review", "缺 postrun.target_left_origin")
+        elif left is False:
+            note("fail", "目标块未离开原处")
+        if arrived is None:
+            note("review", "缺 postrun.arrived")
+        elif arrived is False:
+            note("fail", "目标块未到达放置区")
+    return verdict, reasons
+
+
+def _pad_value_ok(v):
+    """垫参数可以是标量，也可以是 (x, y) 两元组（足迹）。"""
+    if isinstance(v, (list, tuple)):
+        return len(v) == 2 and all(_num(x) is not None for x in v)
+    return _num(v) is not None
+
+
+def _pad_gate(obs):
+    """垫参数必须是每轮 pad solve 的实测值（§20.5）。"""
+    p = obs.get("pad")
+    if not isinstance(p, dict):
+        return None, ["pad 缺失（需每轮 pad solve 的实测参数）"]
+    missing = [k for k in PAD_KEYS if not _pad_value_ok(p.get(k))]
+    if p.get("measured") is not True:
+        missing.append("measured!=true")
+    src = str(p.get("source") or "")
+    low = src.lower()
+    if "gen_scene" in low or "model" in low or "constant" in low:
+        missing.append("source=%r 仍是模型常量" % src)
+    if missing:
+        return None, ["pad 参数不可用：%s" % ",".join(missing)]
+    return p, []
 
 
 def code_hash():
@@ -144,28 +237,47 @@ def score_attempt(rec, i=0):
         return row
     row["id_ok"] = (s_id is not None) and (int(s_id) == int(t_id))
 
-    # ---- 抓取（三路确认，rc=0 不够）
-    gr = rec.get("grasp") or {}
-    conf = gr.get("confirm") or {}
-    missing_conf = [k for k in CONFIRMS if conf.get(k) is not True]
+    # ---- 执行证据闸门（§20.3）：执行日志没归档 ≠ 抓取失败。
+    # 缺字段默认成 False 会把「没证据」算成「系统差」，污染分母；这里判数据缺失。
+    gr = rec.get("grasp")
+    exec_keys = ("lifted", "dropped", "wrong_block", "exec_rc")
+    if not isinstance(gr, dict) or any(k not in gr for k in exec_keys):
+        row["status"] = A_MISSING
+        row["reasons"].append("执行证据缺失（grasp 需 %s）" % "/".join(exec_keys))
+        return row
+
+    # ---- 抓取（回读 + 滑动 + 跑后三机位；rc=0 不够）
     moved = bool(gr.get("lifted")) and not bool(gr.get("dropped")) \
         and not bool(gr.get("wrong_block")) and int(gr.get("exec_rc", 1)) == 0
     if not moved:
         # 没抬起来（或掉了 / 抓错 / rc≠0）就是失败，不需要确认也成立
         row["grasp_ok"] = False
-    elif missing_conf:
-        # 抬起来了但没三路确认 ⇒ 不能算成功，交人（不能默认绿）
-        row["grasp_ok"] = None
-        row["status"] = A_REVIEW
-        row["reasons"].append("抓取未三路确认：缺 %s" % ",".join(missing_conf))
     else:
-        row["grasp_ok"] = True
+        gv, greasons = _grasp_triplet(gr)
+        if gv == "pass":
+            row["grasp_ok"] = True
+        elif gv == "fail":
+            # 回读空夹 / 滑移 / 跑后未见目标——定性失败，不是「待复核」
+            row["grasp_ok"] = False
+            row["reasons"].extend(greasons)
+        else:
+            # 抬起来了但确认不全 ⇒ 不能算成功，交人（不能默认绿）
+            row["grasp_ok"] = None
+            row["status"] = A_REVIEW
+            row["reasons"].append("抓取确认不全：%s" % "；".join(greasons))
 
-    # ---- 放置
-    pl = rec.get("place") or {}
-    row["place_ok"] = (pl.get("in_slot") is True
-                       and pl.get("over_line") is not True
-                       and pl.get("out_of_bounds") is not True)
+    # ---- 放置（三键都必须是明确布尔；缺键 = 没测，不是「没压线」）
+    pl = rec.get("place")
+    place_keys = ("in_slot", "over_line", "out_of_bounds")
+    if not isinstance(pl, dict) or any(_bool(pl.get(k)) is None
+                                       for k in place_keys):
+        row["status"] = A_MISSING
+        row["reasons"].append("放置证据缺失（place 需 %s 三个布尔）"
+                              % "/".join(place_keys))
+        return row
+    row["place_ok"] = (pl["in_slot"] is True
+                       and pl["over_line"] is not True
+                       and pl["out_of_bounds"] is not True)
 
     # ---- 失败必须分类
     failed = row["id_ok"] is False or row["grasp_ok"] is False \
@@ -248,6 +360,11 @@ def score_round(obs, thresholds=None):
     """一轮 → 判分结果（不写文件）。"""
     th = dict(DEFAULT_THRESHOLDS)
     th.update(thresholds or {})
+    scene = obs.get("scene") or {}
+    round_id = obs.get("round_id") or obs.get("round")
+    batch = obs.get("batch") or scene.get("batch")
+    layout = obs.get("layout") or scene.get("layout")
+    repeat = obs.get("repeat", scene.get("repeat"))
     raw = obs.get("attempts") or []
     rows = [score_attempt(r, i) for i, r in enumerate(raw)]
     n_targets = int(_num(obs.get("n_targets")) or len(raw))
@@ -265,6 +382,7 @@ def score_round(obs, thresholds=None):
     safety, safety_missing = _safety(obs)
     inter = _interventions(obs)
     review = obs.get("human_review") or {}
+    pad, pad_missing = _pad_gate(obs)
 
     rates = {
         "id_rate": _rate(n_id, den),
@@ -276,13 +394,19 @@ def score_round(obs, thresholds=None):
     }
 
     verdict, reason = "ok", ""
-    if not raw:
+    if obs.get("complete") is False:
+        verdict, reason = ("missing_data",
+                           "round.json 标记不完整：%s"
+                           % "；".join(obs.get("missing") or ["?"]))
+    elif not raw:
         verdict, reason = "missing_data", "attempts 为空"
     elif len(raw) != n_targets:
         verdict, reason = ("missing_data",
                            "尝试数 %d ≠ 指定块数 %d" % (len(raw), n_targets))
     elif any(r["status"] == A_MISSING for r in rows):
         verdict, reason = "missing_data", "尝试缺真值/来源不合规"
+    elif pad is None:
+        verdict, reason = "missing_data", "；".join(pad_missing)
     elif term_ok is None:
         verdict, reason = "missing_data", "；".join(term_reasons)
     elif safety is None:
@@ -310,15 +434,17 @@ def score_round(obs, thresholds=None):
                     label, 100 * v, 100 * th[key])
                 break
     if verdict == "ok":
-        if review.get("approved") is not True:
-            verdict, reason = "person_review", "人眼复核未批准"
-        elif any(r["status"] == A_REVIEW for r in rows):
-            verdict, reason = "person_review", "有尝试待人评"
+        # 人眼复核只在需要时才是门：有 A_REVIEW 尝试，或 round.json 显式
+        # required=true。判分器自己能判的轮**不要求**人眼签字（契约 §12.4）。
+        needs_review = (any(r["status"] == A_REVIEW for r in rows)
+                        or review.get("required") is True)
+        if needs_review and review.get("approved") is not True:
+            verdict, reason = "person_review", "有尝试需人眼复核，未批准"
 
     return {
-        "version": 1, "kind": "stage4-score",
-        "round": obs.get("round"), "batch": obs.get("batch"),
-        "layout": obs.get("layout"), "repeat": obs.get("repeat"),
+        "version": 2, "kind": "stage4-score",
+        "round": round_id, "batch": batch,
+        "layout": layout, "repeat": repeat,
         "code_hash": obs.get("code_hash") or code_hash(),
         "thresholds": th,
         "n_targets": n_targets, "n_attempts": len(raw),
@@ -336,6 +462,7 @@ def score_round(obs, thresholds=None):
         "interventions": inter,
         "terminal_ok": term_ok, "terminal_reasons": term_reasons,
         "human_review": obs.get("human_review"),
+        "pad": pad,
         "attempts": rows,
         "verdict": verdict, "reason": reason,
     }
