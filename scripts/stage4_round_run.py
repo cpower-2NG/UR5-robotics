@@ -537,7 +537,9 @@ def _q_from_joints(doc, chain):
 #:
 #: 只覆盖源码：`__pycache__` / `*.pyc` / 构建产物 / 备份目录每次跑都会变
 #: （2026-11-11 实测：跑一次 `--help` 就让文件数 1129→1130、哈希全变 ⇒ 预检
-#: 假红，把「部署变了」和「有人 import 过一次」混为一谈）。`.git` 也不进。
+#: 假红，把「部署变了」和「有人 import 过一次」混为一谈）。`.git` 也不进 ——
+#: 注意它在 **worktree 里是文件**（gitdir 指针），不只跳过同名目录，
+#: 否则「本地 worktree vs 板上普通目录」会永远差一个文件（2026-11-12 实测）。
 PREFLIGHT_TREE_CODE = r'''
 _SKIP_DIRNAMES = {".git", "__pycache__"}
 _SKIP_PREFIX = ("ros2_ws/build", "ros2_ws/install", "ros2_ws/log")
@@ -558,6 +560,8 @@ def scan_tree(repo):
             keep.append(d)
         dirs[:] = keep
         for name in sorted(files):
+            if name == ".git":          # worktree 里 .git 是文件，不是目录
+                continue
             if name.endswith((".pyc", ".pyo")) or ".bak-" in name:
                 continue
             path = os.path.join(root, name)

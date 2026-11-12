@@ -164,7 +164,7 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
   >
   > ```bash
   > setsid nohup ~/precision/run.sh ~/stage4-entry/scripts/wrist_tf_publish.py \
-  >   > ~/stage4-entry/wrist-tf.log 2>&1 < /dev/null &
+  >   > ~/precision/logs/wrist-tf.log 2>&1 < /dev/null &
   > ~/precision/run.sh ~/stage4-entry/scripts/wrist_tf_publish.py --verify   # rc=0 才算
   > ```
   >
@@ -215,6 +215,9 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 `scripts/stage4_preflight_expect.py --repo <worktree> --from <旧基线> --out <新基线>`
 只重算 `tree` 两项，`serial` / `stack` 原样继承（别手改 JSON，容易把「认亲」判据改宽）。
 板上预检与本机重算共用同一份哈希代码（`PREFLIGHT_TREE_CODE`），不是两个口径。
+**部署树里不许写日志 / 产物**（会让 `tree` 哈希假红）：日志一律写
+`~/precision/logs/`，板上留档放 `~/stage4-entry-local/`（2026-11-12 清理过一次：
+5 个历史文件从部署树移出）。
 
 ### 3. Round 0 计时干跑（S0 六轮之前，只做一次，不计入六轮）
 

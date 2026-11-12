@@ -108,6 +108,16 @@ with tempfile.TemporaryDirectory() as tt:
           got3['tree_sha256'] == got2['tree_sha256']
           and got3['tree_files'] == got2['tree_files'], repr(got3))
 
+    # worktree 里 `.git` 是文件（gitdir 指针），不是目录 —— 板上是普通目录复制，
+    # 漏跳它就永远差一个文件（2026-11-12 实测本地 370 / 板上 369）。
+    with open(os.path.join(repo, '.git'), 'w') as f:
+        f.write('gitdir: /somewhere/.git/worktrees/x\n')
+    _run(repo, old, out)
+    got4 = json.load(open(out))
+    check('.git 文件不进哈希（本地 worktree 与板上目录才可比）',
+          got4['tree_sha256'] == got3['tree_sha256']
+          and got4['tree_files'] == got3['tree_files'], repr(got4))
+
 print('--- B. 坏输入 fail-closed ---')
 with tempfile.TemporaryDirectory() as tt:
     old_no_serial = os.path.join(tt, 'old-no-serial.json')
