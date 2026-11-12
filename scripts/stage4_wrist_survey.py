@@ -104,7 +104,7 @@ def project_block(cam, R, block_xy, z_top):
 
 
 def survey_plan(chain, q_start, zone=PICK_ZONE_M, height=SURVEY_H_M,
-                yaw_deg=0.0, transit_dz=0.10):
+                yaw_deg=0.0, transit_dz=0.10, qs=None):
     """从 ``q_start`` 平动到巡检位，产出可直接执行的计划 dict。
 
     返回 ``(plan, checks, cam, margins)``。预检不过抛 ``pp.PlanError``
@@ -113,6 +113,10 @@ def survey_plan(chain, q_start, zone=PICK_ZONE_M, height=SURVEY_H_M,
     这是**唯一**构造巡检位计划的地方：E9 的 ``run.sh`` 收尾段（跑后判分帧）
     和手动出计划都走它，两处的位姿因此逐位一致 —— 跑前跑后必须是**同一个
     位姿**，否则两帧真值的块位置不能直接比。
+
+    ``qs``：已经解好的两点关节角 ``[transit, pose]``（来自跨机位的全局 DP，
+    见 ``stage4_clear_run.plan_views``）。给定时不再逐点局部 IK —— 一整串
+    机位必须共用一条分支链，逐点就近会换支并逼出 180° 以上的单关节翻转。
     """
     marg, tool0, cam = coverage(zone, height, yaw_deg)
     if min(marg) <= 0:
@@ -121,7 +125,7 @@ def survey_plan(chain, q_start, zone=PICK_ZONE_M, height=SURVEY_H_M,
     wps, checks, meta = pp.build_move(
         chain, q_start,
         tuple(float(v) for v in tool0), name="survey",
-        transit_dz=float(transit_dz))
+        transit_dz=float(transit_dz), yaw_deg=float(yaw_deg), qs=qs)
     wps, added = pp.split_jumps(wps, chain, q_start=q_start)
     if len(checks) != len(wps) - added:
         raise pp.PlanError("巡检位预检记录不完整")

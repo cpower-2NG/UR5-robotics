@@ -1555,7 +1555,12 @@ class Round:
                     place_clearance=self.args.place_clearance,
                     wrist_survey=False,
                     place_yaw_equiv=bool(self.args.place_yaw_equiv180),
-                    start=idx, min_block_gap=0.06, gap_check="layout_gap")
+                    start=idx, min_block_gap=0.06, gap_check="layout_gap",
+                    # 最后一个块要为**随后追加的三机位**选收尾分支：只参与选支、
+                    # 不写进它的计划（见 cr.view_targets / build_pick 的
+                    # post_targets）。不给的话两条链可能差整整 360°，compute 时
+                    # 才发现机位拍不了（2026-11-12 attempt6）。
+                    tail_targets=(cr.view_targets() if tid == ids[-1] else None))
             except pp.PlanError as e:
                 raise RoundError(EXIT_PLAN, "compute",
                                  "块 %s 的计划预检不过：%s —— run.sh 不写、"

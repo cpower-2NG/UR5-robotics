@@ -106,13 +106,29 @@ ALIGN_TOL_DEG = 2.0
 #:
 #: 位姿由 ``stage4_wrist_survey.survey_plan`` 从 zone+height **现算**，跑前跑后
 #: 各调一次这个常量 ⇒ 逐位一致，不靠人手抄坐标。改这里 = 改判分机位，须记录。
+#:
+#: ``yaw_deg``（tool0 绕工具轴的角，缺省 0）：**只有 pad 用 180°**。这不是画幅
+#: 需要（那个区 0/90/180/270 都在画幅里），而是**可达性**：free 机位的 IK 解在
+#: wrist_2 上有 ±90° 两支（互为 180° 翻腕），pad 机位在 yaw 0 时的合格解全部落在
+#: 翻腕的另一侧，接不上（2026-11-12 attempt6：块 4 收尾与三机位差整整 170–180°）。
+#: yaw 180° 与 0° 是同一个"竖直朝下"姿态绕工具轴转半圈，pad 区照样满画幅
+#: （实测四边余量 330/331/54/47 px，与 yaw 0 逐像素一致），而 IK 支换到能接上的
+#: 那一侧。跑前/跑后都走同一份常量 ⇒ 两帧仍同一位姿。
+#:
+#: 次序即执行次序（跑前只用 pick / pad 两项，见编排器 PRE_VIEWS）。
+#: ``pad`` 排在 ``free`` 前面不是随手：自由区机位在臂展边上（tool0 y≈0.455、
+#: z≈0.474），它的 IK 只有 j0≈−131° 与 +31° 两族、腕 2 只能用 −269.8° 那支；
+#: 从拾取区机位（j0≈−142°、腕 2 −90.2°）直接过去，最小单步 179.6°，正好卡在
+#: 170° 上限外。垫面机位有 j0≈−23°、腕 2 +89.8° 的解，先绕它一脚，两端分别
+#: 差 119° 与 0.4°（2026-11-12 attempt6 实测）。
 E9_VIEWS = (
     {"name": "pick", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500,
      "purpose": "块数/塔层/旁观块（拾取区）"},
+    {"name": "pad", "zone": (0.310, 0.610, -0.300, 0.000), "height": 0.500,
+     "yaw_deg": 180.0,
+     "purpose": "目标块落格（垫面，彩色顶面质心）"},
     {"name": "free", "zone": (0.280, 0.750, 0.460, 0.620), "height": 0.450,
      "purpose": "清障块落点（北侧自由区）"},
-    {"name": "pad", "zone": (0.310, 0.610, -0.300, 0.000), "height": 0.500,
-     "purpose": "目标块落格（垫面，彩色顶面质心）"},
 )
 
 #: 机位之间的悬停抬高（m）。**不能用 0.10**：free 机位在 y≈0.455、z≈0.474，
@@ -515,6 +531,29 @@ def to_pp_block(b):
             "yaw": float(b.get("yaw", 0.0))}
 
 
+def view_targets(views=None):
+    """判分机位的**后续目标**：每个机位两点，直接就是 ``build_pick`` 的
+    ``post_targets`` 格式 —— ``[(名字, xyz, yaw_deg)]``。
+
+    与 ``plan_views`` / ``survey_plan`` 用的是同一个 ``ws.coverage`` —— 坐标只有
+    一处出处。用途只有一个：交给末块的 ``pp.build_pick(post_targets=...)``，让
+    收尾那支 IK 在「之后还得走得到这些点」的前提下选 —— 否则两条链可能分属
+    不同的 ±360 折圈族，事后怎么折圈都差 360°（2026-11-12 attempt6）。
+    """
+    import stage4_wrist_survey as ws   # 惰性 import，同 plan_views
+    out = []
+    for v in (E9_VIEWS if views is None else views):
+        yaw = float(v.get("yaw_deg", 0.0))
+        _, tool0, _ = ws.coverage(tuple(v["zone"]), float(v["height"]), yaw)
+        dz = float(v.get("transit_dz", VIEW_TRANSIT_DZ))
+        out.append(("%s_transit" % v["name"],
+                    (float(tool0[0]), float(tool0[1]),
+                     float(tool0[2]) + dz), yaw))
+        out.append(("%s_pose" % v["name"],
+                    tuple(float(x) for x in tool0), yaw))
+    return out
+
+
 def plan_views(chain, q_start, views, out_dir, start=0):
     """从 ``q_start`` 依次平动到每个判分机位，各写一份计划。
 
@@ -523,20 +562,38 @@ def plan_views(chain, q_start, views, out_dir, start=0):
     手抄坐标。任何机位出画幅 / IK 不过 ⇒ ``pp.PlanError``，调用方整份不写
     （fail-closed：不许跑完才发现某个机位拍不了）。
 
+    **整串机位由一个 DP 一次解出**（``pp.solve_path``），再按机位切片交给
+    ``survey_plan(qs=...)``。以前每个机位各自局部 IK，跨机位时会各挑各的
+    ±360 折圈支：末块收尾在 j0≈−139°、自由区机位只有 j0≈−131° 与 +31° 两族，
+    逐点就近正好卡在 179.6°（单步上限 170°）和 212°（整圈翻转）之间 ——
+    2026-11-12 attempt6 的 compute 就是这么失败两次的。
+
     返回 ``(plans, q_end)``。
     """
     import stage4_wrist_survey as ws   # 惰性 import：只在这条路径上拉 scipy
+    targets = view_targets(views)
+    try:
+        qpath = pp.solve_path(
+            chain, [(n, xyz) for n, xyz, _ in targets], q_start,
+            yaws=[y for _, _, y in targets])
+    except pp.BranchChainError as e:
+        raise pp.PlanError("判分机位链解不出来：%s" % e)
     plans, q = [], [float(v) for v in q_start]
     for i, v in enumerate(views, start=int(start) + 1):
+        yaw = float(v.get("yaw_deg", 0.0))
+        # 每个机位两点：transit 在前、pose 在后（见 ``view_targets``）。
+        base = 2 * (i - int(start) - 1)
         vp, checks, cam, marg = ws.survey_plan(
             chain, q, zone=tuple(v["zone"]), height=float(v["height"]),
-            transit_dz=float(v.get("transit_dz", VIEW_TRANSIT_DZ)))
+            yaw_deg=yaw,
+            transit_dz=float(v.get("transit_dz", VIEW_TRANSIT_DZ)),
+            qs=[qpath[base], qpath[base + 1]])
         name = "%02d-view-%s.json" % (i, v["name"])
         path = os.path.join(out_dir, name)
         vp["meta"]["e9"] = {
             "kind": "view", "view": v["name"], "block": None, "slot": None,
             "from_xy": [float(cam[0]), float(cam[1])],
-            "grasp_yaw_deg": 0.0, "gap_check": "n/a",
+            "grasp_yaw_deg": yaw, "gap_check": "n/a",
             "checks": checks,
             "coverage_px": [round(float(m), 1) for m in marg],
             "zone_m": [float(x) for x in v["zone"]],
@@ -550,7 +607,7 @@ def plan_views(chain, q_start, views, out_dir, start=0):
                       "kind": "view", "view": v["name"], "block": None,
                       "slot": [float(cam[0]), float(cam[1])],
                       "from_xy": [float(cam[0]), float(cam[1])],
-                      "grasp_yaw_deg": 0.0,
+                      "grasp_yaw_deg": yaw,
                       "zone_m": [float(x) for x in v["zone"]],
                       "n_waypoints": len(vp["waypoints"])})
         q = [float(x) for x in vp["waypoints"][-1]["q"]]
@@ -560,7 +617,8 @@ def plan_views(chain, q_start, views, out_dir, start=0):
 def plan_sequence(chain, q_start, actions, blocks, out_dir,
                   survey_tool0=E9_SURVEY_TOOL0, place_clearance=None,
                   wrist_survey=True, views=None, place_yaw_equiv=False,
-                  start=0, min_block_gap=0.0, gap_check="probe_verified"):
+                  start=0, min_block_gap=0.0, gap_check="probe_verified",
+                  tail_targets=None):
     """逐步生成计划；任何一步预检失败就抛 ``pp.PlanError``，不写半份序列。
 
     ``wrist_survey=True``（缺省）在序列末尾依次平动到 ``views`` 里的每个
@@ -582,7 +640,16 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
     ``min_block_gap`` / ``gap_check``：``build_pick`` 的邻块粗判据与它的**判决
     来源**。缺省 ``0.0 / probe_verified`` 是 E9 贴面场景；S0 这类无接触布局
     **必须**用 ``60 mm / layout_gap`` —— 放宽要有判决，判决来源要落盘。
+
+    ``tail_targets``：**最后一个动作之后还要去的目标**（见 ``view_targets``），
+    只交给该动作的 ``build_pick(post_targets=...)`` 选支，不写进它的计划。
+    ``wrist_survey=True`` 时缺省自动取 ``views`` 的机位目标（本函数随后自己
+    就走这些机位）；``wrist_survey=False``（整轮编排器逐目标调用）时由调用方
+    在**最后一个目标**上显式传，否则末块的收尾分支可能和后续机位分属不同的
+    ±360 折圈族（2026-11-12 attempt6 的 compute 失败）。
     """
+    if tail_targets is None and wrist_survey:
+        tail_targets = view_targets(E9_VIEWS if views is None else views)
     layout = [dict(b) for b in blocks]
     q = [float(v) for v in q_start]
     plans = []
@@ -634,7 +701,9 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                     block_h_m=float(blk["size"]),
                     # 见模块头：探针已用 OBB 判过间隙才允许放宽；S0 无接触布局
                     # 仍走 60 mm 粗判据（gap_check=layout_gap）。
-                    min_block_gap=float(min_block_gap))
+                    min_block_gap=float(min_block_gap),
+                    # 只有最后一个动作需要为「之后的机位」选支（见 tail_targets）
+                    post_targets=(tail_targets if i == len(actions) else None))
             except pp.BranchChainError as e:
                 first_err = first_err or e
                 continue

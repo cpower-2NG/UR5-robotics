@@ -317,10 +317,14 @@ def _act_rec(a, blocks):
 def fake_plan_sequence(chain_, q, actions, blocks, out_dir,
                        survey_tool0=None, place_clearance=None,
                        wrist_survey=True, views=None, place_yaw_equiv=False,
-                       start=0, min_block_gap=0.0, gap_check="probe_verified"):
+                       start=0, min_block_gap=0.0, gap_check="probe_verified",
+                       tail_targets=None):
     PLAN_CALLS.append({"start": start, "wrist_survey": wrist_survey,
                        "gap_check": gap_check, "min_block_gap": min_block_gap,
                        "n_actions": len(actions),
+                       # 末块的收尾支：编排器必须把机位目标交给**最后一个**
+                       # 动作，否则收尾 IK 支可能与机位链分属不同折圈族。
+                       "tail_targets": tail_targets,
                        # 每个动作抓的那块在**传入布局**里的位置 —— 抓点是否
                        # 用实测，只能从这里看出来（plan 桩不跑几何）。
                        "acts": [_act_rec(a, blocks) for a in actions]})
@@ -861,9 +865,9 @@ with tempfile.TemporaryDirectory() as td:
     check("跑前只拍 pick/pad 两机位",
           "01-view-pick" in presh and "02-view-pad" in presh and
           "view-free" not in presh, presh[:400])
-    check("跑后三机位只追加一次（06/07/08）",
+    check("跑后三机位只追加一次（06/07/08，次序 pick→pad→free）",
           all(("%02d-view-%s" % (i, n)) in runsh
-              for i, n in ((6, "pick"), (7, "free"), (8, "pad"))),
+              for i, n in ((6, "pick"), (7, "pad"), (8, "free"))),
           runsh[-600:])
     check("板上分析：2D 标定（pad-mat）随轮推一次、md5 走 push",
           [p for p in b.pushed if p.endswith("analysis/stage2-mat.json")] ==
@@ -979,6 +983,12 @@ with tempfile.TemporaryDirectory() as td:
           repr(PLAN_CALLS))
     check("plan_sequence 的 start 逐段递增（计划名不撞）",
           [p["start"] for p in PLAN_CALLS] == [0, 1, 2, 3, 4], repr(PLAN_CALLS))
+    check("收尾支只交给最后一个目标，且就是三机位目标",
+          [p["tail_targets"] is None for p in PLAN_CALLS]
+          == [True, True, True, True, False]
+          and len(PLAN_CALLS[-1]["tail_targets"]) == 6,
+          repr([None if p["tail_targets"] is None
+                else len(p["tail_targets"]) for p in PLAN_CALLS]))
     bias = json.load(open(rd.p("bias.json")))
     # 样本 = 彩色质心 − 命令 = (期望 + 彩偏) − (期望 − 种子) = 彩偏 + 种子
     want = [1.0 + (-2.791), 0.5 + (-0.248)]

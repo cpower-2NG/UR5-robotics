@@ -784,28 +784,44 @@ def build_survey(chain, q_start, which):
     return wps, checks, {"kind": "survey", "which": which, "tool0": list(xyz)}
 
 
-def build_move(chain, q_start, xyz, name="move", quat=None, transit_dz=None):
+def build_move(chain, q_start, xyz, name="move", quat=None, transit_dz=None,
+               yaw_deg=0.0, qs=None):
     """一（或两）个航点的平动计划。
 
     ``quat``：tool0 目标朝向（xyzw）；缺省 = 竖直朝下、yaw 0（老行为）。
     ``transit_dz``：给定且 >0 时，先在**同一 xy、同一朝向**、z 抬高 ``transit_dz``
     的中间点停一个航点再下去。横移到悬停位时用它 —— 直接一条直线过去，JTC 在
     关节空间插值，末端实际会划一道弧，中途离台面/别的块有多近没人算过。
+    ``yaw_deg``：tool0 绕工具轴的角（缺省 0，逐字节不变）。相机偏在 tool0 一侧，
+    转 tool 半圈 = 同一个"竖直朝下"姿态换一个腕部 IK 支（判分机位可达性需要）。
+    ``qs``：**已经解好的关节角**，按本计划航点顺序（``transit`` 在前）。给定时
+    不再局部 IK，只复核残差/限位/护栏 —— 一条链要跨好几个计划时，分支只能由
+    **一次**全局 DP 选（``plan_views``），逐计划局部 IK 会各挑各的支。
     """
     wps, checks = [], []
     q = q_start
+    qlist = [np.asarray(v, float) for v in (qs or [])]
+    if qlist and len(qlist) != (2 if transit_dz else 1):
+        raise PlanError("build_move(%s) 的 qs 长度 %d 与航点数 %d 不符"
+                        % (name, len(qlist), 2 if transit_dz else 1))
+    k = 0
     if transit_dz:
         qy = (xyz[0], xyz[1], xyz[2] + float(transit_dz))
-        q, c = add_move(wps, chain, name + "_transit", qy, q, 0.0,
-                        TABLE_PLANE_Z, quat=quat)
+        q, c = add_move(wps, chain, name + "_transit", qy, q, yaw_deg,
+                        TABLE_PLANE_Z, quat=quat,
+                        q=(qlist[k] if qlist else None))
+        k += 1
         checks.append(c)
-    q, c = add_move(wps, chain, name, xyz, q, 0.0, TABLE_PLANE_Z, quat=quat)
+    q, c = add_move(wps, chain, name, xyz, q, yaw_deg, TABLE_PLANE_Z, quat=quat,
+                    q=(qlist[k] if qlist else None))
     checks.append(c)
     meta = {"kind": "move", "tool0": list(xyz)}
     if quat is not None:
         meta["tool0_quat_xyzw"] = [float(v) for v in quat]
     if transit_dz:
         meta["transit_dz_m"] = float(transit_dz)
+    if yaw_deg:
+        meta["yaw_deg"] = float(yaw_deg)
     return wps, checks, meta
 
 
@@ -865,7 +881,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
                release_dwell_s=0.0, surface_z=None, carry_z=None,
                survey_tool0=None, tower_box=None, held_half_edge=0.020,
                held_off_xy=None, place_clearance=None, block_h_m=None,
-               min_block_gap=None):
+               min_block_gap=None, post_targets=None):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -921,6 +937,12 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
       （``stage4_clear_probe``）用自有 OBB + SAT 逐个候审判「夹爪碰不碰」，
       比「中心距 ≥60 mm」这个粗判据细 —— 贴面块只要在合拢轴方向让开就能
       合法抓取。E9 执行器因此显式传 ``0.0``，并把「探针先判过」写进 manifest。
+    · ``post_targets``：**本动作之后还要去的目标**（``[(名字, xyz, yaw_deg)]``），
+      只参与选支、不写进本计划。给 ``solve_path`` 的 DP 加这几跳，末段
+      （``survey_place``）的分支就会为「接得上后面」而选 —— 否则 DP 只看本动作
+      行程最短，挑中的那支可能把后面的巡检位/判分机位锁在另一个 ±360 折圈族里，
+      之后无论怎么折圈都差 360°（2026-11-12 S0:1 r1 attempt6：块 4 收在
+      shoulder_pan −329°，三机位的合格解全在 +30 族）。正常调用不传 ⇒ 逐字节不变。
     """
     if block_h_m is None and (block["h"] if block.get("h") is not None
                               else block["top"]) / 1000.0 > MAX_TABLE_BLOCK_TOP_M:
@@ -1046,9 +1068,17 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
         ("retreat", (sx, sy, place_approach_z), yaw_place, None, None),
         ("survey_place", survey_xyz, 0.0, None, None),
     ]
-    # 整链选一条分支（见 solve_path 的注释：逐点就近会挑到下一段过不了护栏的解）
-    qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
-                       yaws=[y for _, _, y, _, _ in specs], guard=guard)
+    # 整链选一条分支（见 solve_path 的注释：逐点就近会挑到下一段过不了护栏的解）。
+    # ``post_targets`` 接在末尾只为了选支 —— 它们不进 wps（后续动作自己写计划），
+    # 但让 DP 知道「收尾那支之后还得走得到这些点」。
+    post = ([] if post_targets is None
+            else [(str(n), tuple(xyz), float(y)) for n, xyz, y in post_targets])
+    targets_all = ([(n, xyz) for n, xyz, _, _, _ in specs]
+                   + [(n, xyz) for n, xyz, _ in post])
+    yaws_all = ([y for _, _, y, _, _ in specs] + [y for _, _, y in post])
+    qpath_all = solve_path(chain, targets_all, q_start,
+                           yaws=yaws_all, guard=guard)
+    qpath = qpath_all[:len(specs)]
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
         q, c = add_move(wps, chain, name, xyz, q, yaw, TABLE_PLANE_Z,
@@ -1093,6 +1123,16 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             "tower_box": ([round(float(v), 4) for v in tower_box]
                           if tower_box is not None else None),
             "survey_tool0": [round(float(v), 4) for v in survey_xyz],
+            # 只参与选支、不写进本计划的后续目标（见 ``post_targets``）
+            "post_targets": [{"name": n,
+                              "xyz": [round(float(v), 4) for v in xyz],
+                              "yaw_deg": round(float(y), 3)}
+                             for n, xyz, y in post],
+            # 上面那些目标**由同一条 DP 解出来的关节角**（与 post_targets 同序）。
+            # 后续机位计划必须直接用它们，不能从「本计划末航点」重新局部 IK ——
+            # 局部 IK 会落进另一个 ±360 折圈支，212° 的整圈翻转就是这么来的
+            # （2026-11-12 attempt6）。``plan_views`` 吃这份 ``post_q``。
+            "post_q": [[float(v) for v in qq] for qq in qpath_all[len(specs):]],
             "cand_score": round(cand["score"], 4),
             "cand_width_mm": round(cand["width_mm"], 2),
             "cand_dist_mm": round(cand["dist_mm"], 2),

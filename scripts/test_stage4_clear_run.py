@@ -282,7 +282,7 @@ def section_plans():
     check('两个动作各出一份计划 + 收尾三个判分机位',
           len(plans) == 5 and [p['kind'] for p in plans]
           == ['clear', 'target', 'view', 'view', 'view']
-          and [p['view'] for p in plans[2:]] == ['pick', 'free', 'pad'])
+          and [p['view'] for p in plans[2:]] == ['pick', 'pad', 'free'])
     p1 = json.load(open(plans[0]['path'], encoding='utf-8'))
     p2 = json.load(open(plans[1]['path'], encoding='utf-8'))
     check('第一份 q_start = 起始关节', p1['q_start'] == q0)
@@ -384,9 +384,9 @@ def section_multitarget():
     check('wrist_survey=False ⇒ 本次调用不带机位',
           all(p['kind'] != 'view' for p in plans))
     check('机位只追加一次（三份，不互相覆盖）',
-          [p['view'] for p in vplans] == ['pick', 'free', 'pad'])
+          [p['view'] for p in vplans] == ['pick', 'pad', 'free'])
     check('跑前默认机位只剩 pick / pad（正式轮：观察不解 free）',
-          [v['name'] for v in cr.E9_VIEWS] == ['pick', 'free', 'pad'])
+          [v['name'] for v in cr.E9_VIEWS] == ['pick', 'pad', 'free'])
 
     # gap_check 判决来源随参数落盘；S0 无接触布局走 60 mm 粗判据。
     # 夹具必须**无接触**（上面的塔夹具里块 0/8 中心距 0.0 mm，60 mm 判据本就该拒）。
@@ -510,8 +510,8 @@ def section_mutation():
     except pp.PlanError:
         adj_ok = False
     check('贴面块（中心距 40 mm）能出计划', adj_ok)
-    mut2 = _mut('min_block_gap=float(min_block_gap))',
-                'min_block_gap=0.06)')
+    mut2 = _mut('min_block_gap=float(min_block_gap),',
+                'min_block_gap=0.06,')
     ok, why = raises(mut2['plan_sequence'], ch, q0, a_acts,
                      [dict(b) for b in a_blocks], out)
     check('变异「不放宽 60 mm」：贴面场景必须红', ok, why)
@@ -858,6 +858,100 @@ def section_seed_propagation():
               ok and '单步' in err, err)
     finally:
         pp.ik_candidates = real_ik
+
+
+def section_view_chain():
+    print('\n[4f] 末块收尾支 → 三机位：整串一个 DP，不许逐点重新 IK')
+    truth, att = tower_truth(), tower_attempt()
+    acts, blocks = cr.actions_from_attempt(truth, att, cm.PAD_THICK)
+    ch = chain()
+    q0 = q_start_of(ch)
+    out = tempfile.mkdtemp(prefix='e9-plan-viewchain-')
+    tgt = cr.view_targets()
+    check('机位目标 = 每机位两点（transit + pose），次序同 E9_VIEWS',
+          [t[0] for t in tgt] == ['pick_transit', 'pick_pose',
+                                  'pad_transit', 'pad_pose',
+                                  'free_transit', 'free_pose'], str(
+                                      [t[0] for t in tgt]))
+
+    # ① 末块的收尾支必须由 build_pick 一并解出来（post_q），且真的到得了那些点。
+    q = q0
+    last = None
+    for i in range(2):
+        plans, _lay, q = cr.plan_sequence(
+            ch, q, acts, blocks, out, wrist_survey=False, start=i,
+            tail_targets=(tgt if i == 1 else None))
+        last = json.load(open(plans[-1]['path'], encoding='utf-8'))
+    pq = last['meta'].get('post_q')
+    check('末块 meta 带 post_q（选支用的后续目标关节角）',
+          isinstance(pq, list) and len(pq) == len(tgt), 'len=%r' % (
+              None if pq is None else len(pq)))
+    if isinstance(pq, list) and len(pq) == len(tgt):
+        worst_p, worst_r = 0.0, 0.0
+        for (nm, xyz, yaw), qq in zip(tgt, pq):
+            pe, re = pp.pose_residual(ch, qq, xyz, yaw)
+            worst_p, worst_r = max(worst_p, pe), max(worst_r, re)
+        check('post_q 逐点到位（残差 ≤0.1 mm / 0.05°）',
+              worst_p <= 0.1 and worst_r <= 0.05,
+              '%.3f mm / %.4f°' % (worst_p, worst_r))
+        seq = [last['waypoints'][-1]['q']] + pq
+        step = max(pp.max_joint_step_deg(a, b)
+                   for a, b in zip(seq, seq[1:]))
+        check('末航点 → … → 最后一机位：相邻单步都 ≤170°', step <= 170.0,
+              '%.1f°' % step)
+
+    # ② plan_views 必须**一次** DP 解完整串，并把解好的关节角交给每个机位
+    #    （旧实现是逐机位局部 IK —— 就是它把末块收尾支重新挑到了另一支）。
+    import stage4_wrist_survey as ws
+    q_end = last['waypoints'][-1]['q']
+    real_solve = pp.solve_path
+    calls = []
+
+    def spy(*a, **kw):
+        calls.append(len(a[1]))
+        return real_solve(*a, **kw)
+
+    real_sv = ws.survey_plan
+    given = []
+
+    def spy_sv(chain_, q_, **kw):
+        given.append(kw.get('qs'))
+        return real_sv(chain_, q_, **kw)
+
+    pp.solve_path = spy
+    ws.survey_plan = spy_sv
+    try:
+        vplans, qv = cr.plan_views(ch, q_end, cr.E9_VIEWS, out, start=2)
+    finally:
+        pp.solve_path = real_solve
+        ws.survey_plan = real_sv
+    check('三份机位计划只调一次 solve_path（整串 6 点一起解）',
+          calls == [2 * len(cr.E9_VIEWS)], str(calls))
+    check('每个机位都收到 DP 解好的两点关节角（qs 不为空）',
+          all(isinstance(s, list) and len(s) == 2 for s in given), str(
+              [(None if s is None else len(s)) for s in given]))
+
+    files = [json.load(open(p['path'], encoding='utf-8')) for p in vplans]
+    chain_q = [q_end] + [w['q'] for f in files for w in f['waypoints']]
+    step = max(pp.max_joint_step_deg(a, b) for a, b in zip(chain_q, chain_q[1:]))
+    check('末航点 → 三机位 12 个航点：相邻单步都 ≤170°', step <= 170.0,
+          '%.1f°' % step)
+    check('每份机位计划都是兩点（transit + pose）',
+          [len(f['waypoints']) for f in files] == [2, 2, 2])
+    used = all([w['q'] for w in f['waypoints']]
+               == [[float(x) for x in s[0]], [float(x) for x in s[1]]]
+               for f, s in zip(files, given))
+    check('写进计划的 q 就是 DP 给的那两点（没有悄悄重新 IK）', used)
+
+    # ③ 给了 qs 就必须照着用：换一组别的关节角进来，预检要当场拒。
+    import stage4_wrist_survey as ws
+    v = cr.E9_VIEWS[0]
+    ok, why = raises(ws.survey_plan, ch, q_end, tuple(v['zone']),
+                     height=float(v['height']), yaw_deg=0.0,
+                     transit_dz=cr.VIEW_TRANSIT_DZ,
+                     qs=[[0.0] * 6, [0.0] * 6])
+    check('survey_plan(qs=...) 真按给的关节角走（错的当场拒）',
+          ok and '残差' in why, why)
 
 
 def section_place_yaw_equiv():
@@ -1656,6 +1750,7 @@ def main():
     for fn in (section_yaw, section_surface, section_actions, section_bias,
                section_plans, section_multitarget,
                section_step_cap, section_seed_propagation,
+               section_view_chain,
                section_place_yaw_equiv, section_from_xy,
                section_gap, section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
