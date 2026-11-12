@@ -310,15 +310,22 @@ def min_area_rect_2d(pts, trim_pct=(2.0, 98.0), step_deg=0.5,
     if len(Ps) > max_points:
         Ps = Ps[np.linspace(0, len(Ps) - 1, max_points).astype(int)]
     lo, hi = trim_pct
+    # 角度扫描**向量化**（2026-11-12）：原来每个角度各调两次
+    # ``np.percentile``，一帧顶面量测有 1.1 万次调用（板上实测占单帧 4.9 s 里
+    # 的 1.9 s）。改成一次 ``axis=0`` 的分位计算，cos/sin 仍用 ``math`` 逐个
+    # 算，保证投影值与旧实现逐位相同；下面的循环只做 180 次比较，保留
+    # 「面积须比当前最优小 1e-9 才替换」的原判据（并列时取先到的角度）。
+    degs = np.arange(0.0, 90.0, step_deg)
+    cas = np.array([math.cos(math.radians(float(d))) for d in degs])
+    sas = np.array([math.sin(math.radians(float(d))) for d in degs])
+    X = Ps[:, 0:1] * cas + Ps[:, 1:2] * sas
+    Y = -Ps[:, 0:1] * sas + Ps[:, 1:2] * cas
+    qx = np.percentile(X, [lo, hi], axis=0)
+    qy = np.percentile(Y, [lo, hi], axis=0)
+    ws, hs = qx[1] - qx[0], qy[1] - qy[0]
     best = None
-    for deg in np.arange(0.0, 90.0, step_deg):
-        a = math.radians(float(deg))
-        ca, sa = math.cos(a), math.sin(a)
-        x = Ps[:, 0] * ca + Ps[:, 1] * sa
-        y = -Ps[:, 0] * sa + Ps[:, 1] * ca
-        x0, x1 = np.percentile(x, [lo, hi])
-        y0, y1 = np.percentile(y, [lo, hi])
-        w, h = float(x1 - x0), float(y1 - y0)
+    for k, deg in enumerate(degs):
+        w, h = float(ws[k]), float(hs[k])
         if w <= 0.0 or h <= 0.0:
             continue
         area = w * h
@@ -617,7 +624,12 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                 evals, evecs = np.linalg.eigh(d.T @ d / len(d))
                 yaw = float(np.degrees(np.arctan2(evecs[1, -1], evecs[0, -1])))
                 ext = (d @ evecs).max(0) - (d @ evecs).min(0)
-                rect = min_area_rect_2d(F[:, :2])
+                # 没有切分时 piece 就是整块顶面 —— 与 ``rect_all`` 是同一批点，
+                # 直接复用（2026-11-12：原来白跑第二遍 180° 扫描，占单帧 1 s 量级）。
+                if len(pieces) == 1 and len(piece_rows) == len(rows_all):
+                    rect = rect_all
+                else:
+                    rect = min_area_rect_2d(F[:, :2])
                 f_pix = qpix[rows]
                 px = color[f_pix[:, 1], f_pix[:, 0]].astype(float)
                 med_rgb = np.median(px, axis=0) if len(px) else np.zeros(3)

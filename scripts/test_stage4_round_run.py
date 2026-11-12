@@ -431,6 +431,7 @@ class FakeBoard:
 
     def pull_file(self, remote, local):
         self.pulls.append(("file", remote))
+        self.calls.append(("pull_file", remote))
         os.makedirs(os.path.dirname(os.path.abspath(local)) or ".",
                     exist_ok=True)
         val = self.files.get(remote)
@@ -444,6 +445,7 @@ class FakeBoard:
 
     def pull_dir(self, remote, local):
         self.pulls.append(("dir", remote))
+        self.calls.append(("pull_dir", remote))
         os.makedirs(local, exist_ok=True)
         with open(os.path.join(local, "color_000.png"), "wb") as f:
             f.write(b"\x89PNG")
@@ -603,6 +605,54 @@ except r.RoundError as e:
           e.code == r.EXIT_MISSING)
 
 
+# 板上分析命令（解垫 / 真值 / 彩色）：与探针同一条 ``~/precision/run.sh`` 通路，
+# 只回传 JSON。2026-11-12 用户定调：本机不承担运行时任务。
+class _SshRc(_SshLog):
+    def __init__(self, rc=0):
+        super().__init__()
+        self.rc = rc
+
+    def ssh(self, cmd, quiet=True, check=False):
+        self.cmds.append(cmd)
+        return types.SimpleNamespace(returncode=self.rc, stdout="", stderr="x")
+
+
+def _analysis_cmds(kind="truth", opts=None, repo="~/stage4-entry", rc=0,
+                   pull_log=None):
+    rb = object.__new__(r.RoundBoard)
+    rb._b = _SshRc(rc)
+    rb.pull_file = (lambda remote, local: pull_log.append(remote)) \
+        if pull_log is not None else (lambda remote, local: None)
+    out = "~/precision/e9/x/r/analysis/%s-a.json" % kind
+    rb.analyze(repo, kind,
+               list(opts or ["--burst", "~/precision/e9/x/r/pre/wrist-pick"]),
+               out, "/tmp/unused.json")
+    return rb._b
+
+
+_acmds = _analysis_cmds().cmds
+_acmd = _acmds[-1]
+check("板上分析命令：先建板上目录再跑", _acmds[0].startswith("mkdir -p "),
+      repr(_acmds))
+check("板上分析命令：&& 之后是 run.sh + 板上脚本",
+      _acmd.split("&&", 1)[1].strip().startswith(
+          "~/precision/run.sh scripts/stage4_board_analysis.py truth"), _acmd)
+check("板上分析命令：仓库路径只出现在 cd 里、~ 没被引号焊死",
+      _acmd.startswith("cd ~/stage4-entry && ") and "'~" not in _acmd, _acmd)
+check("板上分析命令：--out 是板上路径（回传后本地才有产物）",
+      "--out ~/precision/e9/x/r/analysis/truth-a.json" in _acmd, _acmd)
+try:
+    _analysis_cmds(opts=["--burst", "~/a b"])
+    check("板上分析：参数含空格 ⇒ 明确报错", False)
+except r.RoundError as e:
+    check("板上分析：参数含空格 ⇒ 明确报错", e.code == r.EXIT_MISSING)
+_pulled = []
+_rb_rc = _analysis_cmds(rc=7, pull_log=_pulled)
+check("板上分析：rc≠0 不拉产物、也不抛（由阶段决定怎么处置）",
+      _pulled == [] and _rb_rc.rc == 7,
+      repr((_pulled, _rb_rc.rc)))
+
+
 def patched(deps):
     """装上规划桩与 deps；返回 (undo, deps)。"""
     saves = {}
@@ -663,6 +713,53 @@ def fake_deviation(argv):
     return 0
 
 
+def _opt_map(opts):
+    """``["--burst", "x", "--allow-empty"]`` → ``{"--burst": "x", "--allow-empty": True}``。"""
+    out, i = {}, 0
+    while i < len(opts):
+        if opts[i].startswith("--"):
+            if i + 1 < len(opts) and not opts[i + 1].startswith("--"):
+                out[opts[i]] = opts[i + 1]
+                i += 2
+                continue
+            out[opts[i]] = True
+        i += 1
+    return out
+
+
+def fake_analyze(d):
+    """板上分析桩：把三个本地 fake 包成 ``analyze(kind, opts, ...)`` 接口。
+
+    闭包引用 ``d`` **本体** ⇒ 测试后面覆盖 ``solve_pad`` / ``measure_colour``
+    时，调用点拿到的是覆盖后的版本（``base_deps`` 先建 dict 再 update）。
+    """
+    def f(kind, opts, out_remote, out_local):
+        kv = _opt_map(opts)
+        os.makedirs(os.path.dirname(os.path.abspath(out_local)) or ".",
+                    exist_ok=True)
+        if kind == "pad":
+            return d["solve_pad"](kv.get("--burst", ""), out_local,
+                                  int(kv.get("--min-frames", 20)),
+                                  float(kv.get("--max-spread-mm", 2.0)),
+                                  float(kv.get("--max-spread-deg", 0.5)))
+        if kind == "truth":
+            return d["truth_from_view"](
+                kv.get("--burst", ""), out_local,
+                allow_empty=bool(kv.get("--allow-empty")))
+        if kind == "colour":
+            xy = [float(v) for v in kv["--xy"].split(",")]
+            doc = d["measure_colour"](
+                kv.get("--burst", ""), xy, float(kv["--top-z"]),
+                kv.get("--expect-class"),
+                float(kv["--hue"]) if kv.get("--hue") else None,
+                float(kv.get("--search-mm", 25.0)))
+            with open(out_local, "w") as fh:
+                json.dump(doc, fh)
+            return 0
+        raise AssertionError("未知分析类型 %r" % kind)
+    return f
+
+
 def base_deps(**over):
     d = {"solve_pad": fake_solve_pad_writer(),
          "truth_from_view": fake_truth,
@@ -672,6 +769,7 @@ def base_deps(**over):
          "score": lambda argv: 0,
          "now": (lambda: 1000.0),
          "sleep": (lambda s: None)}
+    d["analyze"] = fake_analyze(d)
     d.update(over)
     return d
 
@@ -723,6 +821,30 @@ with tempfile.TemporaryDirectory() as td:
           all(("%02d-view-%s" % (i, n)) in runsh
               for i, n in ((6, "pick"), (7, "free"), (8, "pad"))),
           runsh[-600:])
+    check("板上分析：2D 标定（pad-mat）随轮推一次、md5 走 push",
+          [p for p in b.pushed if p.endswith("analysis/stage2-mat.json")] ==
+          ["/b/analysis/stage2-mat.json"], repr(b.pushed))
+
+# ---- C1b 分析段在哪算：正式轮必须在板上（本机不承担运行时任务）
+with tempfile.TemporaryDirectory() as td:
+    try:
+        make_args(td, analysis="local")
+        check("--analysis local 不带 --dry-run ⇒ 直接拒（正式轮必须在板上算）",
+              False)
+    except SystemExit:
+        check("--analysis local 不带 --dry-run ⇒ 直接拒（正式轮必须在板上算）",
+              True)
+
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    rc, out, rd = run(td, b, dry_run=True, analysis="local")
+    dirs = [p for k, p in b.pulls if k == "dir"]
+    check("--analysis local（离线排练）：burst 拉回本机",
+          any(p.endswith("wrist-pre/pad") for p in dirs) and
+          any(p.endswith("wrist-pre/pick") for p in dirs), repr(dirs))
+    check("--analysis local：真值/解垫用本机路径（不是板上路径）",
+          TRUTH_CALLS and all("/pre/" in c[0] for c in TRUTH_CALLS),
+          repr(TRUTH_CALLS))
 
 # ---- C2 全绿
 with tempfile.TemporaryDirectory() as td:
@@ -744,10 +866,20 @@ with tempfile.TemporaryDirectory() as td:
           sum("wrist-" in p for p in paths) >= 4, repr(paths))
     check("干净起跑：每次清都在对应 run_script 之前",
           all(any(i < j for j in run_i) for i in cl), repr((cl, run_i)))
-    check("观察段只拉 pad（pick 的 100 帧留到判分段，不占令牌窗口）",
-          b.pulls and b.pulls[0][1].endswith("wrist-pre/pad") and
-          any(c[1].endswith("wrist-pre/pick") for c in b.pulls),
-          repr([c[1] for c in b.pulls]))
+    # 2026-11-12 用户定调：本机不承担运行时任务 ⇒ 轮内（观察/计算/执行/判分）
+    # 一帧图像都不拉；分析在板上算、只回传 JSON，五组 burst 全在**归档段**
+    # （整轮结束、令牌窗口之外）才归档。
+    run_i = [i for i, c in enumerate(b.calls)
+             if c[0] == "run_script" and c[1].endswith("run.sh")]
+    dir_i = [i for i, c in enumerate(b.calls)
+             if c[0] == "pull_dir" and "wrist-" in c[1]]
+    check("轮内不拉任何 burst（图像不占令牌窗口）",
+          bool(run_i) and dir_i and min(dir_i) > max(run_i),
+          repr((run_i[-1:], dir_i)))
+    check("归档段把五组 burst 都拉回（pre pick/pad + post 三机位）",
+          sum(1 for c in b.calls if c[0] == "pull_dir"
+              and "wrist-" in c[1]) == 5,
+          repr([c[1] for c in b.calls if c[0] == "pull_dir"]))
     check("干净起跑：execute 前也清（exec + 三个跑后机位）",
           any(p.endswith("/exec") for p in paths) and
           sum(p.endswith(("wrist-post/pick", "wrist-post/free",
@@ -794,12 +926,14 @@ with tempfile.TemporaryDirectory() as td:
     # 2026-11-12 S0:1 r1：free 机位本来就没块，真值工具零块 ⇒ rc=2 ⇒ 该机位
     # 被当「缺证据」剔出溯源，「全桌终态」只剩 pad 一只眼。跑后三机位必须允许空；
     # 跑前 pick 不允许空（那里必须有块，零块就是分割/相机坏了）。
-    post = [c for c in TRUTH_CALLS if "/post/" in c[0]]
-    pre = [c for c in TRUTH_CALLS if "/pre/" in c[0]]
+    # 分析缺省在板上算（``--analysis board``）⇒ burst 是**板上**路径。
+    post = [c for c in TRUTH_CALLS if c[1] is True]
+    pre = [c for c in TRUTH_CALLS if c[1] is False]
     check("跑后三机位真值都带 allow_empty（干净的机位也是证据）",
-          len(post) == 3 and all(a for _b, a in post), repr(TRUTH_CALLS))
+          len(post) == 3 and all("wrist-post" in c[0] for c in post),
+          repr(TRUTH_CALLS))
     check("跑前 pick 真值不允许空（零块就是坏，不许静默）",
-          len(pre) == 1 and pre[0][1] is False, repr(TRUTH_CALLS))
+          len(pre) == 1 and "wrist-pre" in pre[0][0], repr(TRUTH_CALLS))
 
 # ---- C3 R1 不足
 with tempfile.TemporaryDirectory() as td:
@@ -883,9 +1017,11 @@ with tempfile.TemporaryDirectory() as td:
           phases_of(rd)[-1] == "execute", repr((rc, phases_of(rd))))
     check("执行失败 ⇒ run.sh 只调一次（不自动重试）", len(runs) == 1,
           repr(runs))
-    check("执行失败 ⇒ 仍回拉证据（jsonl + 跑后 burst 都试过）",
-          any(k == "dir" and "wrist-post" in p for k, p in b.pulls) and
+    check("执行失败 ⇒ 仍回拉 jsonl 证据（KB 级）",
           any(k == "file" and p.endswith(".jsonl") for k, p in b.pulls),
+          repr(b.pulls))
+    check("执行失败 ⇒ 不进归档段（burst 留在板上，随时补拉）",
+          not any(k == "dir" and "wrist-" in p for k, p in b.pulls),
           repr(b.pulls))
 
 # ---- C8 执行中令牌过期 ⇒ void

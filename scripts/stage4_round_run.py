@@ -21,6 +21,14 @@
 全部来自 ``stage4_clear_run``；解垫来自 ``stage4_pad_from_burst``；探针、判分
 各自复用现成脚本。
 
+分析段在板上算（``--analysis board``，缺省）
+────────────────────────────────────────────
+2026-11-12 用户定调：**本机不承担运行时任务**。解垫 / 跑前实测真值 / 跑后三
+机位真值 / 彩色顶面质心全部在板上跑（``stage4_board_analysis.py``），轮内只
+回传 KB 级 JSON；五组 burst 在**归档段**（整轮结束、令牌窗口之外）才拉回。
+``--analysis local`` 只给离线排练（必须配 ``--dry-run``）。板上分析失败 =
+停轮（fail-closed），**不许偷偷回退到本机算**。
+
 时间闸门（600 s 硬窗口，见契约 §5）
 ──────────────────────────────────
 · **R1**（观察后、探针前）：`剩余 ≥ C_est + T_exec_est + 60 s`；
@@ -698,7 +706,7 @@ class RoundBoard:
 
     def _scp(self, src, dst):
         """本地 → 板上（**只管这一个方向**）。"""
-        r = subprocess.run(["scp", "-o", "LogLevel=ERROR", src,
+        r = subprocess.run(["scp"] + pr.ssh_opts() + ["-o", "LogLevel=ERROR", src,
                             "%s:%s" % (self.alias, dst)],
                            capture_output=True, text=True)
         if r.returncode != 0:
@@ -716,7 +724,7 @@ class RoundBoard:
         2026-11-11 Round 0 实测：探针报告明明在板上（1493 B），编排器却报
         「拉不回来」，而且 ``-q`` 把原因也吞了（错误文本是空的）。
         """
-        r = subprocess.run(["scp", "-o", "LogLevel=ERROR",
+        r = subprocess.run(["scp"] + pr.ssh_opts() + ["-o", "LogLevel=ERROR",
                             "%s:%s" % (self.alias, src_remote), dst_local],
                            capture_output=True, text=True)
         if r.returncode != 0:
@@ -781,7 +789,9 @@ class RoundBoard:
         拉失败一律抛错，不许「静默 0 帧」。
         """
         os.makedirs(local, exist_ok=True)
-        r = subprocess.run(["rsync", "-a", "%s:%s/" % (self.alias, remote),
+        r = subprocess.run(["rsync", "-a",
+                            "-e", " ".join(["ssh"] + pr.ssh_opts()),
+                            "%s:%s/" % (self.alias, remote),
                             local.rstrip("/") + "/"],
                            capture_output=True, text=True)
         if r.returncode != 0:
@@ -875,6 +885,35 @@ class RoundBoard:
         cmd = "bash %s %s" % (remote_script, shlex.quote(token))
         r = self.ssh(cmd)
         return r.returncode, ((r.stdout or "") + (r.stderr or ""))
+
+    def analyze(self, repo, kind, opts, out_remote, out_local):
+        """板上跑一次**纯分析**（解垫 / 真值 / 彩色；不动臂、不碰 ROS 服务），
+        只把产出的 KB 级 JSON 拉回来。
+
+        为什么不在本机算（2026-11-12 用户定调）：本机不能承担运行时任务；
+        板子 6 核、依赖齐全，轮内拉 44 MB burst（0.33–1.4 MB/s）是架构遗留。
+        板端失败一律抛错（fail-closed），**不许偷偷回退到本机算** —— 回退会把
+        令牌窗口重新烧在搬运上，而且掩盖板上依赖缺失。
+
+        ``~/precision/run.sh`` 就是 ``exec python3 "$@"``（与探针同一条通路）；
+        参数不许含空白/引号（板端路径一律以 ``~`` 开头，不过 ``shlex.quote``）。
+        """
+        argv = [str(kind)] + [str(v) for v in opts] + ["--out", out_remote]
+        for p in [repo] + argv:
+            if not p or " " in p or "'" in p or '"' in p:
+                raise RoundError(EXIT_MISSING, "board",
+                                 "板上分析参数含空白/引号：%r" % p)
+        self.ssh("mkdir -p %s" % os.path.dirname(out_remote))
+        cmd = ("cd %s && %s/run.sh scripts/stage4_board_analysis.py %s"
+               % (repo, pr.BOARD_DIR, " ".join(argv)))
+        r = self.ssh(cmd)
+        if r.returncode != 0:
+            log("  !! 板上分析 %s rc=%d：%s"
+                % (kind, r.returncode,
+                   ((r.stderr or "") + (r.stdout or "")).strip()[-300:]))
+            return r
+        self.pull_file(out_remote, out_local)
+        return r
 
     def probe(self, repo, cells, group, truth_remote, grid_remote,
               report_remote):
@@ -988,6 +1027,105 @@ class Round:
 
     def b(self, *parts):
         return "/".join([self.board_dir] + list(parts))
+
+    # ---- 分析段：板上算、只回传 JSON（``--analysis board``，缺省）
+    #
+    # 本机不能承担运行时任务（2026-11-12 用户定调）。``--analysis local`` 只给
+    # **离线排练**（还没上真机、手里只有本地 burst）用，由 ``prepare`` 挡在
+    # ``--dry-run`` 之内；正式轮永远走板上分析。
+    def _analysis(self, kind, opts, out_remote, out_local):
+        """板上跑一次分析 → 返回 rc；只有「rc=0 却没有产物」才抛错。
+
+        **rc ≠ 0 不在这里抛**：同一次失败在不同阶段含义不同 —— 计算段的解垫
+        失败 = 停轮（EXIT_PLAN），跑后真值失败 = 记缺证据（判分不完整），
+        彩色失败 = EXIT_SCORE。由调用方决定。
+        """
+        fn = self.deps.get("analyze")
+        opts = [str(v) for v in opts]
+        if fn is not None:
+            rc = int(fn(kind, opts, out_remote, out_local) or 0)
+        else:
+            r = self.board.analyze(self.args.board_repo, kind, opts,
+                                   out_remote, out_local)
+            rc = int(getattr(r, "returncode", 0) or 0)
+        if rc == 0 and not os.path.exists(out_local):
+            raise RoundError(EXIT_MISSING, "board",
+                             "板上分析 %s 回了 0 却没有产物（%s）—— 回传失败？"
+                             % (kind, out_local))
+        return rc
+
+    def _pad_mat_remote(self):
+        """2D 平面标定推上板（KB 级，md5 核对；同一轮只推一次）。
+
+        板子没有外网也没有本仓外的 ``~/robotics/notes``，所以 mat 必须随轮推。
+        版本跟着 round 目录走：这份 mat 是哪天的标定，看本轮命令即可。
+        """
+        remote = getattr(self, "_mat_remote", None)
+        if remote:
+            return remote
+        remote = self.b("analysis", "stage2-mat.json")
+        self.board.push(self.args.pad_mat, remote, "pad-mat")
+        self._mat_remote = remote
+        return remote
+
+    def _solve_pad(self, grid_path):
+        """解垫：板上算（缺省），只回传 ``grid-pre.json``。"""
+        if self.args.analysis == "local":
+            return int(self.deps["solve_pad"](
+                self.p("pre", "wrist-pad"), grid_path,
+                self.args.pad_min_frames, self.args.pad_max_spread_mm,
+                self.args.pad_max_spread_deg) or 0)
+        opts = ["--burst", self.b("wrist-pre", "pad"),
+                "--mat", self._pad_mat_remote(),
+                "--min-frames", int(self.args.pad_min_frames),
+                "--max-spread-mm", float(self.args.pad_max_spread_mm),
+                "--max-spread-deg", float(self.args.pad_max_spread_deg)]
+        return self._analysis("pad", opts, self.b("analysis", "grid-pre.json"),
+                              grid_path)
+
+    def _truth(self, burst_remote, burst_local, out_local, allow_empty=False):
+        """burst → 块真值：板上算（缺省），只回传 JSON。
+
+        跑前 pick 机位不给 ``--allow-empty``（那里本来就必须有块）；跑后三机位
+        给（干净机位是合法结果）。
+        """
+        if self.args.analysis == "local":
+            return int(self.deps["truth_from_view"](
+                burst_local, out_local, allow_empty=allow_empty) or 0)
+        opts = ["--burst", burst_remote,
+                "--camera", "wrist",
+                "--zone", truth_zone_for(burst_remote),
+                "--min-frames", "5"]
+        if allow_empty:
+            opts.append("--allow-empty")
+        name = os.path.basename(os.path.normpath(out_local))
+        return self._analysis("truth", opts,
+                              self.b("analysis", "truth-" + name), out_local)
+
+    def _colour(self, burst_remote, xy_mm, top_z, expect_class, hue_deg,
+                out_local):
+        """目标块彩色顶面质心：板上算（缺省），只回传 JSON。"""
+        if self.args.analysis == "local":
+            return self.deps["measure_colour"](
+                burst_remote, xy_mm, top_z, expect_class, hue_deg,
+                self.args.colour_search_mm)
+        opts = ["--burst", burst_remote,
+                "--xy", "%.6f,%.6f" % (float(xy_mm[0]), float(xy_mm[1])),
+                "--top-z", "%.6f" % float(top_z),
+                "--search-mm", float(self.args.colour_search_mm)]
+        if hue_deg is not None:
+            opts += ["--hue", "%.3f" % float(hue_deg)]
+        if expect_class:
+            opts += ["--expect-class", str(expect_class)]
+        name = os.path.basename(os.path.normpath(out_local))
+        rc = self._analysis("colour", opts,
+                            self.b("analysis", "colour-" + name), out_local)
+        if rc != 0:
+            # 工具跑失败 ≠ 「窗里没看见块」（后者是 ok=False 的**证据**）。
+            # 缺证据 ⇒ 判分不完整，不许当默认值继续。
+            raise RoundError(EXIT_SCORE, "score",
+                             "板上彩色量失败（rc=%d）—— 判分缺证据，停" % rc)
+        return read_json(out_local)
 
     def _t0(self):
         self._t_phase = {"start": float(self.deps["now"]())}
@@ -1202,20 +1340,23 @@ class Round:
                                  "STOP→PLAY 后再跑本轮" % rc)
             raise RoundError(EXIT_EXEC, "observe",
                              "pre.sh rc=%d（观察段失败，计划未执行）" % rc)
-        # 只拉 pad：解垫下一步就要用。pick 机位的 burst 现在喂**实测抓点**
-        # （2026-11-12 用户定调，见 ``_measured_truth``），计算段一开头就要 ——
-        # 所以由 ``_ensure_pre_pick_burst`` 在计算段拉，这里不重复搬一遍。
-        for v in PRE_VIEWS:
-            if v["name"] != "pad":
-                continue
-            local = self.p("pre", "wrist-" + v["name"])
-            self.board.pull_dir(self.b("wrist-pre", v["name"]), local)
-            n = len([f for f in os.listdir(local) if f.startswith("color_")])
-            log("  观察 burst %-5s %d 帧" % (v["name"], n))
-            if n == 0:
-                raise RoundError(EXIT_EXEC, "observe",
-                                 "观察机位 %s 一帧都没拉回来" % v["name"])
-        log("  跑前 pick burst 留给计算段（实测抓点要用）")
+        # 图像**不拉**（缺省）：解垫 / 实测抓点 / 判分全在板上算，轮内只回传
+        # KB 级 JSON；burst 本体在整轮结束的归档段再拉（2026-11-12 用户定调：
+        # 本机不承担运行时任务，跨机搬运不许占令牌窗口）。
+        # ``--analysis local``（只给离线排练）才在这里把 burst 拉回来。
+        if self.args.analysis == "local":
+            for v in PRE_VIEWS:
+                local = self.p("pre", "wrist-" + v["name"])
+                self.board.pull_dir(self.b("wrist-pre", v["name"]), local)
+                n = len([f for f in os.listdir(local)
+                         if f.startswith("color_")])
+                log("  观察 burst %-5s %d 帧（--analysis local）"
+                    % (v["name"], n))
+                if n == 0:
+                    raise RoundError(EXIT_EXEC, "observe",
+                                     "观察机位 %s 一帧都没拉回来" % v["name"])
+        else:
+            log("  观察 burst 留在板上做分析（只回传 JSON；图像整轮后归档）")
         chain = urkin.Chain(self.args.urdf)
         js = self.board.joints(self.p("pre", "after"))
         q = _q_from_joints(js, chain)
@@ -1291,10 +1432,11 @@ class Round:
         # ---- 解垫
         t_pad = float(self.deps["now"]())
         grid_path = self.p("grid-pre.json")
-        rc = self.deps["solve_pad"](self.p("pre", "wrist-pad"), grid_path,
-                                    self.args.pad_min_frames,
-                                    self.args.pad_max_spread_mm,
-                                    self.args.pad_max_spread_deg)
+        if self.args.analysis == "local":
+            log("  解垫在本机算（--analysis local：离线排练）")
+        else:
+            log("  解垫在板上算（只回传 grid-pre.json）")
+        rc = self._solve_pad(grid_path)
         self.timing["pad_s"] = round(float(self.deps["now"]()) - t_pad, 1)
         if rc != 0 or not os.path.exists(grid_path):
             raise RoundError(EXIT_PLAN, "compute",
@@ -1602,10 +1744,16 @@ class Round:
                          "执行失败（rc=%d）—— 不自动重试，按失败分类停轮" % rc)
 
     def _pull_evidence(self, plans):
-        """把板上证据拉回来。**拉不到就记缺，不掩盖真正的退出码**：
+        """把板上**小**证据拉回来（执行 jsonl，KB 级）。
 
-        执行失败时往往正是中间某份 jsonl / burst 不存在。若这里直接抛
-        ``EXIT_MISSING``，真因（执行失败）就被「缺证据」盖掉了。
+        图像（burst）**不在这里拉**：判分在板上算（``--analysis board``），
+        66 MB 的跑后三机位搬到归档段（整轮结束、令牌窗口之外）再拉
+        （2026-11-12 用户定调：本机不承担运行时任务）。``--analysis local``
+        是离线排练，没有板端分析，所以照旧在这里拉。
+
+        **拉不到就记缺，不掩盖真正的退出码**：执行失败时往往正是中间某份
+        jsonl / burst 不存在。若这里直接抛 ``EXIT_MISSING``，真因（执行失败）
+        就被「缺证据」盖掉了。
         """
         os.makedirs(self.p("exec"), exist_ok=True)
         for p in plans:
@@ -1615,6 +1763,8 @@ class Round:
                 self.board.pull_file(remote, local)
             except RoundError as e:
                 log("  !! 执行日志拉不回：%s（%s）" % (p["name"], e))
+        if self.args.analysis != "local":
+            return
         for v in cr.E9_VIEWS:
             try:
                 self.board.pull_dir(self.b("wrist-post", v["name"]),
@@ -1641,12 +1791,13 @@ class Round:
                              % grid_path)
         self._apply_pad(read_json(grid_path), grid_path)
 
-        # 跑后三机位真值（缺一个就缺，不拿默认值补）
+        # 跑后三机位真值（缺一个就缺，不拿默认值补；缺省在板上算）
         view_truth = []
         for v in cr.E9_VIEWS:
             out = self.p("truth", v["name"] + ".json")
-            burst = self.p("post", "wrist-" + v["name"])
-            rc = self.deps["truth_from_view"](burst, out, allow_empty=True)
+            rc = self._truth(self.b("wrist-post", v["name"]),
+                             self.p("post", "wrist-" + v["name"]), out,
+                             allow_empty=True)
             if rc == 0 and os.path.exists(out):
                 view_truth.append((v["name"], out))
                 log("  跑后真值 %-5s：%s" % (v["name"], out))
@@ -1674,15 +1825,14 @@ class Round:
             xy_des = [v * 1000.0 for v in cm.cell_center(cell)]
             blk = [b for b in layouts if str(b["id"]) == tid][0]
             top_z = cm.PAD_THICK + float(blk["size"])
-            colour = self.deps["measure_colour"](
-                self.p("post", "wrist-pad"), xy_des, top_z, blk["color"],
-                bc.MEASURED_HUE_DEG.get(blk["color"]),
-                self.args.colour_search_mm)
+            cpath = os.path.join(colour_dir, "%s.json" % tid)
+            colour = self._colour(
+                self.b("wrist-post", "pad"), xy_des, top_z, blk["color"],
+                bc.MEASURED_HUE_DEG.get(blk["color"]), cpath)
             colour["target"] = tid
             colour["cell"] = cell
             colour["desired_center_mm"] = [round(v, 3) for v in xy_des]
             colour["commanded_center_mm"] = cmd_mm
-            cpath = os.path.join(colour_dir, "%s.json" % tid)
             write_json(cpath, colour)
             colour_paths.append(cpath)
             if colour.get("ok") and cmd_mm is not None and \
@@ -1768,8 +1918,7 @@ class Round:
         # 轮级布局核验（块数 / 终态 / 未动块 / 被搬块落点）
         self._write_verify(manifests, view_truth, colour_paths, layouts)
 
-        # 手摆偏差（用跑前 pick burst 事后量；只归档，绝不改退出码）
-        self._pull_pre_pick_burst()
+        # 手摆偏差（用跑前 pick 真值事后量；只归档，绝不改退出码）
         self._write_placement_deviation()
 
         # 判分器
@@ -1791,13 +1940,14 @@ class Round:
         （2026-11-12 S0:1 r1 第一块回读 0.0 mm）。拉不回 / 量不出就**停轮** ——
         抓点没有可信来源时不许发计划，更不许偷偷退回标称坐标。
         """
-        self._ensure_pre_pick_burst()
-        burst = self.p("pre", "wrist-pick")
+        if self.args.analysis == "local":
+            self._ensure_pre_pick_burst()
         out = self.p("truth", "pick-measured.json")
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         t0 = float(self.deps["now"]())
-        rc = int(self.deps["truth_from_view"](burst, out,
-                                             allow_empty=False) or 0)
+        rc = self._truth(self.b("wrist-pre", "pick"),
+                         self.p("pre", "wrist-pick"), out,
+                         allow_empty=False)
         self.timing["pick_truth_s"] = round(float(self.deps["now"]()) - t0, 1)
         if rc != 0 or not os.path.exists(out):
             raise RoundError(EXIT_PLAN, "compute",
@@ -1822,9 +1972,10 @@ class Round:
         return doc
 
     def _ensure_pre_pick_burst(self):
-        """把跑前 pick burst 拉到本地（观察段故意没拉：它在令牌窗口里）。
+        """把跑前 pick burst 拉到本地（**只有 ``--analysis local`` 用**）。
 
-        计算段现在要拿它**实测抓点**，所以拉不回来就是停轮，不能跳过。
+        缺省的板上分析不需要图像在本机：真值在板上算、只回传 JSON。离线排练
+        手里只有本地 burst / 要本地算，才在这里拉。
         """
         local = self.p("pre", "wrist-pick")
         if os.path.isdir(local) and any(
@@ -1840,17 +1991,6 @@ class Round:
             raise RoundError(EXIT_PLAN, "compute",
                              "跑前 pick burst 一帧都没有（%s）" % local)
 
-    def _pull_pre_pick_burst(self):
-        """判分段兜底：跑前 pick burst 还不在本地就再拉一次（失败只告警）。
-
-        计算段已经拉过一遍（``_ensure_pre_pick_burst``），这里只服务
-        ``--from score`` 单步重跑；缺了就跳过偏差表，不改判分。
-        """
-        try:
-            self._ensure_pre_pick_burst()
-        except RoundError as e:
-            log("  !! 跑前 pick burst 拉不回：%s —— 不出摆位偏差表" % e)
-
     def _write_placement_deviation(self):
         """跑后量一遍**手摆偏差**（只归档，缺证据就跳过，绝不改退出码）。
 
@@ -1861,20 +2001,19 @@ class Round:
         dev = self.deps.get("placement_deviation")
         if dev is None:
             return
-        burst = self.p("pre", "wrist-pick")
-        if not os.path.isdir(burst):
-            log("  !! 没有跑前 pick burst —— 不出摆位偏差表（不补数）")
-            return
         truth = self.p("pre", "truth-pick.json")
         # 计算段已经用**同一组 burst** 量过一遍（``_measured_truth`` → truth/
-        # pick-measured.json）。这里再跑一次 20 帧共识纯属白花 30 s，直接复用。
+        # pick-measured.json）。这里再跑一次 20 帧共识纯属白花时间，直接复用。
         measured = self.p("truth", "pick-measured.json")
         if os.path.exists(measured):
             shutil.copyfile(measured, truth)
             rc = 0
         else:
             try:
-                rc = int(self.deps["truth_from_view"](burst, truth) or 0)
+                if self.args.analysis == "local":
+                    self._ensure_pre_pick_burst()
+                rc = int(self._truth(self.b("wrist-pre", "pick"),
+                                     self.p("pre", "wrist-pick"), truth) or 0)
             except Exception as exc:                      # noqa: BLE001
                 log("  !! 跑前真值失败：%s —— 不出摆位偏差表" % exc)
                 return
@@ -1933,6 +2072,37 @@ class Round:
         write_json(self.p("round-verify.json"), doc)
 
     # ---------------------------------------------------------------- 7 归档
+    def _archive_images(self):
+        """把板上 burst 拉回本地（**整轮结束之后**，不占令牌窗口）。
+
+        判分已经在板上算完（只回传 JSON），图像只是留档/复盘用：拉失败只告警
+        —— 本轮判分已经落盘，不能因为归档失败把它判成不完整。板上原物仍在
+        ``<board_dir>/wrist-*``，随时可补拉。
+        """
+        if self.args.analysis == "local":
+            return
+        pairs = [(self.b("wrist-pre", v["name"]),
+                  self.p("pre", "wrist-" + v["name"])) for v in PRE_VIEWS]
+        pairs += [(self.b("wrist-post", v["name"]),
+                   self.p("post", "wrist-" + v["name"])) for v in cr.E9_VIEWS]
+        rows = []
+        for remote, local in pairs:
+            try:
+                self.board.pull_dir(remote, local)
+                n = len([f for f in os.listdir(local)
+                         if f.startswith("color_")])
+                rows.append({"remote": remote, "local": local,
+                             "frames": n, "ok": n > 0})
+                log("  归档 burst %-28s %d 帧" % (os.path.basename(local), n))
+            except (RoundError, OSError) as e:
+                rows.append({"remote": remote, "local": local, "ok": False,
+                             "why": str(e)[:200]})
+                log("  !! 归档 burst %s 失败：%s（板上仍在，可补拉）"
+                    % (os.path.basename(local), e))
+        write_json(self.p("archive.json"), {"bursts": rows})
+        if not all(r.get("ok") for r in rows):
+            log("  !! 部分 burst 未归档（只影响复盘，不影响本轮判分）")
+
     def phase_archive(self):
         write_json(self.p("phases.json"), self.phases)
         write_json(self.p("round-done.json"),
@@ -1940,7 +2110,9 @@ class Round:
                     "batch": self.args.batch, "layout": int(self.args.layout),
                     "run": int(self.args.run), "at": self.deps["now"](),
                     "out_dir": self.out, "board_dir": self.board_dir,
+                    "analysis": self.args.analysis,
                     "phases": [r["phase"] for r in self.phases]})
+        self._archive_images()
         log("轮目录：%s" % self.out)
         log("板上镜像：%s" % self.board_dir)
         return EXIT_OK
@@ -1974,6 +2146,14 @@ def build_parser():
     ap.add_argument("--pad-spec", default=None,
                     help="垫参数 JSON（footprint_m + 可选 thickness_m）")
     ap.add_argument("--pad-thick", type=float, default=None)
+    ap.add_argument("--analysis", default="board", choices=("board", "local"),
+                    help="分析段（解垫 / 真值 / 彩色）在哪算：board = 板上算、"
+                         "只回传 KB 级 JSON（缺省；本机不承担运行时任务，图像"
+                         "整轮后才归档）；local = 本机算，**只给离线排练**，"
+                         "必须配 --dry-run")
+    ap.add_argument("--pad-mat", default=pfb.DEFAULT_MAT,
+                    help="2D 平面标定 JSON（解垫用；板上分析时随轮推上去，"
+                         "KB 级、md5 核对）")
     ap.add_argument("--place-clearance", type=float, default=None)
     ap.add_argument("--place-yaw-equiv180", action="store_true")
     ap.add_argument("--probe-report", default=None,
@@ -2058,6 +2238,11 @@ def prepare(ap, args):
                     sorted(lay.BATCHES[args.batch])))
     if args.pad_spec and not os.path.exists(args.pad_spec):
         ap.error("--pad-spec 不存在：%s" % args.pad_spec)
+    if args.analysis == "local" and not args.dry_run:
+        ap.error("--analysis local 只给离线排练：正式轮的分析必须在板上算"
+                 "（本机不承担运行时任务）。要真跑就删掉这个旗标")
+    if args.pad_mat and not os.path.exists(os.path.expanduser(args.pad_mat)):
+        ap.error("--pad-mat 不存在：%s" % args.pad_mat)
     if args.expect and not os.path.exists(args.expect):
         ap.error("--expect 不存在：%s" % args.expect)
     return args

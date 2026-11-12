@@ -246,6 +246,7 @@ python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 0 \
 后续轮用 `--timing-prior <round0>/timing.json` 标定 R1/R2。
 **2026-11-11 离线实测**（S0:1，复用同一批 burst 与探针报告）：解垫 0.8 s、规划 8.5 s、
 整段 compute 9.3 s、`T_exec_est` 206 s；探针单独一趟 6.1 s。
+（2026-11-12 起解垫改在板上算：3.1 s；多出的 ~2 s 换掉轮内 20 MB 搬运。）
 
 ### 4. 授权（人，一轮一次）
 
@@ -272,6 +273,12 @@ AI 只读核验两步（Dashboard 29999），都看到才写 600 s 令牌；没�
 任一 rc≠0 / 碰撞 / 掉落 / 指定块丢失 / 夹爪未初始化 / 程序自停 ⇒ 停轮。
 执行后编排器自动判分并归档：`round.json` / `round-verify.json` / `score.json/md` /
 `bias.json` / `placement-deviation.json`。缺证据 ⇒ `complete=false` + 退出码 2。
+
+**分析段在板上算**（2026-11-12 起，`--analysis board` 缺省）：解垫 / 跑前真值 /
+跑后三机位真值 / 彩色质心全由板上 `scripts/stage4_board_analysis.py` 跑，轮内只回传
+KB 级 JSON；板上实测解垫 3.1 s、20 帧真值 7.8 s（`--jobs 6`，线程钉 1）。
+**轮内不拉任何 burst** —— 五组图像（约 44 MB）在归档段（整轮结束、令牌窗口之外）
+才 rsync 回开发机。板上分析失败 = 停轮，不许回退本机算。
 
 ### 7. 连续判分
 

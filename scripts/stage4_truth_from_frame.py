@@ -79,6 +79,13 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+# 每进程只许一个 BLAS/OpenMP 线程（必须在 import numpy 之前）。
+# 2026-11-12 板上实测：6 个 worker 进程各自默认开多线程 ⇒ 36 线程抢 6 核，
+# 同一批 6 帧从 3.6 s（线程=1）恶化到 22.4 s。这里的运算是逐元素数组操作 +
+# 小矩阵乘，多线程没有收益；``setdefault`` 不覆盖调用方显式设置的值。
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np                                                # noqa: E402
 
 import graspnet_candidates as gc                                  # noqa: E402

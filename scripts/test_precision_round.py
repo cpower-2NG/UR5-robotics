@@ -134,6 +134,16 @@ finally:
     time.time = pc
 check('本机快 1 小时也不误判过期', len(_exec_cmds(b)) == 1, repr(b.cmds))
 
+print('--- E. SSH 连接复用 ---')
+# 一轮真机要开约 30 次 ssh/scp；2026-11-12 实测不复用每次 0.36 s、复用后
+# 0.01–0.05 s。这里的判据是「参数确实带上了」，别让人改回去。
+o = pr.ssh_opts()
+check('ControlMaster=auto 在参数里', 'ControlMaster=auto' in o, o)
+check('ControlPath 用 %C（按主机+端口+用户区分）',
+      any(v.startswith('ControlPath=') and v.endswith('%C') for v in o), o)
+check('ControlPersist 给了（整轮只握两次手）',
+      any(v.startswith('ControlPersist=') for v in o), o)
+
 print()
 print('通过 %d，失败 %d' % (N_PASS, N_FAIL))
 if FAILS:

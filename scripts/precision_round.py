@@ -43,6 +43,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -86,6 +87,20 @@ MAX_CAND_MM = 12.0
 # 夹持帧（在 lift 停一下抓一帧）**作废**：腕部相机看不到夹着的块，理由与实测见
 # `measure_held.py` 文件头。留着常量只为了让 --held-capture 的拒绝信息能引用它。
 HELD_CAPTURE_WAYPOINT = "lift"
+
+
+def ssh_opts():
+    """SSH 连接复用参数（ssh / scp / rsync -e 共用）。
+
+    2026-11-12 实测（开发机 → 板子，热点通路）：新建连接 0.36 s/次，复用后
+    ssh 0.011 s、scp 0.04 s。一轮真机要开 ~30 次 ssh/scp（每次分析调用就是
+    mkdir + 跑 + 拉三趟），不复用光连接开销就吃掉约 10 s 的令牌窗口。
+    ``%C`` 是「主机+端口+用户」的哈希 ⇒ 并行作业共用主连接也不会串台；
+    ``ControlPersist=120`` 让整轮只做两次握手（首尾各一次）。
+    """
+    return ["-o", "ControlMaster=auto",
+            "-o", "ControlPath=%s/ur5-ssh-%%C" % tempfile.gettempdir(),
+            "-o", "ControlPersist=120"]
 
 
 def sh(cmd, quiet=False, check=True):
@@ -143,7 +158,8 @@ class Board:
         self.run_dir = run_dir
 
     def ssh(self, remote_cmd, quiet=False, check=True):
-        return sh(["ssh", self.alias, remote_cmd], quiet=quiet, check=check)
+        return sh(["ssh"] + ssh_opts() + [self.alias, remote_cmd],
+                  quiet=quiet, check=check)
 
     def push(self):
         """推板上要用的两个脚本 + run.sh，并核对 md5（推没推上去要能证明）。"""
@@ -151,11 +167,15 @@ class Board:
         self.ssh("mkdir -p %s/plans" % BOARD_DIR, quiet=True)
         for f in BOARD_PY_FILES:
             src = os.path.join(HERE, f)
-            sh(["scp", "-q", src, "%s:%s/" % (self.alias, BOARD_DIR)], quiet=True)
+            sh(["scp"] + ssh_opts() + ["-q", src,
+                                       "%s:%s/" % (self.alias, BOARD_DIR)],
+               quiet=True)
         tmp = os.path.join(self.run_dir, "run.sh")
         open(tmp, "w").write(RUN_SH)
         os.chmod(tmp, 0o755)
-        sh(["scp", "-q", tmp, "%s:%s/run.sh" % (self.alias, BOARD_DIR)], quiet=True)
+        sh(["scp"] + ssh_opts() + ["-q", tmp,
+                                   "%s:%s/run.sh" % (self.alias, BOARD_DIR)],
+           quiet=True)
         self.ssh("chmod +x %s/run.sh" % BOARD_DIR, quiet=True)
         for f in BOARD_PY_FILES + ("run.sh",):
             local = hashlib.md5(open(os.path.join(HERE, f) if f != "run.sh" else tmp,
@@ -174,8 +194,9 @@ class Board:
         self.ssh("%s/run.sh %s/precision_capture.py %s --joints-only --timeout 20"
                  % (BOARD_DIR, BOARD_DIR, remote), quiet=True)
         os.makedirs(dest_local, exist_ok=True)
-        sh(["scp", "-q", "%s:%s/joint_states.json" % (self.alias, remote),
-            dest_local + "/"], quiet=True)
+        sh(["scp"] + ssh_opts() + ["-q",
+                                   "%s:%s/joint_states.json" % (self.alias, remote),
+                                   dest_local + "/"], quiet=True)
         return json.load(open(os.path.join(dest_local, "joint_states.json")))
 
     def capture(self, dest_local, name, timeout=40, camera="wrist"):
@@ -189,7 +210,8 @@ class Board:
         self.ssh("%s/run.sh %s/precision_capture.py %s --timeout %s --camera %s"
                  % (BOARD_DIR, BOARD_DIR, remote, timeout, camera))
         os.makedirs(dest_local, exist_ok=True)
-        sh(["scp", "-q", "%s:%s/*" % (self.alias, remote), dest_local + "/"], quiet=True)
+        sh(["scp"] + ssh_opts() + ["-q", "%s:%s/*" % (self.alias, remote),
+                                   dest_local + "/"], quiet=True)
         need = ["color.png", "depth.png", "meta.json", "tf.json"]
         if camera == "wrist":
             # 俯视相机与臂无关，抓帧本来就不写关节角（`precision_capture.py`
@@ -213,7 +235,9 @@ class Board:
         """
         name = os.path.basename(plan_local)
         remote_plan = "%s/plans/%s" % (BOARD_DIR, name)
-        sh(["scp", "-q", plan_local, "%s:%s" % (self.alias, remote_plan)], quiet=True)
+        sh(["scp"] + ssh_opts() + ["-q", plan_local,
+                                   "%s:%s" % (self.alias, remote_plan)],
+           quiet=True)
         args = "--plan %s" % remote_plan
         if upto:
             args += " --upto %s" % upto
@@ -243,7 +267,7 @@ class Board:
     def _pull_log(self, remote_log, log_local, append, remote_has_prefix=True):
         if append and os.path.exists(log_local):
             tmp = log_local + ".part"
-            sh(["scp", "-q", "%s:%s" % (self.alias, remote_log), tmp],
+            sh(["scp"] + ssh_opts() + ["-q", "%s:%s" % (self.alias, remote_log), tmp],
                quiet=True, check=False)
             if not os.path.exists(tmp):
                 return
@@ -262,7 +286,7 @@ class Board:
             return
         if os.path.exists(log_local):
             os.remove(log_local)
-        sh(["scp", "-q", "%s:%s" % (self.alias, remote_log), log_local],
+        sh(["scp"] + ssh_opts() + ["-q", "%s:%s" % (self.alias, remote_log), log_local],
            quiet=True, check=False)
 
 
