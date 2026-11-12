@@ -137,6 +137,12 @@ python3 ~/simlink/sim_board_agent.py home
 （摆场景 / Round 0 计时干跑 / STOP→PLAY 授权 / R1·R2 时间闸门 / 失败处理 / 连续判分）
 **只在** [`docs/真机起栈runbook.md`](docs/真机起栈runbook.md)「第六步」一节，别另抄。
 
+**分析段在板上算**（`--analysis board`，缺省）：解垫 / 真值 / 彩色由板上
+`scripts/stage4_board_analysis.py` 跑，轮内只回传 KB 级 JSON；五组 burst 在**归档段**
+（整轮结束、令牌窗口之外）才拉回。本机不进运行时回路，完整分工与 fail-closed 判据见
+[`docs/阶段/阶段4-杂乱指定抓取/运行时分工.md`](docs/阶段/阶段4-杂乱指定抓取/运行时分工.md)；
+`--analysis local` 只给离线排练，必须配 `--dry-run`。
+
 ```bash
 # 摆位引导：腕部相机高位拍一张空台面，把本轮目标足迹叠到照片上（不打印纸图）
 python3 scripts/stage4_placement_view.py --plan --urdf <robot.urdf> \
@@ -149,15 +155,17 @@ python3 scripts/stage4_placement_view.py --batch S0 --layout 1 \
 # 正式轮（Round 0 干跑把 --dry-run 加上，并把 --run 记 0）
 python3 scripts/stage4_round_run.py --batch S0 --layout 1 --run 1 \
   --out-dir <run-dir> --urdf <robot.urdf> --board <ssh-alias> \
-  --board-repo ~/yolo_ros_original --expect <preflight-expect.json> \
-  --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json --bias-seed -2.791,-0.248
+  --board-repo ~/stage4-entry --expect <preflight-expect.json> \
+  --pad-spec ~/.config/ur5-vision-grasp/pad-spec.json
+# 种子：缺省读 <bias-run>/bias_estimate.json；没有才加 --bias-seed <x,y>
 ```
 
 退出码：0 全绿 / 2 输入证据缺失 / 3 授权或时间闸门 / 4 计划生成失败 /
 5 执行失败 / 6 判分不完整；**执行阶段不自动重试**。跑后摆位偏差
 （`placement-deviation.json`）只归档、不 void。摆位照片那步 rc=1 = 有目标投出画幅
 （照片引导不了那一块，先查机位/拾取区参数）。
-自检：`test_stage4_round_run.py` / `test_stage4_placement_view.py` /
+自检：`test_stage4_round_run.py` / `test_stage4_board_analysis.py` /
+`test_stage4_preflight_expect.py` / `test_stage4_placement_view.py` /
 `test_stage4_layout_sheet.py` / `test_stage4_placement_deviation.py` /
 `test_grasp_bias.py`。`stage4_layout_sheet.py`（A3 1:1 图）保留，仅在有 A3 打印机时可用。
 

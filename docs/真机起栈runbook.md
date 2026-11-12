@@ -211,6 +211,10 @@ grep -c "State tolerances failed"               <日志>   # 最好是 0
 板子身份（模组序列号）/ 板上全树哈希 / 栈（驱动、MoveIt、腕部相机 USB3）/
 夹爪 `0x0200 == 1` / 急停与顶灯。任一红 ⇒ 编排器不授权、不运动。
 预检期望值由人先写一份 JSON（`--expect`），不给就判红 —— fail-closed。
+部署树一变（**新增一份文档也算**），旧基线必然判红：用
+`scripts/stage4_preflight_expect.py --repo <worktree> --from <旧基线> --out <新基线>`
+只重算 `tree` 两项，`serial` / `stack` 原样继承（别手改 JSON，容易把「认亲」判据改宽）。
+板上预检与本机重算共用同一份哈希代码（`PREFLIGHT_TREE_CODE`），不是两个口径。
 
 ### 3. Round 0 计时干跑（S0 六轮之前，只做一次，不计入六轮）
 

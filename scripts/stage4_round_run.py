@@ -531,6 +531,51 @@ def _q_from_joints(doc, chain):
 # =====================================================================
 # 板端预检脚本（只读：序列号 / 全树哈希 / 夹爪 0x0200 / USB 速度 / 栈进程）
 # =====================================================================
+#: 全树哈希算法 —— **唯一实现**。板上预检把它拼进 `PREFLIGHT_PY` 执行；本机的
+#: ``stage4_preflight_expect.py`` 在同一份字符串上拼个 main 跑（重算期望值），
+#: 两地不许各写一份（否则「期望哈希」与「板上哈希」会静默用不同口径）。
+#:
+#: 只覆盖源码：`__pycache__` / `*.pyc` / 构建产物 / 备份目录每次跑都会变
+#: （2026-11-11 实测：跑一次 `--help` 就让文件数 1129→1130、哈希全变 ⇒ 预检
+#: 假红，把「部署变了」和「有人 import 过一次」混为一谈）。`.git` 也不进。
+PREFLIGHT_TREE_CODE = r'''
+_SKIP_DIRNAMES = {".git", "__pycache__"}
+_SKIP_PREFIX = ("ros2_ws/build", "ros2_ws/install", "ros2_ws/log")
+
+
+def scan_tree(repo):
+    h = hashlib.sha256()
+    n = 0
+    for root, dirs, files in os.walk(repo):
+        rel_root = os.path.relpath(root, repo).replace(os.sep, "/")
+        keep = []
+        for d in sorted(dirs):
+            rel = d if rel_root == "." else rel_root + "/" + d
+            if d in _SKIP_DIRNAMES or d.startswith("scripts.bak"):
+                continue
+            if any(rel == p or rel.startswith(p + "/") for p in _SKIP_PREFIX):
+                continue
+            keep.append(d)
+        dirs[:] = keep
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")) or ".bak-" in name:
+                continue
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, repo)
+            h.update(rel.encode("utf-8") + b"\x00")
+            try:
+                with open(path, "rb") as fh:
+                    while True:
+                        chunk = fh.read(1 << 20)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+            except OSError:
+                h.update(b"<unreadable>")
+            n += 1
+    return {"sha256": h.hexdigest(), "files": n}
+'''
+
 PREFLIGHT_PY = r'''
 import glob
 import hashlib
@@ -538,6 +583,7 @@ import json
 import os
 import subprocess
 import sys
+''' + PREFLIGHT_TREE_CODE + r'''
 
 repo = sys.argv[1] if len(sys.argv) > 1 else "~/stage4-entry"
 # 参数是 shell 引号过的（shlex.quote），``~`` 不会被远端 shell 展开 ⇒ 自己展开。
@@ -553,41 +599,8 @@ except OSError as exc:
     out["serial"] = None
     out["serial_error"] = str(exc)
 
-# 树哈希**只覆盖源码**：`__pycache__` / `*.pyc` / 构建产物 / 备份目录每次跑都会
-# 变（2026-11-11 实测：跑一次 `--help` 就让文件数 1129→1130、哈希全变 ⇒ 预检
-# 假红，把「部署变了」和「有人 import 过一次」混为一谈）。`.git` 也不进。
-_SKIP_DIRNAMES = {".git", "__pycache__"}
-_SKIP_PREFIX = ("ros2_ws/build", "ros2_ws/install", "ros2_ws/log")
-h = hashlib.sha256()
-n = 0
-for root, dirs, files in os.walk(repo):
-    rel_root = os.path.relpath(root, repo).replace(os.sep, "/")
-    keep = []
-    for d in sorted(dirs):
-        rel = d if rel_root == "." else rel_root + "/" + d
-        if d in _SKIP_DIRNAMES or d.startswith("scripts.bak"):
-            continue
-        if any(rel == p or rel.startswith(p + "/") for p in _SKIP_PREFIX):
-            continue
-        keep.append(d)
-    dirs[:] = keep
-    for name in sorted(files):
-        if name.endswith((".pyc", ".pyo")) or ".bak-" in name:
-            continue
-        path = os.path.join(root, name)
-        rel = os.path.relpath(path, repo)
-        h.update(rel.encode("utf-8") + b"\x00")
-        try:
-            with open(path, "rb") as fh:
-                while True:
-                    chunk = fh.read(1 << 20)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-        except OSError:
-            h.update(b"<unreadable>")
-        n += 1
-out["tree"] = {"sha256": h.hexdigest(), "files": n}
+# 树哈希（算法见 `PREFLIGHT_TREE_CODE`：全仓唯一实现，本机重算期望值也用它）。
+out["tree"] = scan_tree(repo)
 
 try:
     sys.path.insert(0, os.path.join(repo, "scripts"))

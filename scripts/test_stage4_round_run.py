@@ -201,9 +201,14 @@ check("预检：空树（路径对不上）⇒ 红，不靠期望值蒙过去",
 # 这些都不该让「这棵树是哪棵」变味（2026-11-11 实测：`--help` 跑一次，
 # 文件数 1129→1130、哈希全变 ⇒ 预检假红，把「部署变了」和「有人 import 过」混淆）
 def _run_preflight(repo):
-    p = subprocess.run([sys.executable, "-c", r.PREFLIGHT_PY, repo],
+    # 只跑共享的树哈希代码（`PREFLIGHT_TREE_CODE` 与板上预检同一份）；跑整份
+    # PREFLIGHT_PY 会去开夹爪串口 / 查 dashboard，本机白等 ~28 s。
+    src = ("import hashlib\nimport json\nimport os\nimport sys\n"
+           + r.PREFLIGHT_TREE_CODE
+           + "\nprint(json.dumps(scan_tree(sys.argv[1])))\n")
+    p = subprocess.run([sys.executable, "-", repo], input=src,
                        capture_output=True, text=True)
-    return json.loads(p.stdout)
+    return {"tree": json.loads(p.stdout)}
 
 
 with tempfile.TemporaryDirectory() as _tt:
