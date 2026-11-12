@@ -98,7 +98,12 @@ PHASE_ERROR = {"preflight": EXIT_MISSING, "views": EXIT_PLAN,
                "score": EXIT_SCORE, "archive": EXIT_MISSING}
 
 #: ``T_exec_est`` 的初值（Round 0 实测后由 ``--timing-prior`` 覆盖）。
-PLAN_OVERHEAD_S = 5.0        # 每份计划：到起点 / 夹爪开合 / 停稳
+#:
+#: 2026-11-12 实测（S0:1 满五块一轮，8 份计划）：航点标称总时长 140 s，run.sh
+#: 实际 ~390 s ⇒ **每份计划 ~30 s 固定开销**（每航点 1.5 s 停稳 ×8 = 12 s、
+#: 夹爪开合 ~8 s、独立进程起 rclpy/等服务发现 5–20 s）。旧值 5 s 把执行估成
+#: 206 s、实际 440 s —— R1/R2 用这种估时等于没有闸门（2026-11-12 实测）。
+PLAN_OVERHEAD_S = 30.0       # 每份计划：停稳 / 夹爪开合 / 进程启动
 PER_PLAN_S = 1.0             # 执行器逐条建链 / 日志开销
 BURST_OVERHEAD_S = 6.0       # 每组腕部 burst 20 帧
 R1_MARGIN_S = 60.0           # R1 的固定余量
@@ -352,6 +357,16 @@ def evaluate_preflight(got, expect):
     for name, want in (expect.get("stack") or {}).items():
         if want and not (got.get("stack") or {}).get(name):
             probs.append("栈里没有 %s 进程" % name)
+
+    # dashboard 连接必须是活的：死了不会报「错」，只会让第一次闸门在**令牌窗口
+    # 内**等 20 s × 重试（2026-11-12 实测 147 s）。预检阶段（授权前）先修好。
+    d = got.get("dashboard")
+    if not isinstance(d, dict):
+        probs.append("预检没查 dashboard_client 连接（板上预检脚本版本旧）—— "
+                     "不查就可能在令牌窗口里白等 ~150 s")
+    elif not d.get("ok"):
+        probs.append("dashboard_client 没响应（state=%r）：先重连再跑"
+                     % (d.get("state"),))
     return probs
 
 
@@ -493,6 +508,52 @@ ps = subprocess.run(["ps", "-eo", "pid,args", "--no-headers"],
 lines = [l for l in ps.splitlines() if "bash -c" not in l]
 out["stack"] = {p: any(p in l for l in lines)
                 for p in ("ur_robot_driver", "move_group", "controller_manager")}
+
+
+# dashboard_client 的 TCP 会静默死掉（控制柜断过电 / 久置）：症状是第一次
+# 闸门查询回 "Did not receive answer from dashboard server in time (20 s)"，
+# ``precision_exec`` 原地重试到 ~150 s。这段等待如果发生在令牌窗口里，就是
+# 白烧整轮（2026-11-12 实测 147.7 s，观察段 193.6 s 里的四分之三）。
+# 所以把它挪到**授权前**的预检里：只读查一次 programState，读不到就
+# ``/dashboard_client/connect`` 重连再读 —— 只读服务，不动臂、不碰 RTDE。
+def _ros_shell(cmd, timeout):
+    return subprocess.run(
+        ["bash", "-c",
+         "export ROS_DOMAIN_ID=99; . /opt/ros/humble/setup.bash; "
+         ". $HOME/yolo_ros_original/ros2_ws/install/setup.bash; " + cmd],
+        capture_output=True, text=True, timeout=timeout)
+
+
+def _program_state():
+    r = _ros_shell(
+        'timeout 25 ros2 service call /dashboard_client/raw_request '
+        'ur_dashboard_msgs/srv/RawRequest "{query: programState}"', 40)
+    return ((r.stdout or "") + (r.stderr or "")).strip()
+
+
+def _state_of(text):
+    if "PLAYING" in text:
+        return "PLAYING"
+    if "STOPPED" in text:
+        return "STOPPED"
+    return "unknown"
+
+
+try:
+    raw = _program_state()
+    reconnected = False
+    if "Did not receive answer" in raw or _state_of(raw) == "unknown":
+        _ros_shell('timeout 25 ros2 service call /dashboard_client/connect '
+                   'std_srvs/srv/Trigger "{}"', 40)
+        reconnected = True
+        raw = _program_state()
+    out["dashboard"] = {"ok": _state_of(raw) != "unknown",
+                        "state": _state_of(raw),
+                        "reconnected": reconnected}
+except Exception as exc:                                  # noqa: BLE001
+    out["dashboard"] = {"ok": False, "state": "unknown",
+                        "why": str(exc)[:160]}
+
 print(json.dumps(out))
 '''
 
@@ -588,6 +649,16 @@ class RoundBoard:
         if not remote:
             raise RoundError(EXIT_MISSING, "board", "板上目录为空")
         self.ssh("mkdir -p %s" % remote)
+
+    def clear(self, remote):
+        """删掉板上一条产物路径（幂等）。
+
+        ``precision_exec`` / ``precision_capture`` 只追加/覆写、从不清理：同一轮
+        重跑时旧执行日志会留在文件里（2026-11-12 实测 ``pre/exec/01-view-pick
+        .json.jsonl`` 同时有 20:40 与 21:28 两次运行的记录）⇒ 判分会把上一次
+        尝试的记录当成本轮证据。每次推/跑之前先清。
+        """
+        self.ssh("rm -rf %s" % remote)
 
     def pull_file(self, remote, local):
         os.makedirs(os.path.dirname(os.path.abspath(local)) or ".", exist_ok=True)
@@ -910,7 +981,8 @@ class Round:
         write_json(self.p("preflight.json"),
                    {"at": self.deps["now"](), "board_repo": self.args.board_repo,
                     "got": got, "expect": expect, "problems": probs})
-        for k in ("serial", "tree", "gripper", "realsense", "stack"):
+        for k in ("serial", "tree", "gripper", "realsense", "stack",
+                  "dashboard"):
             v = got.get(k)
             if k == "serial" and v:
                 # 指纹 + 是否匹配期望；序列号真值绝不进对话/日志（红线 3）
@@ -996,6 +1068,10 @@ class Round:
     def phase_observe(self):
         tok = self._current_token()
         plans = read_json(self.p("pre", "plans.json"))
+        # 同一轮重跑时板上旧日志/旧帧会留在原处（工具只追加不清理）⇒ 先清。
+        self.board.clear(self.b("pre", "exec"))
+        for v in PRE_VIEWS:
+            self.board.clear(self.b("wrist-pre", v["name"]))
         files = [(self.p("pre", "plan", p["name"]),
                   self.b("pre", "plan", p["name"])) for p in plans]
         self.board.push_many(files)
@@ -1019,7 +1095,12 @@ class Round:
                                  "STOP→PLAY 后再跑本轮" % rc)
             raise RoundError(EXIT_EXEC, "observe",
                              "pre.sh rc=%d（观察段失败，计划未执行）" % rc)
+        # 只拉 pad：解垫下一步就要用。pick 机位的 burst 只喂**跑后的**摆位偏差表
+        # （record-only），留到判分段再拉 —— 观察段在令牌窗口里，少传 100 帧
+        # （2026-11-12：观察段 193.6 s 里有相当一部分是这种可以挪走的搬运）。
         for v in PRE_VIEWS:
+            if v["name"] != "pad":
+                continue
             local = self.p("pre", "wrist-" + v["name"])
             self.board.pull_dir(self.b("wrist-pre", v["name"]), local)
             n = len([f for f in os.listdir(local) if f.startswith("color_")])
@@ -1027,6 +1108,7 @@ class Round:
             if n == 0:
                 raise RoundError(EXIT_EXEC, "observe",
                                  "观察机位 %s 一帧都没拉回来" % v["name"])
+        log("  跑前 pick burst 留在板上，判分段再拉（只喂摆位偏差表）")
         chain = urkin.Chain(self.args.urdf)
         js = self.board.joints(self.p("pre", "after"))
         q = _q_from_joints(js, chain)
@@ -1380,6 +1462,11 @@ class Round:
                              % why)
         plans = read_json(self.p("plan", "plans.json"))
         log("执行 %d 份计划（一条 run.sh，Agent 不介入）" % len(plans))
+        # 旧执行日志与旧机位帧**先清**：工具只追加不清理，重跑时会把上一次尝试
+        # 的记录留进本轮证据（判分读到两轮混在一起的 jsonl）。
+        self.board.clear(self.b("exec"))
+        for v in cr.E9_VIEWS:
+            self.board.clear(self.b("wrist-post", v["name"]))
         self.board.mkdir(self.b("exec"))     # 只写不推，必须显式建
         rc, out = self.board.run_script(self.b("run.sh"), tok)
         os.makedirs(self.p("exec"), exist_ok=True)
@@ -1532,6 +1619,13 @@ class Round:
                 % (sum(mags) / len(mags), max(mags), gb.BIAS_LIMIT_MM))
 
         # facts（机器能证明的 + 人给的安全/干预）
+        # 给了 --facts 却不在 ⇒ 明说缺什么。安全/干预是人给的计数，缺了就是
+        # 「没测」，不许悄悄按空字典当「都没发生」判 complete=true。
+        if self.args.facts and not os.path.exists(self.args.facts):
+            raise RoundError(EXIT_SCORE, "score",
+                             "facts 输入不存在：%s —— 安全事件/人工干预是人给的"
+                             "计数，拿不到就不判（补好证据后 --from score）"
+                             % self.args.facts)
         human = read_json(self.args.facts) if self.args.facts else {}
         facts = build_facts(self.round_id, self.args.batch,
                             int(self.args.layout), layouts, bias_report, human)
@@ -1563,6 +1657,7 @@ class Round:
         self._write_verify(manifests, view_truth, colour_paths, layouts)
 
         # 手摆偏差（用跑前 pick burst 事后量；只归档，绝不改退出码）
+        self._pull_pre_pick_burst()
         self._write_placement_deviation()
 
         # 判分器
@@ -1576,6 +1671,20 @@ class Round:
                              "看 round.json 的 missing 与 score.md"
                              % (rc_round, rc_score))
         return EXIT_OK
+
+    def _pull_pre_pick_burst(self):
+        """把跑前 pick burst 从板上拉回来（观察段故意没拉 —— 它在令牌窗口里）。
+
+        只给 ``placement-deviation.json`` 用；拉不回来就跳过偏差表，不改判分。
+        """
+        local = self.p("pre", "wrist-pick")
+        if os.path.isdir(local) and any(
+                f.startswith("color_") for f in os.listdir(local)):
+            return
+        try:
+            self.board.pull_dir(self.b("wrist-pre", "pick"), local)
+        except RoundError as e:
+            log("  !! 跑前 pick burst 拉不回：%s —— 不出摆位偏差表" % e)
 
     def _write_placement_deviation(self):
         """跑后量一遍**手摆偏差**（只归档，缺证据就跳过，绝不改退出码）。
@@ -1714,10 +1823,11 @@ def build_parser():
     # 2026-11-11 Round 0 实测：解垫 0.9 s + 规划 8.6 s（5 目标 + 3 机位）
     # + 探针 6.1 s（板上一趟）≈ 16 s。缺省从 210 s 收到 90 s（约 5× 余量）；
     # 估时只影响 R1 保守程度，不是判分阈值 —— 但改了就记在台账里。
-    ap.add_argument("--compute-est", type=float, default=90.0,
-                    help="R1 用的轮内计算估时（秒；缺省 90 = Round 0 实测 16 s 的 ~5×）")
-    ap.add_argument("--exec-est", type=float, default=450.0,
-                    help="无 timing-prior 时的执行估时（秒）")
+    ap.add_argument("--compute-est", type=float, default=30.0,
+                    help="R1 用的轮内计算估时（秒；缺省 30 = 实测 16–25 s 的 ~1.5×）")
+    ap.add_argument("--exec-est", type=float, default=400.0,
+                    help="无 timing-prior 时的执行估时（秒；缺省 400 = 实测 run.sh "
+                         "~390 s）")
 
     ap.add_argument("--pad-min-frames", type=int, default=20)
     ap.add_argument("--pad-max-spread-mm", type=float, default=2.0)

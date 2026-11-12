@@ -81,8 +81,9 @@ with tempfile.TemporaryDirectory() as td:
     est = r.exec_estimate([
         {"path": good, "kind": "target"},
         {"path": view, "kind": "view", "view": "pick"}])
-    # 15 + (5+1) + 2 + (5+1) + 1×6 = 35
-    check("exec_estimate：Σduration + 每份开销 + burst 开销", abs(est - 35.0) < 1e-6,
+    # 15 + (30+1) + 2 + (30+1) + 1×6 = 85（每份计划 30 s：停稳/夹爪/进程启动，
+    # 2026-11-12 实测值；旧值 5 s 会把执行估低一半，闸门形同虚设）
+    check("exec_estimate：Σduration + 每份开销 + burst 开销", abs(est - 85.0) < 1e-6,
           repr(est))
     miss = os.path.join(td, "nope.json")
     try:
@@ -161,6 +162,7 @@ EXPECT = {"serial": "SN-1", "tree_sha256": "abc123", "tree_files": 7,
 GOT = {"serial": "SN-1", "tree": {"sha256": "abc123", "files": 7},
        "gripper": {"ok": True, "init_state": 1},
        "realsense": [{"dev": "1-1", "speed": "5000"}],
+       "dashboard": {"ok": True, "state": "PLAYING"},
        "stack": {"ur_robot_driver": True}}
 check("预检全绿 ⇒ 无问题", r.evaluate_preflight(GOT, EXPECT) == [])
 check("预检缺 --expect ⇒ 红（不知道是哪块板）",
@@ -178,6 +180,13 @@ check("预检：腕部相机在 USB2 ⇒ 红",
           dict(GOT, realsense=[{"dev": "1-1", "speed": "480"}]), EXPECT)))
 check("预检：栈里没驱动 ⇒ 红",
       bool(r.evaluate_preflight(dict(GOT, stack={}), EXPECT)))
+# dashboard 死在令牌窗口里是纯浪费（2026-11-12 实测白等 147 s）⇒ 预检必须拦。
+check("预检：dashboard 没响应 ⇒ 红（不许把卡死带进令牌窗口）",
+      any("dashboard" in x for x in r.evaluate_preflight(
+          dict(GOT, dashboard={"ok": False, "state": "unknown"}), EXPECT)))
+check("预检：没查 dashboard ⇒ 红（旧版预检脚本不算绿）",
+      any("dashboard" in x for x in r.evaluate_preflight(
+          {k: v for k, v in GOT.items() if k != "dashboard"}, EXPECT)))
 # 序列号真值不许出现在问题文本/日志里（AGENTS.md 红线 3）
 _msg = "；".join(r.evaluate_preflight(dict(GOT, serial="SN-2"), EXPECT))
 check("预检：序列号不符只打指纹（真值不进文本）",
@@ -367,6 +376,7 @@ class FakeBoard:
             "serial": "SN-1", "tree": {"sha256": "abc123", "files": 7},
             "gripper": {"ok": True, "init_state": 1},
             "realsense": [{"dev": "1-1", "speed": "5000"}],
+            "dashboard": {"ok": True, "state": "PLAYING"},
             "stack": {"ur_robot_driver": True}}
         self.tokens = [(("t" * 32), 800.0, "")]
         self._last_token = (None, None, "没有令牌")
@@ -387,6 +397,9 @@ class FakeBoard:
 
     def mkdir(self, remote):
         self.calls.append(("mkdir", remote))
+
+    def clear(self, remote):
+        self.calls.append(("clear", remote))
 
     def joints(self, dest):
         self.calls.append(("joints", dest))
@@ -715,6 +728,24 @@ with tempfile.TemporaryDirectory() as td:
           [os.path.basename(c[1]) for c in runs] == ["pre.sh", "run.sh"],
           repr(runs))
     check("全绿：run.sh 输出含 ALL DONE 才认", "ALL DONE" in out)
+    # 板上执行日志/机位帧只追加不清理：重跑前必须清，否则判分读进上一次尝试。
+    cl = [i for i, c in enumerate(b.calls) if c[0] == "clear"]
+    run_i = [i for i, c in enumerate(b.calls) if c[0] == "run_script"]
+    paths = [c[1] for c in b.calls if c[0] == "clear"]
+    check("干净起跑：pre/exec 与三个机位在跑前被清",
+          len(cl) >= 5 and any(p.endswith("/pre/exec") for p in paths) and
+          sum("wrist-" in p for p in paths) >= 4, repr(paths))
+    check("干净起跑：每次清都在对应 run_script 之前",
+          all(any(i < j for j in run_i) for i in cl), repr((cl, run_i)))
+    check("观察段只拉 pad（pick 的 100 帧留到判分段，不占令牌窗口）",
+          b.pulls and b.pulls[0][1].endswith("wrist-pre/pad") and
+          any(c[1].endswith("wrist-pre/pick") for c in b.pulls),
+          repr([c[1] for c in b.pulls]))
+    check("干净起跑：execute 前也清（exec + 三个跑后机位）",
+          any(p.endswith("/exec") for p in paths) and
+          sum(p.endswith(("wrist-post/pick", "wrist-post/free",
+                          "wrist-post/pad")) for p in paths) == 3,
+          repr(paths))
     man = json.load(open(rd.p("plan", "manifest-0.json")))
     cmd = [a for a in man["actions"] if a["kind"] == "target"][0]
     check("manifest：命令 = 期望 − b̂，且期望仍是格心",
@@ -891,6 +922,14 @@ with tempfile.TemporaryDirectory() as td:
     rc, out, rd = run(td, b, deps={"round_report": lambda argv: 2})
     check("判分不完整 ⇒ rc 6、停在 score", rc == r.EXIT_SCORE and
           phases_of(rd)[-1] == "score", repr((rc, phases_of(rd))))
+
+# ---- C9b --facts 给了但文件不在 ⇒ 明说缺、不许当「都没发生」
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    rc, out, rd = run(td, b, facts=os.path.join(td, "nope.json"))
+    check("facts 缺失 ⇒ rc 6 且报「facts 输入不存在」（不默认成空字典）",
+          rc == r.EXIT_SCORE and "facts 输入不存在" in out,
+          repr((rc, out[-300:])))
 
 # ---- C10 探针问题
 

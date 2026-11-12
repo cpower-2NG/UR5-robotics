@@ -165,10 +165,34 @@ def load_bias_estimate(path):
         return None
 
 
+def _drop_round(prev, rid):
+    """把 ``prev`` 里 ``round == rid`` 的那条记录去掉，并按剩下的轮重算聚合。
+
+    判分是**只读阶段、可以重跑**（``--from score``）。若写入是纯追加，重跑一次
+    就把同一批样本再并一次：``n`` 从 5 变 10，同一轮的 5 个块被重复计权
+    （2026-11-12 实测：``S0-1-r1`` 在文件里出现三次、n=15）。同一个 round 的
+    多次执行/重跑以**最后一次**为准。
+    """
+    rounds = [r for r in ((prev or {}).get("rounds") or [])
+              if r.get("round") != rid]
+    tot = sum(int(r.get("n") or 0) for r in rounds)
+    if not rounds:
+        return None
+    if tot <= 0:               # 老文件只有聚合值、没有逐轮记录 ⇒ 无法拆分
+        return prev
+    return {"version": BIAS_ESTIMATE_VERSION, "model": BIAS_ESTIMATE_MODEL,
+            "bias_mm": [round(sum(float(r["bias_mm"][0]) * int(r.get("n") or 0)
+                                  for r in rounds) / tot, 3),
+                        round(sum(float(r["bias_mm"][1]) * int(r.get("n") or 0)
+                                  for r in rounds) / tot, 3)],
+            "n": tot, "rounds": rounds}
+
+
 def write_bias_estimate(rdir, doc):
     """把本轮的 b̂ 并进 ``<run>/bias_estimate.json``：下一轮第 1 层就有先验。
 
     没有测量（离线预检 / 第一层就停）⇒ 不写，返回 ``None``。
+    **同一个 ``round`` 覆盖而不是追加** —— 判分可重跑，追加会把样本重复计权。
     """
     hist = [h["bias_mm"] for h in (doc.get("bias_history") or [])]
     if not hist:
@@ -180,6 +204,7 @@ def write_bias_estimate(rdir, doc):
         prev = None
     if (prev or {}).get("version") != BIAS_ESTIMATE_VERSION:
         prev = None            # 旧口径的样本不能并进新口径（见常量注释）
+    prev = _drop_round(prev, doc.get("round"))
     merged = merge_bias_estimate(prev, hist)
     if merged is None:
         return None

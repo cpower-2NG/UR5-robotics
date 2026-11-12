@@ -149,6 +149,17 @@ def main():
         check('load: 读回同一份',
               gb.load_bias_estimate(path) == out2['bias_mm'],
               repr(gb.load_bias_estimate(path)))
+        # 判分是只读阶段、可以重跑：同一个 round 再写一次必须**覆盖**而不是追加，
+        # 否则 n 会翻倍、同一批样本被重复计权（2026-11-12 实测 n=15 凭空多两轮）。
+        out3 = gb.write_bias_estimate(td, doc2)
+        check('write: 同一 round 重跑不重复计权（n 仍 3、轮记录仍 2）',
+              out3 and out3['n'] == 3 and len(out3['rounds']) == 2,
+              repr(out3))
+        doc2b = {'round': 8, 'bias_history': [{'bias_mm': [0.0, 2.0]}]}
+        out4 = gb.write_bias_estimate(td, doc2b)
+        check('write: 同一 round 改样本 ⇒ 以最后一次为准（均值跟着变）',
+              out4 and out4['n'] == 3 and out4['bias_mm'] == [-1.333, 0.0],
+              repr(out4))
         # 版本闸门：v2（矫正后含拖拽）样本口径不同，必须当没有。
         bad = dict(out2)
         bad['version'] = 2
