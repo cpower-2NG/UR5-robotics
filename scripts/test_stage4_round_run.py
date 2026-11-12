@@ -43,6 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import stage4_clear_model as cm                                 # noqa: E402
+import stage4_clear_run as cr                                   # noqa: E402
 import stage4_layouts as lay                                    # noqa: E402
 import stage4_round_run as r                                    # noqa: E402
 
@@ -299,13 +300,30 @@ def fake_plan_views(chain_, q, views, out_dir, start=0):
     return plans, list(q)
 
 
+def _act_rec(a, blocks):
+    """一条动作 + 它在**传入布局**里的块位置（抓点是否用实测只看这里）。
+
+    桩动作表的块键是 ``block``（真实现）或 ``id``（本文件 ``fake_actions_*``），
+    两种都认。
+    """
+    bid = a.get("block", a.get("id"))
+    blk = cr.find_block(blocks, bid) if bid is not None else None
+    return {"kind": a.get("kind"), "block": bid,
+            "block_xy": (None if blk is None else
+                         [float(blk["x"]), float(blk["y"])]),
+            "from_xy": a.get("from_xy")}
+
+
 def fake_plan_sequence(chain_, q, actions, blocks, out_dir,
                        survey_tool0=None, place_clearance=None,
                        wrist_survey=True, views=None, place_yaw_equiv=False,
                        start=0, min_block_gap=0.0, gap_check="probe_verified"):
     PLAN_CALLS.append({"start": start, "wrist_survey": wrist_survey,
                        "gap_check": gap_check, "min_block_gap": min_block_gap,
-                       "n_actions": len(actions)})
+                       "n_actions": len(actions),
+                       # 每个动作抓的那块在**传入布局**里的位置 —— 抓点是否
+                       # 用实测，只能从这里看出来（plan 桩不跑几何）。
+                       "acts": [_act_rec(a, blocks) for a in actions]})
     plans = []
     os.makedirs(out_dir, exist_ok=True)
     for i, a in enumerate(actions):
@@ -331,8 +349,12 @@ def fake_actions_from_attempt(truth, attempt, pad_thick, bias_mm=None):
     cx, cy = cm.cell_center(cell)
     desired = [cx * 1000.0, cy * 1000.0]
     cmd = [desired[0] - bias[0], desired[1] - bias[1]]
-    act = {"kind": "target", "id": attempt["id"], "slot": [cmd[0] / 1000.0,
-                                                           cmd[1] / 1000.0],
+    blk = cr.find_block(truth["blocks"], attempt["id"])
+    act = {"kind": "target", "id": attempt["id"],
+           # 与真实现同约定：动作自带抓点 ``from_xy``（实测/探针/fold 后）。
+           "from_xy": [float(blk["x"]), float(blk["y"])],
+           "slot": [cmd[0] / 1000.0,
+                    cmd[1] / 1000.0],
            "desired_center_mm": [round(v, 3) for v in desired],
            "commanded_center_mm": [round(v, 3) for v in cmd],
            "applied_bias_mm": [round(v, 3) for v in bias]}
@@ -706,6 +728,23 @@ def fake_truth(burst, out, allow_empty=False):
     return 0
 
 
+def fake_truth_offset(dx_mm, dy_mm):
+    """跑前 pick burst 的实测块位姿 = 布局表 + 固定偏移（手摆偏差的替身）。"""
+    def f(burst, out, allow_empty=False):
+        TRUTH_CALLS.append((burst, allow_empty))
+        blocks = []
+        if not allow_empty:
+            blocks = [{"id": b["id"], "color": b["color"],
+                       "x": b["x"] + dx_mm / 1000.0,
+                       "y": b["y"] + dy_mm / 1000.0,
+                       "yaw": b["yaw"], "size": b["size"], "top": b["top"]}
+                      for b in lay.layout_blocks("S0", 1)]
+        with open(out, "w") as f:
+            json.dump({"blocks": blocks}, f)
+        return 0
+    return f
+
+
 def fake_colour(offset=(1.0, 0.5), ok=True):
     def f(burst, xy_mm, top_z, expect_class, hue_deg, search_mm):
         return {"ok": ok, "xy_mm": [xy_mm[0] + offset[0], xy_mm[1] + offset[1]],
@@ -829,6 +868,39 @@ with tempfile.TemporaryDirectory() as td:
     check("板上分析：2D 标定（pad-mat）随轮推一次、md5 走 push",
           [p for p in b.pushed if p.endswith("analysis/stage2-mat.json")] ==
           ["/b/analysis/stage2-mat.json"], repr(b.pushed))
+
+# ---- C1c 抓点：实测块位姿必须进 plan_sequence（不是标称坐标）
+# 回归 2026-11-12 S0:1 r1 attempt5：跑前 burst 量出实测（写进 e9.from_xy），
+# 编排器却把布局表标称坐标喂给 plan_sequence ⇒ IK 目标差 25 mm ⇒ 空夹
+# （夹爪回读 0.0 mm）。计划里的 from_xy 与真正抓的位置必须是同一份。
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    rc, out, rd = run(td, b, dry_run=True,
+                      deps={"truth_from_view": fake_truth_offset(20.0, -15.0)})
+    want = {str(bl["id"]): [bl["x"] + 0.020, bl["y"] - 0.015]
+            for bl in lay.layout_blocks("S0", 1)}
+    got = {}
+    for p in PLAN_CALLS:
+        for a in p.get("acts") or []:
+            got.setdefault(str(a["block"]), a["block_xy"])
+    check("抓点：plan_sequence 吃实测合并后的块位姿（不是标称）",
+          rc == 0 and got and all(
+              got.get(k) is not None
+              and abs(got[k][0] - want[k][0]) < 1e-6
+              and abs(got[k][1] - want[k][1]) < 1e-6 for k in want),
+          repr({k: got.get(k) for k in want}))
+
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    rc, out, rd = run(td, b, dry_run=True,
+                      deps={"truth_from_view": fake_truth_offset(20.0, -15.0)})
+    acts = [a for p in PLAN_CALLS for a in (p.get("acts") or [])]
+    check("抓点：from_xy 与传进规划的那块位置一致（量了就用同一份）",
+          bool(acts) and all(
+              a["from_xy"] is not None and a["block_xy"] is not None
+              and abs(a["from_xy"][0] - a["block_xy"][0]) < 1e-6
+              and abs(a["from_xy"][1] - a["block_xy"][1]) < 1e-6
+              for a in acts), repr(acts[:2]))
 
 # ---- C1b 分析段在哪算：正式轮必须在板上（本机不承担运行时任务）
 with tempfile.TemporaryDirectory() as td:

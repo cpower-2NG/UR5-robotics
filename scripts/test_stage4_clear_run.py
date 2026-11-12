@@ -886,6 +886,31 @@ def section_place_yaw_equiv():
         pp.build_pick = real
 
 
+def section_from_xy():
+    print('\n[4d] 抓点只认动作表的 from_xy（实测 / 对中修正后的抓取点）')
+    truth, att = tower_truth(), tower_attempt()
+    acts, blocks = cr.actions_from_attempt(truth, att, cm.PAD_THICK)
+    ch = chain()
+    q0 = q_start_of(ch)
+    tgt = next(a for a in acts if a['kind'] == 'target')
+    blk = cr.find_block(blocks, tgt['block'])
+    nominal = [float(blk['x']), float(blk['y'])]
+    # 布局故意停在标称，from_xy 改成「实测」：抓点必须跟着 from_xy 走。
+    # （回归 2026-11-12 S0:1 r1 attempt5：计划 meta 的 from_xy 是实测，IK 却按
+    # 布局标称坐标算，差 25 mm ⇒ 空夹回读 0.0 mm。）
+    tgt['from_xy'] = [nominal[0] + 0.015, nominal[1] - 0.010]
+    out = tempfile.mkdtemp(prefix='e9-fromxy-')
+    plans, layout, q_end = cr.plan_sequence(ch, q0, acts, blocks, out,
+                                            wrist_survey=False)
+    m = json.load(open(plans[-1]['path'], encoding='utf-8'))['meta']
+    check('IK 抓点 = act.from_xy（不是布局标称坐标）',
+          abs(m['grasp_point'][0] - tgt['from_xy'][0]) < 1e-12
+          and abs(m['grasp_point'][1] - tgt['from_xy'][1]) < 1e-12,
+          repr((m.get('grasp_point'), tgt['from_xy'], nominal)))
+    check('计划照样记下 from_xy（可追溯）',
+          m['e9']['from_xy'] == tgt['from_xy'], repr(m['e9'].get('from_xy')))
+
+
 def section_merge_truth():
     print('\n[7c] 多机位跑后真值合并：去重必须带层')
     two = [{'x': 0.4406, 'y': 0.3443, 'top': 0.04425, 'size': 0.0295},
@@ -1573,8 +1598,8 @@ def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_bias,
                section_plans, section_multitarget,
-               section_step_cap, section_place_yaw_equiv, section_gap,
-               section_mutation, section_verify, section_fuse,
+               section_step_cap, section_place_yaw_equiv, section_from_xy,
+               section_gap, section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
                section_align, section_view_gate, section_finish):
         try:

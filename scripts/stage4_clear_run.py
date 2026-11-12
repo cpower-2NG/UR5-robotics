@@ -590,6 +590,15 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
         blk = find_block(layout, act["block"])
         if blk is None:
             raise ValueError("布局里没有块 %r" % (act["block"],))
+        # 抓点只认动作表里的 ``from_xy``（探针记录 / 跑前实测 / 对中修正后的
+        # 抓取点），就地覆盖布局里该块的 x/y，``pp_blocks`` 也跟着更新。
+        # ``apply_align`` 本来就同时改这两处、保持一致；只信布局会把实测抓点
+        # 丢掉 —— 2026-11-12 S0:1 r1 attempt5：``e9.from_xy`` 是实测，IK 目标
+        # 却是标称坐标，差 25 mm，空夹回读 0.0 mm。
+        from_xy = act.get("from_xy")
+        if from_xy is not None:
+            blk["x"] = float(from_xy[0])
+            blk["y"] = float(from_xy[1])
         pp_blocks = [to_pp_block(b) for b in layout]
         # ``build_pick`` 只从 cand 里取两样真东西：抓点 xy（这里不用 ——
         # ``grasp_at="block_center"``）与「候选离块心 ≤12 mm」的检查。

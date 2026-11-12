@@ -1533,7 +1533,14 @@ class Round:
         q = read_json(self.p("pre", "q_after_observe.json"))["q"]
         plan_dir = self.p("plan")
         os.makedirs(plan_dir, exist_ok=True)
-        all_plans, layout, idx = [], [dict(b) for b in layout_blocks], 0
+        # 抓点/邻块几何必须吃**本轮真正要抓的那份块位姿**：``--truth-source
+        # measured`` 时 ``truth`` 已被换成跑前 pick burst 实测（``_measured_truth``），
+        # 若这里还拿布局表的标称坐标喂 ``plan_sequence``，就是「量了不用」——
+        # 2026-11-12 S0:1 r1 attempt5 空夹（回读 0.0 mm）的根因：计划 meta 里
+        # ``e9.from_xy`` 是实测，而 IK 目标是标称，两者差 25 mm。
+        layout_src = truth["blocks"] if self.args.truth_source == "measured" \
+            else layout_blocks
+        all_plans, layout, idx = [], [dict(b) for b in layout_src], 0
         scenes = report.get("scenes") or []
         attempts = {str(a["id"]): a for a in
                     (scenes[0].get("attempts") if scenes else []) or []}
