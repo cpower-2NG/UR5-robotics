@@ -46,6 +46,10 @@ pkill -f 'ros2 launch yolo_bringup'
 > 多于 1 说明有孤儿（实测：整栈重启后 2026-11-05 的旧节点 PPID=1 还活着），两个同名节点抢同一个服务，
 > `programState` 查询会**随机时通时不通**，阶段 3 的前置闸门会因此拒跑（fail-closed，不会误发轨迹）。
 
+> ⚠️ **控制箱重新上电后先重连 dashboard**：栈没动过也会失联（TCP 随控制箱断，节点进程还在）。
+> `ros2 service call /dashboard_client/connect std_srvs/srv/Trigger "{}"`；不重连的话执行闸门读到的是
+> `Did not receive answer from dashboard server in time.(Configured timeout: 20 sec)`，整轮在发第一条轨迹前停（2026-11-12 实测）。
+>
 > ⚠️ **顺序别反**：拆栈会停掉示教器上的 `ur5ros.urp`。合法次序只有一条：
 > **起栈（驱动先监听）→ 示教器按 PLAY → 连接后把控制器拉回来 → 规划器才起**。
 > 没有驱动监听时按 PLAY，示教器直接「连接被拒绝」，程序停在 STOPPED（实测守 5 分钟也一样）。
@@ -290,3 +294,6 @@ python3 scripts/stage4_score.py --exit --need 3 <s0-*-r*/round.json ...>
 | 相机没数据、日志 30 秒刷 7 万行 | 有孤儿进程占着相机（`ros2 topic info --verbose` 看 Publishers，别信「话题还在」） |
 | burst 报 `TF 链缺 ['tool0:camera_link']` | 腕部 TF 发布者没起（`pgrep -af wrist_tf_publish`）；板上起 `~/stage4-entry/scripts/wrist_tf_publish.py`，`--verify` rc=0 再重拍 |
 | `programState` 时通时不通（`Failed to send request to dashboard server`） | `pgrep -cf dashboard_client` 是不是 >1 —— 孤儿与新节点同名抢服务（2026-11-06 实测） |
+| 控制箱**重新上电**后 `programState` 报 `Did not receive answer from dashboard server in time`（节点进程活着、`node list` 也有它） | dashboard_client 的 TCP 连接随控制箱断掉、不会自己重连。**不要重起整栈**：`ros2 service call /dashboard_client/connect std_srvs/srv/Trigger "{}"`，回 `success: True` 后 raw_request 立刻恢复（2026-11-12 实测） |
+| 抓帧等不到 TF，报缺整段 `base_link→…→tool0`（robot_state_publisher 进程在、ELAPSED 在涨） | 它的 **DDS 参与者**掉了：`ros2 topic info /tf` 的 publisher 数掉到 1（正常 2）。`bash ~/precision/restart_stack3.sh` 重起（会核对每个节点恰好一份）；这是机器人侧故障，**不是相机/参数问题**（2026-11-12 实测） |
+| 判分把示教器/台外杂物当成一块积木，「全桌终态」假红 | 真值工具的保留区是「本机位 zone 外扩 25 mm」（`truth_zone_for`，2026-11-12 改）；被喂整张台（x 到 0.80 m）时会把示教器当 42 mm 高的青块（785, 509 mm）。看 `--zone` 是否被改回大区 |

@@ -499,6 +499,12 @@ def main(argv=None):
                     help="拾取区外的检测也写进真值（默认丢掉，防止幻影变假障碍）")
     ap.add_argument("--keep-unknown", action="store_true",
                     help="保留 class=unknown 的簇（整簇无饱和像素，默认丢）")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="零块也照常写出真值并返 0：**干净的机位是合法结果**。"
+                         "跑后三机位用它 —— 否则「本机位没有块」会退化成"
+                         "「本机位没有证据」，整轮的全桌终态就少了一只眼"
+                         "（2026-11-12 S0:1 实测：free 机位空 ⇒ rc=2 ⇒ 被剔"
+                         "出溯源）。默认仍返 2，防止分割/相机整体坏掉时出假绿")
     ap.add_argument("--min-class-share", type=float, default=0.0,
                     help="颜色票占比下限（默认 0 = 不过滤）")
     ap.add_argument("--survey", action="store_true",
@@ -639,10 +645,12 @@ def main(argv=None):
                      b["meas"].get("yaw_source", "?"),
                      "" if "warn_h_mm" not in b
                      else "  ⚠ h−层高=%+.1f mm" % b["warn_h_mm"]))
-    if n == 0:
+    if n == 0 and not args.allow_empty:
         print("!! 一块都没量出来 —— 俯视里没有块，或分割/颜色表不对",
               file=sys.stderr)
         return 2
+    if n == 0:
+        print("（--allow-empty：本机位零块，按「干净机位」记）")
 
     text = json.dumps(truth, ensure_ascii=False, indent=2, sort_keys=True)
     if args.out:

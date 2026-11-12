@@ -108,8 +108,33 @@ R2_MARGIN_FRAC = 0.15        # R2 的按比例余量
 #: 跑前只拍 pick / pad 两个机位（S0 无清障、free 只在跑后拍）。
 PRE_VIEWS = tuple(v for v in cr.E9_VIEWS if v["name"] in ("pick", "pad"))
 
-#: 跑后三机位真值的保留区（base 系米）：覆盖拾取区 + 垫面 + 北侧自由区。
+#: 真值保留区的兜底值（只在 burst 目录名认不出机位时用）。正式轮每个机位
+#: 各用**自己 zone 外扩 25 mm** 的区，见 ``truth_zone_for``。
 TRUTH_ZONE = "0.20,0.80,-0.30,0.65"
+
+#: 机位 zone 的外扩量（米）。区外检测由真值工具按「幻影」丢掉（它自己的语义），
+#: 所以这份区必须只圈「本机位允许出现块的地方」。
+TRUTH_ZONE_MARGIN_M = 0.025
+
+
+def truth_zone_for(burst):
+    """按 burst 目录名（``wrist-pick`` / ``wrist-pad`` / ``wrist-free``）取保留区。
+
+    为什么不再用一张大区：2026-11-12 S0:1 r1 实测，自由区机位把**示教器**
+    当成一块 42 mm 高的青色块（785, 509 mm）——它在旧的大区（x ≤ 0.80）里，
+    块角只越出模型桌沿 0.3 mm，于是「全桌终态」判 0/5、整轮假红。真值工具
+    自己的语义是「区外 = 幻影，默认丢掉」，喂它整张台就等于把台外的东西也
+    当成块。丢块不会因此瞒过去：块数一致 / 被搬块逐块配对仍会报缺。
+    """
+    name = os.path.basename(os.path.normpath(burst))
+    if name.startswith("wrist-"):
+        name = name[len("wrist-"):]
+    for v in cr.E9_VIEWS:
+        if v["name"] == name:
+            x0, x1, y0, y1 = v["zone"]
+            m = TRUTH_ZONE_MARGIN_M
+            return "%.3f,%.3f,%.3f,%.3f" % (x0 - m, x1 + m, y0 - m, y1 + m)
+    return TRUTH_ZONE
 
 
 def log(*a):
@@ -710,9 +735,19 @@ def default_solve_pad(burst, out, min_frames=20, max_spread_mm=2.0,
                      "--max-spread-deg", str(float(max_spread_deg))])
 
 
-def default_truth_from_view(burst, out):
-    return tf.main(["--frame", burst, "--consensus", "--min-frames", "5",
-                    "--camera", "wrist", "--zone", TRUTH_ZONE, "--out", out])
+def default_truth_from_view(burst, out, allow_empty=False):
+    """量一个机位的真值。
+
+    ``allow_empty`` 只给**跑后三机位**用：干净的机位（该区域确实没有块）是
+    合法结果，不能退化成「没有证据」被剔出溯源。跑前 pick 机位不传它 ——
+    那里本来就必须有块，零块就是分割/相机坏了，该红。
+    """
+    argv = ["--frame", burst, "--consensus", "--min-frames", "5",
+            "--camera", "wrist", "--zone", truth_zone_for(burst),
+            "--out", out]
+    if allow_empty:
+        argv.append("--allow-empty")
+    return tf.main(argv)
 
 
 def default_measure_colour(burst, xy_mm, top_z, expect_class, hue_deg,
@@ -1395,12 +1430,24 @@ class Round:
         colour_dir = self.p("colour")
         os.makedirs(colour_dir, exist_ok=True)
 
+        # 判分与计划必须读**同一份**实测垫位姿：`--from score` 是设计里允许的
+        # 单步重跑，那个进程没跑过 compute，``cm`` 还停在模型常量（与印刷垫差
+        # 87.5 mm / 88.7°，台账第 295 轮）。2026-11-12 S0:1 r1 实测：彩色量
+        # 用模型格心开窗 ⇒ 5 块里 3 块「窗内没看见彩色块」、2 块量到邻块。
+        # 所以这里自己装一遍（幂等，全流程跑下来也不吃亏）。
+        grid_path = self.p("grid-pre.json")
+        if not os.path.exists(grid_path):
+            raise RoundError(EXIT_MISSING, "score",
+                             "缺 %s —— 判分用的垫位姿与计划必须是同一份"
+                             % grid_path)
+        self._apply_pad(read_json(grid_path), grid_path)
+
         # 跑后三机位真值（缺一个就缺，不拿默认值补）
         view_truth = []
         for v in cr.E9_VIEWS:
             out = self.p("truth", v["name"] + ".json")
             burst = self.p("post", "wrist-" + v["name"])
-            rc = self.deps["truth_from_view"](burst, out)
+            rc = self.deps["truth_from_view"](burst, out, allow_empty=True)
             if rc == 0 and os.path.exists(out):
                 view_truth.append((v["name"], out))
                 log("  跑后真值 %-5s：%s" % (v["name"], out))
@@ -1492,8 +1539,12 @@ class Round:
         write_json(facts_path, facts)
 
         # round.json
-        argv = ["--manifest"] + [self.p("plan", "manifest-%s.json" % t)
-                                 for t in ids]
+        # --manifest 是 action="append"：每个文件都要带一次自己的开关。
+        # 写成 ["--manifest", p1, p2, ...] 时 argparse 只认第一个参数，其余全
+        # 落进 unrecognized（2026-11-12 S0:1 r1 判分就是这么炸的）。
+        argv = []
+        for t in ids:
+            argv += ["--manifest", self.p("plan", "manifest-%s.json" % t)]
         argv += ["--facts", facts_path,
                  "--exec-log", self.p("exec"),
                  "--pad", self.p("grid-pre.json"),

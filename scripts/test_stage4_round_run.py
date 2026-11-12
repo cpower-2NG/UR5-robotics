@@ -621,7 +621,11 @@ def fake_solve_pad_writer():
     return f
 
 
-def fake_truth(burst, out):
+TRUTH_CALLS = []
+
+
+def fake_truth(burst, out, allow_empty=False):
+    TRUTH_CALLS.append((burst, allow_empty))
     with open(out, "w") as f:
         json.dump({"blocks": []}, f)
     return 0
@@ -654,9 +658,10 @@ def base_deps(**over):
 
 def run(td, board, deps=None, **over):
     write_expect(td)
-    global PLAN_CALLS, DEVIATION_CALLS
+    global PLAN_CALLS, DEVIATION_CALLS, TRUTH_CALLS
     PLAN_CALLS = []
     DEVIATION_CALLS = []
+    TRUTH_CALLS = []
     undo = patched(deps)
     try:
         args = make_args(td, **over)
@@ -748,6 +753,15 @@ with tempfile.TemporaryDirectory() as td:
           and "--truth" in DEVIATION_CALLS[0]
           and DEVIATION_CALLS[0][DEVIATION_CALLS[0].index("--out") + 1]
           .endswith("placement-deviation.json"), repr(DEVIATION_CALLS))
+    # 2026-11-12 S0:1 r1：free 机位本来就没块，真值工具零块 ⇒ rc=2 ⇒ 该机位
+    # 被当「缺证据」剔出溯源，「全桌终态」只剩 pad 一只眼。跑后三机位必须允许空；
+    # 跑前 pick 不允许空（那里必须有块，零块就是分割/相机坏了）。
+    post = [c for c in TRUTH_CALLS if "/post/" in c[0]]
+    pre = [c for c in TRUTH_CALLS if "/pre/" in c[0]]
+    check("跑后三机位真值都带 allow_empty（干净的机位也是证据）",
+          len(post) == 3 and all(a for _b, a in post), repr(TRUTH_CALLS))
+    check("跑前 pick 真值不允许空（零块就是坏，不许静默）",
+          len(pre) == 1 and pre[0][1] is False, repr(TRUTH_CALLS))
 
 # ---- C3 R1 不足
 with tempfile.TemporaryDirectory() as td:
@@ -1066,6 +1080,100 @@ with tempfile.TemporaryDirectory() as td:
           not os.path.exists(os.path.join(td, "run", "bias_estimate.json")))
     check("|b̂|>15 mm 仍能完成判分（失败分类交给 round_report）", rc == 0,
           repr(rc))
+
+# ---- C13 --from score 单步重跑：判分必须装**同一份**实测垫（不是模型常量）
+# 2026-11-12 真机 S0:1 r1：执行段炸在最后一张 pad 照片上，用 --from score 重跑
+# 判分时进程没跑过 compute，cm 还在模型常量（与印刷垫差 87.5 mm / 88.7°）——
+# 彩色量按模型格心开窗，5 块里 3 块「窗内没看见彩色块」、2 块量到邻块。
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    rc_a, _, rd_a = run(td, b)
+    # 把本轮 grid-pre.json 换成一份**与模型常量不同**的实测垫（真机就是这样：
+    # 2026-11-12 实测中心 471.94, −157.6 mm / −91.623°，模型是 424.2, −112.24
+    # mm / −179.778°）。pad_ok 是测试夹具，恰好等于模型常量，所以必须换。
+    alt = dict(pad_ok, grid_center_base_mm=[471.94, -157.6],
+               grid_yaw_base_deg=-91.623)
+    gp = rd_a.p("grid-pre.json")
+    with open(gp, "w") as f:
+        json.dump(alt, f)
+    model = {c: [v * 1000.0 for v in cm.cell_center(c)] for c in (8, 6, 4, 2, 0)}
+    cm.load_grid(gp)
+    want = {c: [v * 1000.0 for v in cm.cell_center(c)] for c in (8, 6, 4, 2, 0)}
+    cm.reset_pad()
+    seen_score = []
+
+    def rec_score(burst, xy_mm, top_z, expect_class, hue_deg, search_mm):
+        seen_score.append(list(xy_mm))
+        return {"ok": True, "xy_mm": [xy_mm[0] + 1.0, xy_mm[1] + 0.5],
+                "hue_deg": 30.0, "n_frames": 8, "n_missed": 0}
+
+    rc_b, out_b, rd_b = run(td, b, deps={"measure_colour": rec_score},
+                            from_="score", to="score")
+    check("--from score：rc 0（判分可单步重跑）", rc_b == 0, repr((rc_b, out_b[-300:])))
+    check("--from score：开窗 = grid-pre.json 的格心（同一份实测垫）",
+          len(seen_score) == 5 and all(
+              abs(s[0] - want[c][0]) < 1e-6 and abs(s[1] - want[c][1]) < 1e-6
+              for s, c in zip(seen_score, (8, 6, 4, 2, 0))),
+          repr((seen_score, want)))
+    check("--from score：开窗**不是**模型常量格心（回归：曾整盘错 87 mm）",
+          all(any(abs(s[j] - model[c][j]) > 20.0 for j in (0, 1))
+              for s, c in zip(seen_score, (8, 6, 4, 2, 0))),
+          repr((seen_score, model)))
+
+# ---- C14 round_report 的 --manifest 必须逐份带开关（action="append"）
+# 2026-11-12 真机 S0:1 r1：写成 ["--manifest", p1, p2, ...] ⇒ argparse 只认
+# 第一个，其余全落 unrecognized，判分整段 rc=2。
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    seen_argv = []
+
+    def rec_report(argv):
+        seen_argv.append(list(argv))
+        return 0
+
+    rc, out, rd = run(td, b, deps={"round_report": rec_report})
+    argv = seen_argv[0] if seen_argv else []
+    n_flag = argv.count("--manifest")
+    man_paths = [argv[i + 1] for i, a in enumerate(argv[:-1])
+                 if a == "--manifest"]
+    check("round_report：5 份 manifest 各带一次 --manifest",
+          n_flag == 5 and all(os.path.exists(p) for p in man_paths),
+          repr((n_flag, man_paths)))
+    check("round_report：--manifest 后不跟别人的参数（旧写法会吞 4 份）",
+          rc == 0 and len(set(man_paths)) == 5, repr(rc))
+
+# ---- C15 真值保留区按机位取（不喂整张台）
+# 2026-11-12 真机 S0:1 r1：自由区机位把示教器当成一块 42 mm 高的青色块
+# （785, 509 mm），旧大区（x ≤ 0.80）放它进来 ⇒ 全桌终态假红。
+z_free = r.truth_zone_for("/x/post/wrist-free")
+z_pick = r.truth_zone_for("/x/pre/wrist-pick")
+check("保留区：free = 本机位 zone 外扩 25 mm",
+      z_free == "0.255,0.775,0.435,0.645", z_free)
+check("保留区：pick = 本机位 zone 外扩 25 mm",
+      z_pick == "0.225,0.600,0.145,0.445", z_pick)
+check("保留区：示教器幻影点 (785, 509) mm 在 free 区外",
+      not (0.255 <= 0.7847 <= 0.775 and 0.435 <= 0.5094 <= 0.645))
+check("保留区：认不出机位 ⇒ 兜底大区（不猜）",
+      r.truth_zone_for("/x/nope") == r.TRUTH_ZONE)
+
+_tf_calls = []
+_orig_tf_main = r.tf.main
+r.tf.main = lambda argv: _tf_calls.append(list(argv)) or 0
+try:
+    r.default_truth_from_view("/x/post/wrist-pad", "/tmp/o.json")
+    r.default_truth_from_view("/x/post/wrist-pad", "/tmp/o.json",
+                              allow_empty=True)
+    r.default_truth_from_view("/x/pre/wrist-pick", "/tmp/o.json")
+finally:
+    r.tf.main = _orig_tf_main
+_z = (_tf_calls[0][_tf_calls[0].index("--zone") + 1]
+      if _tf_calls and "--zone" in _tf_calls[0] else None)
+check("default_truth_from_view 把机位区传给真值工具",
+      _z == r.truth_zone_for("/x/post/wrist-pad"), repr((_z, _tf_calls)))
+check("allow_empty 才加 --allow-empty（默认不加）",
+      "--allow-empty" not in _tf_calls[0]
+      and "--allow-empty" in _tf_calls[1]
+      and "--allow-empty" not in _tf_calls[2], repr(_tf_calls))
 
 # =====================================================================
 print()
