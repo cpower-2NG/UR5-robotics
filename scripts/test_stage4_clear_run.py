@@ -803,6 +803,63 @@ def section_step_cap():
         pp.MAX_JOINT_STEP_DEG = real_cap
 
 
+def section_seed_propagation():
+    print('\n[4e] IK 沿链传种子：独立播种漏解 ⇒ 用上一航点候选当种子补解')
+    rad = math.radians
+
+    def q_at(deg0):
+        q = [0.0] * 6
+        q[0] = rad(deg0)
+        return np.asarray(q, float)
+
+    ok_guard = lambda qa, qb: (True, 0.0)                 # noqa: E731
+    tgt = [('w1', (0.0, 0.0, 'w1')), ('w2', (0.0, 0.0, 'w2'))]
+    # 链起点 = 全 0；w1 只有 60° 一支；w2 的近支是 80°（距 w1 20°），
+    # 独立播种只采到 240° 的那支（距 w1 180°，超 170° 上限）。
+    a, near, far = q_at(60.0), q_at(80.0), q_at(240.0)
+    real_ik = pp.ik_candidates
+
+    def factory(mode):
+        calls = []
+
+        def fake(chain, xyz, yaw_deg=0.0, seeds=None, n_random=0):
+            sl = [np.asarray(s, float) for s in (seeds or [])]
+            calls.append((xyz[2], sl))
+            if xyz[2] == 'w1':
+                return [a]
+            has_a = any(np.allclose(s, a) for s in sl)
+            if mode == 'ok' or (mode == 'defect' and has_a):
+                return [near]
+            return [far]
+
+        return fake, calls
+
+    try:
+        fake, calls = factory('defect')
+        pp.ik_candidates = fake
+        path = pp.solve_path(None, tgt, [0.0] * 6, guard=ok_guard)
+        check('独立播种只采到 180° 时，沿链传种子找到 80°（距 w1 仅 20°）近支',
+              np.allclose(path[-1], near), str(np.degrees(path[-1])))
+        w2 = [s for n, s in calls if n == 'w2']
+        check('第二个航点解了两遍，第二遍的种子里带着上一航点的候选',
+              len(w2) == 2 and any(np.allclose(s, a) for s in w2[1]),
+              [len(s) for s in w2])
+
+        fake, calls = factory('ok')
+        pp.ik_candidates = fake
+        path = pp.solve_path(None, tgt, [0.0] * 6, guard=ok_guard)
+        check('第一遍能过 ⇒ 每个航点只解一遍（不白跑传播）',
+              len(calls) == 2, len(calls))
+
+        fake, calls = factory('hopeless')
+        pp.ik_candidates = fake
+        ok, err = raises(pp.solve_path, None, tgt, [0.0] * 6, guard=ok_guard)
+        check('两遍都过不了 ⇒ 仍按分支链拒绝（不静默放行）',
+              ok and '单步' in err, err)
+    finally:
+        pp.ik_candidates = real_ik
+
+
 def section_place_yaw_equiv():
     print('\n[4c] 放置朝向 180° 等价兜底：只对 BranchChainError 生效')
     truth, att = tower_truth(), tower_attempt()
@@ -1598,7 +1655,8 @@ def main():
     print('=' * 68)
     for fn in (section_yaw, section_surface, section_actions, section_bias,
                section_plans, section_multitarget,
-               section_step_cap, section_place_yaw_equiv, section_from_xy,
+               section_step_cap, section_seed_propagation,
+               section_place_yaw_equiv, section_from_xy,
                section_gap, section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
                section_align, section_view_gate, section_finish):

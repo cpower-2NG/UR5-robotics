@@ -586,16 +586,15 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
     （2026-11-09 E9 第 2 场实测：链里出现 309° / 201° 的单关节跳变，末段
     ``survey_place`` 上真机后被控制器中止 status=6）。超过上限的转移一律不走；
     整条链都过不了 ⇒ ``BranchChainError``（fail-closed，宁可不写计划也不发怪姿态）。
+
+    **沿链传种子（泛化性，2026-11-12）**：数值 IK 是局部收敛的，而候选集原先对
+    每个航点都只从链起点播种 —— 后段航点与前一航点同支的近解**常常根本没被采到**。
+    S0:1 attempt6 块 4 就是被这一点判死的：抬升位姿的近支只差 20.3°，候选里最近的
+    却是 180.0°（>170° 上限）。所以第一遍独立播种失败时，第二遍把**上一航点的候选**
+    当种子传下去再解一次；正常能过的场景第一遍就返回，行为逐字节不变。
     """
     if max_step_deg is None:            # 运行时读，便于自检/复现时改档对比
         max_step_deg = MAX_JOINT_STEP_DEG
-    sets = [ik_candidates(chain, xyz,
-                          yaw_deg if yaws is None else yaws[i],
-                          seeds=[q_start], n_random=n_random)
-            for i, (name, xyz) in enumerate(targets)]
-    empty = [name for (name, _), s in zip(targets, sets) if not s]
-    if empty:
-        raise PlanError("这些航点连一支合格 IK 解都没有：%s" % "、".join(empty))
 
     def _guard(qa, qb):
         if guard is not None:
@@ -606,39 +605,63 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
         return (max_step_deg is None
                 or max_joint_step_deg(qa, qb) <= float(max_step_deg))
 
-    INF = float("inf")
-    cost = [[INF] * len(s) for s in sets]
-    prev = [[None] * len(s) for s in sets]
-    for j, q in enumerate(sets[0]):
-        ok, _ = _guard(q_start, q)
-        if ok and _step_ok(q_start, q):
-            cost[0][j] = travel_cost(q, q_start)
-    for i in range(1, len(sets)):
-        for j, q in enumerate(sets[i]):
-            for k, qp in enumerate(sets[i - 1]):
-                if not np.isfinite(cost[i - 1][k]):
-                    continue
-                ok, _ = _guard(qp, q)
-                if not ok or not _step_ok(qp, q):
-                    continue
-                c = cost[i - 1][k] + travel_cost(q, qp)
-                if c < cost[i][j]:
-                    cost[i][j] = c
-                    prev[i][j] = k
-    ends = [(c, j) for j, c in enumerate(cost[-1]) if np.isfinite(c)]
-    if not ends:
-        raise BranchChainError(
-            "这些航点的所有 IK 分支组合都过不了高度护栏或单步 %.0f° 上限"
-            "（同一末端位姿换分支会要求先原地转半圈）：%s"
-            % (float(max_step_deg or 0.0),
-               "、".join(name for name, _ in targets)))
-    _, j = min(ends)
-    path = []
-    for i in range(len(sets) - 1, -1, -1):
-        path.append(sets[i][j])
-        j = prev[i][j]
-    path.reverse()
-    return path
+    def _yaw(i):
+        return yaw_deg if yaws is None else yaws[i]
+
+    def _solve(sets):
+        empty = [name for (name, _), s in zip(targets, sets) if not s]
+        if empty:
+            raise PlanError("这些航点连一支合格 IK 解都没有：%s"
+                            % "、".join(empty))
+        INF = float("inf")
+        cost = [[INF] * len(s) for s in sets]
+        prev = [[None] * len(s) for s in sets]
+        for j, q in enumerate(sets[0]):
+            ok, _ = _guard(q_start, q)
+            if ok and _step_ok(q_start, q):
+                cost[0][j] = travel_cost(q, q_start)
+        for i in range(1, len(sets)):
+            for j, q in enumerate(sets[i]):
+                for k, qp in enumerate(sets[i - 1]):
+                    if not np.isfinite(cost[i - 1][k]):
+                        continue
+                    ok, _ = _guard(qp, q)
+                    if not ok or not _step_ok(qp, q):
+                        continue
+                    c = cost[i - 1][k] + travel_cost(q, qp)
+                    if c < cost[i][j]:
+                        cost[i][j] = c
+                        prev[i][j] = k
+        ends = [(c, j) for j, c in enumerate(cost[-1]) if np.isfinite(c)]
+        if not ends:
+            raise BranchChainError(
+                "这些航点的所有 IK 分支组合都过不了高度护栏或单步 %.0f° 上限"
+                "（同一末端位姿换分支会要求先原地转半圈）：%s"
+                % (float(max_step_deg or 0.0),
+                   "、".join(name for name, _ in targets)))
+        _, j = min(ends)
+        path = []
+        for i in range(len(sets) - 1, -1, -1):
+            path.append(sets[i][j])
+            j = prev[i][j]
+        path.reverse()
+        return path
+
+    sets = [ik_candidates(chain, xyz, _yaw(i), seeds=[q_start],
+                          n_random=n_random)
+            for i, (name, xyz) in enumerate(targets)]
+    try:
+        return _solve(sets)
+    except BranchChainError as first_err:
+        sets2 = [sets[0]]           # 第 1 点种子相同 ⇒ 结果相同，不重算
+        for i in range(1, len(targets)):
+            sets2.append(ik_candidates(chain, targets[i][1], _yaw(i),
+                                       seeds=[q_start] + list(sets2[i - 1]),
+                                       n_random=n_random))
+        try:
+            return _solve(sets2)
+        except BranchChainError:
+            raise first_err
 
 
 def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
