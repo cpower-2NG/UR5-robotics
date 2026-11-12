@@ -639,8 +639,15 @@ TRUTH_CALLS = []
 
 def fake_truth(burst, out, allow_empty=False):
     TRUTH_CALLS.append((burst, allow_empty))
+    # 跑前 pick burst 现在喂**实测抓点**（``--truth-source measured``）：
+    # 返回与布局表一一对应的块（偏移 0），否则计算段会按「量不出块」停轮。
+    blocks = []
+    if not allow_empty:
+        blocks = [{"id": b["id"], "color": b["color"], "x": b["x"],
+                   "y": b["y"], "yaw": b["yaw"], "size": b["size"],
+                   "top": b["top"]} for b in lay.layout_blocks("S0", 1)]
     with open(out, "w") as f:
-        json.dump({"blocks": []}, f)
+        json.dump({"blocks": blocks}, f)
     return 0
 
 

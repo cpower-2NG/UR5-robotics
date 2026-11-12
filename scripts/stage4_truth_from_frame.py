@@ -73,6 +73,7 @@ import json
 import math
 import os
 import sys
+import time
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -333,6 +334,25 @@ def measure_dir(frame_dir, index=None, split=True, yaw_method="colour",
     return frame, rows, table_z
 
 
+def _measure_index(job):
+    """进程池的一帧任务：量一帧 → 单帧真值。
+
+    顶层函数（不是闭包/方法）才可被 ``ProcessPoolExecutor`` pickle 过去。
+    参数是一个 dict，省得加参数时要同步改签名两侧。
+    """
+    kw = job
+    fr, rows, _ = measure_dir(kw["frame_dir"], index=kw["index"],
+                              split=kw["split"], yaw_method=kw["yaw_method"],
+                              camera=kw["camera"])
+    return build_truth(rows, fr, table_top=kw["table_top"],
+                       block_size=kw["block_size"],
+                       batch=kw["batch"], index=kw["index"],
+                       keep_outside=True,
+                       drop_unknown=kw["drop_unknown"],
+                       min_class_share=kw["min_class_share"],
+                       layers=kw["layers"], zone_m=kw["zone"])
+
+
 def _median(vals):
     v = sorted(vals)
     n = len(v)
@@ -511,6 +531,9 @@ def main(argv=None):
                     help="逐帧各量一遍，只打印稳定性，不写真值")
     ap.add_argument("--consensus", action="store_true",
                     help="每帧各量一遍再按位置聚类合并（抗单帧漏块/裂块/幻影）")
+    ap.add_argument("--jobs", type=int, default=None, metavar="N",
+                    help="--consensus 逐帧量测的并行进程数（默认 min(CPU, 帧数)；"
+                         "1 = 串行，用于对照/调试）")
     ap.add_argument("--min-frames", type=int, default=None,
                     help="共识要求至少出现的帧数（默认 max(3, ⌈n/2⌉)）")
     ap.add_argument("--cluster-mm", type=float, default=20.0,
@@ -576,23 +599,38 @@ def main(argv=None):
 
     if args.consensus:
         idxs = gc.list_frame_indices(args.frame)
-        truths = []
+        batch = os.path.basename(args.frame.rstrip("/"))
         # 逐帧**先不按区筛**：贴边界的块会因单帧噪声在区内/区外来回跳，
         # 先筛会把同一块在不同帧切掉 ⇒ 出现帧数虚低。区的判定留到合并之后，
         # 用中位位置判一次。
-        for i in idxs:
-            fr, rows_i, _ = measure_dir(args.frame, index=i,
-                                        split=not args.no_split,
-                                        yaw_method=yaw_method,
-                                        camera=args.camera)
-            truths.append(build_truth(
-                rows_i, fr, table_top=args.table_top,
-                block_size=args.block_size,
-                batch=os.path.basename(args.frame.rstrip("/")), index=i,
-                keep_outside=True,
-                drop_unknown=not args.keep_unknown,
-                min_class_share=args.min_class_share,
-                layers=not args.no_layers, zone_m=zone))
+        #
+        # 每帧互相独立（只读各自 PNG + tf json），所以丢进程池并行。2026-11-12
+        # 实测 20 帧单进程 30.4 s（串行、只吃 1 核，本机 16 核闲着）—— 这是
+        # 整轮里最容易拿回来的一段。``--jobs 1`` 保留串行路径做对照。
+        jobs = {k: v for k, v in (
+            ("frame_dir", args.frame), ("split", not args.no_split),
+            ("yaw_method", yaw_method), ("camera", args.camera),
+            ("table_top", args.table_top), ("block_size", args.block_size),
+            ("batch", batch), ("drop_unknown", not args.keep_unknown),
+            ("min_class_share", args.min_class_share),
+            ("layers", not args.no_layers), ("zone", zone))}
+        tasks = [dict(jobs, index=i) for i in idxs]
+        n_jobs = args.jobs
+        if n_jobs is None:
+            n_jobs = min(len(tasks), os.cpu_count() or 1)
+        n_jobs = max(1, min(n_jobs, len(tasks) or 1))
+        t0 = time.time()
+        if n_jobs == 1 or len(tasks) <= 1:
+            truths = [_measure_index(t) for t in tasks]
+        else:
+            import concurrent.futures as cf
+            with cf.ProcessPoolExecutor(max_workers=n_jobs) as ex:
+                # map 保序：共识里 frames 集合用枚举下标，顺序变了不影响结果，
+                # 但首帧元数据（batch/index/zone）取自 truths[0]，保序更直观。
+                truths = list(ex.map(_measure_index, tasks))
+        print("逐帧量测 %d 帧 / %d 进程：%.1f s（串行时约 %.1f s）"
+              % (len(tasks), n_jobs, time.time() - t0,
+                 (time.time() - t0) * n_jobs if n_jobs > 1 else 0.0))
         truth = consensus(truths, radius_m=args.cluster_mm / 1000.0,
                           min_frames=args.min_frames)
         if not args.keep_outside:

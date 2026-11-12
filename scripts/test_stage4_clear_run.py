@@ -1354,6 +1354,43 @@ def section_align():
     check('不给对中/偏心目录 ⇒ 老行为（不切开、不拍俯视）',
           '--upto lift' not in txt2 and '--camera topcam' not in txt2)
 
+    # ---- 6b) 相邻计划合并成**一个** precision_exec 进程（2026-11-12）
+    seq = [{'name': '10-target-0.json', 'kind': 'target'},
+           {'name': '11-target-1.json', 'kind': 'target'},
+           {'name': '12-target-2.json', 'kind': 'target'},
+           {'name': '13-view-pick.json', 'kind': 'view', 'view': 'pick'},
+           {'name': '14-view-pad.json', 'kind': 'view', 'view': 'pad'},
+           {'name': '15-view-free.json', 'kind': 'view', 'view': 'free'}]
+    txt3 = cr.run_script_text(seq, '$BD', '$LD',
+                              burst_dirs={'pick': '$W/pick', 'pad': '$W/pad',
+                                          'free': '$W/free'})
+    ex = [ln for ln in txt3.splitlines() if 'precision_exec.py' in ln]
+    check('三份相邻目标计划合成一次 exec',
+          len(ex) == 4 and ex[0] == (
+              '~/precision/run.sh ~/precision/precision_exec.py '
+              '--plan $BD/10-target-0.json $BD/11-target-1.json '
+              '$BD/12-target-2.json --go --require-auth "$TOKEN" '
+              '--log-dir $LD'), str(ex))
+    check('机位计划不许合并（每份跑完就地拍 burst，所以各占一个进程）',
+          all(ln.count('--plan ') == 1 and '--log $LD/' in ln
+              for ln in ex[1:]), str(ex[1:]))
+    check('合并组的失败提示点名整组（run.sh 只认 rc）',
+          '|| fail "10-target-0.json 11-target-1.json 12-target-2.json '
+          'rc=$rc"' in txt3, txt3[-400:])
+    i_exec_pick = txt3.index('--plan $BD/13-view-pick.json')
+    check('机位 burst 紧跟它自己的 exec（中间不插别的计划）',
+          i_exec_pick < txt3.index('--camera wrist --burst 20 $W/pick')
+          < txt3.index('--plan $BD/14-view-pad.json'), txt3[-600:])
+    # 切开的目标计划**不与邻居合并**（切口必须留在两段之间）
+    txt4 = cr.run_script_text(
+        [{'name': '20-target-0.json', 'kind': 'target'},
+         {'name': '21-target-1.json', 'kind': 'target'}],
+        '$BD', '$LD', held_burst_dir='$T/held')
+    ex4 = [ln for ln in txt4.splitlines() if 'precision_exec.py' in ln]
+    check('被切开的目标计划各占独立进程（--upto / --from 两条）',
+          len(ex4) == 4 and sum('--upto lift' in ln for ln in ex4) == 2
+          and sum('--from to_slot' in ln for ln in ex4) == 2, str(ex4))
+
     # ---- 7) align_plan_main 端到端（写 json + sh）
     rep = tempfile.mkdtemp(prefix='cr-align-main-')
     tp = _write_json(rep, 'truth.json', tower_truth())

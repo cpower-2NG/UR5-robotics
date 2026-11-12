@@ -17,9 +17,18 @@
 2. 12 键的链**必须到齐**才算抓帧成功。capture_live.py 超时后仍会写出半条链的帧，
    下游只能报一个看不懂的 KeyError；这里直接非 0 退出并说清缺哪一帧。
 3. 写出的 `meta.json` 里带图像的时间戳与 frame_id —— 帧与 TF 必须是同一时刻的量。
-4. 关节角存一小段历史，写盘时挑**与图像时间戳最近**的那一条。臂在动时图像与
+4. 关节角存一小段历史，写盘时**插值到图像时间戳**上。臂在动时图像与
    `/joint_states` 各有几十到上百毫秒延迟（实测差过 140.5 ms），直接拿「最新的」
    会把这段时差算成手臂链的位姿误差。残差写进 `joint_states.json` 的 `gap_ms`。
+5. **常驻自旋 + 全链按时间戳配对**（2026-11-12 第 321 轮实测后改）。旧实现在写盘
+   （每帧几百毫秒）期间完全不 spin，`wait_one()` 又靠旧状态立刻返回 ⇒ 订阅队列
+   一次都没排空过：同一组 burst 里 TF↔图像时间差从 +42 ms 线性恶化到 −1793 ms，
+   彩色与深度也常常差**一整帧**（0 / ±33.36 ms 各半）。现在：
+     · 自旋在独立线程里常驻，回调只做 append（图像 QoS depth=1，只要最新）；
+     · 每帧取「比上一帧新」的彩色，深度/内参/动态 TF 全部按**时间戳挑最近的**，
+       差量写进 `meta_*.json`；配不上（> 40 ms 深度、> 250 ms TF）或动态 TF 流
+       断了（最近的 `/tf` 已 > 500 ms 前）⇒ 这一帧判失败，不写半成品。
+   `tf_*.json` 的 `origin` 字段仍标明每帧来自 `/tf` 还是 `/tf_static`。
 
 用法：
   python3 precision_capture.py /tmp/frame-01
@@ -42,6 +51,7 @@ import collections
 import json
 import os
 import sys
+import threading
 import time
 
 sys.dont_write_bytecode = True
@@ -83,6 +93,22 @@ TOPCAM_TOPICS = {
     "info": ("/topcam/color/camera_info", "CameraInfo"),
 }
 JOINT_STATE_TOPIC = ("/joint_states", "JointState")
+
+#: 图像订阅的队列深度。**1**：只要最新一帧。实测（第 321 轮）旧值 10 会让
+#: 「排空队列」变成处理一串旧帧；帧率 15 Hz 时积压 10 帧就是 0.67 s 的时差。
+IMAGE_QOS_DEPTH = 1
+
+#: 彩色与深度/内参按时间戳配对时允许的最大时差（毫秒）。相机一帧 66.7 ms，
+#: 实测「取最新」的偏差恰好是 0 / ±33.357 ms —— 也就是**差了一帧**。
+MATCH_TOL_MS = 40.0
+
+#: 动态 TF 与图像时间戳之间的最大允许时差（毫秒）。实测抖动只有几毫秒，
+#: 250 ms 远在之上；而第 321 轮那种积压是 1793 ms，会被这条挡住。
+TF_MATCH_TOL_MS = 250.0
+
+#: 动态 TF 流本身的鲜度上限（毫秒）：最近的 /tf 帧比现在旧这么多 ⇒ 流断了。
+#: 第 320 轮跑后 pad burst 就栽在这里（整条链消失却先写了几帧）。
+TF_STREAM_MAX_AGE_MS = 500.0
 
 CAMERAS = {
     "wrist": {
@@ -128,6 +154,76 @@ def joints_at(hist, stamp):
     return list(m.name), [float(v) for v in m.position], abs(t - stamp) / 1e6, False
 
 
+def nearest(hist, stamp):
+    """``hist`` 里时间戳离 ``stamp`` 最近的一条 → ``(|Δ|ns, stamp_ns, obj)``。
+
+    ``hist`` 的元素是 ``(stamp_ns, obj)``。空表返回 None。
+    """
+    best = None
+    for t, obj in hist:
+        d = abs(t - stamp)
+        if best is None or d < best[0]:
+            best = (d, t, obj)
+    return best
+
+
+def match(hist, stamp, tol_ms, wait_s=0.2, sleep=time.sleep):
+    """按时间戳配对：先等一个**完全相同**的戳，等不到再退到最近的一条。
+
+    超过 ``tol_ms`` 视为配不上（返回 None）—— 宁可报错，也不拿另一帧的数据
+    冒充这一帧的。2026-11-12 实测：旧实现取「最新」，color↔depth 的时差是
+    0 / ±33.357 ms 各占一半，差的正好是**另一帧**（相机 66.7 ms 一帧）。
+    """
+    deadline = time.monotonic() + wait_s
+    while True:
+        hit = nearest(hist, stamp)
+        if hit is not None and hit[0] == 0:
+            return hit
+        if time.monotonic() >= deadline:
+            if hit is None:
+                return None
+            return hit if hit[0] <= tol_ms * 1e6 else None
+        sleep(0.01)
+
+
+def pick_chain(chain_keys, tf_static, tf_dyn, color_stamp, now_ns):
+    """按图像时间戳取整条链：静态取最新，动态取**离图像最近**的那一帧。
+
+    ``tf_static`` 是 ``{key: transform}``；``tf_dyn`` 是 ``{key: [(stamp, tf)]}``。
+
+    返回 ``(trans, origin, deltas_ms, why)``：
+      · 成功 ⇒ ``deltas_ms`` 是每个动态帧相对图像的时间差（可为空）；
+      · 缺链 / 动态帧配不上 / 动态流断了 ⇒ ``trans is None``，``why`` 说明原因。
+    """
+    trans, origin, deltas, miss = {}, {}, [], []
+    for key in chain_keys:
+        hist = tf_dyn.get(key)
+        if hist:
+            d, t, tf = nearest(hist, color_stamp)
+            if d > TF_MATCH_TOL_MS * 1e6:
+                return None, None, None, (
+                    "动态 TF 与图像配不上：%s 差 %.0f ms（上限 %.0f）"
+                    % (key, (t - color_stamp) / 1e6, TF_MATCH_TOL_MS))
+            trans[key] = tf
+            origin[key] = "tf"
+            deltas.append((t - color_stamp) / 1e6)
+        elif key in tf_static:
+            trans[key] = tf_static[key]
+            origin[key] = "tf_static"
+        else:
+            miss.append(key)
+    if miss:
+        return None, None, None, "TF 链缺 %s" % miss
+    # 动态 TF 流本身必须还活着（第 320 轮：流断了，旧帧还在缓冲里，照写不误）。
+    ages = [(now_ns - hist[-1][0]) / 1e6
+            for hist in (tf_dyn.get(k) for k in chain_keys) if hist]
+    if ages and max(ages) > TF_STREAM_MAX_AGE_MS:
+        return None, None, None, (
+            "动态 TF 流断了：最近一帧已是 %.0f ms 前（上限 %.0f）"
+            % (max(ages), TF_STREAM_MAX_AGE_MS))
+    return trans, origin, sorted(deltas), None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out", help="帧目录（会新建）")
@@ -170,70 +266,106 @@ def main():
 
     rclpy.init()
     node = Node("precision_capture")
-    got = {}
-    tf_acc = {"tf": {}, "tf_static": {}}
-    chain = {}            # 相机链的键，跨 /tf 与 /tf_static 合并
-    chain_origin = {}
-    qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+
+    # ---------------------------------------------------------------- 采集缓冲
+    # 回调只把消息塞进缓冲，处理全在主线程 —— 但**自旋在独立线程里常驻**。
+    #
+    # 2026-11-12 第 321 轮实测：旧实现只在 `wait_one()` 里 spin_once，而 PNG 写盘
+    # （1280×720 彩色 + 深度，每帧几百毫秒）期间**完全不 spin**，`wait_one()` 又
+    # 靠旧状态立刻返回 ⇒ 订阅队列一次都没被排空过。同一组 burst 里 TF↔图像时间差
+    # 从 +42 ms 线性恶化到 −1793 ms（每帧正好一个抓帧周期），队列里全是旧帧。
+    # 臂静止时旧 TF 仍然是对的（所以没出过事），但「帧 / 关节 / TF 是同一时刻」
+    # 这个前提已经破了。常驻自旋之后，缓冲里永远是新到的消息。
+    color_q = collections.deque(maxlen=8)       # (stamp_ns, msg) 未消费的彩色帧
+    depth_hist = collections.deque(maxlen=64)   # 供按**时间戳**配对（不是取最新）
+    info_hist = collections.deque(maxlen=16)
+    js_hist = collections.deque(maxlen=200)     # 关节角历史，插值到图像时间戳
+    seen = set()
+
+    def on_color(m):
+        seen.add("color")
+        color_q.append((stamp_ns(m), m))
+
+    def on_depth(m):
+        seen.add("depth")
+        depth_hist.append((stamp_ns(m), m))
+
+    def on_info(m):
+        seen.add("info")
+        info_hist.append((stamp_ns(m), m))
+
+    def on_js(m):
+        seen.add("js")
+        js_hist.append(m)
+
+    # 静态 / 动态 TF **分开存**：
+    #   · `/tf_static` 上的帧不随时间变（实测本机脚本里整条腕部链只有那六个
+    #     转动关节在 `/tf`，`tool0:camera_link` 也在 `/tf_static`），留最新一条就够；
+    #   · `/tf` 上的必须**按图像时间戳挑**，否则臂在动时相机位姿用的是另一时刻
+    #     的关节角 —— 旧实现取「最新的」，等于把延迟直接算成位姿误差。
+    tf_static = {}                                   # key -> transform
+    tf_dyn = collections.defaultdict(
+        lambda: collections.deque(maxlen=120))       # key -> [(stamp_ns, tf)]
+
+    def key_of(t):
+        return "%s:%s" % (t.header.frame_id, t.child_frame_id)
+
+    def acc_static(m):
+        seen.add("tf_static")
+        for t in m.transforms:
+            tf_static[key_of(t)] = t
+
+    def acc_dyn(m):
+        seen.add("tf")
+        for t in m.transforms:
+            tf_dyn[key_of(t)].append((stamp_ns(t), t))
+
+    qos_img = QoSProfile(depth=IMAGE_QOS_DEPTH,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    qos_info = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
     qos_static = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE,
                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
-    # 彩色帧计数：burst 每次都要**一条新的**帧。只等「got 里有 color」的话，
-    # 第一帧会被写 N 遍 —— 那样 E4a 的「20 帧」是假的（同一个瞬间的 20 份拷贝）。
-    color_count = [0]
-
-    def on_color(m):
-        got["color"] = m
-        color_count[0] += 1
-
-    def keep(key):
-        return lambda m: got.__setitem__(key, m)
-
-    # 关节角留一小段历史：**臂在动时**图像与关节角各自有几十到上百毫秒的延迟，
-    # 拿「保存那一刻最新的」关节角去配一张旧图，会把延迟直接算成手臂链的位姿误差
-    # （实测两者差过 140 ms）。存历史、再挑**与图像时间戳最近**的那一条。
-    js_hist = collections.deque(maxlen=200)
-
-    def on_js(m):
-        got["js"] = m
-        js_hist.append(m)
+    if not args.joints_only:
+        node.create_subscription(RosImage, topics["color"][0], on_color, qos_img)
+        node.create_subscription(RosImage, topics["depth"][0], on_depth, qos_img)
+        node.create_subscription(CameraInfo, topics["info"][0], on_info, qos_info)
+    node.create_subscription(JointState, JOINT_STATE_TOPIC[0], on_js, qos_info)
 
     if not args.joints_only:
-        node.create_subscription(RosImage, topics["color"][0], on_color, qos)
-        node.create_subscription(RosImage, topics["depth"][0], keep("depth"), qos)
-        node.create_subscription(CameraInfo, topics["info"][0], keep("info"), qos)
-    node.create_subscription(JointState, JOINT_STATE_TOPIC[0], on_js, qos)
+        node.create_subscription(TFMessage, "/tf", acc_dyn, qos_info)
+        node.create_subscription(TFMessage, "/tf_static", acc_static, qos_static)
 
-    def acc(slot):
-        def cb(m):
-            d = tf_acc[slot]
-            for t in m.transforms:
-                key = "%s:%s" % (t.header.frame_id, t.child_frame_id)
-                d[key] = t
-                # 相机链**跨两个话题**：腕部那条里六个转动的关节在 /tf（动态），
-                # flange/tool0、tool0:camera_link 与相机内的固定帧在 /tf_static；
-                # 俯视那条则整条都在 /tf_static。只查 /tf_static 会永远缺腕部
-                # 那六个 —— 2026-10-25 第一次上板就这么栽了一次。
-                chain[key] = t
-                chain_origin[key] = slot
-            got[slot] = d
-        return cb
+    # 自旋放到独立线程里常驻：主线程写盘时订阅照常被排空（见上面那段说明）。
+    from rclpy.executors import SingleThreadedExecutor
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, name="capture-spin",
+                                   daemon=True)
+    spin_thread.start()
 
-    if not args.joints_only:
-        node.create_subscription(TFMessage, "/tf", acc("tf"), qos)
-        node.create_subscription(TFMessage, "/tf_static", acc("tf_static"), qos_static)
+    def close_all():
+        executor.shutdown()
+        spin_thread.join(timeout=2.0)
+        node.destroy_node()
+        rclpy.shutdown()
+
+    def wait_for(pred, timeout):
+        """等 pred() 为真（或超时）。自旋在别的线程，这里只睡觉。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return pred()
 
     if args.joints_only:
-        t0 = time.time()
-        while time.time() - t0 < args.timeout and "js" not in got:
-            rclpy.spin_once(node, timeout_sec=0.2)
-        if "js" not in got:
+        if not wait_for(lambda: "js" in seen, args.timeout):
             print("!! %.0f s 没收到 /joint_states —— 驱动起了吗？" % args.timeout,
                   file=sys.stderr)
-            node.destroy_node()
-            rclpy.shutdown()
+            close_all()
             return 2
-        js = got["js"]
+        js = js_hist[-1]
         json.dump({"name": list(js.name),
                    "position": [float(v) for v in js.position],
                    "stamp_ns": stamp_ns(js)},
@@ -241,8 +373,7 @@ def main():
         print("OK %s （只取关节角）" % args.out)
         print("  关节(deg)：%s" % {k: round(v * 57.2957795, 1)
                                   for k, v in zip(js.name, js.position)})
-        node.destroy_node()
-        rclpy.shutdown()
+        close_all()
         return 0
 
     # 一次成功的抓帧需要哪些话题：俯视那条链整条在 /tf_static 上、与臂无关，
@@ -250,31 +381,12 @@ def main():
     needed = ["color", "depth", "info", "tf_static"] + (
         ["js", "tf"] if cam["need_js"] else [])
 
-    def wait_one(start_count):
-        """等到**一条新的**彩色帧、且链到齐；超时返回 False。"""
-        t0 = time.time()
-        while time.time() - t0 < args.timeout:
-            rclpy.spin_once(node, timeout_sec=0.2)
-            if color_count[0] <= start_count:
-                continue          # 还是旧帧 —— burst 不允许把同一帧写两遍
-            if not all(k in got for k in needed):
-                continue
-            if not all(k in chain for k in chain_keys):
-                continue
-            if cam["need_js"]:
-                # 收到还不够：要等 /joint_states 的历史把**图像时间戳夹住**，
-                # 否则插值退化成「取最近一条」，残差就是那个未知的时差。
-                # 相机 7.3 Hz、关节 100 Hz，通常 20 ms 内就夹住了。
-                t1 = time.time()
-                while time.time() - t1 < 2.0:
-                    if js_hist:
-                        lo = min(stamp_ns(m) for m in js_hist)
-                        hi = max(stamp_ns(m) for m in js_hist)
-                        if lo <= stamp_ns(got["color"]) <= hi:
-                            break
-                    rclpy.spin_once(node, timeout_sec=0.05)
-            return True
-        return False
+    def tf_snapshot(color_stamp):
+        """``pick_chain`` 的现场版：把「现在」也传进去（流鲜度用它判）。"""
+        return pick_chain(chain_keys, tf_static, tf_dyn, color_stamp,
+                          time.time_ns())
+
+
 
     def to_array(m):
         buf = np.frombuffer(m.data, dtype=np.uint8)
@@ -295,19 +407,23 @@ def main():
             return os.path.join(args.out, name + ext)
         return os.path.join(args.out, "%s_%03d%s" % (name, idx, ext))
 
-    def write_one(idx):
-        """把 got/chain/js_hist 的**当前**内容写成第 idx 帧。返回退出码。"""
+    def write_one(idx, fr):
+        """把**这一帧的快照**写成文件。返回退出码。
+
+        快照由主线程按时间戳配好再传进来（``fr``），这里不再读「全局最新」——
+        旧实现读的是写盘那一刻的最新消息，与这张图像不是同一时刻。
+        """
+        color_m, depth_m, info = fr["color"], fr["depth"], fr["info"]
+        color_ns = fr["color_stamp_ns"]
         try:
-            color = to_array(got["color"])
-            depth = to_array(got["depth"])
+            color = to_array(color_m)
+            depth = to_array(depth_m)
         except ValueError as e:
             print("!! %s" % e, file=sys.stderr)
             return 3
 
         Image.fromarray(color).save(_p(idx, "color", ".png"))
         Image.fromarray(depth).save(_p(idx, "depth", ".png"))
-
-        info = got["info"]
 
         meta = {
             "camera": args.camera,
@@ -317,30 +433,37 @@ def main():
                 "D": list(info.d), "K": list(info.k),
                 "R": list(info.r), "P": list(info.p),
                 "frame_id": info.header.frame_id,
+                "stamp_ns": stamp_ns(info),
+                "stamp_delta_ms": fr["info_delta_ms"],
             },
             # depth 与 color 已对齐（话题名里就写着），所以共用一份 K。
-            "color": {"width": got["color"].width, "height": got["color"].height,
-                      "encoding": got["color"].encoding,
-                      "is_bigendian": bool(got["color"].is_bigendian),
-                      "step": got["color"].step,
-                      "frame_id": got["color"].header.frame_id,
-                      "stamp_ns": stamp_ns(got["color"])},
-            "depth": {"width": got["depth"].width, "height": got["depth"].height,
-                      "encoding": got["depth"].encoding,
-                      "is_bigendian": bool(got["depth"].is_bigendian),
-                      "step": got["depth"].step,
-                      "frame_id": got["depth"].header.frame_id,
-                      "stamp_ns": stamp_ns(got["depth"])},
+            "color": {"width": color_m.width, "height": color_m.height,
+                      "encoding": color_m.encoding,
+                      "is_bigendian": bool(color_m.is_bigendian),
+                      "step": color_m.step,
+                      "frame_id": color_m.header.frame_id,
+                      "stamp_ns": color_ns},
+            "depth": {"width": depth_m.width, "height": depth_m.height,
+                      "encoding": depth_m.encoding,
+                      "is_bigendian": bool(depth_m.is_bigendian),
+                      "step": depth_m.step,
+                      "frame_id": depth_m.header.frame_id,
+                      "stamp_ns": stamp_ns(depth_m),
+                      # 与彩色时间戳的差。按时间戳配对后应恒为 0；不为 0 时
+                      # 这里就是证据（旧实现中位数是 ±33.36 ms = 差一帧）。
+                      "stamp_delta_ms": fr["depth_delta_ms"]},
             "chain_tip": tip,
             "chain_keys": list(chain_keys),
+            # 动态 TF 相对图像的时间差（毫秒）。相机位姿就是拿它们算的。
+            "tf_stamp_delta_ms": fr["tf_deltas"],
         }
         json.dump(meta, open(_p(idx, "meta", ".json"), "w"), indent=2)
 
-        # ⚠️ 这里 dump 的是**所有**收到的 /tf 与 /tf_static 键，不只是链上的。
+        # ⚠️ 这里 dump 的是**链上所有**帧（静态 + 动态），不只是这次判定要用的。
         # 俯视那条链只有四段，但联合标定还要用驱动实测的 link→optical 链，
         # 少存一段就得重新抓帧。
         trans = {}
-        for key, t in chain.items():
+        for key, t in fr["trans"].items():
             trans[key] = {
                 "translation": {"x": t.transform.translation.x,
                                 "y": t.transform.translation.y,
@@ -353,18 +476,17 @@ def main():
                 "frame_id": t.header.frame_id, "child_frame_id": t.child_frame_id,
             }
         json.dump({"ok": trans, "missing": [],
-                   "origin": {k: chain_origin.get(k) for k in trans}},
+                   "origin": {k: fr["origin"].get(k) for k in trans}},
                   open(_p(idx, "tf", ".json"), "w"), indent=2)
 
         # 俯视相机与臂无关：可能根本没起驱动，那就没有 /joint_states。
-        if "js" not in got:
+        if "js" not in seen:
             print("  第 %d 帧：%s %dx%d（无 /joint_states，跳过关节记录）"
-                  % (idx, args.camera, got["color"].width, got["color"].height))
+                  % (idx, args.camera, color_m.width, color_m.height))
             return 0
 
         # 关节角插值到**图像时间戳**上（见 joints_at 的说明）。残差 = 离最近的
         # 插值端点有多远；没夹住（图像早于/晚于整段历史）时退化成最近一条，并标 False。
-        color_ns = stamp_ns(got["color"])
         js = joints_at(js_hist, color_ns)
         if js is None:
             print("  第 %d 帧：关节历史为空，跳过关节记录" % idx)
@@ -382,12 +504,7 @@ def main():
         st = sorted(stamp_ns(m) for m in win)
         gaps = [(b - a) / 1e6 for a, b in zip(st, st[1:])]
         max_gap = max(gaps) if gaps else None
-        # 动态 TF（来自 /tf 的那几帧，实际就是六个转动关节）的时间戳与图像的差 ——
-        # 相机位姿就是从这条链算的。/tf_static 的时间戳常是 0，不能一起比。
-        dyn = [(k, t) for k, t in chain.items()
-               if chain_origin.get(k) == "tf" and stamp_ns(t) > 0]
-        tf_gaps = sorted((stamp_ns(t) - color_ns) / 1e6 for _, t in dyn
-                         if stamp_ns(t) > 0)
+        tf_gaps = fr["tf_deltas"]
         still = p2p is not None and p2p < 0.005      # ≈0.29°，对应指尖 <3 mm
         json.dump({"name": names,
                    "position": pos,
@@ -407,10 +524,10 @@ def main():
                   open(_p(idx, "joint_states", ".json"), "w"), indent=2)
 
         print("第 %d 帧 %s：图像 %dx%d  深度 %dx%d  关节 %d 个  TF %d 帧"
-              % (idx, args.camera,
-                 got["color"].width, got["color"].height,
-                 got["depth"].width, got["depth"].height,
-                 len(names), len(trans)))
+              % (idx, args.camera, color_m.width, color_m.height,
+                 depth_m.width, depth_m.height, len(names), len(trans)))
+        print("  深度/彩色 时间差 %+.1f ms，内参 %+.1f ms（按时间戳配对）"
+              % (fr["depth_delta_ms"], fr["info_delta_ms"]))
         print("  关节角%s到图像时间戳：残差 %.1f ms（历史 %d 条，±0.3 s 内 %d 条，"
               "相邻最大间隔 %s ms）"
               % ("插值" if interp else "**没夹住，取最近一条**", resid_ms,
@@ -428,13 +545,59 @@ def main():
                                   for k, v in zip(names, pos)})
         return 0
 
+    last_stamp = 0            # 已经写过的最后一帧的彩色时间戳（burst 不许写同一帧两遍）
     for idx in range(args.burst):
-        start = color_count[0]
-        if not wait_one(start):
-            print("!! 第 %d/%d 帧没等到（超时 %.0f s）：话题缺 %s；TF 链缺 %s"
-                  % (idx + 1, args.burst, args.timeout,
-                     [k for k in needed if k not in got] or "无",
-                     [k for k in chain_keys if k not in chain] or "无"),
+        deadline = time.monotonic() + args.timeout
+        fr, why = None, None
+        while time.monotonic() < deadline:
+            # 1) 一条**比上一帧新**的彩色帧
+            while color_q and color_q[0][0] <= last_stamp:
+                color_q.popleft()
+            if not color_q:
+                missing = [k for k in needed if k not in seen]
+                why = ("话题缺 %s" % missing) if missing else \
+                    "还没有新的彩色帧（上一帧 %d）" % last_stamp
+                time.sleep(0.01)
+                continue
+            color_ns = color_q[0][0]
+            # 2) 链上每帧都能按时间戳取到（静态取最新、动态取离图像最近的）
+            trans, origin, deltas, why = tf_snapshot(color_ns)
+            if trans is None:
+                time.sleep(0.01)
+                continue
+            # 3) 腕部：关节历史要能把图像时间戳**夹住**（插值，不是取最近）
+            if cam["need_js"]:
+                if not js_hist:
+                    why = "还没收到 /joint_states"
+                    time.sleep(0.01)
+                    continue
+                lo = min(stamp_ns(m) for m in js_hist)
+                hi = max(stamp_ns(m) for m in js_hist)
+                if not lo <= color_ns <= hi:
+                    why = ("关节历史还没夹住图像时间戳（图像 %d，历史 %d–%d）"
+                           % (color_ns, lo, hi))
+                    time.sleep(0.01)
+                    continue
+            # 4) 深度与内参：按时间戳配对，不拿「最新」冒充
+            dhit = match(depth_hist, color_ns, MATCH_TOL_MS)
+            ihit = match(info_hist, color_ns, 2 * MATCH_TOL_MS)
+            if dhit is None or ihit is None:
+                why = ("深度/内参与图像配不上：深度 %s，内参 %s"
+                       % ("缺" if dhit is None else "差 %.0f ms" % (dhit[0] / 1e6),
+                          "缺" if ihit is None else "差 %.0f ms" % (ihit[0] / 1e6)))
+                time.sleep(0.01)
+                continue
+            # 全部就位 —— 从队列里真正取走这一帧，其余状态都是它的快照
+            color_ns, color_msg = color_q.popleft()
+            fr = {"color": color_msg, "depth": dhit[2],
+                  "info": ihit[2], "color_stamp_ns": color_ns,
+                  "depth_delta_ms": dhit[0] / 1e6, "info_delta_ms": ihit[0] / 1e6,
+                  "trans": trans, "origin": origin, "tf_deltas": deltas}
+            break
+
+        if fr is None:
+            print("!! 第 %d/%d 帧没等到（超时 %.0f s）：%s"
+                  % (idx + 1, args.burst, args.timeout, why or "原因未知"),
                   file=sys.stderr)
             if cam["need_js"]:
                 print("   ↑ 腕部链缺 TF 多半是 wrist_tf_publish.py 没起，或者"
@@ -444,20 +607,18 @@ def main():
                 print("   ↑ 俯视链缺 TF：先确认 topcam 驱动起来了、并且"
                       "（第 1 轮之后）topcam_publish_tf:=true 已发 base_link→topcam_link。",
                       file=sys.stderr)
-            node.destroy_node()
-            rclpy.shutdown()
+            close_all()
             return 2
-        rc = write_one(idx)
+        rc = write_one(idx, fr)
         if rc:
-            node.destroy_node()
-            rclpy.shutdown()
+            close_all()
             return rc
+        last_stamp = fr["color_stamp_ns"]
         if idx + 1 < args.burst and args.interval > 0:
             time.sleep(args.interval)
 
     print("OK %s （%s，%d 帧）" % (args.out, args.camera, args.burst))
-    node.destroy_node()
-    rclpy.shutdown()
+    close_all()
     return 0
 
 

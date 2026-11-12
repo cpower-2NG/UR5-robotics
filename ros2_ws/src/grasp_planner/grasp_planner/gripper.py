@@ -129,6 +129,14 @@ AG95_MOVE_TIMEOUT_S = 3.0
 #: 等手指到位时的轮询间隔（秒）。
 AG95_POLL_INTERVAL_S = 0.1
 
+#: 手指被物体挡住时**到不了**目标值 —— 位置在这么久内几乎不变就按「已接触」
+#: 提前返回（秒）。实测正常闭合 0.1 s 走 2–8 mm，夹块停住后只剩编码器噪声。
+AG95_STALL_WINDOW_S = 0.5
+
+#: 「几乎不变」的门限（毫米）。取 0.3 mm：AG-95 编码器回读分辨率约 0.1‰
+#: （满行程 100 mm ⇒ 0.01 mm），0.3 mm 远在噪声之上、又在单步行程之下。
+AG95_STALL_EPS_MM = 0.3
+
 # ---------------------------------------------------------------- Modbus 寄存器
 #: ⚠️ **这份表是现场必须复核的对象，不是既成事实。** 来源是大寰 AG 系列手册，
 #: 但接线、从站号、缩放都要在实物上确认（`scripts/ag95_probe.py` 就是为此写的）。
@@ -420,6 +428,10 @@ class Ag95Gripper(GripperBackend):
         self._close_mm = close_mm
         self._dry_run = bool(dry_run)
         self._open_is_high = bool(open_is_high)
+        # 手指「卡住 ⇒ 提前返回」（见 `_wait_until`）。默认**关**：别的调用点
+        # 依赖「返回时手指一定停了」，提前返回只保证「此刻没在动」。
+        # `precision_exec` 自己接 `wait_stable()` 复核，所以由它显式打开。
+        self._stall_detect = False
         self._client = None
         # 先校验几何再连硬件：三个毫米参数彼此矛盾属于**配置错误**，
         # 应该在碰串口之前就报出来。
@@ -672,21 +684,43 @@ class Ag95Gripper(GripperBackend):
         self._check_write_took_effect(mm, before)
 
     def _wait_until(self, mm: float) -> None:
-        """等手指走到目标开口（或超时）。**只读轮询，不发任何命令**。
+        """等手指走到目标开口（或超时 / **卡住**）。**只读轮询，不发任何命令**。
 
         超时**不抛错**：AG-95 全行程最慢 3 s，超过可能只是慢，也可能是被物体
         挡住了（那正是「夹住了」的正常情形）。判空由 `is_empty()` 用当时的
         真实回读决定，不依赖这一步。
+
+        **卡住提前返回**（2026-11-12，``stall_detect`` 开启时）：夹块时目标是
+        全闭 0 mm，手指被 29.5 mm 的块挡住**永远走不到**，于是这条固定等满
+        3 s —— 实测每次闭合 3.8 s 里约 3 s 是在等一个不可能到达的值。位置在
+        ``AG95_STALL_WINDOW_S`` 内变化不超过 ``AG95_STALL_EPS_MM`` 就当作
+        「已接触」提前返回（正常闭合时 0.1 s 就走 2–8 mm，远在门限之上）。
+
+        ``stall_detect`` **默认关**：别的调用点（规划器状态机）依赖「返回时手指
+        一定停了」，而提前返回只保证「此刻没在动」。``precision_exec`` 自己
+        接在 ``wait_stable()`` 后面判夹没夹住，所以由它显式打开。
         """
         deadline = time.monotonic() + AG95_MOVE_TIMEOUT_S
         tol = max(AG95_EMPTY_TOLERANCE_MM, 0.02 * self._stroke_mm)
         last = None
+        stall_ref, stall_since = None, None
         while time.monotonic() < deadline:
             pos = self._read_position()
+            now = time.monotonic()
             if pos is not None:
                 last = pos
                 if abs(pos - mm) <= tol:
                     return
+                if self._stall_detect:
+                    if (stall_ref is None
+                            or abs(pos - stall_ref) > AG95_STALL_EPS_MM):
+                        stall_ref, stall_since = pos, now
+                    elif now - stall_since >= AG95_STALL_WINDOW_S:
+                        self._node.get_logger().info(
+                            f"AG-95 手指已停住（目标 {mm:.1f} mm，回读 "
+                            f"{pos:.1f} mm，{AG95_STALL_WINDOW_S:.1f}s 未变）"
+                            f"⇒ 按「接触/被挡住」提前返回")
+                        return
             time.sleep(AG95_POLL_INTERVAL_S)
         self._node.get_logger().warn(
             f"AG-95 等手指到位超时（{AG95_MOVE_TIMEOUT_S:.1f}s）："
@@ -781,6 +815,15 @@ class Ag95Gripper(GripperBackend):
 
     def current_position(self) -> Optional[float]:
         return self._read_position()
+
+    def set_stall_detect(self, on: bool) -> None:
+        """开关「手指停住就提前返回」（``_wait_until``）。**默认关**。
+
+        别的调用点（规划器状态机）依赖「返回时手指一定停了」，而提前返回只
+        保证「此刻没在动」。``precision_exec`` 在每个夹爪动作后接
+        ``wait_stable()`` 复核最终位置，所以由它显式打开。
+        """
+        self._stall_detect = bool(on)
 
     def is_empty(self) -> bool:
         """位置回读推断是否空夹。判据与 `SimGripper.is_empty` **同构**，

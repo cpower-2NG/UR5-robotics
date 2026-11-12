@@ -142,6 +142,113 @@ def truth_zone_for(burst):
     return TRUTH_ZONE
 
 
+#: 实测块心离布局表多远还算「同一块」。
+#:
+#: 手摆要求 ±3–5 mm，但**实测过 15–38 mm**（2026-11-12 S0:1 r1：用户按摆位图重摆
+#: 后逐块偏 −33/−20、+35/+4、+15/+1、−9/+32、+25/−2 mm）。所以这条不是判分容差，
+#: 只是「布局表与画面是不是同一个场景」的兜底：超过它多半是换错布局 / 少摆多摆 /
+#: 台上有别的块 —— 盲抓只会抓空，停轮给人看。
+PICK_OFFSET_LIMIT_MM = 120.0
+
+
+def _mm(v):
+    """米 → 毫米（真值文档统一用米，日志与偏差表用毫米）。"""
+    return float(v) * 1000.0
+
+
+def wrap180(deg):
+    """角度折到 (−180, 180]。"""
+    d = (float(deg) + 180.0) % 360.0 - 180.0
+    return 180.0 if d == -180.0 else d
+
+
+def match_measured_blocks(manifest_blocks, measured_blocks,
+                          limit_mm=PICK_OFFSET_LIMIT_MM):
+    """布局表 ↔ 实测块 一一配对，返回 ``[(manifest, measured, dx_mm, dy_mm)]``。
+
+    先按**颜色**配（正式布局里五块颜色互不相同）；颜色重复或缺失时退回**最近
+    位置**贪心配对，每个实测块只用一次。配不出 1:1、或某一块离标称超过
+    ``limit_mm``，都抛 ``ValueError`` —— 抓点没有可信来源就不发计划。
+    """
+    man = [dict(b) for b in (manifest_blocks or [])]
+    obs = [dict(b) for b in (measured_blocks or [])]
+    if len(man) != len(obs):
+        raise ValueError("布局表 %d 块、实测 %d 块 —— 不是同一个场景"
+                         % (len(man), len(obs)))
+    by_col = {}
+    for b in obs:
+        by_col.setdefault(str(b.get("color")), []).append(b)
+    pairs = []
+    free = list(obs)
+    for m in man:
+        c = str(m.get("color"))
+        cand = by_col.get(c) or []
+        pick = None
+        if len(cand) == 1 and cand[0] in free:
+            pick = cand[0]
+        if pick is None and free:       # 颜色不可靠 ⇒ 按位置最近
+            pick = min(free, key=lambda o: math.hypot(
+                float(o["x"]) - float(m["x"]), float(o["y"]) - float(m["y"])))
+        if pick is None:
+            raise ValueError("块 %s（%s）没有对应的实测块" % (m.get("id"), c))
+        free.remove(pick)
+        dx = (_mm(pick["x"]) - _mm(m["x"]))
+        dy = (_mm(pick["y"]) - _mm(m["y"]))
+        d = math.hypot(dx, dy)
+        if d > float(limit_mm):
+            raise ValueError(
+                "块 %s（%s）实测 (%.1f, %.1f) 离标称 (%.1f, %.1f) 有 %.1f mm"
+                "（上限 %.0f）—— 布局表与台面不是同一个场景，先核对摆位"
+                % (m.get("id"), c, _mm(pick["x"]), _mm(pick["y"]),
+                   _mm(m["x"]), _mm(m["y"]), d, limit_mm))
+        pairs.append((m, pick, dx, dy))
+    return pairs
+
+
+def merge_measured_truth(truth_doc, measured_doc,
+                         limit_mm=PICK_OFFSET_LIMIT_MM):
+    """抓点用**实测块位姿**（2026-11-12 用户定调，覆盖旧的「布局表即真值」）。
+
+    布局表仍定义**块身份**（id / 颜色 / 尺寸 / 层）与判分口径；``x / y / yaw``
+    一律换成跑前 pick burst 的实测值。为什么必须换：手摆偏差实测 15–38 mm，
+    按标称坐标抓就是夹爪全闭的空夹（2026-11-12 S0:1 r1 第一块，回读 0.0 mm）。
+
+    返回 ``(doc, records)``：``doc`` 形状与 ``lay.scene_truth`` 相同（探针与
+    ``actions_from_attempt`` 直接吃），每个块多带 ``nominal`` 与 ``meas``；
+    ``records`` 是逐块偏差（只归档，不判分）。
+    """
+    pairs = match_measured_blocks(truth_doc.get("blocks") or [],
+                                  measured_doc.get("blocks") or [], limit_mm)
+    blocks, recs = [], []
+    for m, o, dx, dy in pairs:
+        nb = dict(m)
+        nb["x"] = float(o["x"])
+        nb["y"] = float(o["y"])
+        nb["yaw"] = float(o.get("yaw", m.get("yaw", 0.0)))
+        nb["nominal"] = {"x_mm": round(_mm(m["x"]), 2),
+                         "y_mm": round(_mm(m["y"]), 2),
+                         "yaw_deg": round(float(m.get("yaw", 0.0)), 2)}
+        nb["meas"] = dict(o.get("meas") or {})
+        blocks.append(nb)
+        recs.append({"id": m.get("id"), "color": m.get("color"),
+                     "dx_mm": round(dx, 2), "dy_mm": round(dy, 2),
+                     "dist_mm": round(math.hypot(dx, dy), 2),
+                     "dyaw_deg": round(wrap180(float(o.get("yaw", 0.0)) -
+                                               float(m.get("yaw", 0.0))), 2),
+                     "x_mm": round(_mm(o["x"]), 2),
+                     "y_mm": round(_mm(o["y"]), 2)})
+    doc = dict(truth_doc)
+    doc["blocks"] = blocks
+    doc["truth_source"] = "pick-burst-measured"
+    doc["nominal_source"] = "layout-manifest"
+    doc["pick_measurement"] = {
+        "burst": measured_doc.get("batch"),
+        "blocks": len(blocks),
+        "max_offset_mm": (max(r["dist_mm"] for r in recs) if recs else None),
+    }
+    return doc, recs
+
+
 def log(*a):
     print("  " + " ".join(str(x) for x in a), flush=True)
 
@@ -1095,9 +1202,9 @@ class Round:
                                  "STOP→PLAY 后再跑本轮" % rc)
             raise RoundError(EXIT_EXEC, "observe",
                              "pre.sh rc=%d（观察段失败，计划未执行）" % rc)
-        # 只拉 pad：解垫下一步就要用。pick 机位的 burst 只喂**跑后的**摆位偏差表
-        # （record-only），留到判分段再拉 —— 观察段在令牌窗口里，少传 100 帧
-        # （2026-11-12：观察段 193.6 s 里有相当一部分是这种可以挪走的搬运）。
+        # 只拉 pad：解垫下一步就要用。pick 机位的 burst 现在喂**实测抓点**
+        # （2026-11-12 用户定调，见 ``_measured_truth``），计算段一开头就要 ——
+        # 所以由 ``_ensure_pre_pick_burst`` 在计算段拉，这里不重复搬一遍。
         for v in PRE_VIEWS:
             if v["name"] != "pad":
                 continue
@@ -1108,7 +1215,7 @@ class Round:
             if n == 0:
                 raise RoundError(EXIT_EXEC, "observe",
                                  "观察机位 %s 一帧都没拉回来" % v["name"])
-        log("  跑前 pick burst 留在板上，判分段再拉（只喂摆位偏差表）")
+        log("  跑前 pick burst 留给计算段（实测抓点要用）")
         chain = urkin.Chain(self.args.urdf)
         js = self.board.joints(self.p("pre", "after"))
         q = _q_from_joints(js, chain)
@@ -1206,12 +1313,11 @@ class Round:
                pad_doc.get("n_frames_ok") or 0,
                pad_doc.get("n_frames_total") or 0))
 
-        # ---- 本轮真值（布局表 = 真值；带上实测垫位姿）
+        # ---- 本轮真值：布局表定**块身份**，抓点位姿用跑前 pick burst 实测
         layout_blocks = lay.layout_blocks(self.args.batch, int(self.args.layout))
         truth = lay.scene_truth(self.args.batch, int(self.args.layout),
                                 pad_pose=self._pad_pose(pad_doc, grid_path))
         truth_path = self.p("truth", "layout.json")
-        write_json(truth_path, truth)
         errs = lay.validate_layout(self.args.batch, int(self.args.layout))
         if errs:
             raise RoundError(EXIT_PLAN, "compute",
@@ -1220,6 +1326,12 @@ class Round:
         if mism:
             raise RoundError(EXIT_PLAN, "compute",
                              "布局表与 gen_scene 不一致：%s" % "；".join(mism))
+        if self.args.truth_source == "measured":
+            truth = self._measured_truth(truth)
+        else:
+            log("抓点：用布局表标称坐标（--truth-source manifest）—— 手摆偏差"
+                "不进计划，偏差只进摆位表")
+        write_json(truth_path, truth)
 
         ids = _sorted_ids([b["id"] for b in layout_blocks])
         cells = cm.parse_cells(self.args.cells, len(ids))
@@ -1672,10 +1784,47 @@ class Round:
                              % (rc_round, rc_score))
         return EXIT_OK
 
-    def _pull_pre_pick_burst(self):
-        """把跑前 pick burst 从板上拉回来（观察段故意没拉 —— 它在令牌窗口里）。
+    def _measured_truth(self, truth):
+        """抓点用跑前 pick burst 的**实测块位姿**（用户 2026-11-12 定调）。
 
-        只给 ``placement-deviation.json`` 用；拉不回来就跳过偏差表，不改判分。
+        为什么要它：手摆偏差实测 15–38 mm，按标称坐标抓 = 夹爪全闭的空夹
+        （2026-11-12 S0:1 r1 第一块回读 0.0 mm）。拉不回 / 量不出就**停轮** ——
+        抓点没有可信来源时不许发计划，更不许偷偷退回标称坐标。
+        """
+        self._ensure_pre_pick_burst()
+        burst = self.p("pre", "wrist-pick")
+        out = self.p("truth", "pick-measured.json")
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        t0 = float(self.deps["now"]())
+        rc = int(self.deps["truth_from_view"](burst, out,
+                                             allow_empty=False) or 0)
+        self.timing["pick_truth_s"] = round(float(self.deps["now"]()) - t0, 1)
+        if rc != 0 or not os.path.exists(out):
+            raise RoundError(EXIT_PLAN, "compute",
+                             "跑前 pick burst 量不出块（rc=%r）—— 抓点没有实测"
+                             "来源，停（先查分割/腕部相机，别退回标称坐标）"
+                             % (rc,))
+        meas = read_json(out)
+        try:
+            doc, recs = merge_measured_truth(truth, meas,
+                                             self.args.pick_offset_limit_mm)
+        except ValueError as e:
+            raise RoundError(EXIT_PLAN, "compute",
+                             "实测块位姿对不上布局表：%s" % e)
+        write_json(self.p("truth", "measured-merge.json"), recs)
+        for r in recs:
+            log("  实测块 %s %-11s (%7.1f, %7.1f) mm  离标称 %5.1f mm  "
+                "yaw 差 %+6.1f°"
+                % (r["id"], r["color"], r["x_mm"], r["y_mm"], r["dist_mm"],
+                   r["dyaw_deg"]))
+        log("抓点：跑前 pick burst 实测（%d 块，最远离标称 %.1f mm）"
+            % (len(recs), max(r["dist_mm"] for r in recs) if recs else 0.0))
+        return doc
+
+    def _ensure_pre_pick_burst(self):
+        """把跑前 pick burst 拉到本地（观察段故意没拉：它在令牌窗口里）。
+
+        计算段现在要拿它**实测抓点**，所以拉不回来就是停轮，不能跳过。
         """
         local = self.p("pre", "wrist-pick")
         if os.path.isdir(local) and any(
@@ -1683,6 +1832,22 @@ class Round:
             return
         try:
             self.board.pull_dir(self.b("wrist-pre", "pick"), local)
+        except RoundError as e:
+            raise RoundError(EXIT_PLAN, "compute",
+                             "跑前 pick burst 拉不回：%s —— 抓点没有实测来源" % e)
+        n = len([f for f in os.listdir(local) if f.startswith("color_")])
+        if n == 0:
+            raise RoundError(EXIT_PLAN, "compute",
+                             "跑前 pick burst 一帧都没有（%s）" % local)
+
+    def _pull_pre_pick_burst(self):
+        """判分段兜底：跑前 pick burst 还不在本地就再拉一次（失败只告警）。
+
+        计算段已经拉过一遍（``_ensure_pre_pick_burst``），这里只服务
+        ``--from score`` 单步重跑；缺了就跳过偏差表，不改判分。
+        """
+        try:
+            self._ensure_pre_pick_burst()
         except RoundError as e:
             log("  !! 跑前 pick burst 拉不回：%s —— 不出摆位偏差表" % e)
 
@@ -1701,11 +1866,18 @@ class Round:
             log("  !! 没有跑前 pick burst —— 不出摆位偏差表（不补数）")
             return
         truth = self.p("pre", "truth-pick.json")
-        try:
-            rc = int(self.deps["truth_from_view"](burst, truth) or 0)
-        except Exception as exc:                          # noqa: BLE001
-            log("  !! 跑前真值失败：%s —— 不出摆位偏差表" % exc)
-            return
+        # 计算段已经用**同一组 burst** 量过一遍（``_measured_truth`` → truth/
+        # pick-measured.json）。这里再跑一次 20 帧共识纯属白花 30 s，直接复用。
+        measured = self.p("truth", "pick-measured.json")
+        if os.path.exists(measured):
+            shutil.copyfile(measured, truth)
+            rc = 0
+        else:
+            try:
+                rc = int(self.deps["truth_from_view"](burst, truth) or 0)
+            except Exception as exc:                      # noqa: BLE001
+                log("  !! 跑前真值失败：%s —— 不出摆位偏差表" % exc)
+                return
         if rc != 0 or not os.path.exists(truth):
             log("  !! 跑前真值 rc=%d —— 不出摆位偏差表（不补数）" % rc)
             return
@@ -1820,15 +1992,26 @@ def build_parser():
 
     ap.add_argument("--timing-prior", default=None,
                     help="Round 0 实测的 timing.json（标定 R1/R2）")
-    # 2026-11-11 Round 0 实测：解垫 0.9 s + 规划 8.6 s（5 目标 + 3 机位）
-    # + 探针 6.1 s（板上一趟）≈ 16 s。缺省从 210 s 收到 90 s（约 5× 余量）；
-    # 估时只影响 R1 保守程度，不是判分阈值 —— 但改了就记在台账里。
-    ap.add_argument("--compute-est", type=float, default=30.0,
-                    help="R1 用的轮内计算估时（秒；缺省 30 = 实测 16–25 s 的 ~1.5×）")
+    # 2026-11-12 实测（S0:1 r1 真机）：解垫 2.0 + 探针 28.1 + 规划 9.1 + 推板
+    # ≈ 47.7 s；**抓点改实测**后还要拉跑前 pick burst（~10 s）再跑 20 帧共识
+    # 真值（本机 32 s）⇒ ~90 s。取 100。
+    ap.add_argument("--compute-est", type=float, default=100.0,
+                    help="R1 用的轮内计算估时（秒；缺省 100 = 实测 ~90 的 1.1×，"
+                         "含跑前 pick burst 回传与实测真值）")
     ap.add_argument("--exec-est", type=float, default=400.0,
                     help="无 timing-prior 时的执行估时（秒；缺省 400 = 实测 run.sh "
                          "~390 s）")
 
+    ap.add_argument("--truth-source", default="measured",
+                    choices=("measured", "manifest"),
+                    help="抓点位姿来源：measured = 跑前 pick burst 实测（缺省，"
+                         "2026-11-12 用户定调）；manifest = 布局表标称坐标（只给"
+                         "离线排练/没有 burst 的场合，真机正式轮禁用）")
+    ap.add_argument("--pick-offset-limit-mm", type=float,
+                    default=PICK_OFFSET_LIMIT_MM,
+                    help="实测块心离布局表超过它就不抓（不是判分容差，是"
+                         "「布局表与台面是不是同一场景」的兜底；缺省 %.0f）"
+                         % PICK_OFFSET_LIMIT_MM)
     ap.add_argument("--pad-min-frames", type=int, default=20)
     ap.add_argument("--pad-max-spread-mm", type=float, default=2.0)
     ap.add_argument("--pad-max-spread-deg", type=float, default=0.5)

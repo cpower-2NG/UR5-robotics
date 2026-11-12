@@ -276,6 +276,76 @@ def section_empty():
 
 
 # ---------------------------------------------------------------- 多帧共识
+def section_consensus_parallel():
+    """``--consensus`` 的进程池路径：结果必须与串行**逐字相同**。
+
+    2026-11-12：20 帧串行 30.4 s，进程池 16 进程 7.0 s（本机 16 核）。
+    加速的前提是不能改变语义 —— 每帧互相独立（只读自己的 PNG + tf json），
+    所以只并行「逐帧量测」，聚类合并仍在一个进程里按原顺序做。
+
+    这里不碰真帧：把 ``measure_dir`` / ``build_truth`` 换成确定性的假实现，
+    让 6 帧给出同一个块（±2 mm 抖动）。串行与 3 进程的 JSON 必须一字不差。
+    fork 起子进程（Linux 默认），假实现随父进程内存带过去。
+    """
+    print('\n[14] --consensus 并行：串行 vs 进程池结果逐字相同')
+    import json
+    import shutil
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix='tfpar-')
+    tmp = tempfile.mkdtemp(prefix='tfpar-out-')
+    try:
+        for i in range(6):
+            open(os.path.join(d, 'color_%03d.png' % i), 'wb').close()
+
+        real_m, real_b = tf.measure_dir, tf.build_truth
+
+        def fake_measure(frame_dir, index=None, split=True, yaw_method='colour',
+                         camera='wrist'):
+            return {'idx': index}, [], 0.0
+
+        def fake_build(rows, frame, table_top=0.0, block_size=0.0295,
+                       batch='b', index=0, keep_outside=False,
+                       drop_unknown=True, min_class_share=0.0, layers=True,
+                       zone_m=None):
+            i = frame['idx']
+            return {'batch': batch, 'index': i, 'source': 'fake',
+                    'block_size_m': block_size, 'table_top_m': table_top,
+                    'zone_m': list(tf.sp.ZONE_M if zone_m is None else zone_m),
+                    'dropped_out_of_zone': 0, 'dropped_not_block': 0,
+                    'blocks': [{'x': 0.400 + 0.001 * i, 'y': 0.300,
+                                'z': 0.0, 'top': block_size, 'layer': 0,
+                                'color': 'red', 'size': block_size,
+                                'yaw': 2.0 * i,
+                                'meas': {'yaw_source': 'colour_rect',
+                                         'from': 'fake', 'h_mm': 29.5}}]}
+
+        tf.measure_dir, tf.build_truth = fake_measure, fake_build
+        try:
+            outs = {}
+            for jobs in ('1', '3'):
+                out = os.path.join(tmp, 'truth-j%s.json' % jobs)
+                rc = tf.main(['--frame', d, '--consensus', '--min-frames', '3',
+                              '--jobs', jobs, '--out', out])
+                outs[jobs] = (rc, open(out, encoding='utf-8').read()
+                              if os.path.exists(out) else None)
+        finally:
+            tf.measure_dir, tf.build_truth = real_m, real_b
+
+        check("串行与 3 进程都返 0", outs['1'][0] == 0 and outs['3'][0] == 0,
+              {k: v[0] for k, v in outs.items()})
+        check("真值文件内容逐字相同", outs['1'][1] == outs['3'][1]
+              and outs['1'][1] is not None,
+              (outs['1'][1] or '')[:200])
+        got = json.loads(outs['3'][1] or '{}')
+        check("6 帧聚成 1 块（并行没丢帧）",
+              len(got.get('blocks', [])) == 1
+              and got['blocks'][0]['meas']['n_frames'] == 6, got.get('blocks'))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def section_consensus():
     print('\n[8] 多帧共识：同块聚一簇、幻影按帧数剔、颜色多数、方块的 yaw 折 90°')
     def one(uv, cls="red", yaw=0.0):
@@ -503,6 +573,7 @@ def main():
     section_warn()
     section_empty()
     section_consensus()
+    section_consensus_parallel()
     section_layers()
     section_colour_yaw()
     section_consensus_yaw()

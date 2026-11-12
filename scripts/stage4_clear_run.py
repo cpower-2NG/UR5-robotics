@@ -1400,6 +1400,17 @@ def _exec_cmd(board_dir, log_dir, name, extra=""):
             '--log %s/%s.jsonl' % (board_dir, name, extra, log_dir, name))
 
 
+def _exec_cmd_multi(board_dir, log_dir, names):
+    """多份计划**同一个进程**跑完（一个节点、一根串口、一次夹爪自检）。
+
+    2026-11-12：之前每份计划起一个 ``precision_exec``，每次约 2.7 s 的
+    import/rclpy/串口/自检开销，S0 一轮 8 份就是 20 多秒纯开销。
+    """
+    return ('~/precision/run.sh ~/precision/precision_exec.py '
+            '--plan %s --go --require-auth "$TOKEN" --log-dir %s'
+            % (" ".join("%s/%s" % (board_dir, n) for n in names), log_dir))
+
+
 def _burst_cmd(camera, out_dir, n=20):
     return ('~/precision/run.sh ~/precision/precision_capture.py '
             '--camera %s --burst %d %s' % (camera, n, out_dir))
@@ -1426,6 +1437,11 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
     STOP→PLAY 起算，观察/解垫/探针/规划都在里面耗；执行起手时剩多少，只有板子
     自己知道。最后一道仍是 ``precision_exec --require-auth``（逐条计划前查），
     但它过期发生在**跑到一半**，那时块可能已经夹在爪里 —— 所以先拦一道。
+
+    **合并**（2026-11-12）：相邻、中间不插拍帧的计划写进**同一条**
+    ``precision_exec --plan a b c``（一个进程跑完）—— 每次起进程约 2.7 s 的
+    import/rclpy/串口/自检开销，S0 一轮光是这个就 20 多秒。合并只在「同一双
+    手、同一次授权、同一个不变量」的前提下做：失败仍然 fail-closed 整条停。
     """
     burst_dirs = burst_dirs or {}
     lines = ["#!/bin/bash",
@@ -1449,10 +1465,32 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
             '[ $rc -eq 0 ] || fail "令牌剩余不足 %.0f 秒（rc=$rc）—— 先重做 '
             'STOP→PLAY；本轮 void（aborted_token），不算抓取失败"'
             % float(token_min_remaining))
+    # 相邻计划合并成一个 ``precision_exec`` 进程（见 ``_exec_cmd_multi``）。
+    # 能吃进同一组的条件很窄：中间**不插拍帧**。机位计划跑完必须就地在那个机位
+    # 拍 burst（换机位就拍不到了），被 180° 拆开的计划也不能和人合并 ——
+    # 那些切口就是刷子，必须留在两段之间。
+    group = []
+
+    def flush():
+        if not group:
+            return
+        if len(group) == 1:
+            lines.append('echo "===== %s : exec"' % group[0])
+            lines.append(_exec_cmd(board_dir, log_dir, group[0]))
+        else:
+            lines.append('echo "===== %s : exec（一个进程跑完）"'
+                         % " ".join(group))
+            lines.append(_exec_cmd_multi(board_dir, log_dir, group))
+        lines.append('rc=$?')
+        lines.append('[ $rc -eq 0 ] || fail "%s rc=$rc"'
+                     % " ".join(group))
+        del group[:]
+
     for p in plans:
-        lines.append('echo "===== %s : exec"' % p["name"])
         split = (held_burst_dir is not None and p.get("kind") == "target")
         if split:
+            flush()
+            lines.append('echo "===== %s : exec（lift 处切开拍帧）"' % p["name"])
             lines.append(_exec_cmd(board_dir, log_dir, p["name"],
                                    "--upto lift "))
             lines.append('rc=$?')
@@ -1470,23 +1508,34 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
             lines.append('rc=$?')
             lines.append('[ $rc -eq 0 ] || fail "%s --from to_slot rc=$rc"'
                          % p["name"])
-        else:
-            lines.append(_exec_cmd(board_dir, log_dir, p["name"]))
-            lines.append('rc=$?')
-            lines.append('[ $rc -eq 0 ] || fail "%s rc=$rc"' % p["name"])
-        lines.append('sleep 1')
+            continue
+        group.append(p["name"])
         view = p.get("view")
+        burst_after = ((p.get("kind") == "view" and view in burst_dirs)
+                       or (p.get("kind") == "align_hover" and align_burst_dir))
+        if not burst_after:
+            continue
+        # 这份跑完就地拍帧 ⇒ 它自己收尾：先把之前的合并组跑完，再把这一份
+        # 单独跑完，然后才拍。**不能**留在合并组尾巴上 —— 那会让拍帧挪到
+        # 别的计划之后（臂已经不在这个机位）。
+        _tail = group.pop()
+        flush()
+        group.append(_tail)
+        flush()
         if p.get("kind") == "view" and view in burst_dirs:
             # 判分帧：臂刚停在这个机位上，就地拍（换机位就拍不到了）。
+            lines.append('sleep 1')     # 等臂停稳再拍（原来是每条计划后都睡）
             lines.append('echo "===== 判分机位 %s : burst 20"' % view)
             lines.append(_burst_cmd("wrist", burst_dirs[view]))
             lines.append('rc=$?')
             lines.append('[ $rc -eq 0 ] || fail "机位 %s burst rc=$rc"' % view)
-        elif p.get("kind") == "align_hover" and align_burst_dir:
+        else:
+            lines.append('sleep 1')
             lines.append('echo "===== 对中悬停 : 俯视 burst 20"')
             lines.append(_burst_cmd("topcam", align_burst_dir))
             lines.append('rc=$?')
             lines.append('[ $rc -eq 0 ] || fail "对中 burst rc=$rc"')
+    flush()
     lines.append('echo "ALL DONE"')
     return "\n".join(lines) + "\n"
 

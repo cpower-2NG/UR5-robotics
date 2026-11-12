@@ -220,7 +220,7 @@ def exc_reply(slave_id, fc, code):
 
 
 def make_slave_classes():
-    """两个「坏从站」：写一律被拒 / 回读朝反方向走。
+    """三个「坏从站」：写一律被拒 / 回读朝反方向走 / 手指被挡住走不动。
 
     **必须延迟到 `harness` 加载之后**才能定义 —— 它们的基类是按路径从
     `test_ag95_probe.py` 加载来的，写成模块级的类会在 `harness is None` 的
@@ -250,7 +250,25 @@ def make_slave_classes():
             elif want > cur:
                 self.regs[self.actual_reg] = max(0, cur - self.step)
 
-    return WriteRefusingSlave, InvertedSlave
+    class BlockedSlave(harness._RtuSlave):
+        """手指被**东西挡住**：朝闭合方向走到 ``floor`` 就再也走不动。
+
+        模拟「夹住一块 29.5 mm 的块」—— 命令目标是 0‰（全闭），实际停在
+        260‰（``permille_to_mm`` 换算后 ≈24.7 mm），此后每次回读都一样。
+        真机夹块时就是这条路径：目标永远到不了，旧实现白等满 3 s 超时。
+        """
+
+        floor = 260
+
+        def _step_towards_target(self):
+            cur = self.regs.get(self.actual_reg, 0)
+            want = self.regs.get(self.target_reg, cur)
+            if want < cur:
+                self.regs[self.actual_reg] = max(self.floor, cur - self.step)
+            elif want > cur:
+                self.regs[self.actual_reg] = min(1000, cur + self.step)
+
+    return WriteRefusingSlave, InvertedSlave, BlockedSlave
 
 
 def main():
@@ -283,7 +301,7 @@ def main():
 
     probe = load_module("ag95_probe", PROBE_PY)
     harness = load_module("ag95_probe_harness", PROBE_TEST_PY)
-    WriteRefusingSlave, InvertedSlave = make_slave_classes()
+    WriteRefusingSlave, InvertedSlave, BlockedSlave = make_slave_classes()
     OK = g.GoalStatus.STATUS_SUCCEEDED
     print(f"pymodbus 的从站号参数名（签名探测）："
           f"{g.ag95_slave_kwarg(ModbusSerialClient)}")
@@ -609,6 +627,48 @@ def main():
         check("open_is_high=False 时 close() 的目标是 1000‰（方向语义被钉住）",
               len(slave.writes) > 1 and slave.writes[1][1] == 1000,
               f"{slave.writes}")
+
+    # ------------------------------------------------------------------
+    print("\n--- 6b. 夹到东西：手指停住就**提前返回**（默认关，显式开）---")
+    blocked_regs = {g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY,
+                    g.AG95_REG_ACTUAL_POS: 1000, g.AG95_REG_TARGET_POS: 1000,
+                    g.AG95_REG_FORCE: 50, g.AG95_REG_INIT_STATE: 1}
+    blocked_kw = {"target_reg": g.AG95_REG_TARGET_POS,
+                  "actual_reg": g.AG95_REG_ACTUAL_POS, "step": 250}
+    # 先证「默认不动」：不打开开关时仍是老旧行为 —— 白等满超时，只记 warn。
+    with rig(dry_run=False, open_is_high=True, regs=blocked_regs,
+             slave_cls=BlockedSlave, slave_kw=blocked_kw) as (gr, slave, node, box):
+        t0 = time.monotonic()
+        gr.close(done_cb=cb(box))
+        got = wait_done(box, timeout=g.AG95_MOVE_TIMEOUT_S * 2 + 2.0)
+        elapsed = time.monotonic() - t0
+        check("默认（未开开关）：被挡住时**照样等满**超时才返回",
+              elapsed >= g.AG95_MOVE_TIMEOUT_S * 0.8,
+              f"耗时 {elapsed:.2f}s（超时上限 {g.AG95_MOVE_TIMEOUT_S}s）")
+        check("默认路径的超时仍然只是 warn（不报错、不抛异常）",
+              "等手指到位超时" in node.log.text("warn")
+              and got is not None and got[0] == OK,
+              f"warn={node.log.text('warn')[:160]!r} 回调={None if got is None else got[0]}")
+    # 再证开关有效：同样是「被挡住」，0.5 s 停住就返回。
+    with rig(dry_run=False, open_is_high=True, regs=blocked_regs,
+             slave_cls=BlockedSlave, slave_kw=blocked_kw) as (gr, slave, node, box):
+        gr.set_stall_detect(True)
+        t0 = time.monotonic()
+        gr.close(done_cb=cb(box))
+        got = wait_done(box, timeout=g.AG95_MOVE_TIMEOUT_S * 2 + 2.0)
+        elapsed = time.monotonic() - t0
+        check("★ 打开开关：手指停住 0.5 s 就返回，不再白等满超时",
+              elapsed < g.AG95_MOVE_TIMEOUT_S * 0.5,
+              f"耗时 {elapsed:.2f}s（超时上限 {g.AG95_MOVE_TIMEOUT_S}s）")
+        check("提前返回仍然**回调成功**（命令本身没失败）",
+              got is not None and got[0] == OK, f"回调 {got}")
+        check("提前返回**不报超时 warn**（识别成了接触，不是异常）",
+              "等手指到位超时" not in node.log.text("warn"),
+              f"warn={node.log.text('warn')[:160]!r}")
+        pos = gr.current_position()
+        check("回读停在**被挡住的位置**（≈24.7 mm），不是闭合位 0",
+              pos is not None and 20.0 <= pos <= 30.0, f"回读 {pos}")
+        check("停在半途 ⇒ is_empty() 判「夹着东西」", gr.is_empty() is False)
 
     # ------------------------------------------------------------------
     print("\n--- 7. 写失败必须是**失败**（D52 那一类：没动被当成到位）---")
