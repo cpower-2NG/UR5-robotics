@@ -964,9 +964,9 @@ def section_place_yaw_equiv():
     calls = []
 
     def fake(*a, **kw):
-        yp = kw.get('yaw_place_deg')
-        calls.append(yp)
-        if yp is None:
+        calls.append((round(float(kw.get('yaw_grasp_deg')), 4),
+                      kw.get('yaw_place_deg')))
+        if kw.get('yaw_place_deg') is None:
             raise pp.BranchChainError(
                 '这些航点的所有 IK 分支组合都过不了高度护栏或单步 170° 上限'
                 '（测试注入）')
@@ -975,12 +975,17 @@ def section_place_yaw_equiv():
         kw = dict(kw, yaw_place_deg=None)
         return real(*a, **kw)
 
+    # A3：抓取朝向 ±180° 等价重试的两支候选（原值、折叠(raw+180)）
+    g_raw = [float(a['grasp_yaw_deg']) for a in acts]
+    g_alt = [pp.fold_yaw_180(g + 180.0) for g in g_raw]
     try:
         pp.build_pick = fake
         out = tempfile.mkdtemp(prefix='e9-equiv-off-')
         ok, err = raises(cr.plan_sequence, ch, q0, acts, blocks, out)
         check('缺省不开旗子 ⇒ BranchChainError 原样上抛', ok and '测试注入' in err)
-        check('缺省不开旗子 ⇒ 不换写法（每块只试一次）', calls == [None], calls)
+        check('缺省不开旗子 ⇒ place 不换写法，抓取朝向两支各试一次（place 全 None）',
+              calls == [(round(g_raw[0], 4), None), (round(g_alt[0], 4), None)],
+              calls)
         check('缺省不开旗子 ⇒ 一份计划都不写',
               not any(f.endswith('.json') for f in os.listdir(out)), os.listdir(out))
 
@@ -990,11 +995,15 @@ def section_place_yaw_equiv():
         plans, layout, q_end = cr.plan_sequence(ch, q0, acts, blocks, out2,
                                                 wrist_survey=False,
                                                 place_yaw_equiv=True)
-        want = [pp.fold_yaw_180(a['grasp_yaw_deg']) - 180.0 for a in acts]
-        check('开了旗子 ⇒ 每个动作都先默认、失败再试 180° 等价写法',
-              calls == [None, want[0], None, want[1]], calls)
+        want = [pp.fold_yaw_180(g) - 180.0 for g in g_raw]
+        expected = []
+        for i in range(len(acts)):
+            expected += [(round(g_raw[i], 4), None),
+                         (round(g_raw[i], 4), want[i])]
+        check('开了旗子 ⇒ 每个动作先默认抓取朝向、place 失败再试 180° 等价写法',
+              calls == expected, calls)
         check('180° 等价写法 = 折叠后的抓取朝向 −180°',
-              all(abs(c - w) < 1e-9 for c, w in zip(calls[1::2], want)), calls)
+              all(abs(c[1] - w) < 1e-9 for c, w in zip(calls[1::2], want)), calls)
         check('等价写法落在计划 meta 里（可追溯）',
               all(p['place_yaw_equiv180'] for p in plans)
               and all(json.load(open(p['path']))['meta']['yaw_source']
@@ -1007,7 +1016,7 @@ def section_place_yaw_equiv():
         calls.clear()
 
         def both_fail(*a, **kw):
-            calls.append(kw.get('yaw_place_deg'))
+            calls.append((kw.get('yaw_grasp_deg'), kw.get('yaw_place_deg')))
             raise pp.BranchChainError('这些航点的所有 IK 分支组合都被拒（测试注入）')
 
         pp.build_pick = both_fail
@@ -1024,7 +1033,7 @@ def section_place_yaw_equiv():
         calls.clear()
 
         def plain_fail(*a, **kw):
-            calls.append(kw.get('yaw_place_deg'))
+            calls.append((kw.get('yaw_grasp_deg'), kw.get('yaw_place_deg')))
             raise pp.PlanError('块 #0 离最近邻块只有 30.0 mm（测试注入）')
 
         pp.build_pick = plain_fail
@@ -1032,7 +1041,8 @@ def section_place_yaw_equiv():
         ok, err = raises(cr.plan_sequence, ch, q0, acts, blocks, out4,
                          place_yaw_equiv=True)
         check('非 BranchChainError ⇒ 不重试（只试了默认写法）',
-              ok and calls == [None] and '测试注入' in err, (calls, err))
+              ok and calls == [(round(g_raw[0], 4), None)]
+              and '测试注入' in err, (calls, err))
     finally:
         pp.build_pick = real
 

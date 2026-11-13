@@ -576,7 +576,10 @@ def plan_views(chain, q_start, views, out_dir, start=0):
     try:
         qpath = pp.solve_path(
             chain, [(n, xyz) for n, xyz, _ in targets], q_start,
-            yaws=[y for _, _, y in targets])
+            yaws=[y for _, _, y in targets],
+            # 机位链 = 高空平移段：单步帽用 TRANSIT（170°），不用作业段的 90°
+            # —— attempt6 的机位链实测要 144.4° 单步（见 TRANSIT_STEP_CAP_DEG）
+            max_step_deg=pp.TRANSIT_STEP_CAP_DEG)
     except pp.BranchChainError as e:
         raise pp.PlanError("判分机位链解不出来：%s" % e)
     plans, q = [], [float(v) for v in q_start]
@@ -679,45 +682,63 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                 "dist_mm": 0.0,
                 "angle_deg": float(act["grasp_yaw_deg"]),
                 "seed": None}
-        yaw_grasp = pp.fold_yaw_180(float(act["grasp_yaw_deg"]))
-        # 放置朝向的候选写法：默认（= 抓取朝向）先试，旗子开了才加 180° 等价。
-        yaw_places = [None]
-        if place_yaw_equiv:
-            yaw_places.append(yaw_grasp - 180.0)
+        yaw_grasp_raw = float(act["grasp_yaw_deg"])
+        yaw_grasp = pp.fold_yaw_180(yaw_grasp_raw)
+        # 抓取朝向的候选写法：原值先试；被分支链/单步上限拒了才试 ±180° 等价
+        # （平行两指绕工具轴转 180° 只是两根手指互换位置，抓的还是同一对面 ——
+        # 物理等价，见 `pp.fold_yaw_180`）。A3（90° 单步帽）下这条重试是把
+        # 「能救的链」救回来的第一道；两支都救不回来才 fail-closed。
+        grasp_variants = [yaw_grasp_raw, pp.fold_yaw_180(yaw_grasp_raw + 180.0)]
         wps = checks = meta = None
+        grasp_used = None
         yaw_used = None
         first_err = None
-        for yaw_place in yaw_places:
-            try:
-                wps, checks, meta = pp.build_pick(
-                    chain, q, cand, to_pp_block(blk), pp_blocks, act["slot"],
-                    yaw_grasp_deg=act["grasp_yaw_deg"], grasp_at="block_center",
-                    surface_z=act["surface_z"], survey_tool0=tuple(survey_tool0),
-                    place_clearance=place_clearance,
-                    yaw_place_deg=yaw_place,
-                    yaw_source=("place-equiv180" if yaw_place is not None
-                                else "zero"),
-                    # 压在目标上的块：`h`（块顶离台面）≠ 物理块高，必须显式给
-                    # 物理块高，否则抓取高度按两个块高算（= 2026-11-02 拆塔事故）。
-                    block_h_m=float(blk["size"]),
-                    # 见模块头：探针已用 OBB 判过间隙才允许放宽；S0 无接触布局
-                    # 仍走 60 mm 粗判据（gap_check=layout_gap）。
-                    min_block_gap=float(min_block_gap),
-                    # 只有最后一个动作需要为「之后的机位」选支（见 tail_targets）
-                    post_targets=(tail_targets if i == len(actions) else None))
-            except pp.BranchChainError as e:
-                first_err = first_err or e
-                continue
-            yaw_used = yaw_place
-            break
+        for g in grasp_variants:
+            # 放置朝向的候选写法：默认（= 本变体的抓取朝向）先试，旗子开了才加
+            # 180° 等价写法（`fold_yaw_180` 的物理等价：只换手指、不换面，
+            # 方块/矩形块的落点与朝向逐字节相同）。
+            yaw_places = [None]
+            if place_yaw_equiv:
+                yaw_places.append(pp.fold_yaw_180(g) - 180.0)
+            for yaw_place in yaw_places:
+                try:
+                    wps, checks, meta = pp.build_pick(
+                        chain, q, cand, to_pp_block(blk), pp_blocks, act["slot"],
+                        yaw_grasp_deg=g, grasp_at="block_center",
+                        surface_z=act["surface_z"], survey_tool0=tuple(survey_tool0),
+                        place_clearance=place_clearance,
+                        yaw_place_deg=yaw_place,
+                        yaw_source=("place-equiv180" if yaw_place is not None
+                                    else "zero"),
+                        # 压在目标上的块：`h`（块顶离台面）≠ 物理块高，必须显式给
+                        # 物理块高，否则抓取高度按两个块高算（= 2026-11-02 拆塔事故）。
+                        block_h_m=float(blk["size"]),
+                        # 见模块头：探针已用 OBB 判过间隙才允许放宽；S0 无接触布局
+                        # 仍走 60 mm 粗判据（gap_check=layout_gap）。
+                        min_block_gap=float(min_block_gap),
+                        # 只有最后一个动作需要为「之后的机位」选支（见 tail_targets）
+                        post_targets=(tail_targets if i == len(actions) else None))
+                except pp.BranchChainError as e:
+                    first_err = first_err or e
+                    continue
+                grasp_used = g
+                yaw_used = yaw_place
+                break
+            if wps is not None:
+                break
         if wps is None:
             # 所有等价写法都被分支链/单步上限拒了 ⇒ 抛第一次（默认朝向）的原始
             # 报错：它才是「按实测朝向根本走不通」这件事本身。
             raise first_err
+        grasp_equiv = grasp_used != yaw_grasp_raw
         if yaw_used is not None:
             log("  !! 块 %s：默认放置朝向过不了分支链/单步上限，改用 180° 等价"
                 "写法（只换手指、不换面）：ψ_place %.3f° → %.3f°"
                 % (act["block"], yaw_grasp, yaw_grasp - 180.0))
+        if grasp_equiv:
+            log("  !! 块 %s：原抓取朝向过不了分支链/单步上限，改用 180° 等价"
+                "写法（只换手指、不换面）：ψ_grasp %.3f° → %.3f°"
+                % (act["block"], yaw_grasp_raw, grasp_used))
         plan = {"version": 2,
                 "meta": dict(meta,
                              e9={"kind": act["kind"], "block": act["block"],
@@ -725,6 +746,9 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                                  "from_xy": list(act["from_xy"]),
                                  "grasp_yaw_deg": round(
                                      float(act["grasp_yaw_deg"]), 3),
+                                 "grasp_yaw_used_deg": round(
+                                     float(grasp_used), 3),
+                                 "grasp_yaw_equiv180": grasp_equiv,
                                  "place_yaw_equiv180": yaw_used is not None,
                                  "gap_check": gap_check,
                                  "desired_center_mm": act.get(
@@ -744,6 +768,7 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                       "kind": act["kind"], "block": act["block"],
                       "slot": act["slot"], "from_xy": act["from_xy"],
                       "grasp_yaw_deg": act["grasp_yaw_deg"],
+                      "grasp_yaw_equiv180": grasp_equiv,
                       "place_yaw_equiv180": yaw_used is not None,
                       "desired_center_mm": act.get("desired_center_mm"),
                       "commanded_center_mm": act.get("commanded_center_mm"),

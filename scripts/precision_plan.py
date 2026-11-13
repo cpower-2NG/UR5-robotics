@@ -160,15 +160,30 @@ GUARD_SAMPLES = 8
 TABLE_PLANE_Z = 0.0
 MIN_BLOCK_GAP = 0.060
 #: 相邻航点之间**单关节**的跳变上限（度）。见 `solve_path` 的注释。
-#: 同一笛卡尔位姿有多支 IK 解，其中一些要求先把腕子/大臂原地转半圈才接得上；
+#: 同一笛卡尔位姿有多支 IK 解，其中一些要求「先原地把腕子转半圈」才接得上；
 #: 只按总行程最小化会挑中它们。2026-11-09 E9 第 2 场就是这么出的：链里出现
 #: 309° / 201° 的单关节跳变，末段 `survey_place` 上真机后被控制器中止 status=6
 #: （姿态看上去「先原地拧一圈」，当场被叫停）。
-#: 取 **170°** 的依据（同一份代码、同一份输入复跑）：
-#:   · 第 1 场（真跑通）整链最大单步 136° ⇒ 170° 放行，不误杀；
-#:   · 第 2 场无论上限给 180 / 170 / 150 / 120，能解的链最大单步都要 179.7°
-#:     ⇒ 170° 一律拒绝，生成器直接 PlanError、不写计划（fail-closed）。
-MAX_JOINT_STEP_DEG = 170.0
+#:
+#: **作业段**（抓/放/搬运，块在爪里或指尖贴近台面）的帽值。
+#: **2026-11-13（A3）从 170° 收到 150°**。证据分隔（同一份代码、历史真机输入）：
+#:   · **164.6° 撞臂**：attempt6 的 approach 单步 j3 +113°/wrist_3 +164.6°，
+#:     170° 帽下门全绿放行 ⇒ 夹爪撞臂、PROTECTIVE_STOP C153A3（台账第三百二十六轮）；
+#:   · **136° 安全**：s8 全链最大单步 136°，真机整段跑通；127.4°（s10 的
+#:     place-equiv 支）同样安全。
+#: 150 把已知坏形态拒在规划期、放行已知好形态。**这不是最终答案**：步长只是
+#: 自碰撞的粗代理，真正的门是 A2 的逐航点碰撞裁决（MoveIt /check_state_validity，
+#: 待 AG-95 模型几何补齐）—— A2 上线后再评估收紧到 90°。配合出路：
+#: 抓取朝向 ±180° 物理等价重试（`stage4_clear_run.plan_sequence`）；
+#: 机位链整串一个 DP（`plan_views`）+ pad 机位 yaw 180°（E9_VIEWS）。
+MAX_JOINT_STEP_DEG = 150.0
+#: 高空**机位平移段**（survey / post_targets 那些收尾航点之间）的单步帽。
+#: 与作业段分开的理由（2026-11-13 A3）：机位段是 transit_dz 抬起、路径上无块
+#: 的纯平移，attempt6 的机位链实测要 **144.4°** 单步（台账第三百二十六轮 §一）
+#: —— 一刀切用作业帽会把 S0 整轮判死。170° 保持原值不动：E9 第 2 场实测
+#: 179.7° 的坏链照样被它拒；A2（MoveIt 碰撞裁决）上线后这段的真正护栏是
+#: 碰撞检查，不是步长数字。
+TRANSIT_STEP_CAP_DEG = 170.0
 
 # ---- 阶段 3（堆叠）用的几何常量
 # 相机（color optical）相对 tool0 的偏置（m，yaw 0）；出处见 SURVEY_TOOL0 的注释。
@@ -597,18 +612,28 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
     S0:1 attempt6 块 4 就是被这一点判死的：抬升位姿的近支只差 20.3°，候选里最近的
     却是 180.0°（>170° 上限）。所以第一遍独立播种失败时，第二遍把**上一航点的候选**
     当种子传下去再解一次；正常能过的场景第一遍就返回，行为逐字节不变。
+
+    ``max_step_deg``：标量 = 所有转移同一上限；也接受**逐转移列表**（长度等于
+    ``targets``，第 i 项管「进入第 i 个航点」的那一跳）。`build_pick` 用它把
+    作业段（MAX_JOINT_STEP_DEG，90°）与收尾机位段（TRANSIT_STEP_CAP_DEG，170°）
+    分开 —— 理由见 TRANSIT_STEP_CAP_DEG 的注释。
     """
     if max_step_deg is None:            # 运行时读，便于自检/复现时改档对比
         max_step_deg = MAX_JOINT_STEP_DEG
+    caps = max_step_deg
+
+    def _cap(i):
+        if isinstance(caps, (list, tuple)):
+            return float(caps[i])
+        return float(caps)
 
     def _guard(qa, qb):
         if guard is not None:
             return guard(qa, qb)
         return check_guard(chain, qa, qb, table_z)
 
-    def _step_ok(qa, qb):
-        return (max_step_deg is None
-                or max_joint_step_deg(qa, qb) <= float(max_step_deg))
+    def _step_ok(i, qa, qb):
+        return max_joint_step_deg(qa, qb) <= _cap(i)
 
     def _yaw(i):
         return yaw_deg if yaws is None else yaws[i]
@@ -623,7 +648,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
         prev = [[None] * len(s) for s in sets]
         for j, q in enumerate(sets[0]):
             ok, _ = _guard(q_start, q)
-            if ok and _step_ok(q_start, q):
+            if ok and _step_ok(0, q_start, q):
                 cost[0][j] = travel_cost(q, q_start)
         for i in range(1, len(sets)):
             for j, q in enumerate(sets[i]):
@@ -631,7 +656,7 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
                     if not np.isfinite(cost[i - 1][k]):
                         continue
                     ok, _ = _guard(qp, q)
-                    if not ok or not _step_ok(qp, q):
+                    if not ok or not _step_ok(i, qp, q):
                         continue
                     c = cost[i - 1][k] + travel_cost(q, qp)
                     if c < cost[i][j]:
@@ -639,11 +664,13 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
                         prev[i][j] = k
         ends = [(c, j) for j, c in enumerate(cost[-1]) if np.isfinite(c)]
         if not ends:
+            caps_txt = (("%.0f" % min(_cap(i) for i in range(len(targets))))
+                        if isinstance(caps, (list, tuple))
+                        else "%.0f" % float(caps))
             raise BranchChainError(
-                "这些航点的所有 IK 分支组合都过不了高度护栏或单步 %.0f° 上限"
+                "这些航点的所有 IK 分支组合都过不了高度护栏或单步 %s° 上限"
                 "（同一末端位姿换分支会要求先原地转半圈）：%s"
-                % (float(max_step_deg or 0.0),
-                   "、".join(name for name, _ in targets)))
+                % (caps_txt, "、".join(name for name, _ in targets)))
         _, j = min(ends)
         path = []
         for i in range(len(sets) - 1, -1, -1):
@@ -1086,8 +1113,13 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     targets_all = ([(n, xyz) for n, xyz, _, _, _ in specs]
                    + [(n, xyz) for n, xyz, _ in post])
     yaws_all = ([y for _, _, y, _, _ in specs] + [y for _, _, y in post])
+    # 单步帽分段（A3）：作业段（approach..retreat，块在爪里/指尖贴台面）90°；
+    # 收尾机位段（survey_place 与 post_targets，高空平移）170° —— 理由见
+    # TRANSIT_STEP_CAP_DEG 的注释。
+    caps = ([MAX_JOINT_STEP_DEG] * (len(specs) - 1)
+            + [TRANSIT_STEP_CAP_DEG] * (1 + len(post)))
     qpath_all = solve_path(chain, targets_all, q_start,
-                           yaws=yaws_all, guard=guard)
+                           yaws=yaws_all, guard=guard, max_step_deg=caps)
     qpath = qpath_all[:len(specs)]
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
@@ -1274,8 +1306,11 @@ def build_place(chain, q_start, block, slot, surface_z, carry_z,
         ("retreat", (sx, sy, place_approach_z), yaw_place, None, None),
         ("survey_place", survey_xyz, 0.0, None, None),
     ]
+    caps = ([MAX_JOINT_STEP_DEG] * (len(specs) - 1)
+            + [TRANSIT_STEP_CAP_DEG])
     qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
-                       yaws=[y for _, _, y, _, _ in specs], guard=guard)
+                       yaws=[y for _, _, y, _, _ in specs], guard=guard,
+                       max_step_deg=caps)
     wps, checks = [], []
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
@@ -1461,7 +1496,9 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
         ("nudge_survey", survey_xyz, 0.0, None, None),
     ]
     qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
-                       yaws=[y for _, _, y, _, _ in specs], guard=guard)
+                       yaws=[y for _, _, y, _, _ in specs], guard=guard,
+                       max_step_deg=([MAX_JOINT_STEP_DEG] * (len(specs) - 1)
+                                     + [TRANSIT_STEP_CAP_DEG]))
     wps, checks = [], []
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
