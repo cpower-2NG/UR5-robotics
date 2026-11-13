@@ -594,7 +594,8 @@ def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
 
 
 def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
-               n_random=32, yaws=None, guard=None, max_step_deg=None):
+               n_random=32, yaws=None, guard=None, max_step_deg=None,
+               validator=None):
     """给一串末端目标选**一条前后一致的 IK 分支链**（最小总关节行程）。
 
     `targets` 是 [(名字, xyz), ...]。``yaws`` 可选，逐点姿态角；缺省全用
@@ -617,6 +618,12 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
     ``targets``，第 i 项管「进入第 i 个航点」的那一跳）。`build_pick` 用它把
     作业段（MAX_JOINT_STEP_DEG，90°）与收尾机位段（TRANSIT_STEP_CAP_DEG，170°）
     分开 —— 理由见 TRANSIT_STEP_CAP_DEG 的注释。
+
+    ``validator``：**段级碰撞裁决**（A2，2026-11-13）。签名 ``(qa, qb) ->
+    (ok, why)``，对「进入每个航点的转移」逐段调用（板上实现 =
+    ``stage4_moveit_validator``：关节直线采样过 MoveIt ``/check_state_validity``）。
+    拒绝即该转移不可走（与 guard 同语义：DP 里剪枝）；``None`` = 本机离线排练
+    没有碰撞裁决，只靠步长/护栏，正式轮在板上必须给（fail-closed 由调用方把关）。
     """
     if max_step_deg is None:            # 运行时读，便于自检/复现时改档对比
         max_step_deg = MAX_JOINT_STEP_DEG
@@ -629,8 +636,14 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
 
     def _guard(qa, qb):
         if guard is not None:
-            return guard(qa, qb)
-        return check_guard(chain, qa, qb, table_z)
+            ok, worst = guard(qa, qb)
+        else:
+            ok, worst = check_guard(chain, qa, qb, table_z)
+        if ok and validator is not None:
+            vok, vwhy = validator(qa, qb)
+            if not vok:
+                return False, ("validator", vwhy)
+        return ok, worst
 
     def _step_ok(i, qa, qb):
         return max_joint_step_deg(qa, qb) <= _cap(i)
@@ -918,7 +931,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
                release_dwell_s=0.0, surface_z=None, carry_z=None,
                survey_tool0=None, tower_box=None, held_half_edge=0.020,
                held_off_xy=None, place_clearance=None, block_h_m=None,
-               min_block_gap=None, post_targets=None):
+               min_block_gap=None, post_targets=None, validator=None):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -1119,7 +1132,8 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     caps = ([MAX_JOINT_STEP_DEG] * (len(specs) - 1)
             + [TRANSIT_STEP_CAP_DEG] * (1 + len(post)))
     qpath_all = solve_path(chain, targets_all, q_start,
-                           yaws=yaws_all, guard=guard, max_step_deg=caps)
+                           yaws=yaws_all, guard=guard, max_step_deg=caps,
+                           validator=validator)
     qpath = qpath_all[:len(specs)]
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
@@ -1175,6 +1189,8 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             # 局部 IK 会落进另一个 ±360 折圈支，212° 的整圈翻转就是这么来的
             # （2026-11-12 attempt6）。``plan_views`` 吃这份 ``post_q``。
             "post_q": [[float(v) for v in qq] for qq in qpath_all[len(specs):]],
+            # A2：段级碰撞裁决是否参与选支（None = 本机离线排练，没有裁决）
+            "collision_validator": bool(validator is not None),
             "cand_score": round(cand["score"], 4),
             "cand_width_mm": round(cand["width_mm"], 2),
             "cand_dist_mm": round(cand["dist_mm"], 2),

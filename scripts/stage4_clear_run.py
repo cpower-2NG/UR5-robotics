@@ -555,7 +555,7 @@ def view_targets(views=None):
     return out
 
 
-def plan_views(chain, q_start, views, out_dir, start=0):
+def plan_views(chain, q_start, views, out_dir, start=0, validator=None):
     """从 ``q_start`` 依次平动到每个判分机位，各写一份计划。
 
     **跑前（``--views-only``）与跑后（``plan_sequence`` 末尾）都走这一个函数**，
@@ -579,7 +579,8 @@ def plan_views(chain, q_start, views, out_dir, start=0):
             yaws=[y for _, _, y in targets],
             # 机位链 = 高空平移段：单步帽用 TRANSIT（170°），不用作业段的 90°
             # —— attempt6 的机位链实测要 144.4° 单步（见 TRANSIT_STEP_CAP_DEG）
-            max_step_deg=pp.TRANSIT_STEP_CAP_DEG)
+            max_step_deg=pp.TRANSIT_STEP_CAP_DEG,
+            validator=validator)
     except pp.BranchChainError as e:
         raise pp.PlanError("判分机位链解不出来：%s" % e)
     plans, q = [], [float(v) for v in q_start]
@@ -622,7 +623,7 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                   survey_tool0=E9_SURVEY_TOOL0, place_clearance=None,
                   wrist_survey=True, views=None, place_yaw_equiv=False,
                   start=0, min_block_gap=0.0, gap_check="probe_verified",
-                  tail_targets=None):
+                  tail_targets=None, validator=None):
     """逐步生成计划；任何一步预检失败就抛 ``pp.PlanError``，不写半份序列。
 
     ``wrist_survey=True``（缺省）在序列末尾依次平动到 ``views`` 里的每个
@@ -717,7 +718,10 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                         # 仍走 60 mm 粗判据（gap_check=layout_gap）。
                         min_block_gap=float(min_block_gap),
                         # 只有最后一个动作需要为「之后的机位」选支（见 tail_targets）
-                        post_targets=(tail_targets if i == len(actions) else None))
+                        post_targets=(tail_targets if i == len(actions) else None),
+                        # A2：段级碰撞裁决（板上 MoveIt /check_state_validity）；
+                        # None = 本机离线排练（无裁决，只靠步长/护栏）
+                        validator=validator)
                 except pp.BranchChainError as e:
                     first_err = first_err or e
                     continue
