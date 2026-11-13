@@ -139,6 +139,29 @@ def build_doc(rows, t_med, yaw_med, spread, k, camera, burst, mat, n_total):
     }
 
 
+def embed_pad_spec(doc, spec_doc):
+    """把 pad-spec（足迹/厚度真值）嵌进 grid 文档，使其**自洽**。
+
+    ``pad_thickness_m``：spec 的 thickness_m > 解垫垫面 z（``T_base_pad[2,3]``，
+    台面 = base 0）。``pad_footprint_m``：只认 spec（模型默认 0.30×0.30 与实垫
+    差 90 mm，状态层 §4 早有记录）。spec 缺席时厚度仍嵌入（垫面 z 是实测），
+    足迹不嵌 —— 下游用到时按 C1 哨兵 fail-closed。
+
+    纯函数，可离线自测。
+    """
+    doc = dict(doc)
+    try:
+        doc['pad_thickness_m'] = float(doc['T_base_pad'][2][3])
+    except (KeyError, TypeError, IndexError, ValueError):
+        pass
+    if spec_doc:
+        if spec_doc.get('thickness_m') is not None:
+            doc['pad_thickness_m'] = float(spec_doc['thickness_m'])
+        if spec_doc.get('footprint_m'):
+            doc['pad_footprint_m'] = [float(v) for v in spec_doc['footprint_m']]
+    return doc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description='从腕部 burst 解本场垫位姿 → grid-pre.json')
@@ -157,6 +180,11 @@ def main(argv=None):
                     help='透传给 stage2_pad（缺省用它的默认门）')
     ap.add_argument('--min-markers', type=int, default=None,
                     help='透传给 stage2_pad（缺省用它的默认门）')
+    ap.add_argument('--pad-spec', default=None,
+                    help='仓外 pad-spec.json（足迹/厚度真值）。给了就把 '
+                         'pad_footprint_m / pad_thickness_m 写进 grid 文档 '
+                         '—— **grid 文档自此自洽**：探针/判分在新进程里 '
+                         'load_grid 一份文件就拿到全部实测垫参数（C1 后置）')
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.burst):
@@ -192,10 +220,21 @@ def main(argv=None):
 
     doc = build_doc(rows, t_med, yaw_med, spread, k, args.camera, args.burst,
                     args.mat, n_total)
+    spec_doc = None
+    if args.pad_spec:
+        if not os.path.exists(args.pad_spec):
+            print('!! --pad-spec 不存在：%s' % args.pad_spec)
+            return 2
+        with open(args.pad_spec, encoding='utf-8') as f:
+            spec_doc = json.load(f)
+    doc = embed_pad_spec(doc, spec_doc)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or '.', exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as f:
         json.dump(doc, f, ensure_ascii=False, indent=1)
     print('写出 %s（采用 %s）' % (args.out, doc['adopted_frame']))
+    if spec_doc is None:
+        print('  ⚠ 未给 --pad-spec：grid 文档缺 pad_footprint_m —— 下游'
+              '（探针/判分）用到足迹时会 fail-closed')
     return 0
 
 

@@ -50,6 +50,9 @@ def cmd_pad(a):
             "--min-frames", str(int(a.min_frames)),
             "--max-spread-mm", str(float(a.max_spread_mm)),
             "--max-spread-deg", str(float(a.max_spread_deg))]
+    if a.pad_spec:
+        # C1 后置：grid 文档自洽（嵌足迹/厚度真值），下游新进程不再缺参
+        argv += ["--pad-spec", a.pad_spec]
     return int(pfb.main(argv) or 0)
 
 
@@ -109,6 +112,9 @@ def build_parser():
     p.add_argument("--min-frames", type=int, default=20)
     p.add_argument("--max-spread-mm", type=float, default=2.0)
     p.add_argument("--max-spread-deg", type=float, default=0.5)
+    p.add_argument("--pad-spec", default=None,
+                   help="pad-spec.json（足迹/厚度真值）：给了就嵌进 grid 文档，"
+                        "使其自洽（探针/判分新进程 load_grid 即全量）")
     p.set_defaults(func=cmd_pad)
 
     t = sub.add_parser("truth", help="burst → 块真值（20 帧共识）")

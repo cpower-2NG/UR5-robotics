@@ -186,10 +186,13 @@ reset_pad()
 
 
 def load_grid(path):
-    """读 ``stage2_pad.py`` 产出的 grid.json，按**实测垫位姿**配置宫格。
+    """读 grid 文档，按**实测垫参数**配置宫格（C1 后：位姿 + 厚度 + 足迹）。
 
-    缺文件、不是 stage2-grid、缺字段 ⇒ 一律抛异常（fail-closed）。宁可停下
-    让人看清，也不要拿模型常量悄悄把块放到 88 mm 外。
+    新文档（stage4_pad_from_burst --pad-spec 起）自带 ``pad_thickness_m`` /
+    ``pad_footprint_m`` ⇒ 一份文件就是全部实测垫真值，探针/判分的**新进程**
+    不再有「厚度足迹从哪来」的问题。旧文档缺厚度时回退 ``T_base_pad[2,3]``
+    （解垫垫面 z，同是实测）；缺足迹时不回退（哨兵毒着，下游用到即抛——
+    足迹只有一个家：pad-spec）。
     """
     with open(path, encoding='utf-8') as f:
         doc = json.load(f)
@@ -202,6 +205,17 @@ def load_grid(path):
     except KeyError as exc:
         raise ValueError('%s 缺字段 %s' % (path, exc))
     configure_pad(center, yaw, source=os.path.abspath(path))
+    thick = doc.get('pad_thickness_m')
+    if thick is None and doc.get('T_base_pad'):
+        try:
+            thick = float(doc['T_base_pad'][2][3])
+        except (TypeError, IndexError, ValueError):
+            thick = None
+    if thick is not None:
+        configure_pad(thickness_m=float(thick))
+    foot = doc.get('pad_footprint_m')
+    if foot:
+        configure_pad(footprint_m=[float(foot[0]), float(foot[1])])
     return doc
 
 

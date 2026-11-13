@@ -20,6 +20,7 @@ import numpy as np
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import stage4_pad_from_burst as pfb                    # noqa: E402
 
 import stage4_clear_model as cm                                  # noqa: E402
 import stage4_pad_from_burst as pb                               # noqa: E402
@@ -170,9 +171,31 @@ def sec_gates():
     check('burst 目录不存在 ⇒ rc=2（不悄悄当成 0 帧共识）', rc == 2, 'rc=%s' % rc)
 
 
+def sec_embed_spec():
+    print('\n[5] grid 文档自洽：嵌 pad-spec（C1 后置）')
+    base = {'kind': 'stage2-grid', 'T_base_pad': [[1, 0, 0, 0.4242],
+                                                  [0, 1, 0, -0.112],
+                                                  [0, 0, 1, 0.00017],
+                                                  [0, 0, 0, 1]]}
+    d = pfb.embed_pad_spec(base, None)
+    check('无 spec ⇒ 厚度嵌解垫垫面 z、足迹不嵌',
+          abs(d['pad_thickness_m'] - 0.00017) < 1e-12
+          and 'pad_footprint_m' not in d, d.get('pad_thickness_m'))
+    d = pfb.embed_pad_spec(base, {'footprint_m': [0.393, 0.21]})
+    check('有足迹 ⇒ 嵌足迹（0.393×0.21 实测）',
+          abs(d['pad_footprint_m'][0] - 0.393) < 1e-12
+          and abs(d['pad_footprint_m'][1] - 0.21) < 1e-12)
+    d = pfb.embed_pad_spec(base, {'thickness_m': 0.002,
+                                  'footprint_m': [0.393, 0.21]})
+    check('spec 的 thickness_m 优先于垫面 z',
+          abs(d['pad_thickness_m'] - 0.002) < 1e-12)
+    d2 = pfb.embed_pad_spec(d, None)
+    check('纯函数：不改入参', base.get('pad_thickness_m') is None)
+
+
 def main():
     print('=' * 68)
-    for fn in (sec_wrap, sec_consensus, sec_doc, sec_gates):
+    for fn in (sec_wrap, sec_consensus, sec_doc, sec_gates, sec_embed_spec):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

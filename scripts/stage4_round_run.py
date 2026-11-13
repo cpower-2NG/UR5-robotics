@@ -1279,6 +1279,17 @@ class Round:
         self._mat_remote = remote
         return remote
 
+    def _pad_spec_remote(self):
+        """pad-spec（足迹/厚度真值）推上板：解垫把它嵌进 grid 文档（自洽），
+        探针等**新进程**才不会因哨兵 fail-closed（C1 后置）。"""
+        remote = getattr(self, "_padspec_remote", None)
+        if remote:
+            return remote
+        remote = self.b("analysis", "pad-spec.json")
+        self.board.push(self.args.pad_spec, remote, "pad-spec")
+        self._padspec_remote = remote
+        return remote
+
     def _solve_pad(self, grid_path):
         """解垫：板上算（缺省），只回传 ``grid-pre.json``。"""
         if self.args.analysis == "local":
@@ -1291,6 +1302,8 @@ class Round:
                 "--min-frames", int(self.args.pad_min_frames),
                 "--max-spread-mm", float(self.args.pad_max_spread_mm),
                 "--max-spread-deg", float(self.args.pad_max_spread_deg)]
+        if self.args.pad_spec:
+            opts += ["--pad-spec", self._pad_spec_remote()]
         return self._analysis("pad", opts, self.b("analysis", "grid-pre.json"),
                               grid_path)
 
