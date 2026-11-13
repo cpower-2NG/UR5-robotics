@@ -838,7 +838,7 @@ def run(td, board, deps=None, **over):
         return rc, out, rd
     finally:
         undo()
-        cm.reset_pad()
+        cm.install_model_pad_defaults()   # C1：回到模型基线（显式，不再靠隐式默认）
 
 
 def phases_of(rd):
@@ -1331,7 +1331,7 @@ with tempfile.TemporaryDirectory() as td:
         rc2, out2 = quiet(rd2.run)
     finally:
         undo()
-        cm.reset_pad()
+        cm.install_model_pad_defaults()   # C1：回到模型基线（显式，不再靠隐式默认）
     before = [p["phase"] for p in rd.phases]
     check("--from/--to archive：只跑归档一段（前几段保留不重跑）",
           [p["phase"] for p in rd2.phases] == before + ["archive"] and rc2 == 0,
@@ -1368,7 +1368,7 @@ with tempfile.TemporaryDirectory() as td:
     model = {c: [v * 1000.0 for v in cm.cell_center(c)] for c in (8, 6, 4, 2, 0)}
     cm.load_grid(gp)
     want = {c: [v * 1000.0 for v in cm.cell_center(c)] for c in (8, 6, 4, 2, 0)}
-    cm.reset_pad()
+    cm.install_model_pad_defaults()       # C1：回到模型基线（显式）
     seen_score = []
 
     def rec_score(burst, xy_mm, top_z, expect_class, hue_deg, search_mm):

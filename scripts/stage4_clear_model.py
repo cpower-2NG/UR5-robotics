@@ -72,10 +72,69 @@ PAD_HALF = 0.15                                     # 兼容旧调用：正方�
 # （台账第二百九十五轮）：计划把块放到 88 mm 外，判分再拿同一个错格心去量。
 PAD_POSE_SOURCE = 'gen_scene 模型常量（未实测）'
 
-_DEFAULT_PAD_CENTER = PAD_CENTER
-_DEFAULT_PAD_YAW_RAD = PAD_YAW_RAD
-_DEFAULT_PAD_THICK = PAD_THICK
-_DEFAULT_PAD_FOOTPRINT = PAD_FOOTPRINT
+# ── 垫参数的「未实测」哨兵（C1，2026-11-13）──────────────────────────
+# 历史事故（台账第 295 轮）：模型常量与印刷垫实测差 87.5 mm / 88.7°，且同时喂
+# 「放哪」和「判对没」—— 放错判错同源、互相自洽。原先的防法是「每个入口记得
+# configure_pad」，漏一个入口就静默用错（score 单步重跑就真漏过一次）。
+# 现在的防法是**毒值**：垫参数未实测时是下面这个哨兵，任何数值使用（算格心、
+# 判垫面、写 manifest、进 f-string）都在**使用处**当场抛 PadNotMeasured ——
+# 36 个读取点一个都不用改，静默通道被结构性堵死。
+
+_PAD_MODEL_CENTER = PAD_CENTER            # gen_scene 模型常量，仅仿真复现用
+_PAD_MODEL_YAW_RAD = PAD_YAW_RAD
+_PAD_MODEL_THICK = PAD_THICK
+_PAD_MODEL_FOOTPRINT = PAD_FOOTPRINT
+_MODEL_PAD_SOURCE = PAD_POSE_SOURCE
+
+
+class PadNotMeasured(RuntimeError):
+    """垫参数没有实测值就被读了。消息里带该做什么。"""
+
+
+class _UnmeasuredPad(float):
+    """未实测哨兵：``isinstance(float)``（保住类型分派），但一切数值使用都抛。
+
+    变异友好：谁把「未实测」当数字用，谁就在自己那一行红，报错带指引。
+    """
+
+    def __new__(cls, label):
+        self = super().__new__(cls, 'nan')
+        self._label = label
+        return self
+
+    def _fail(self, *a, **kw):
+        raise PadNotMeasured(
+            "垫参数 %s 没有实测值 —— 真机流程先 load_grid()/configure_pad()；"
+            "仿真复现显式调 install_model_pad_defaults()（%s）"
+            % (self._label, PAD_POSE_SOURCE))
+
+    __add__ = __radd__ = _fail
+    __sub__ = __rsub__ = _fail
+    __mul__ = __rmul__ = _fail
+    __truediv__ = __rtruediv__ = _fail
+    __lt__ = __le__ = __gt__ = __ge__ = _fail
+    __neg__ = _fail
+    __float__ = _fail
+    __round__ = _fail
+    __format__ = _fail
+
+    def __repr__(self):
+        return 'PAD_UNMEASURED(%s)' % self._label
+
+    __str__ = __repr__
+
+
+def _unmeasured(label):
+    return _UnmeasuredPad(label)
+
+
+def _install_pad(center, yaw_rad, thick, footprint, source):
+    global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE, PAD_THICK, PAD_FOOTPRINT
+    PAD_CENTER = (float(center[0]), float(center[1]))
+    PAD_YAW_RAD = float(yaw_rad)
+    PAD_THICK = float(thick)
+    PAD_FOOTPRINT = (float(footprint[0]), float(footprint[1]))
+    PAD_POSE_SOURCE = str(source)
 
 
 def configure_pad(center_mm=None, yaw_deg=None, source=None,
@@ -83,8 +142,9 @@ def configure_pad(center_mm=None, yaw_deg=None, source=None,
     """把宫格参考换成实测垫位姿 / 垫厚 / 外框。
 
     ``center_mm`` 是 base 系**毫米**；``thickness_m``、``footprint_m``（``(x, y)``
-    米）来自真机实测（v0.6 §20.5：仿真跟真机，不反过来）。旧调用只给位姿时，
-    厚度/外框保持原值。
+    米）来自真机实测（v0.6 §20.5：仿真跟真机，不反过来）。给 None 的字段**保持
+    原值** —— 未实测的就保持未实测（哨兵继续毒着），**不回退模型常量**（C1：
+    隐式回退正是要拆掉的东西）。
     """
     global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE, PAD_THICK, PAD_FOOTPRINT
     if center_mm is not None:
@@ -100,14 +160,29 @@ def configure_pad(center_mm=None, yaw_deg=None, source=None,
         PAD_POSE_SOURCE = str(source)
 
 
+def install_model_pad_defaults():
+    """显式安装 gen_scene 模型常量 —— **只许仿真复现/自检调用**。
+
+    真机流程没有这一步的容身之处：模型常量与印刷垫实测差 87.5 mm / 88.7°，
+    装上它 = 放错判错同源。
+    """
+    _install_pad(_PAD_MODEL_CENTER, _PAD_MODEL_YAW_RAD, _PAD_MODEL_THICK,
+                 _PAD_MODEL_FOOTPRINT, 'gen_scene 模型常量（显式安装）')
+
+
 def reset_pad():
-    """回到模型默认垫参数（自检用；真机运行不该调用它）。"""
+    """回到「未实测」哨兵（自检的干净起点；真机运行不该调它装模型常量）。"""
     global PAD_CENTER, PAD_YAW_RAD, PAD_POSE_SOURCE, PAD_THICK, PAD_FOOTPRINT
-    PAD_CENTER = _DEFAULT_PAD_CENTER
-    PAD_YAW_RAD = _DEFAULT_PAD_YAW_RAD
-    PAD_THICK = _DEFAULT_PAD_THICK
-    PAD_FOOTPRINT = _DEFAULT_PAD_FOOTPRINT
-    PAD_POSE_SOURCE = 'gen_scene 模型常量（未实测）'
+    PAD_CENTER = (_unmeasured('PAD_CENTER.x'), _unmeasured('PAD_CENTER.y'))
+    PAD_YAW_RAD = _unmeasured('PAD_YAW_RAD')
+    PAD_THICK = _unmeasured('PAD_THICK')
+    PAD_FOOTPRINT = (_unmeasured('PAD_FOOTPRINT.x'),
+                     _unmeasured('PAD_FOOTPRINT.y'))
+    PAD_POSE_SOURCE = '未实测（须先解垫：stage4_pad_from_burst.py）'
+
+
+# 缺省状态 = **未实测**（C1 的核心：没有隐式模型回退）。
+reset_pad()
 
 
 def load_grid(path):

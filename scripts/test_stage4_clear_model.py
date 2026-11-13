@@ -38,11 +38,22 @@ def check(name, cond, detail=''):
         print('  FAIL  %s%s' % (name, '   ← %s' % detail if detail else ''))
 
 
+def _raises_pad_not_measured(fn, *a):
+    try:
+        fn(*a)
+    except cm.PadNotMeasured:
+        return True
+    return False
+
+
 def _mut(old, new):
     src = inspect.getsource(cm)
     assert old in src, '变异锚点不在源码里：%r' % old
     ns = {'__file__': cm.__file__, '__name__': 'mut'}
     exec(compile(src.replace(old, new, 1), '<mut>', 'exec'), ns)
+    # C1：变异模块重新 exec ⇒ 回到「未实测」哨兵；变异用例全是模型世界，
+    # 统一显式装模型常量。
+    ns['install_model_pad_defaults']()
     return ns
 
 
@@ -317,6 +328,9 @@ def section_mutation():
     blocks = s4_blocks(0)
     real = cm.terminal_report(blocks)
     mut = _mut('if sep < -pen_tol:', 'if sep <= 0.0:')
+    # 变异模块是重新 exec 的一份源码 ⇒ import 时回到「未实测」哨兵；
+    # 它和正身一样跑模型世界的用例，显式装模型常量（C1）。
+    mut['install_model_pad_defaults']()
     bad = mut['terminal_report'](blocks)
     check('变异「接触也算重叠」：真实合法、改坏后贴面被判穿插',
           real['ok'] and not bad['ok'] and bad['overlaps'] >= 1,
@@ -363,10 +377,13 @@ def section_pad_pose():
         json.dump(grid, f)
 
     try:
-        # 默认值是模型常量，且标记成「未实测」
-        check('默认垫位姿 = 模型常量（未实测）',
-              cm.PAD_CENTER == (cm._DEFAULT_PAD_CENTER) and
-              '未实测' in cm.PAD_POSE_SOURCE, cm.PAD_POSE_SOURCE)
+        # C1：缺省 = 未实测哨兵（不是模型常量）—— 回到未实测态再断言
+        cm.reset_pad()
+        check('默认垫参数 = 未实测哨兵（没有隐式模型回退）',
+              'PAD_UNMEASURED' in repr(cm.PAD_THICK)
+              and '未实测' in cm.PAD_POSE_SOURCE, cm.PAD_POSE_SOURCE)
+        check('未实测哨兵当坐标用 ⇒ 抛（不是悄悄给个格号）',
+              _raises_pad_not_measured(cm.cell_index_of, 0.0, 0.0))
 
         doc = cm.load_grid(gpath)
         check('load_grid 读入实测垫心',
@@ -385,9 +402,6 @@ def section_pad_pose():
               all(abs(a - b) < 1e-12 for a, b in zip(cm.cell_center(4), cm.PAD_CENTER)))
         check('重配后格心反查 = 自己',
               all(cm.cell_index_of(*cm.cell_center(i)) == i for i in range(9)))
-        check('旧垫心不再被判成格 4（模型常量已退场）',
-              cm.cell_index_of(*cm._DEFAULT_PAD_CENTER) != 4,
-              str(cm.cell_index_of(*cm._DEFAULT_PAD_CENTER)))
 
         # 判分端与计划端（gen_scene 的 SDF）必须落到同一批坐标
         gs.load_grid(gpath)
@@ -459,20 +473,34 @@ def section_pad_pose():
         cm.reset_pad()
         gs.reset_pad()
 
-    check('reset_pad 回到模型常量（判分端）',
-          cm.PAD_CENTER == cm._DEFAULT_PAD_CENTER and
-          cm.PAD_YAW_RAD == cm._DEFAULT_PAD_YAW_RAD and
-          '未实测' in cm.PAD_POSE_SOURCE)
-    check('reset_pad 回到模型常量（计划端）',
-          gs.PAD_CENTER_MM == gs._DEFAULT_PAD_CENTER_MM and
-          gs.PAD_YAW_DEG == gs._DEFAULT_PAD_YAW_DEG)
-    check('复位后 gen_scene 默认值仍与判分端同步',
+    # C1（2026-11-13）：reset_pad 的语义改成「回到未实测哨兵」—— 任何数值
+    # 使用当场抛 PadNotMeasured；模型常量必须显式 install_model_pad_defaults()
+    # 才回来（真机不许走它）。计划端 gen_scene 自己的 reset_pad 仍是模型常量
+    # （那是仿真世界的家，两边语义从此有意不同）。
+    check('reset_pad ⇒ 未实测哨兵（repr 可见）',
+          'PAD_UNMEASURED' in repr(cm.PAD_THICK), repr(cm.PAD_THICK))
+    try:
+        float(cm.PAD_THICK)
+    except cm.PadNotMeasured:
+        check('哨兵被当数字用 ⇒ 抛 PadNotMeasured（带指引）', True)
+    else:
+        check('哨兵被当数字用 ⇒ 抛 PadNotMeasured（带指引）', False, '竟然能算')
+    cm.install_model_pad_defaults()
+    check('install_model_pad_defaults 显式装回模型常量',
+          cm.PAD_CENTER == cm._PAD_MODEL_CENTER
+          and cm.PAD_YAW_RAD == cm._PAD_MODEL_YAW_RAD
+          and '显式安装' in cm.PAD_POSE_SOURCE,
+          (cm.PAD_CENTER, cm.PAD_POSE_SOURCE))
+    check('装回后 gen_scene 默认值仍与判分端同步',
           math.degrees(cm.PAD_YAW_RAD) == gs.PAD_YAW_DEG and
           tuple(v * 1000.0 for v in cm.PAD_CENTER) == gs.PAD_CENTER_MM)
 
 
 def main():
     print('=' * 68)
+    # C1：模块缺省 = 未实测哨兵；本套件全是**模型世界**的几何测试，
+    # 夹具显式装模型常量（真机流程走 load_grid，不经过这里）。
+    cm.install_model_pad_defaults()
     section_gen_scene_sync()
     section_cells()
     section_cell_plan()

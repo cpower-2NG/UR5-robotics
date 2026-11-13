@@ -46,13 +46,44 @@ import numpy as np                                                # noqa: E402
 from scipy.spatial.transform import Rotation as Rot               # noqa: E402
 
 import precision_plan as pp                                       # noqa: E402
+import stage4_clear_model                                         # noqa: E402
 import urkin                                                      # noqa: E402
 
-#: 手眼：相机光心在 tool0 系的位置（米）。出处见模块 docstring。
-T_TOOL0_CAM_M = np.array([-0.031924, -0.085321, 0.024256])
+REPO = os.path.dirname(HERE)
+WristCALIB_PATH = os.path.join(REPO, 'docs', 'calib',
+                               'wrist_eih_camlink-2026-10-24.json')
 
-#: 契约拾取区（base 系，米）：x0, x1, y0, y1。
-PICK_ZONE_M = (0.25, 0.575, 0.17, 0.42)
+#: RealSense 驱动内部 ``camera_link → camera_color_optical_frame`` 的有效平移，
+#: **link 系**表示（米）。出处：``docs/calib/wrist_eih_camlink-2026-10-24.json``
+#: 的标定值只给到 camera_link；光心还要再走驱动内部那一段。这个数由
+#: 2026-11-07 e4a-b 帧的 tf 链反解（模长 14.737 mm —— D435 彩色光心的已知
+#: 内偏，方向对得上）。若换相机/换标定，重算：p = R_tl^T (t_光心旧 − t_tl)。
+CAM_LINK_TO_OPTICAL_IN_LINK_M = (-0.0003428, 0.0147317, 0.0002021)
+
+
+def _tool0_to_optical():
+    """tool0 → 相机 color optical 的平移（米）—— **手眼单一出处**。
+
+    = 标定文件（与 ``wrist_tf_publish`` 发 TF 同一份）的 ``tool0→camera_link``，
+    复合驱动内部的 link→optical 偏置。原先这里直接写死合成值
+    (−31.92, −85.32, +24.26) mm、TF 另一个家 —— 改标定不同步到规划，正是
+    审计 C4 指出的「一个事实两个家」。回归测试钉住合成值 = 历史拟合值。
+    """
+    import json
+    from scipy.spatial.transform import Rotation as Rot
+    with open(WristCALIB_PATH, encoding='utf-8') as f:
+        doc = json.load(f)
+    t_tl = np.array([doc['translation'][k] for k in 'xyz'])
+    R_tl = Rot.from_quat([doc['rotation'][k] for k in 'xyzw']).as_matrix()
+    return t_tl + R_tl @ np.asarray(CAM_LINK_TO_OPTICAL_IN_LINK_M, float)
+
+
+#: 手眼：相机光心在 tool0 系的位置（米）。回归钉：= 2026-11-07 e4a-b 拟合值。
+T_TOOL0_CAM_M = _tool0_to_optical()
+
+#: 契约拾取区（base 系，米）：x0, x1, y0, y1。**单一出处 = gen_scene.ZONE**
+#: （经 ``stage4_clear_model.PICK_ZONE``），这里不再自抄一份（审计 C2）。
+PICK_ZONE_M = tuple(stage4_clear_model.PICK_ZONE)
 
 #: 巡检位相机高度（台面上方，米）。可用 ``--height`` 覆盖。
 SURVEY_H_M = 0.500

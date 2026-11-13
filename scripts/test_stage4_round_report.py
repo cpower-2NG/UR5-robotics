@@ -37,6 +37,9 @@ FAILS = []
 S11 = os.path.expanduser(
     "~/robotics/notes/ur5-vision-grasp/runs/2026-11-10-stage4-entry/e9-s11")
 
+# C1：模块缺省 = 未实测哨兵 ⇒ 模型世界套件显式装模型常量（main() 里再装一次
+# 以覆盖中途 reset 的段落）。
+cm.install_model_pad_defaults()
 PAD_TOP_Z = cm.PAD_THICK + 0.0295 / 2.0
 
 
@@ -464,6 +467,8 @@ def section_s11_replay():
 
 def main():
     print('=' * 68)
+    # C1：模块缺省 = 未实测哨兵；模型世界用例显式装模型常量。
+    cm.install_model_pad_defaults()
     for fn in (section_exec_evidence, section_happy, section_missing,
                section_pad_constant, section_pad_thickness_unmeasured,
                section_void_and_class,

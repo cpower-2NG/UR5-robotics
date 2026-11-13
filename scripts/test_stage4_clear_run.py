@@ -39,6 +39,9 @@ FAILS = []
 # 垫面上静止块心的 z。**不许写死**：以前这里写死「0.01763」（= 旧 2.88 mm 垫厚
 # + 半块高），§20.5 把垫厚改成真机实测 0.17 mm 后，写死的值会让
 # `surface_of` 推出 0.00288 m 而判「既不是台面也不是垫面」。
+# C1：模块缺省 = 未实测哨兵 ⇒ 本套件（模型世界）在 import 后显式装模型常量，
+# 这个模块级常量才能保持「跟 cm 走」的原义。
+cm.install_model_pad_defaults()
 PAD_TOP_Z = cm.PAD_THICK + cm.BLOCK_M / 2.0
 
 
@@ -1327,9 +1330,9 @@ def section_pad_pose():
             cr.apply_pad_pose, _Args(), empty,
             {'measured': True, 'center_mm': [461.3, -158.2]})   # 缺 yaw
         check('manifest 字段不全 ⇒ 不猜，仍 fail-closed 停下', ok)
-        cm.reset_pad()
 
-        # manifest 记账
+        # manifest 记账（此时垫是上面 manifest 实测装上的；C1 后未实测会抛，
+        # 这本身就是「记账只认实测」的守卫）
         rec = cr.pad_pose_record(gpath)
         check('pad_pose_record 标 measured、不记绝对路径',
               rec['measured'] is True and rec['source'] == 'grid-pre.json'
@@ -1367,12 +1370,14 @@ def section_pad_pose():
         finally:
             cr.log = real_log
     finally:
-        cm.reset_pad()
+        # C1：后续段落（align/view_gate）是模型世界 ⇒ 装回模型常量；
+        # 「未实测 ⇒ fail-closed」的用例在本节内部已经覆盖。
+        cm.install_model_pad_defaults()
         cm._GS.reset_pad()
 
-    check('复位后不再残留实测垫位姿',
-          cm.PAD_CENTER == cm._DEFAULT_PAD_CENTER and
-          '未实测' in cm.PAD_POSE_SOURCE)
+    check('模型世界装回（后续段落可用）',
+          cm.PAD_CENTER == cm._PAD_MODEL_CENTER
+          and '显式安装' in cm.PAD_POSE_SOURCE, cm.PAD_POSE_SOURCE)
 
 
 # ----------------------------------------------------------------- [11]
@@ -1757,6 +1762,9 @@ def section_finish():
 
 def main():
     print('=' * 68)
+    # C1：模块缺省 = 未实测哨兵；本套件是模型世界（仿真几何），显式装模型常量。
+    # section_pad_pose 自己负责「未实测态」的用例（它内部 reset）。
+    cm.install_model_pad_defaults()
     for fn in (section_yaw, section_surface, section_actions, section_bias,
                section_plans, section_multitarget,
                section_step_cap, section_seed_propagation,

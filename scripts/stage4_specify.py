@@ -39,9 +39,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import block_classes                                              # noqa: E402
 import graspnet_candidates as gc                                  # noqa: E402
+import stage4_clear_model as cm_z                                 # noqa: E402
 
-# 拾取区（base 系，米）：契约 §1 逐字沿用。与 stage4_score / 入口实验同一常量。
-ZONE_M = (0.25, 0.575, 0.17, 0.42)
+# 拾取区（base 系，米）：**单一出处 = gen_scene.ZONE**（经 stage4_clear_model，
+# 审计 C2），不再自抄一份。
+ZONE_M = tuple(cm_z.PICK_ZONE)
 
 BLOCK_MM = 29.5
 VIS_FULL_REF = 0.79          # 满可见参考，见模块 docstring

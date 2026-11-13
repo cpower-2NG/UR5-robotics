@@ -122,12 +122,13 @@ ALIGN_TOL_DEG = 2.0
 #: 170° 上限外。垫面机位有 j0≈−23°、腕 2 +89.8° 的解，先绕它一脚，两端分别
 #: 差 119° 与 0.4°（2026-11-12 attempt6 实测）。
 E9_VIEWS = (
-    {"name": "pick", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500,
+    {"name": "pick", "zone": tuple(cm.PICK_ZONE), "height": 0.500,
      "purpose": "块数/塔层/旁观块（拾取区）"},
     {"name": "pad", "zone": (0.310, 0.610, -0.300, 0.000), "height": 0.500,
      "yaw_deg": 180.0,
      "purpose": "目标块落格（垫面，彩色顶面质心）"},
-    {"name": "free", "zone": (0.280, 0.750, 0.460, 0.620), "height": 0.450,
+    {"name": "free", "zone": (cm.FREE_X[0], cm.FREE_X[1],
+                              cm.FREE_Y[0], cm.FREE_Y[1]), "height": 0.450,
      "purpose": "清障块落点（北侧自由区）"},
 )
 
@@ -1310,7 +1311,9 @@ def apply_pad_pose(args, hint_dir, recorded=None):
                doc.get("checks", {}).get("rms_adopted_px", float("nan"))))
         return path
     if getattr(args, "allow_model_pad", False):
-        cm.reset_pad()          # 真复位：不许残留上一次的实测值
+        # C1：显式安装模型常量（仿真复现专用）。真复位（清实测值）由
+        # reset_pad 的哨兵语义管；这里要的是「装上模型世界」。
+        cm.install_model_pad_defaults()
         log("  ⚠ 没找到实测垫位姿，按 --allow-model-pad 用模型常量 %.1f, %.1f mm / %.3f°"
             % (cm.PAD_CENTER[0] * 1000.0, cm.PAD_CENTER[1] * 1000.0,
                math.degrees(cm.PAD_YAW_RAD)))
