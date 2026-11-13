@@ -702,6 +702,36 @@ def default_board_dir(out_dir):
                                      os.path.basename(out))
 
 
+def pad_thickness_and_footprint(doc, pad_thick_arg, pad_spec_path):
+    """垫厚/足迹的实测来源链。返回 ``(thickness_m, footprint_m|None)``。
+
+    ``--pad-thick`` > ``--pad-spec`` 的 ``thickness_m`` > 解垫的垫面 z
+    （``T_base_pad[2,3]``）。三处皆无 ⇒ ``RoundError``（EXIT_PLAN）—— C1 哨兵
+    不许「静默退回模型常量」（2026-11-13 attempt 干跑实测咬合过一次）。
+    """
+    thick = None
+    foot = None
+    if pad_thick_arg is not None:
+        thick = float(pad_thick_arg)
+    if pad_spec_path and os.path.exists(os.path.expanduser(pad_spec_path)):
+        with open(os.path.expanduser(pad_spec_path), encoding="utf-8") as f:
+            spec = json.load(f)
+        if thick is None and spec.get("thickness_m") is not None:
+            thick = float(spec["thickness_m"])
+        if spec.get("footprint_m"):
+            foot = (float(spec["footprint_m"][0]),
+                    float(spec["footprint_m"][1]))
+    if thick is None:
+        try:
+            thick = float(doc["T_base_pad"][2][3])
+        except (KeyError, TypeError, IndexError, ValueError):
+            raise RoundError(
+                EXIT_PLAN, "compute",
+                "垫厚没有实测来源：--pad-thick / --pad-spec 的 thickness_m / "
+                "解垫 T_base_pad 的垫面 z 三处皆无 —— 不许静默用模型常量，停")
+    return thick, foot
+
+
 class BoardPort(object):
     """Board 端口（B1，2026-11-13）：编排器对「板子」的全部依赖面。
 
@@ -1798,14 +1828,23 @@ class Round:
         return None
 
     def _apply_pad(self, doc, grid_path):
-        """实测垫位姿同时装进 ``cm`` 与 ``gen_scene``（两份源必须同步）。"""
+        """实测垫位姿同时装进 ``cm`` 与 ``gen_scene``（两份源必须同步）。
+
+        厚度/足迹的实测来源链（C1 后置，2026-11-13）：``--pad-thick`` >
+        ``--pad-spec`` 的 ``thickness_m`` > **解垫的垫面 z**（``T_base_pad[2,3]``，
+        台面 = base 0）。全都缺 ⇒ ``RoundError``（fail-closed）—— C1 哨兵已把
+        「静默用模型常量」堵死（attempt 干跑实测：没有这段就会 PadNotMeasured）。
+        足迹只认 ``--pad-spec`` 的 ``footprint_m``（11-11 卷尺实测 0.393×0.21；
+        模型默认 0.30×0.30 与实垫差 90 mm，会判错「垫外」，状态层 §4 早有记录）。
+        """
         cm.load_grid(grid_path)
         cm._GS.configure_pad(center_mm=doc["grid_center_base_mm"],
                              yaw_deg=doc["grid_yaw_base_deg"],
                              source=os.path.basename(grid_path))
-        if self.args.pad_thick is not None:
-            cm.configure_pad(thickness_m=float(self.args.pad_thick))
-            cm._GS.configure_pad(thickness_m=float(self.args.pad_thick))
+        thick, foot = pad_thickness_and_footprint(
+            doc, self.args.pad_thick, self.args.pad_spec)
+        cm.configure_pad(thickness_m=thick, footprint_m=foot)
+        cm._GS.configure_pad(thickness_m=thick, footprint_m=foot)
 
     @staticmethod
     def _pad_pose(doc, grid_path):

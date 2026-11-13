@@ -147,7 +147,10 @@ with tempfile.TemporaryDirectory() as td:
 pad_ok = {"kind": "stage2-grid", "n_frames_ok": 20, "n_frames_total": 20,
           "spread_xy_mm": {"max": 1.0}, "spread_yaw_deg": {"max": 0.2},
           "grid_center_base_mm": [424.2, -112.24],
-          "grid_yaw_base_deg": -179.778}
+          "grid_yaw_base_deg": -179.778,
+          # C1 后置：厚度来源链吃解垫的垫面 z（T_base_pad[2,3]，台面=0）
+          "T_base_pad": [[1, 0, 0, 0.4242], [0, 1, 0, -0.11224],
+                         [0, 0, 1, 0.00017], [0, 0, 0, 1]]}
 check("解垫文档合格 ⇒ 无问题", r.validate_pad_doc(pad_ok) == [])
 check("解垫：帧数不足 ⇒ 红",
       any("帧" in x for x in
@@ -1443,6 +1446,34 @@ check("allow_empty 才加 --allow-empty（默认不加）",
       "--allow-empty" not in _tf_calls[0]
       and "--allow-empty" in _tf_calls[1]
       and "--allow-empty" not in _tf_calls[2], repr(_tf_calls))
+
+# =====================================================================
+# 垫厚/足迹实测来源链（C1 后置，2026-11-13 attempt 干跑咬合的那处）
+# =====================================================================
+_doc = {"T_base_pad": [[1, 0, 0, 0.4242], [0, 1, 0, -0.1122],
+                       [0, 0, 1, 0.0017], [0, 0, 0, 1]]}
+_spec = tempfile.mkdtemp(prefix="pad-spec-")
+_spec_path = os.path.join(_spec, "pad-spec.json")
+with open(_spec_path, "w") as f:
+    json.dump({"footprint_m": [0.393, 0.21]}, f)
+
+_t, _f = r.pad_thickness_and_footprint(_doc, None, None)
+check("垫厚来源链：解垫垫面 z 兜底（T_base_pad[2,3]）",
+      abs(_t - 0.0017) < 1e-12 and _f is None, (_t, _f))
+_t, _f = r.pad_thickness_and_footprint(_doc, 0.005, None)
+check("垫厚来源链：--pad-thick 优先", abs(_t - 0.005) < 1e-12, _t)
+_t, _f = r.pad_thickness_and_footprint(_doc, None, _spec_path)
+check("垫厚来源链：--pad-spec 贡献足迹（0.393×0.21 实测）",
+      abs(_t - 0.0017) < 1e-12 and abs(_f[0] - 0.393) < 1e-12
+      and abs(_f[1] - 0.21) < 1e-12, (_t, _f))
+try:
+    r.pad_thickness_and_footprint({}, None, None)
+except r.RoundError as e:
+    check("垫厚来源链：三处皆无 ⇒ RoundError（fail-closed，不回模型常量）",
+          "垫厚没有实测来源" in str(e), str(e))
+else:
+    check("垫厚来源链：三处皆无 ⇒ RoundError（fail-closed，不回模型常量）",
+          False, "竟然给出来了")
 
 # =====================================================================
 print()
