@@ -157,7 +157,10 @@ def plan_one(chain, q_ref, T_tc, R_nom, K, w, h, block_xy_m, z_top_m, hover_m,
     Ttgt[:3, :3] = R
     Ttgt[:3, 3] = P
     seed = [q_ref[j] for j in chain.move_joints]
-    sol, pe, re, nfev = chain.ik(Ttgt, seed)
+    sol, pe, re, nfev, conv = chain.ik(Ttgt, seed)
+    if not conv:
+        raise RuntimeError('B 案悬停 IK 撞迭代上限（半解，残差 %.3f mm / %.4f°）'
+                           % (pe, re))
     in_lim = all(chain.limits[j][0] <= sol[i] <= chain.limits[j][1]
                  for i, j in enumerate(chain.move_joints))
     margin_deg = min(min(sol[i] - chain.limits[j][0],

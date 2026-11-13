@@ -412,12 +412,17 @@ def stage3_survey_retry_tool0(pose_xyz, pair, shift_mm=STAGE3_RETRY_SHIFT_MM):
 
 
 def solve_waypoint(chain, xyz, yaw_deg, seed, max_iter=200, quat=None):
+    """解一个航点。返回 ``(q, pe, re, nfev, converged)``。
+
+    ``converged=False``（撞 ``max_iter`` 上限的半解）由调用方处置 —— 这里的
+    报错给不出航点名，命名与拒绝统一在 `add_move`（一处判一次）。
+    """
     T = target_matrix(xyz, yaw_deg, quat=quat)
-    q, pe, re, nfev = chain.ik(T, seed, max_iter=max_iter)
+    q, pe, re, nfev, conv = chain.ik(T, seed, max_iter=max_iter)
     # 数值 IK 可能收敛到「同一个位姿、差 2π」的那一支；折回离种子最近的
     # 字面值，否则执行器会照字面整圈转过去（见 unwrap_near 的注释）。
     q = unwrap_near(chain, q, seed)
-    return q, pe, re, nfev
+    return q, pe, re, nfev, conv
 
 
 def pose_residual(chain, q, xyz, yaw_deg=0.0, quat=None):
@@ -556,8 +561,8 @@ def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
     all_seeds += [rng.uniform(-np.pi, np.pi, 6) for _ in range(n_random)]
     out = []
     for s in all_seeds:
-        q, pe, re, _ = chain.ik(T, s, max_iter=max_iter)
-        if pe > 0.1 or re > 0.05:
+        q, pe, re, _, conv = chain.ik(T, s, max_iter=max_iter)
+        if not conv or pe > 0.1 or re > 0.05:
             continue
         if check_limits(chain, q) or check_wrist(chain, q):
             continue
@@ -666,14 +671,19 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
 
 def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
              duration=None, before=None, after=None, q=None, guard=None,
-             quat=None):
+             quat=None, max_iter=200):
     """解一个航点并跑单点预检，追加到 waypoints。返回该点的 q。
 
     ``q`` 已经解好（来自 `solve_path`）时直接用，只复核残差与各项预检。
     ``quat``（xyzw）给定时用它取代「竖直朝下 + yaw」，见 `target_matrix`。
     """
     if q is None:
-        q, pe, re, nfev = solve_waypoint(chain, xyz, yaw_deg, q_seed, quat=quat)
+        q, pe, re, nfev, conv = solve_waypoint(chain, xyz, yaw_deg, q_seed,
+                                               quat=quat, max_iter=max_iter)
+        if not conv:
+            raise PlanError(
+                "航点 %s 的 IK 撞迭代上限：只得到半解（残差 %.3f mm / %.4f°，"
+                "xyz=%s）—— 撞顶的解不许发，换种子也不许救" % (name, pe, re, xyz))
     else:
         q = np.asarray(q, float)
         pe, re = pose_residual(chain, q, xyz, yaw_deg, quat=quat)

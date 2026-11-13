@@ -479,11 +479,12 @@ def plan_align_hover(chain, q_start, action, out_dir, hover_z=ALIGN_HOVER_Z,
     for i, (nm, z) in enumerate((("align_transit", hover_z + transit_dz),
                                  ("align", hover_z))):
         T = pp.target_matrix([x, y, z], yaw)
-        qn, err_mm, err_deg, _it = chain.ik(T, q)
-        if qn is None or err_mm > 2.0 or err_deg > 1.0:
+        qn, err_mm, err_deg, _it, conv = chain.ik(T, q)
+        if qn is None or not conv or err_mm > 2.0 or err_deg > 1.0:
             raise pp.PlanError(
-                "对中悬停航点 %s IK 不过：err=%.2f mm / %.2f°"
-                % (nm, 0.0 if qn is None else err_mm,
+                "对中悬停航点 %s IK 不过：%serr=%.2f mm / %.2f°"
+                % (nm, "" if conv else "撞迭代上限（半解），",
+                   0.0 if qn is None else err_mm,
                    0.0 if qn is None else err_deg))
         wp = {"name": nm, "q": [float(v) for v in qn],
               "duration": pp.duration_for(q, qn)}

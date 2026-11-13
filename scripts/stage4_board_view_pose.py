@@ -126,7 +126,10 @@ def main(argv=None):
     Ttgt[:3, :3] = R
     Ttgt[:3, 3] = P
     seed = [q_ref[j] for j in chain.move_joints]
-    sol, pe, re, nfev = chain.ik(Ttgt, seed)
+    sol, pe, re, nfev, conv = chain.ik(Ttgt, seed)
+    if not conv:
+        raise RuntimeError('看板机位 IK 撞迭代上限（半解，残差 %.3f mm / %.4f°）'
+                           % (pe, re))
     lim = chain.limits
     in_lim = all(lim[j][0] <= sol[i] <= lim[j][1]
                  for i, j in enumerate(chain.move_joints))

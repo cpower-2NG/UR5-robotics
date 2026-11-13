@@ -818,8 +818,8 @@ def scene(chain):
             "angle_deg": 12.0, "seed": 0, "tilt_deg": 4.0,
             "xyz_base": [0.523, 0.331, 0.0295],
             "approach_base": [0.0, 0.0, -1.0]}
-    q0, pe, re, _ = chain.ik(pp.target_matrix(pp.SURVEY_TOOL0["pick"]),
-                             [0.0, -1.2, 1.4, -1.6, -1.5, 0.0])
+    q0, pe, re, _, _conv = chain.ik(pp.target_matrix(pp.SURVEY_TOOL0["pick"]),
+                                    [0.0, -1.2, 1.4, -1.6, -1.5, 0.0])
     assert pe < 0.1 and re < 0.05, "巡检位自己就解不出来：%.3f mm" % pe
     return blocks, cand, q0
 

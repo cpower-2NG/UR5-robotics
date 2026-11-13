@@ -510,7 +510,7 @@ def run_scene(arm, chain, scene, out_dir, urdf, timeout, views):
         T[:3, :3] = R
         T[:3, 3] = tool0
         q0 = arm.wait_joints()
-        q, _pe, _re, _it = chain.ik(T, q0)
+        q, _pe, _re, _it, _conv = chain.ik(T, q0)
         mv = arm.goto(q)
         moves[name] = mv
         if not mv["ok"]:

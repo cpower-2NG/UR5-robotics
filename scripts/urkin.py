@@ -95,7 +95,15 @@ class Chain:
         return T
 
     def ik(self, T_target, seed, max_iter=200):
-        """数值 IK。返回 (q, pos_err_mm, rot_err_deg, 迭代数)。"""
+        """数值 IK。返回 (q, pos_err_mm, rot_err_deg, 迭代数, converged)。
+
+        ``converged`` = scipy 的 ``status``（xtol/ftol/gtol 三种正常收敛）；
+        ``status=0`` 是 **撞 ``max_iter`` 上限被掐断**，此时返回的是「到目前为止
+        最好的半解」而不是解 —— 调用方必须把它当失败处理（审计实测：远种子下
+        ~5% 的可达目标会撞顶，残差 50–200 mm，不区分就会把半解当解往下传）。
+        注意它与残差是**两道独立的门**：不可达目标可能 ftol「收敛」到一个高残差
+        的局部极小（残差门拦它），可达目标也可能撞顶（本标志拦它）。
+        """
         def resid(q):
             T = self.fk(q)
             e_p = T[:3, 3] - T_target[:3, 3]
@@ -107,7 +115,7 @@ class Chain:
         T = self.fk(sol.x)
         pe = np.linalg.norm(T[:3, 3] - T_target[:3, 3]) * 1000
         re = np.degrees(np.linalg.norm(Rot.from_matrix(T_target[:3, :3].T @ T[:3, :3]).as_rotvec()))
-        return sol.x, pe, re, sol.nfev
+        return sol.x, pe, re, sol.nfev, bool(sol.success)
 
     def link_names(self):
         """base_link→tip 这条链上的所有 link（含起止），按从根到梢排序。"""

@@ -85,9 +85,10 @@ def scene(chain):
             "angle_deg": 12.0, "seed": 0, "tilt_deg": 4.0,
             "xyz_base": [0.523, 0.331, 0.032],
             "approach_base": [0.0, 0.0, -1.0]}
-    q0, pe, re, _ = chain.ik(pp.target_matrix(pp.SURVEY_TOOL0["pick"]),
-                            [0.0, -1.2, 1.4, -1.6, -1.5, 0.0])
+    q0, pe, re, _, conv = chain.ik(pp.target_matrix(pp.SURVEY_TOOL0["pick"]),
+                                   [0.0, -1.2, 1.4, -1.6, -1.5, 0.0])
     assert pe < 0.1 and re < 0.05, "巡检位自己就解不出来：%.3f mm" % pe
+    assert conv, "巡检位解出来了却是撞顶半解"
     return blocks, cand, q0
 
 
@@ -101,6 +102,35 @@ def test_limits_reject_raw_overflow(chain):
     assert pp.check_limits(chain, [6.5, 0, 0, 0, 0, 0]), \
         "6.5 rad 被放过 —— 限位检查是不是先做了 ±π 折算？"
     assert pp.check_limits(chain, [0, 0, -3.1, 0, 0, 0]), "肘 −3.1 rad 超过 −2.992"
+
+
+@case
+def test_ik_reports_max_iter_exhaustion(chain):
+    """撞 max_iter 的半解必须带 ``converged=False``，且不许被当成解发出去。
+
+    审计实测（2026-11-13）：远种子下 ~5% 的可达目标撞 200 次上限，返回残差
+    50–200 mm 的半解；``chain.ik`` 原先不区分「正常收敛」与「撞顶」，全靠下游
+    残差门兜底。现在两道门独立：撞顶 ⇒ ``converged=False``；不可达目标可能
+    ftol「收敛」到高残差局部极小 ⇒ 残差门拦。这条测试把两道门各钉一头。
+
+    变异：把 urkin.ik 的返回改成永远 ``conv=True`` ⇒ 两处断言都红。
+    """
+    T = pp.target_matrix(pp.SURVEY_TOOL0["pick"])
+    seed = [0.0, -1.2, 1.4, -1.6, -1.5, 0.0]
+    _, pe, _, _, conv = chain.ik(T, seed, max_iter=200)
+    assert pe < 0.1 and conv, "正常目标应当收敛（pe=%.3f, conv=%s）" % (pe, conv)
+    _, pe1, _, _, conv1 = chain.ik(T, seed, max_iter=1)
+    assert not conv1, "max_iter=1 必然撞顶，converged 却是 True"
+    q1, pe1, _, _, conv2 = pp.solve_waypoint(chain, pp.SURVEY_TOOL0["pick"],
+                                             0.0, seed, max_iter=1)
+    assert not conv2, "solve_waypoint 把撞顶半解标成了收敛解"
+    try:
+        pp.add_move([], chain, "t", pp.SURVEY_TOOL0["pick"], seed, 0.0,
+                    pp.TABLE_PLANE_Z, max_iter=1)
+    except pp.PlanError as exc:
+        assert "t" in str(exc) and "撞迭代上限" in str(exc), exc
+    else:
+        raise AssertionError("撞顶半解居然从 add_move 过关了")
 
 
 @case
@@ -307,7 +337,7 @@ def test_ik_branch_selection_keeps_forearm_above_table(chain):
     naive_bad = None
     for name, xyz in targets:
         prev = q
-        q, pe, re, _ = pp.solve_waypoint(chain, xyz, 0.0, q)
+        q, pe, re, _, _conv = pp.solve_waypoint(chain, xyz, 0.0, q)
         assert pe < 0.1 and re < 0.05, "%s 单种子都解不出：%.3f mm" % (name, pe)
         ok, worst = pp.check_guard(chain, prev, q, pp.TABLE_PLANE_Z)
         if not ok:
@@ -957,12 +987,12 @@ def test_fingertip_guard_direct(chain):
     _, _, meta = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25))
     gx, gy = meta["grasp_point"]
     T = pp.target_matrix((gx, gy, meta["grasp_z"]))
-    q_hi, pe, re, _ = chain.ik(T, q0)
+    q_hi, pe, re, _, _conv = chain.ik(T, q0)
     assert pe < 0.1
     ok, worst = pp.check_guard(chain, q_hi, q_hi)
     assert ok, "抓取点自身不该被判红：%s" % (worst,)
     T2 = pp.target_matrix((gx, gy, meta["grasp_z"] - 0.060))
-    q_lo, pe2, re2, _ = chain.ik(T2, q_hi)
+    q_lo, pe2, re2, _, _conv = chain.ik(T2, q_hi)
     assert pe2 < 0.1, "压低后的姿态应该解得出来（否则测的就不是护栏）"
     ok2, worst2 = pp.check_guard(chain, q_hi, q_lo)
     assert not ok2, "压低 60 mm 却没判红：%s" % (worst2,)
