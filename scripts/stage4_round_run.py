@@ -702,7 +702,75 @@ def default_board_dir(out_dir):
                                      os.path.basename(out))
 
 
-class RoundBoard:
+class BoardPort(object):
+    """Board 端口（B1，2026-11-13）：编排器对「板子」的全部依赖面。
+
+    八个阶段只经这 13 个方法碰板子；``SshBoard``（= RoundBoard）经 SSH 实现，
+    ``LocalBoard`` 在**板子上本机跑编排器**时用同机实现 —— ``Round`` 的阶段
+    逻辑与闸门对两者零感知。这就是「编排器上板」的结构改动点：搬的是适配器，
+    不是状态机。
+
+    端口方法：ssh / push / push_many / mkdir / clear / pull_file / pull_dir /
+    joints / preflight / token_state / wait_token / run_script / analyze / probe。
+    """
+
+    def wait_token(self, timeout_s, poll_s, now=time.time, sleep=time.sleep,
+                   out=log, fresh_min=None):
+        """在板上轮询到「**这一次**两步握手写完令牌」为止；超时 ⇒ ``RoundError(3)``。
+
+        ``fresh_min``：令牌剩余秒数下限。**不给下限就会捡到上一轮/上一次尝试
+        留下的令牌**——它还没过期，``wait_token`` 立刻「授权成立」，等于沿用
+        旧授权。2026-11-11 Round 0 重跑时就发生过一次（令牌还剩 479 s，而这一
+        次人还没按 STOP/PLAY）。红线 6 要求逐次授权 ⇒ 缺省要求令牌几乎是新
+        签发的（600 s TTL 留 60 s 余量）。
+        """
+        deadline = float(now()) + float(timeout_s)
+        last = None
+        while float(now()) < deadline:
+            tok, rem, why = self.token_state()
+            if tok and (fresh_min is None or float(rem) >= float(fresh_min)):
+                log("授权成立：按板上时钟令牌还剩 %.0f 秒" % rem)
+                return tok, rem
+            if tok:
+                why = ("令牌只剩 %.0f 秒（< %.0f）—— 不是这一次签发的，继续等"
+                       "新的 STOP→PLAY" % (float(rem), float(fresh_min)))
+            if why != last:
+                log("等待授权：%s" % why)
+                last = why
+            sleep(float(poll_s))
+        raise RoundError(EXIT_GATE, "authorize",
+                         "等 %.0f 秒仍没有有效令牌（最后一次：%s）—— "
+                         "按了 PLAY 也不算，要两步都看到（fail-closed）"
+                         % (float(timeout_s), last or "没有读到令牌文件"))
+
+
+def _require_clean_args(parts, what):
+    for p in parts:
+        if not p or " " in p or "'" in p or '"' in p:
+            raise RoundError(EXIT_MISSING, "board",
+                             "%s参数含空白/引号：%r" % (what, p))
+
+
+def _analysis_cmd(repo, kind, opts, out_remote):
+    """板上分析命令串（ssh 与 LocalBoard 共用一条构造）。"""
+    argv = [str(kind)] + [str(v) for v in opts] + ["--out", out_remote]
+    _require_clean_args([repo] + argv, "板上分析")
+    return ("cd %s && %s/run.sh scripts/stage4_board_analysis.py %s"
+            % (repo, pr.BOARD_DIR, " ".join(argv)))
+
+
+def _probe_cmd(repo, cells, group, truth_remote, grid_remote, report_remote):
+    """板上探针命令串（ssh 与 LocalBoard 共用一条构造）。"""
+    parts = [repo, truth_remote, str(cells), group, grid_remote,
+             report_remote]
+    _require_clean_args(parts, "探针")
+    return ("cd %s && %s/run.sh scripts/stage4_clear_probe.py "
+            "--truth %s --grid %s --cells %s --group %s --report %s"
+            % (repo, pr.BOARD_DIR, truth_remote, grid_remote, cells,
+               group, report_remote))
+
+
+class RoundBoard(BoardPort):
     """板子适配器：SSH / 推文件（md5 核对）/ 取关节 / 跑脚本 / 令牌剩余。
 
     开发机不能当 ROS 节点（跨进程 DDS 不可用），所以一切板上动作都在这里。
@@ -860,35 +928,6 @@ class RoundBoard:
                                 % (-rem))
         return tok, rem, ""
 
-    def wait_token(self, timeout_s, poll_s, now=time.time, sleep=time.sleep,
-                   out=log, fresh_min=None):
-        """在板上轮询到「**这一次**两步握手写完令牌」为止；超时 ⇒ ``RoundError(3)``。
-
-        ``fresh_min``：令牌剩余秒数下限。**不给下限就会捡到上一轮/上一次尝试
-        留下的令牌**——它还没过期，``wait_token`` 立刻「授权成立」，等于沿用
-        旧授权。2026-11-11 Round 0 重跑时就发生过一次（令牌还剩 479 s，而这一
-        次人还没按 STOP/PLAY）。红线 6 要求逐次授权 ⇒ 缺省要求令牌几乎是新
-        签发的（600 s TTL 留 60 s 余量）。
-        """
-        deadline = float(now()) + float(timeout_s)
-        last = None
-        while float(now()) < deadline:
-            tok, rem, why = self.token_state()
-            if tok and (fresh_min is None or float(rem) >= float(fresh_min)):
-                log("授权成立：按板上时钟令牌还剩 %.0f 秒" % rem)
-                return tok, rem
-            if tok:
-                why = ("令牌只剩 %.0f 秒（< %.0f）—— 不是这一次签发的，继续等"
-                       "新的 STOP→PLAY" % (float(rem), float(fresh_min)))
-            if why != last:
-                log("等待授权：%s" % why)
-                last = why
-            sleep(float(poll_s))
-        raise RoundError(EXIT_GATE, "authorize",
-                         "等 %.0f 秒仍没有有效令牌（最后一次：%s）—— "
-                         "按了 PLAY 也不算，要两步都看到（fail-closed）"
-                         % (float(timeout_s), last or "没有读到令牌文件"))
-
     def run_script(self, remote_script, token):
         """在板上跑 ``bash <script> <token>``；返回 ``(rc, 输出)``。
 
@@ -915,14 +954,8 @@ class RoundBoard:
         ``~/precision/run.sh`` 就是 ``exec python3 "$@"``（与探针同一条通路）；
         参数不许含空白/引号（板端路径一律以 ``~`` 开头，不过 ``shlex.quote``）。
         """
-        argv = [str(kind)] + [str(v) for v in opts] + ["--out", out_remote]
-        for p in [repo] + argv:
-            if not p or " " in p or "'" in p or '"' in p:
-                raise RoundError(EXIT_MISSING, "board",
-                                 "板上分析参数含空白/引号：%r" % p)
+        cmd = _analysis_cmd(repo, kind, opts, out_remote)
         self.ssh("mkdir -p %s" % os.path.dirname(out_remote))
-        cmd = ("cd %s && %s/run.sh scripts/stage4_board_analysis.py %s"
-               % (repo, pr.BOARD_DIR, " ".join(argv)))
         r = self.ssh(cmd)
         if r.returncode != 0:
             log("  !! 板上分析 %s rc=%d：%s"
@@ -945,16 +978,147 @@ class RoundBoard:
         **路径不能过 ``shlex.quote``**：板端路径一律以 ``~`` 开头，单引号会把
         波浪号焊死、不展开。改为直接要求不含空白/引号（本仓生成的都是这种）。
         """
-        parts = [repo, truth_remote, str(cells), group, grid_remote,
-                 report_remote]
-        for p in parts:
-            if not p or " " in p or "'" in p or '"' in p:
-                raise RoundError(EXIT_MISSING, "board",
-                                 "探针参数含空白/引号：%r" % p)
-        cmd = ("cd %s && %s/run.sh scripts/stage4_clear_probe.py "
-               "--truth %s --grid %s --cells %s --group %s --report %s"
-               % (repo, pr.BOARD_DIR, truth_remote, grid_remote, cells,
-                  group, report_remote))
+        cmd = _probe_cmd(repo, cells, group, truth_remote, grid_remote,
+                         report_remote)
+        return self.ssh(cmd)
+
+
+class LocalBoard(BoardPort):
+    """``--where board`` 的适配器：编排器**就在板上跑**，同机直呼。
+
+    与 ``RoundBoard``（SSH）逐方法同义，但执行体从「ssh 到板子」换成「本地
+    bash / 文件系统」—— 八个阶段的逻辑与闸门两边零感知。板上路径仍以 ``~``
+    开头（与 ssh 时代同一套命令串），文件系统操作前 ``expanduser``。
+
+    这就是「编排器上板」的落点：开发机断网/睡眠不再触及令牌窗口内的任何
+    一步（验收判据见方案文件 B3 —— 发起后 kill 本地 ssh，整轮照跑）。
+    """
+
+    def __init__(self, board_dir, exp_dir=None, alias=None):
+        if not board_dir:
+            raise RoundError(EXIT_MISSING, "board", "板上镜像目录为空")
+        self.alias = alias or "local"
+        self.board_dir = board_dir.rstrip("/")
+        self.exp_dir = exp_dir
+        self._root = os.path.expanduser("/")
+
+    def _p(self, path):
+        return os.path.expanduser(str(path))
+
+    def ssh(self, cmd, quiet=True, check=False):
+        """同机执行同一条命令串（bash -c；``~`` 由 shell 展开，与 ssh 一致）。"""
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True,
+                           text=True)
+        if check and r.returncode != 0:
+            raise RoundError(EXIT_MISSING, "board",
+                             "本地命令 rc=%d：%s（%s）"
+                             % (r.returncode, cmd[:80],
+                                (r.stderr or "").strip()[:200]))
+        return r
+
+    def push(self, local, remote, label=None):
+        dst = self._p(remote)
+        os.makedirs(os.path.dirname(dst) or "/", exist_ok=True)
+        shutil.copyfile(self._p(local), dst)
+        want = hashlib.md5(open(self._p(local), "rb").read()).hexdigest()
+        got = hashlib.md5(open(dst, "rb").read()).hexdigest()
+        if got != want:
+            raise RoundError(EXIT_MISSING, "board",
+                             "推送后 md5 不一致：%s" % (label or remote))
+        log("  推送 %-40s md5 %s 一致" % (label or os.path.basename(remote),
+                                         want[:12]))
+
+    def push_many(self, pairs):
+        for local, remote in pairs:
+            self.push(local, remote)
+
+    def mkdir(self, remote):
+        if not remote:
+            raise RoundError(EXIT_MISSING, "board", "板上目录为空")
+        os.makedirs(self._p(remote), exist_ok=True)
+
+    def clear(self, remote):
+        shutil.rmtree(self._p(remote), ignore_errors=True)
+
+    def pull_file(self, remote, local):
+        os.makedirs(os.path.dirname(os.path.abspath(local)) or ".", exist_ok=True)
+        shutil.copyfile(self._p(remote), local)
+
+    def pull_dir(self, remote, local):
+        os.makedirs(local, exist_ok=True)
+        shutil.copytree(self._p(remote), local, dirs_exist_ok=True)
+
+    def joints(self, dest_local):
+        remote = pr.BOARD_SCRATCH + "/joints"
+        self.mkdir(remote)
+        self.ssh("%s/run.sh %s/precision_capture.py %s --joints-only --timeout 20"
+                 % (pr.BOARD_DIR, pr.BOARD_DIR, remote))
+        os.makedirs(dest_local, exist_ok=True)
+        self.pull_file(remote + "/joint_states.json",
+                       os.path.join(dest_local, "joint_states.json"))
+        return json.load(open(os.path.join(dest_local,
+                                           "joint_states.json")))
+
+    def preflight(self, repo):
+        cmd = "python3 - %s <<'PY'\n%s\nPY" % (shlex.quote(repo),
+                                               PREFLIGHT_PY)
+        r = self.ssh(cmd)
+        if r.returncode != 0:
+            raise RoundError(EXIT_MISSING, "preflight",
+                             "预检脚本失败（rc=%d）：%s"
+                             % (r.returncode, (r.stderr or "").strip()[:300]))
+        try:
+            return json.loads((r.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError) as e:
+            raise RoundError(EXIT_MISSING, "preflight",
+                             "预检输出不是 JSON：%s（%s）"
+                             % (str(e), (r.stdout or "").strip()[:200]))
+
+    def token_state(self):
+        """令牌与时钟都在本机 —— 读文件 + 本机 ``time.time()``（= 板上时钟）。"""
+        path = self._p(pr.AUTH_TOKEN_FILE)
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            return None, None, "读不到令牌文件（%s）" % pr.AUTH_TOKEN_FILE
+        tok = (doc or {}).get("token")
+        if not tok:
+            return None, None, "没有运动授权令牌（先做 STOP→PLAY 两步握手）"
+        if not doc.get("stop_at") or not doc.get("play_at"):
+            return None, None, "令牌缺 STOP/PLAY 两步记录 —— 重做握手"
+        rem = float(doc.get("expires") or 0) - time.time()
+        if rem <= 0:
+            return None, None, "令牌已过期 %.0f 秒（本机时钟 = 板上时钟）" % (-rem)
+        return tok, rem, ""
+
+    def run_script(self, remote_script, token):
+        script = self._p(remote_script)
+        if " " in remote_script or "'" in remote_script:
+            raise RoundError(EXIT_MISSING, "board",
+                             "板上脚本路径含空格/引号：%r" % remote_script)
+        if not os.path.exists(script):
+            raise RoundError(EXIT_MISSING, "board",
+                             "脚本不存在：%s" % remote_script)
+        r = self.ssh("bash %s %s" % (remote_script, shlex.quote(token)))
+        return r.returncode, ((r.stdout or "") + (r.stderr or ""))
+
+    def analyze(self, repo, kind, opts, out_remote, out_local):
+        cmd = _analysis_cmd(repo, kind, opts, out_remote)
+        self.mkdir(os.path.dirname(out_remote))
+        r = self.ssh(cmd)
+        if r.returncode != 0:
+            log("  !! 板上分析 %s rc=%d：%s"
+                % (kind, r.returncode,
+                   ((r.stderr or "") + (r.stdout or "")).strip()[-300:]))
+            return r
+        self.pull_file(out_remote, out_local)
+        return r
+
+    def probe(self, repo, cells, group, truth_remote, grid_remote,
+              report_remote):
+        cmd = _probe_cmd(repo, cells, group, truth_remote, grid_remote,
+                         report_remote)
         return self.ssh(cmd)
 
 
@@ -2159,6 +2323,10 @@ def build_parser():
     ap.add_argument("--out-dir", required=True, help="轮目录（仓外）")
     ap.add_argument("--round-id", default=None)
     ap.add_argument("--urdf", default=None, help="真机 robot.urdf（规划用）")
+    ap.add_argument("--where", choices=("dev", "board"), default="dev",
+                    help="编排器在哪跑：dev = 本机经 SSH 驱动板子（过渡态）；"
+                         "board = 就在板上跑（B3 目标态：本机断网不影响令牌"
+                         "窗口内的任何一步）。board 时 --board 别名不需要")
     ap.add_argument("--board", default=None, help="SSH 别名 / 主机")
     ap.add_argument("--board-repo", default=None,
                     help="板上本仓检出路径（探针与预检在里面跑）。阶段 4 是 "
@@ -2247,7 +2415,7 @@ def prepare(ap, args):
     把这段从 ``main`` 里拆出来，是为了让测试用**和真机完全同一条**参数路径：
     如果只在 main 里做缺省填充，测试就会自造一套参数，漂了也看不见。
     """
-    if not args.board:
+    if getattr(args, "where", "dev") == "dev" and not args.board:
         ap.error("要给 --board（SSH 别名）")
     if not args.board_repo:
         ap.error("要给 --board-repo（板上本仓检出路径）")
@@ -2297,9 +2465,14 @@ def parse_cli(ap, argv=None):
 def main(argv=None):
     ap = build_parser()
     args = prepare(ap, parse_cli(ap, argv))
-    board = RoundBoard(args.board,
-                       args.board_dir or default_board_dir(args.out_dir),
-                       os.path.dirname(os.path.abspath(args.out_dir)))
+    board_dir = args.board_dir or default_board_dir(args.out_dir)
+    if getattr(args, "where", "dev") == "board":
+        # B3 目标态：编排器就在板上跑 —— 同机适配器，SSH 只剩「发起/观察」。
+        board = LocalBoard(board_dir,
+                           os.path.dirname(os.path.abspath(args.out_dir)))
+    else:
+        board = RoundBoard(args.board, board_dir,
+                           os.path.dirname(os.path.abspath(args.out_dir)))
     return Round(args, board).run()
 
 
