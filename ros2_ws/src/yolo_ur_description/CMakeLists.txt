@@ -24,7 +24,9 @@ message(STATUS "yolo_ur_description: 镜像上游自 ${ur_description_share}")
 install(DIRECTORY "${ur_description_share}/config/"
         DESTINATION share/${PROJECT_NAME}/config
         PATTERN "default_kinematics.yaml" EXCLUDE)
-install(FILES "${ur_description_share}/urdf/ur.urdf.xacro"
+# A1（2026-11-13）：不再镜像 ur_description 的透传版，改装本包 urdf/ 里
+# **带 AG-95 碰撞代理**的版本（ur.urdf.xacro + ag95_collision.urdf.xacro）。
+install(FILES urdf/ur.urdf.xacro urdf/ag95_collision.urdf.xacro
         DESTINATION share/${PROJECT_NAME}/urdf)
 # 两个官方 launch 都会用 description_package 拼 rviz 配置的路径
 # （ur_control.launch.py:220、ur_moveit.launch.py:236 —— 后者其实用

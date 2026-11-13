@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/xacro">
+  <!-- ── AG-95 夹爪碰撞代理（A1，2026-11-13）────────────────────────────
+       给真机 MoveIt 模型补夹爪几何：原先真机模型 0 个 ag95 连杆 ⇒
+       /check_state_validity 查不到「夹爪撞臂」（attempt6，C153A3 的盲区）。
+       **3 个 fixed 连杆**：不引入任何可动关节 ⇒ ros2_control/驱动零影响；
+       两指取 **全开** 位（95 mm，中心 x=±58.5 mm）= 对自碰撞与世界碰撞都取
+       最坏包络（与探针 OPEN_Q 同口径）。
+       尺寸逐字来自 arm_grasp_sim/models/ag95.urdf.xacro（本仓仿真代理）：
+       本体 100×75×60 mm；指 22×30×144.2 mm；tool0→指尖外沿 204.2 mm。
+       SRDF 侧的相邻对豁免见 ur_moveit_config/srdf/ur.srdf.xacro 的 A1 块
+       （板上 /opt 同文件，已同步补）。 -->
+  <xacro:macro name="ag95_collision" params="parent">
+    <link name="ag95_base_link">
+      <collision>
+        <origin xyz="0 0 0.030" rpy="0 0 0"/>
+        <geometry><box size="0.100 0.075 0.060"/></geometry>
+      </collision>
+    </link>
+    <joint name="ag95_mount_joint" type="fixed">
+      <parent link="${parent}"/>
+      <child link="ag95_base_link"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+    <link name="ag95_left_finger_link">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><box size="0.022 0.030 0.1442"/></geometry>
+      </collision>
+    </link>
+    <joint name="ag95_left_finger_fixed" type="fixed">
+      <parent link="ag95_base_link"/>
+      <child link="ag95_left_finger_link"/>
+      <origin xyz="0.0585 0 0.0600" rpy="0 0 0"/>
+    </joint>
+    <link name="ag95_right_finger_link">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry><box size="0.022 0.030 0.1442"/></geometry>
+      </collision>
+    </link>
+    <joint name="ag95_right_finger_fixed" type="fixed">
+      <parent link="ag95_base_link"/>
+      <child link="ag95_right_finger_link"/>
+      <origin xyz="-0.0585 0 0.0600" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+</robot>
