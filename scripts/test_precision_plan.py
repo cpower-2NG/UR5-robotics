@@ -435,14 +435,20 @@ def test_no_full_circle_wrist_flip(chain):
         return [float(np.abs(np.asarray(b["q"]) - np.asarray(a["q"])).max())
                 for a, b in zip(wps, wps[1:])]
 
-    # ① 旧行为（抓取角不折 180° + 行程按 2π 折算 + 不折角）⇒ 必须被
-    #    `MAX_JOINT_SWING` 拦下，否则这条测试证明不了护栏在起作用。
-    #    `fold_yaw_180` 也要一起关掉：148.583° 折成 −31.417° 之后，腕根本不用
-    #    绕远路，单独关 unwrap/travel_cost 已经复现不出事故（2026-10-27 实测）。
-    orig = (pp.unwrap_near, pp.travel_cost, pp.fold_yaw_180)
+    # ① 旧行为（抓取角不折 180° + 行程按 2π 折算 + 不折角 + **步长帽也放开**）
+    # ⇒ 必须被 `MAX_JOINT_SWING` 拦下，否则这条测试证明不了护栏在起作用。
+    # 2026-11-13（A4）更新：A3 之后 DP 内就有单步门（作业 150°/机位 170°），
+    # 旧事故路径在变异下会被 DP 先滤掉、根本到不了 `MAX_JOINT_SWING` ——
+    # 所以变异必须连步长帽一起放开，才能打到它要证明的那道护栏。
+    # `fold_yaw_180` 也要一起关掉：148.583° 折成 −31.417° 之后，腕根本不用
+    # 绕远路，单独关 unwrap/travel_cost 已经复现不出事故（2026-10-27 实测）。
+    orig = (pp.unwrap_near, pp.travel_cost, pp.fold_yaw_180,
+            pp.MAX_JOINT_STEP_DEG, pp.TRANSIT_STEP_CAP_DEG)
     pp.unwrap_near = lambda ch, q, ref: np.asarray(q, float)
     pp.travel_cost = pp.joint_dist
     pp.fold_yaw_180 = lambda d: float(d)
+    pp.MAX_JOINT_STEP_DEG = 1e9
+    pp.TRANSIT_STEP_CAP_DEG = 1e9
     try:
         try:
             build()
@@ -453,6 +459,7 @@ def test_no_full_circle_wrist_flip(chain):
     finally:
         pp.unwrap_near, pp.travel_cost = orig[0], orig[1]
         pp.fold_yaw_180 = orig[2]
+        pp.MAX_JOINT_STEP_DEG, pp.TRANSIT_STEP_CAP_DEG = orig[3], orig[4]
 
     # ② 正身
     wps = build()
@@ -512,6 +519,9 @@ def test_grasp_yaw_folds_mod_180(chain):
     assert len(wps) == 8, [w["name"] for w in wps]   # 不该再有插点
 
     # 变异：关掉折算 ⇒ 必须被护栏拦下（否则这条测试证明不了折算在起作用）
+    # A4（2026-11-13）：拦的形式随门进化——要么 `JointSwingError`（「整圈翻转」，
+    # 2026-10-27 时的门），要么 `BranchChainError`（A3 的分段单步上限把那条
+    # 链整链拒掉）。两者都是 fail-closed，断言认「被拒」这个事实本身。
     orig = pp.fold_yaw_180
     pp.fold_yaw_180 = lambda d: float(d)
     try:
@@ -520,7 +530,7 @@ def test_grasp_yaw_folds_mod_180(chain):
                                        slot, **kw)
             pp.split_jumps(wps0, chain)
         except pp.PlanError as exc:
-            assert "整圈翻转" in str(exc), exc
+            assert ('整圈翻转' in str(exc)) or ('上限' in str(exc)), exc
         else:
             raise AssertionError("未折角的计划居然通过了")
     finally:
