@@ -273,6 +273,83 @@ with tempfile.TemporaryDirectory() as td:
 rma.observe = _ob
 
 # =====================================================================
+print('--- C2. do_listen：自动顺序两步（板上轮内用，B3-lite） ---')
+_ob = rma.observe
+
+with tempfile.TemporaryDirectory() as td:
+    # 顺序语义与手动两步一致：先看到 STOPPED、再看到 PLAYING+RUNNING+NORMAL
+    rma.observe = Seq([obs('PLAYING'), obs('STOPPED'),
+                       obs('PLAYING', robotmode='STOPPED'),
+                       obs('PLAYING', robotmode='RUNNING')])
+    rc, out = quiet(rma.do_listen, 'IP', td, 2.0, 0.2)
+    check('listen：PLAYING→STOPPED→(非 RUNNING)→RUNNING ⇒ 退出 0', rc == 0,
+          'rc=%r out=%r' % (rc, out[-200:]))
+    doc = {}
+    p = os.path.join(td, rma.TOKEN_FILE)
+    if os.path.exists(p):
+        doc = json.load(open(p, encoding='utf-8'))
+    check('listen：令牌带 STOP/PLAY 两步记录',
+          doc.get('stop_at') and doc.get('play_at')
+          and doc.get('stop_nonce'), repr(doc))
+    check('listen：令牌自述从未发送 play/stop',
+          '从未发送' in doc.get('note', ''), repr(doc.get('note')))
+    check('listen：提示包含完整握手指引',
+          '按 STOP' in out and '按 PLAY' in out and '急停' in out, repr(out))
+
+with tempfile.TemporaryDirectory() as td:
+    # 第 1 步超时 ⇒ 不写令牌（fail-closed，与 do_stop 同判据）
+    rma.observe = Seq([obs('PLAYING')])
+    rc, out = quiet(rma.do_listen, 'IP', td, 0.3, 0.2)
+    check('listen：一直 PLAYING（没按 STOP）⇒ 退出 2', rc == 2, 'rc=%r' % rc)
+    check('listen：不写令牌',
+          not os.path.exists(os.path.join(td, rma.TOKEN_FILE)))
+
+with tempfile.TemporaryDirectory() as td:
+    # 第 2 步状态不全 ⇒ 不写令牌
+    rma.observe = Seq([obs('STOPPED'), obs('PLAYING', robotmode='STOPPED')])
+    rc, out = quiet(rma.do_listen, 'IP', td, 0.3, 0.2)
+    check('listen：PLAYING 但 robotmode 停着 ⇒ 退出 2', rc == 2, 'rc=%r' % rc)
+    check('listen：不写令牌',
+          not os.path.exists(os.path.join(td, rma.TOKEN_FILE)))
+
+with tempfile.TemporaryDirectory() as td:
+    # 变异：STOP 窗口 0 秒 ⇒ 刚记的第 1 步也被拒（窗口真的被查）
+    rma.observe = Seq([obs('STOPPED'), obs('PLAYING', robotmode='RUNNING')])
+    rc, out = quiet(rma.do_listen, 'IP', td, 2.0, 0.2, stop_window=0.0)
+    check('listen：变异 STOP 窗口 0 秒 ⇒ 拒（rc 2，不写令牌）', rc == 2, 'rc=%r' % rc)
+    check('listen：不写令牌',
+          not os.path.exists(os.path.join(td, rma.TOKEN_FILE)))
+
+# CLI 接线：--listen 进互斥组、走到 do_listen
+_rmai = rma.observe
+with tempfile.TemporaryDirectory() as td:
+    rma.observe = Seq([obs('STOPPED'), obs('PLAYING', robotmode='RUNNING')])
+    rc, out = quiet(rma.main, ['--listen', '--auth-dir', td,
+                               '--timeout', '2.0', '--interval', '0.2',
+                               '--robot-ip', 'IP'])
+    check('CLI --listen ⇒ 退出 0 且令牌落盘', rc == 0 and
+          os.path.exists(os.path.join(td, rma.TOKEN_FILE)), repr(out[-200:]))
+rma.observe = _ob
+
+# =====================================================================
+print('--- C3. stop_requested：软停请求的读端（只能减权，无「继续」通道） ---')
+with tempfile.TemporaryDirectory() as td:
+    asked, doc = rma.stop_requested(os.path.join(td, 'nope.json'))
+    check('文件不在 ⇒ 不在（False，空内容）', asked is False and doc == {},
+          repr((asked, doc)))
+    p = os.path.join(td, 'stop-request.json')
+    with open(p, 'w', encoding='utf-8') as fh:
+        json.dump({'requested': True, 'reason': '现场按停', 'at': 123.0}, fh)
+    asked, doc = rma.stop_requested(p)
+    check('requested=true ⇒ 在场，内容原样带出', asked is True and
+          doc.get('reason') == '现场按停', repr(doc))
+    with open(p, 'w', encoding='utf-8') as fh:
+        fh.write('{坏 JSON')
+    asked, doc = rma.stop_requested(p)
+    check('坏 JSON ⇒ 当作不在（不猜）', asked is False and doc == {},
+          repr((asked, doc)))
+
+# =====================================================================
 print('--- D. 闸门接到 precision_exec：--go 没令牌就一条也不发 ---')
 _argv = sys.argv
 try:

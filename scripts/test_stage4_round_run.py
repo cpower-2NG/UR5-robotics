@@ -1130,7 +1130,26 @@ with tempfile.TemporaryDirectory() as td:
           row.get("void") is True, repr(row))
     check("aborted_token 的提示写明不算抓取失败", "不算抓取失败" in out)
 
-# ---- C8b 观察段缺目录之类的普通失败 ≠ 令牌问题（2026-11-11 Round 0 误诊）
+# ---- C8c 人为软停（watch_round --stop）⇒ void，但与 aborted_token 分开记
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    b.run_results = [(3, "!! 软停请求在（stop-request.json，现场按停）—— "
+                         "计划 3/6 不发，本轮 void（stop_requested）")]
+    rc, out, rd = run(td, b)
+    row = [p for p in rd.phases if p["phase"] == "execute"][0]
+    void = json.load(open(os.path.join(td, "run", "s0-1-r1", "void.json")))
+    check("人为软停 ⇒ rc 3 且 void=true", rc == r.EXIT_GATE and
+          row.get("void") is True, repr((rc, row)))
+    check("软停的 void.json 记 stop_requested（与 aborted_token 分开）",
+          void.get("reason") == "stop_requested", repr(void))
+    check("软停不算抓取失败（提示写明）", "不记抓取失败" in out, out[-200:])
+    # 软停请求是**一次性**的：执行段开始时先清（下一轮不被上一轮的残留拦停）
+    cleared = [c for c in b.calls if c[0] == "ssh"
+               and "stop-request" in str(c[1])]
+    check("执行段起手清残留软停请求（rm -f stop-request.json）",
+          any("rm -f" in str(c[1]) for c in cleared), repr(cleared))
+
+# ---- C8d 观察段缺目录之类的普通失败 ≠ 令牌问题（2026-11-11 Round 0 误诊）
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
     b.pre_results = [(9, "===== 令牌剩余时间守卫（要求 ≥ 30 s）\n"

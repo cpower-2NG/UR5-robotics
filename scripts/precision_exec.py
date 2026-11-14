@@ -822,6 +822,22 @@ def main():
                     break
                 print("  运动授权仍在：握手在 %.0f 秒前完成" % age)
             time.sleep(1.0)
+        # 软停（watch_round --stop 写入，计划边界粒度）：这份计划还没发，
+        # 现在停最干净；**正在走的那条轨迹不中断**——立刻停只有示教器急停。
+        # 本机接口的唯一指令是减权：这个文件只能让轮早停，没有「继续」通道。
+        asked, sreq = (False, {})
+        if args.go:
+            asked, sreq = rma.stop_requested()
+        if asked:
+            print("!! 软停请求在（stop-request.json，%s）—— 计划 %d/%d 不发，"
+                  "本轮 void（stop_requested）"
+                  % (sreq.get("reason") or "?", i + 1, len(jobs)))
+            log_line(jobs[i]["log"], event="stop_requested",
+                     reason=str(sreq.get("reason") or "?"),
+                     requested_at=sreq.get("at"), plan_index=i + 1,
+                     plans_total=len(jobs))
+            rc = 3
+            break
         rc = run_plan(i, job)
         if rc != 0:
             print("!! 计划 %d/%d 失败（rc=%d）—— 后面的计划不跑"

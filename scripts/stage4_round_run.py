@@ -82,6 +82,7 @@ import block_classes as bc                                      # noqa: E402
 import grasp_bias as gb                                         # noqa: E402
 import precision_plan as pp                                     # noqa: E402
 import precision_round as pr                                    # noqa: E402
+import real_motion_authorize as rma                             # noqa: E402
 import stage4_clear_model as cm                                 # noqa: E402
 import stage4_clear_run as cr                                   # noqa: E402
 import stage4_layouts as lay                                    # noqa: E402
@@ -2026,6 +2027,9 @@ class Round:
         self.board.clear(self.b("exec"))
         for v in cr.E9_VIEWS:
             self.board.clear(self.b("wrist-post", v["name"]))
+        # 上一轮残留的软停请求**先清**：它是「让这一轮早停」的一次性减权指令，
+        # 留着会让下一轮在第一个计划边界就停（watch_round --stop 每次要重新写）。
+        self.board.ssh("rm -f %s" % rma.STOP_REQUEST_FILE)
         self.board.mkdir(self.b("exec"))     # 只写不推，必须显式建
         rc, out = self.board.run_script(self.b("run.sh"), tok)
         os.makedirs(self.p("exec"), exist_ok=True)
@@ -2040,6 +2044,19 @@ class Round:
                 raise RoundError(EXIT_EXEC, "execute",
                                  "run.sh 返回 0 但没有 ALL DONE —— 不认")
             return EXIT_OK
+        if "stop_requested" in out:
+            # 人为软停（watch_round --stop，计划边界生效）：同为 void、不计
+            # streak、不记抓取失败，但原因与令牌过期分开记。
+            write_json(self.p("void.json"),
+                       {"reason": "stop_requested",
+                        "at": self.deps["now"](),
+                        "exec_rc": rc,
+                        "note": "人为软停 ⇒ 本轮 void：不计连续 streak、"
+                                "不记抓取失败；正在走的轨迹已按计划边界停"})
+            raise RoundError(EXIT_GATE, "execute",
+                             "人为软停（rc=%d）—— 本轮 void"
+                             "（stop_requested），不计连续 streak，不记抓取失败"
+                             % rc, void=True)
         if "aborted_token" in out or "令牌剩余不足" in out:
             # 令牌过期的**机器证据落盘**：`--from score` 单步重跑判分时，
             # 不再依赖人记得在 facts 里填 voids（2026-11-14 审计：此前这条
@@ -2209,8 +2226,11 @@ class Round:
         void_evidence = self.p("void.json")
         if os.path.exists(void_evidence):
             vd = read_json(void_evidence)
-            merged_voids = {tid: "aborted_token（执行中令牌过期/不足，机器证据）"
-                            for tid in ids}
+            why_text = {"aborted_token": "执行中令牌过期/不足（机器证据）",
+                        "stop_requested": "人为软停（watch_round --stop，"
+                                          "计划边界生效）"}.get(
+                vd.get("reason"), str(vd.get("reason")))
+            merged_voids = {tid: why_text for tid in ids}
             merged_voids.update(human.get("voids") or {})
             human = dict(human) if isinstance(human, dict) else {}
             human["voids"] = merged_voids

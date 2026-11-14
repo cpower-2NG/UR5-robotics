@@ -174,6 +174,13 @@ def section_exec_evidence():
     ])
     check('令牌过期事件 ⇒ aborted_token=True（不算 traj/gripper 失败）',
           ev.get('aborted_token') is True and ev['exec_rc'] == 0, str(ev))
+    ev = rr.exec_evidence([
+        {'event': 'gate', 'ok': True},
+        {'event': 'stop_requested', 'reason': '现场按停'},
+    ])
+    check('软停事件 ⇒ stop_requested=True（与 aborted_token 分开记）',
+          ev.get('stop_requested') is True and 'aborted_token' not in ev
+          and ev['exec_rc'] == 0, str(ev))
     ev = rr.exec_evidence([{'event': 'traj', 'ok': True}])
     check('没有令牌事件 ⇒ 不写 aborted_token 键', 'aborted_token' not in ev,
           str(ev))

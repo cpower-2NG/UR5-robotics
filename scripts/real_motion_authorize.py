@@ -23,7 +23,14 @@
     export UR_ROBOT_IP=<ur-controller-ip>          # 或每次 --robot-ip
     python3 scripts/real_motion_authorize.py --step stop --timeout 120
     python3 scripts/real_motion_authorize.py --step play --timeout 120
+    python3 scripts/real_motion_authorize.py --listen --timeout 1800   # 板上轮内用
     python3 scripts/precision_exec.py --plan ... --go --require-auth <token>
+
+``--listen``（B3-lite，2026-11-14）：编排器上板后，两步握手不能再依赖有人在
+开发机记得敲两条命令 —— 同一个只读观测循环里**自动顺序**做两步（看到 STOPPED
+记第 1 步 → 看到 PLAYING+RUNNING+NORMAL 写令牌）。观测语义、写盘内容、
+fail-closed 判据与 ``--step stop/--step play`` 逐条一致；``wait_token`` 的
+fresh_min 核验照旧是独立的一道。它仍然**从不发送 play/stop**。
 
 令牌写在 ``~/.config/ur5-vision-grasp/motion-auth.json``（仓外），**10 分钟**过期。
 上一次的授权不覆盖下一次：每个动臂段落都要重新握手。
@@ -44,6 +51,7 @@ DEFAULT_AUTH_DIR = os.path.join(os.path.expanduser('~'), '.config',
                                 'ur5-vision-grasp')
 STOP_FILE = 'motion-auth-stop.json'
 TOKEN_FILE = 'motion-auth.json'
+STOP_REQUEST_FILE = os.path.join(DEFAULT_AUTH_DIR, 'stop-request.json')
 TOKEN_TTL_S = 600.0        # 令牌有效期：10 分钟
 STOP_WINDOW_S = 600.0      # PLAY 必须在 STOP 之后这么久以内
 DASHBOARD_PORT = 29999
@@ -128,6 +136,40 @@ def _poll(robot_ip, want, timeout, interval, extra=None):
 
 
 # ---------------------------------------------------------------- 两步
+def _record_stop(obs, auth_dir):
+    """第 1 步的落盘（do_stop 与 do_listen 共用）。返回记录。"""
+    os.makedirs(auth_dir, exist_ok=True)
+    rec = {'nonce': secrets.token_hex(8), 'at': time.time(),
+           'at_iso': datetime.datetime.now().isoformat(timespec='seconds'),
+           'observed': obs['raw'], 'program': obs['program']}
+    with open(os.path.join(auth_dir, STOP_FILE), 'w', encoding='utf-8') as fh:
+        json.dump(rec, fh, ensure_ascii=False, indent=1)
+    return rec
+
+
+def _write_token(obs, stop_rec, auth_dir):
+    """第 2 步的落盘（do_play 与 do_listen 共用）。返回令牌。"""
+    now = time.time()
+    token = secrets.token_hex(16)
+    doc = {
+        'kind': 'stage4-motion-authorization',
+        'token': token,
+        'stop_nonce': stop_rec.get('nonce'),
+        'stop_at': stop_rec.get('at'),
+        'play_at': now,
+        'play_at_iso': datetime.datetime.now().isoformat(timespec='seconds'),
+        'expires': now + TOKEN_TTL_S,
+        'observed_stop': stop_rec.get('observed'),
+        'observed_play': obs['raw'],
+        'note': 'STOP→PLAY 两步都是脚本从 Dashboard 只读查询里**看到**的；'
+                '脚本从未发送 play/stop',
+    }
+    os.makedirs(auth_dir, exist_ok=True)
+    with open(os.path.join(auth_dir, TOKEN_FILE), 'w', encoding='utf-8') as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=1)
+    return token
+
+
 def do_stop(robot_ip, auth_dir, timeout, interval):
     print('>>> 需要人动手：示教器按 STOP（我随后开始等）')
     obs, why = _poll(robot_ip, lambda o: o['program'] == 'STOPPED',
@@ -136,12 +178,7 @@ def do_stop(robot_ip, auth_dir, timeout, interval):
         print('!! 没看到 STOPPED：%s' % why)
         print('   ⇒ 不写任何授权（fail-closed）')
         return 2
-    os.makedirs(auth_dir, exist_ok=True)
-    rec = {'nonce': secrets.token_hex(8), 'at': time.time(),
-           'at_iso': datetime.datetime.now().isoformat(timespec='seconds'),
-           'observed': obs['raw'], 'program': obs['program']}
-    with open(os.path.join(auth_dir, STOP_FILE), 'w', encoding='utf-8') as fh:
-        json.dump(rec, fh, ensure_ascii=False, indent=1)
+    rec = _record_stop(obs, auth_dir)
     print('看到 STOPPED（robotmode=%s）⇒ 记下第 1 步' % obs['robotmode'])
     print('>>> 需要人动手：示教器按 PLAY（我随后开始等）')
     return 0
@@ -170,26 +207,50 @@ def do_play(robot_ip, auth_dir, timeout, interval, stop_window=STOP_WINDOW_S):
         print('!! 没看到 PLAYING+RUNNING+NORMAL：%s' % why)
         print('   ⇒ 不写令牌（fail-closed）')
         return 2
-    now = time.time()
-    token = secrets.token_hex(16)
-    doc = {
-        'kind': 'stage4-motion-authorization',
-        'token': token,
-        'stop_nonce': stop_rec.get('nonce'),
-        'stop_at': stop_rec.get('at'),
-        'play_at': now,
-        'play_at_iso': datetime.datetime.now().isoformat(timespec='seconds'),
-        'expires': now + TOKEN_TTL_S,
-        'observed_stop': stop_rec.get('observed'),
-        'observed_play': obs['raw'],
-        'note': 'STOP→PLAY 两步都是脚本从 Dashboard 只读查询里**看到**的；'
-                '脚本从未发送 play/stop',
-    }
-    os.makedirs(auth_dir, exist_ok=True)
-    with open(os.path.join(auth_dir, TOKEN_FILE), 'w', encoding='utf-8') as fh:
-        json.dump(doc, fh, ensure_ascii=False, indent=1)
+    token = _write_token(obs, stop_rec, auth_dir)
     print('看到 PLAYING（robotmode=%s，safety=%s）⇒ 两步握手成立' % (
         obs['robotmode'], obs['safety']))
+    print('令牌：%s   （%.0f 秒内有效）' % (token, TOKEN_TTL_S))
+    return 0
+
+
+def do_listen(robot_ip, auth_dir, timeout, interval,
+              stop_window=STOP_WINDOW_S):
+    """自动顺序两步（板上轮内用，B3-lite）。
+
+    与 ``--step stop/--step play`` 的人工接力的唯一区别是「谁记得喊下一步」：
+    这里是同一个观测循环按次序自动推进，**观测门、窗口门、fail-closed 判据
+    逐条相同**。两步超时/窗口超了 ⇒ 不写令牌退出 2 —— 编排器的 wait_token
+    等不到新鲜令牌自然停轮。
+    """
+    print('>>> 需要人动手：确认两指整个行程内无手无遮挡、急停在手，')
+    print('>>> 然后示教器先按 STOP，看到 STOPPED 后再按 PLAY。')
+    obs, why = _poll(robot_ip, lambda o: o['program'] == 'STOPPED',
+                     timeout, interval)
+    if why:
+        print('!! [listen] 没看到 STOPPED：%s —— 不写任何授权（fail-closed）'
+              % why)
+        return 2
+    rec = _record_stop(obs, auth_dir)
+    print('看到 STOPPED（robotmode=%s）⇒ 记下第 1 步' % obs['robotmode'])
+    print('>>> 需要人动手：示教器按 PLAY（我随后开始等）')
+    obs2, why2 = _poll(
+        robot_ip,
+        lambda o: o['program'] == 'PLAYING',
+        timeout, interval,
+        extra=lambda o: o['robotmode'] == 'RUNNING' and o['safety'] == 'NORMAL')
+    if why2:
+        print('!! [listen] 没看到 PLAYING+RUNNING+NORMAL：%s —— 不写令牌'
+              '（fail-closed）' % why2)
+        return 2
+    age = time.time() - float(rec.get('at', 0))
+    if age > stop_window:
+        print('!! [listen] 第 1 步（STOP）已过去 %.0f 秒（> %.0f）—— 重新握手'
+              % (age, stop_window))
+        return 2
+    token = _write_token(obs2, rec, auth_dir)
+    print('看到 PLAYING（robotmode=%s，safety=%s）⇒ 两步握手成立' % (
+        obs2['robotmode'], obs2['safety']))
     print('令牌：%s   （%.0f 秒内有效）' % (token, TOKEN_TTL_S))
     return 0
 
@@ -239,12 +300,32 @@ def token_remaining(token, auth_dir=None, now=None):
     return rem, ''
 
 
+def stop_requested(path=None):
+    """软停请求（``watch_round.py --stop`` 写入）是否在场。``(bool, 内容)``。
+
+    B3-lite 接口铁律的落点：本机对轮内**唯一**的指令只能「减权」——这个文件
+    让本轮在下一个计划边界提前停，除此之外**没有任何效果**；不存在对应的
+    「继续 / 加权」通道。内容只做日志（谁在何时因何停）。
+    """
+    p = path or STOP_REQUEST_FILE
+    try:
+        with open(p, encoding='utf-8') as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return False, {}
+    return bool(doc.get('requested')), doc
+
+
 # ---------------------------------------------------------------- CLI
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description='真机运动授权：STOP→PLAY 两步只读核验（从不发送 play/stop）')
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--step', choices=('stop', 'play'))
+    g.add_argument('--listen', action='store_true',
+                   help='板上轮内用：自动顺序两步（看到 STOPPED → 看到 '
+                        'PLAYING+RUNNING+NORMAL 才写令牌；观测语义与手动两步'
+                        '逐条一致，仍然从不发送 play/stop）')
     g.add_argument('--check-token', default=None,
                    help='只校验令牌（不动控制柜）')
     ap.add_argument('--min-remaining', type=float, default=0.0,
@@ -275,6 +356,9 @@ def main(argv=None):
         return 2
     if args.step == 'stop':
         return do_stop(args.robot_ip, args.auth_dir, args.timeout, args.interval)
+    if args.listen:
+        return do_listen(args.robot_ip, args.auth_dir, args.timeout,
+                         args.interval)
     return do_play(args.robot_ip, args.auth_dir, args.timeout, args.interval)
 
 

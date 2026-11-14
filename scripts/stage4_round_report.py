@@ -161,6 +161,9 @@ def exec_evidence(events):
             # 2026-11-14 起这条有结构化日志（precision_exec 写 event），
             # 不再只活在 stdout 字符串里。
             out["aborted_token"] = True
+        elif kind == "stop_requested":
+            # 人为软停（watch_round --stop）⇒ 同为 void，原因分开记。
+            out["stop_requested"] = True
         elif kind in ("traj", "gripper_fail", "gripper_selftest"):
             if ev.get("event") == "gripper_fail":
                 rc = max(rc, 1)
