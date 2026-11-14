@@ -290,7 +290,7 @@ def _write_plan(path, duration=10.0):
                                  {"duration": duration}]}, f)
 
 
-def fake_plan_views(chain_, q, views, out_dir, start=0):
+def fake_plan_views(chain_, q, views, out_dir, start=0, validator=None):
     plans = []
     os.makedirs(out_dir, exist_ok=True)
     for i, v in enumerate(views, start=int(start) + 1):
@@ -321,7 +321,7 @@ def fake_plan_sequence(chain_, q, actions, blocks, out_dir,
                        survey_tool0=None, place_clearance=None,
                        wrist_survey=True, views=None, place_yaw_equiv=False,
                        start=0, min_block_gap=0.0, gap_check="probe_verified",
-                       tail_targets=None):
+                       tail_targets=None, validator=None):
     PLAN_CALLS.append({"start": start, "wrist_survey": wrist_survey,
                        "gap_check": gap_check, "min_block_gap": min_block_gap,
                        "n_actions": len(actions),
@@ -518,6 +518,10 @@ def make_args(td, **over):
             "--board", "fake", "--board-repo", "/repo",
             "--board-dir", "/b",
             "--expect", os.path.join(td, "expect.json")]
+    # 这套件测的是编排，不是裁决准入：非干跑用例统一带豁免旗
+    # （开发机没有 move_group；准入策略本身由 resolve_validator 段守着）。
+    if not over.get("dry_run"):
+        argv += ["--allow-no-validator"]
     if bias_seed is not False:
         argv += ["--bias-seed", str(bias_seed)]
     for key, val in over.items():
@@ -1466,6 +1470,66 @@ _t, _f = r.pad_thickness_and_footprint(_doc, None, _spec_path)
 check("垫厚来源链：--pad-spec 贡献足迹（0.393×0.21 实测）",
       abs(_t - 0.0017) < 1e-12 and abs(_f[0] - 0.393) < 1e-12
       and abs(_f[1] - 0.21) < 1e-12, (_t, _f))
+
+# =====================================================================
+# A2 准入策略（2026-11-14 审计：validator 此前从不被构造）
+# =====================================================================
+print()
+print("== resolve_validator 准入策略 ==")
+
+class _NS(object):
+    """最小 args 命名空间。"""
+    def __init__(self, where="dev", dry_run=False, allow=False):
+        self.where = where
+        self.dry_run = dry_run
+        self.allow_no_validator = allow
+
+import stage4_moveit_validator as _mv
+_mv_sentinel = object()
+_mv_real = _mv.make_segment_validator
+_log_lines = []
+try:
+    _mv.make_segment_validator = lambda names, require=False, **kw: _mv_sentinel
+    _v = r.resolve_validator("board", False, False, ["j1"],
+                             log=_log_lines.append)
+    check("板上 ⇒ 必构 validator（require=True 的构造结果）",
+          _v is _mv_sentinel, repr(_v))
+    check("板上构造有日志", any("板上构造" in s for s in _log_lines),
+          _log_lines)
+
+    def _boom(names, require=False, **kw):
+        raise RuntimeError("move_group 没起（测试注入）")
+    _mv.make_segment_validator = _boom
+    try:
+        r.resolve_validator("board", False, False, ["j1"],
+                            log=_log_lines.append)
+    except RuntimeError as e:
+        check("板上 move_group 不可达 ⇒ 构造期异常直通（fail-closed）",
+              "move_group" in str(e), str(e))
+    else:
+        check("板上 move_group 不可达 ⇒ 构造期异常直通", False, "竟然放行了")
+
+    _v = r.resolve_validator("dev", True, False, ["j1"],
+                             log=_log_lines.append)
+    check("开发机 + 干跑 ⇒ 不构造（None，没有保护对象）", _v is None, repr(_v))
+
+    try:
+        r.resolve_validator("dev", False, False, ["j1"],
+                            log=_log_lines.append)
+    except r.RoundError as e:
+        check("开发机 + 非干跑 + 无豁免 ⇒ RoundError（不许静默裸奔）",
+              "allow-no-validator" in str(e), str(e))
+    else:
+        check("开发机 + 非干跑 + 无豁免 ⇒ RoundError", False, "竟然放行了")
+
+    _log_lines.clear()
+    _v = r.resolve_validator("dev", False, True, ["j1"],
+                             log=_log_lines.append)
+    check("开发机 + 非干跑 + 显式豁免 ⇒ None + 响亮告警",
+          _v is None and any("缺席" in s for s in _log_lines), _log_lines)
+finally:
+    _mv.make_segment_validator = _mv_real
+
 try:
     r.pad_thickness_and_footprint({}, None, None)
 except r.RoundError as e:

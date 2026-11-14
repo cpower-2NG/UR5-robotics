@@ -800,6 +800,43 @@ def _probe_cmd(repo, cells, group, truth_remote, grid_remote, report_remote):
                group, report_remote))
 
 
+def resolve_validator(where, dry_run, allow_no_validator, joint_names,
+                      log=log):
+    """A2 段级碰撞裁决的**构造与准入策略**。
+
+    2026-11-14 审计：`make_segment_validator` 造好了、测试齐了，但编排器
+    从不构造、调用点从不传 —— 正式轮一直在**没有碰撞裁决**的情况下规划。
+    本函数把「谁在什么条件下必须带着裁决规划」钉成一处：
+
+    · ``where == "board"``（编排器在板上，与 move_group 同图）：**必构**，
+      ``require=True`` —— move_group 不可达当场 RuntimeError ⇒ 停轮
+      （契约 §4.3 前置「段级碰撞裁决可用且模型含夹爪」的落地）。
+    · 开发机 + 干跑：不构造（离线排练没有保护对象，也不该为纯计算要求
+      move_group）。
+    · 开发机 + 非干跑：规划物理上够不着板上的 move_group（跨机 DDS 坏，
+      AGENTS §4）⇒ 只能无裁决规划；必须显式 ``--allow-no-validator``，
+      否则停轮。这不是宽松门，是「不许静默裸奔」的闸。
+    """
+    if where == "board":
+        import stage4_moveit_validator as mv
+        log("碰撞裁决：板上构造（require=True，move_group 不可达即停轮）")
+        return mv.make_segment_validator(joint_names, require=True)
+    if dry_run:
+        log("碰撞裁决：干跑不构造（离线排练）")
+        return None
+    if not allow_no_validator:
+        raise RoundError(
+            EXIT_PLAN, "compute",
+            "开发机上构造不出碰撞裁决（跨机 DDS 坏，规划够不着板上的 "
+            "move_group）—— 正式轮要么 `--where board` 在板上跑编排器，"
+            "要么显式 `--allow-no-validator`（响亮告警 + 记 manifest）；"
+            "不许静默地在无裁决下规划真机轨迹")
+    log("!! 碰撞裁决缺席（--allow-no-validator）：计划只受步长/限位/护栏"
+        "约束，拦不住合法关节角的自碰撞（attempt6 C153A3 的形态）—— "
+        "已记入 manifest")
+    return None
+
+
 class RoundBoard(BoardPort):
     """板子适配器：SSH / 推文件（md5 核对）/ 取关节 / 跑脚本 / 令牌剩余。
 
@@ -1475,8 +1512,14 @@ class Round:
         write_json(self.p("pre", "q_start.json"), {"q": q0})
         pre_plan = self.p("pre", "plan")
         os.makedirs(pre_plan, exist_ok=True)
+        self._validator = resolve_validator(
+            getattr(self.args, "where", "dev"), bool(self.args.dry_run),
+            bool(getattr(self.args, "allow_no_validator", False)),
+            chain.move_joints)
+        self._validator_on = self._validator is not None
         try:
-            plans, _q = cr.plan_views(chain, q0, PRE_VIEWS, pre_plan)
+            plans, _q = cr.plan_views(chain, q0, PRE_VIEWS, pre_plan,
+                                      validator=self._validator)
         except pp.PlanError as e:
             raise RoundError(EXIT_PLAN, "views",
                              "跑前机位预检不过：%s —— 计划没有写出" % e)
@@ -1740,6 +1783,15 @@ class Round:
         q = read_json(self.p("pre", "q_after_observe.json"))["q"]
         plan_dir = self.p("plan")
         os.makedirs(plan_dir, exist_ok=True)
+        # --from compute 单步重跑时 views 阶段没跑过 ⇒ 这里自建（幂等）。
+        if getattr(self, "_validator", None) is None and \
+                not getattr(self, "_validator_done", False):
+            self._validator = resolve_validator(
+                getattr(self.args, "where", "dev"), bool(self.args.dry_run),
+                bool(getattr(self.args, "allow_no_validator", False)),
+                chain.move_joints)
+        self._validator_done = True
+        self._validator_on = getattr(self, "_validator", None) is not None
         # 抓点/邻块几何必须吃**本轮真正要抓的那份块位姿**：``--truth-source
         # measured`` 时 ``truth`` 已被换成跑前 pick burst 实测（``_measured_truth``），
         # 若这里还拿布局表的标称坐标喂 ``plan_sequence``，就是「量了不用」——
@@ -1767,7 +1819,10 @@ class Round:
                     # 不写进它的计划（见 cr.view_targets / build_pick 的
                     # post_targets）。不给的话两条链可能差整整 360°，compute 时
                     # 才发现机位拍不了（2026-11-12 attempt6）。
-                    tail_targets=(cr.view_targets() if tid == ids[-1] else None))
+                    tail_targets=(cr.view_targets() if tid == ids[-1] else None),
+                    # A2：段级碰撞裁决随计划进 solve_path（构造与准入见
+                    # resolve_validator；2026-11-14 审计前这里从不传）
+                    validator=getattr(self, "_validator", None))
             except pp.PlanError as e:
                 raise RoundError(EXIT_PLAN, "compute",
                                  "块 %s 的计划预检不过：%s —— run.sh 不写、"
@@ -1782,7 +1837,8 @@ class Round:
             log("  目标 %s：%d 个动作 → 计划 %s"
                 % (tid, len(actions), [p["name"] for p in tgt_plans]))
         # 跑后三机位：只追加一次
-        vplans, q = cr.plan_views(chain, q, cr.E9_VIEWS, plan_dir, start=idx)
+        vplans, q = cr.plan_views(chain, q, cr.E9_VIEWS, plan_dir, start=idx,
+                                  validator=getattr(self, "_validator", None))
         all_plans.extend(vplans)
         self.timing["plan_s"] = round(float(self.deps["now"]()) - t_plan, 1)
 
@@ -1930,6 +1986,10 @@ class Round:
             "survey_tool0": list(cr.E9_SURVEY_TOOL0),
             "gap_check": "layout_gap",
             "place_yaw_equiv180": bool(self.args.place_yaw_equiv180),
+            # 可追溯（改造方案 §3 不变量 3）：这轮计划是谁规划的、有没有带着
+            # 段级碰撞裁决出闸（2026-11-14 审计：此前 manifest 层答不了这两问）
+            "planner_backend": "urkin",
+            "collision_validator": bool(getattr(self, "_validator_on", False)),
             "actions": actions,
             "plans": plans,
             "q_start": list(q_before),
@@ -1981,6 +2041,15 @@ class Round:
                                  "run.sh 返回 0 但没有 ALL DONE —— 不认")
             return EXIT_OK
         if "aborted_token" in out or "令牌剩余不足" in out:
+            # 令牌过期的**机器证据落盘**：`--from score` 单步重跑判分时，
+            # 不再依赖人记得在 facts 里填 voids（2026-11-14 审计：此前这条
+            # 只活在 stdout 字符串里，直接走 round_report 会被判 missing）。
+            write_json(self.p("void.json"),
+                       {"reason": "aborted_token",
+                        "at": self.deps["now"](),
+                        "exec_rc": rc,
+                        "note": "执行中令牌过期/不足 ⇒ 本轮 void：不计连续 "
+                                "streak、不记抓取失败（契约 §4.6）"})
             raise RoundError(EXIT_GATE, "execute",
                              "执行中令牌过期 / 不足（rc=%d）—— 本轮 void"
                              "（aborted_token），不计连续 streak，不记抓取失败"
@@ -2134,6 +2203,19 @@ class Round:
                              "计数，拿不到就不判（补好证据后 --from score）"
                              % self.args.facts)
         human = read_json(self.args.facts) if self.args.facts else {}
+        # 执行中令牌过期的机器证据（phase_execute 落盘 void.json）自动并入：
+        # 契约 §4.6「本轮 void、不计 streak、不记抓取失败」。人填的同键文案
+        # 优先，但键本身不会被人的漏填抹掉 —— 机器证据是事实，不是默认值。
+        void_evidence = self.p("void.json")
+        if os.path.exists(void_evidence):
+            vd = read_json(void_evidence)
+            merged_voids = {tid: "aborted_token（执行中令牌过期/不足，机器证据）"
+                            for tid in ids}
+            merged_voids.update(human.get("voids") or {})
+            human = dict(human) if isinstance(human, dict) else {}
+            human["voids"] = merged_voids
+            log("  void.json 在（%s）：本轮 %d 个目标全记 void"
+                % (vd.get("reason"), len(merged_voids)))
         facts = build_facts(self.round_id, self.args.batch,
                             int(self.args.layout), layouts, bias_report, human)
         facts_path = self.p("facts.json")
@@ -2405,6 +2487,10 @@ def build_parser():
                          "KB 级、md5 核对）")
     ap.add_argument("--place-clearance", type=float, default=None)
     ap.add_argument("--place-yaw-equiv180", action="store_true")
+    ap.add_argument("--allow-no-validator", action="store_true",
+                    help="开发机上无碰撞裁决规划真机轨迹的显式豁免（干跑不需要；"
+                         "正式轮要么 --where board，要么带这面旗 + 响亮告警"
+                         "+ 记 manifest）")
     ap.add_argument("--probe-report", default=None,
                     help="复用一份已经跑过的探针报告（本地 JSON），本轮不重跑"
                          "板端探针；只读、不动臂，格位与规划组仍逐项核对")
