@@ -277,11 +277,71 @@ def section_mutation():
           len(r["candidates"]) == 3, r)
 
 
+# ---------------------------------------------- 歧义回退（2026-11-14 补洞）
+def section_qualifier_tie_group():
+    print('\n[4] 方位/关系歧义时，限定词只在打平的头部组里挑（不越谓词）')
+    # 三个红块：两个在左几乎并排（y 差 2 < TIE_MM=5）、一个在右但离 base 更近。
+    # "red left nearest"：旧实现在**全部同色块**上按 nearest 重排 ⇒ 会选中最右
+    # 的块还返回 ok（方位谓词被整句丢掉）。修后：只在左侧打平的两块里挑。
+    scene = [
+        block(0, "red", 300.0, 260.0),
+        block(1, "red", 330.0, 258.0),      # 与 #0 的 y 只差 2 ⇒ left 打平；
+        block(2, "red", 250.0, 180.0),      #   x 错开 ⇒ nearest 拉得开（>5 mm）
+    ]
+    r = sp.select(scene, "red left nearest")
+    check('left 打平 + nearest ⇒ 限定词只在左侧打平组里挑（修前会选中 #2）',
+          r["status"] == "ok" and r["instance"] == 0, r)
+    r = sp.select(scene, "red left")
+    check('不带限定词时，left 打平照旧判歧义（不猜）',
+          r["status"] == "ambiguous", r)
+    # 限定词在打平组里也分不出 ⇒ 仍判歧义
+    scene2 = [
+        block(0, "red", 300.0, 260.0),
+        block(1, "red", 300.0, 258.0),      # nearest 距离几乎一样 ⇒ 仍打平
+    ]
+    r = sp.select(scene2, "red left nearest")
+    check('限定词也分不出高下 ⇒ ambiguous（与修前一致）',
+          r["status"] == "ambiguous", r)
+    # 方位不打平 ⇒ 限定词根本不参与，直接 ok
+    scene3 = [
+        block(0, "red", 300.0, 260.0),
+        block(1, "red", 300.0, 200.0),
+        block(2, "red", 250.0, 180.0),
+    ]
+    r = sp.select(scene3, "red left nearest")
+    check('方位唯一胜出时限定词不参与（仍是那块）',
+          r["status"] == "ok" and r["instance"] == 0, r)
+
+    # relation 分支同一口径：间隔打平的对里挑限定词，不越过关系谓词
+    rel_scene = [
+        block(0, "red", 300.0, 340.0, ext=(40.0, 29.0)),
+        block(1, "red", 300.0, 339.5, ext=(32.0, 29.0)),   # 与 #0 间隔打平；
+        block(2, "red", 300.0, 334.0, ext=(45.0, 29.0)),   #   ext 差 20% ⇒ largest
+        block(3, "cyan", 400.0, 300.0),                    #   分得出高下
+    ]
+    r = sp.select(rel_scene, "red left-of cyan largest")
+    check('间隔打平的对里按 largest 挑（#2 满足关系但不在打平组，ext 再大也不参与）',
+          r["status"] == "ok" and r["instance"] == 0, r)
+    # 旧实现的变异对照：把「打平组过滤」改回「全部满足关系的块」 ⇒ 会选 #2
+    m = _mutate('cands = []\n'
+                '            for a, m in pairs:\n'
+                '                if m >= m_max - TIE_MM and a not in cands:\n'
+                '                    cands.append(a)',
+                'cands = []\n'
+                '            for a, _ in pairs:\n'
+                '                if a not in cands:\n'
+                '                    cands.append(a)')
+    r = m["select"](rel_scene, "red left-of cyan largest")
+    check('变异「回退越过关系谓词」⇒ 选到间隔小的 #2（证明守卫钉得住）',
+          r["status"] == "ok" and r["instance"] == 2, r)
+
+
 def main():
     print('=' * 68)
     section_grammar()
     section_selection()
     section_mutation()
+    section_qualifier_tie_group()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('未通过：' + '; '.join(FAILS))

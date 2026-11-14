@@ -106,14 +106,18 @@ class SimBridge(Node):
         traj = JointTrajectory()
         traj.joint_names = list(names)
         # 起点：当前角。缺了它 JTC 会把整段时间压缩成一次冲刺（2026-11-07 实测）。
+        # 2026-11-14 审计补洞：原来缺关节就**静默**不补起点继续发 —— 单点轨迹
+        # 全速冲刺的事故路径无声回归。改响亮拒绝（t=0 起点构造与 exec 同源，
+        # traj_util / D3）。
+        import traj_util
         start = [current.get(n) for n in names]
-        msg_points = []
-        if all(v is not None for v in start):
-            p0 = JointTrajectoryPoint()
-            p0.positions = [float(v) for v in start]
-            p0.velocities = [0.0] * len(names)
-            p0.time_from_start = Duration(sec=0, nanosec=0)
-            msg_points.append(p0)
+        missing = traj_util.missing_joints(names, current)
+        if missing:
+            return {"ok": False,
+                    "error": "/joint_states 里没有 %s —— 不发无起点的轨迹"
+                             "（缺起点 JTC 会全速冲刺，2026-11-07 打飞块）"
+                             % missing}
+        msg_points = [traj_util.start_point([float(v) for v in start])]
         t = 0.0
         for positions, secs in points:
             t += float(secs)
@@ -206,6 +210,23 @@ class SimBridge(Node):
             pass
 
 
+def process_line(node, line):
+    """一行请求 → (req, rep, should_record)。serve 与测试共用（2026-11-14）。
+
+    契约：**任何一行都要得到回包**。json.loads 失败时 ``req=None`` ——
+    2026-11-14 审计前实现直接 ``node.record(req, rep)``，未绑定变量抛
+    NameError 打死客户端线程且无回包；现在解析失败的行也回错误、只是不进
+    req/rep 日志（没解析出来的请求没资格占日志）。
+    """
+    req = None
+    try:
+        req = json.loads(line)
+        rep = node.dispatch(req)
+    except Exception as e:      # 单条命令出错不能打断链路
+        rep = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    return req, rep
+
+
 def serve(node: SimBridge, host: str, port: int):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -220,12 +241,9 @@ def serve(node: SimBridge, host: str, port: int):
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    req = json.loads(line)
-                    rep = node.dispatch(req)
-                except Exception as e:  # 单条命令出错不能打断链路
-                    rep = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
-                node.record(req, rep)
+                req, rep = process_line(node, line)
+                if req is not None:
+                    node.record(req, rep)
                 f.write((json.dumps(rep, ensure_ascii=False) + "\n").encode())
                 f.flush()
 

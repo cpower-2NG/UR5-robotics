@@ -369,8 +369,13 @@ def select(blocks, cmd, zone_m=ZONE_M, block_mm=BLOCK_MM):
                       for b in same]
         best, margin, amb = _pick_best(scored, "mm")
         if qual is not None and amb:
-            # 方位分不出高下时，交给限定词；限定词也分不出就仍判歧义
-            return _select_from(same, qual, block_mm)
+            # 方位分不出高下 ⇒ 只在**打平的头部组**里交给限定词，限定词也
+            # 分不出才判歧义。2026-11-14 审计补洞：原来把限定词作用在**全部
+            # 同色块**上（_select_from(same, ...)），方位谓词被整句丢掉 ——
+            # "red left nearest" 在左块打平时可能选中最右的块还返回 ok。
+            s_max = max(m for _, m in scored)
+            tied = [b for b, m in scored if m >= s_max - TIE_MM]
+            return _select_from(tied, qual, block_mm)
         return _result("ambiguous" if amb else "ok", best,
                        reason="" if not amb else
                        "%s 色里有两个实例的 %s 坐标只差 %.1f mm"
@@ -414,9 +419,12 @@ def select(blocks, cmd, zone_m=ZONE_M, block_mm=BLOCK_MM):
         best, margin, amb = _pick_best(pairs, "mm")
         qual = cmd.get("qualifier")
         if qual is not None and amb:
+            # 与 position 分支同一口径（2026-11-14 审计收口）：限定词只在
+            # **间隔打平的头部对**里挑，不越过关系谓词本身。
+            m_max = max(m for _, m in pairs)
             cands = []
-            for a, _ in pairs:
-                if a not in cands:
+            for a, m in pairs:
+                if m >= m_max - TIE_MM and a not in cands:
                     cands.append(a)
             return _select_from(cands, qual, block_mm)
         return _result("ambiguous" if amb else "ok", best,
