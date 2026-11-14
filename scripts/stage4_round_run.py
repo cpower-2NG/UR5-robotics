@@ -83,6 +83,7 @@ import grasp_bias as gb                                         # noqa: E402
 import precision_plan as pp                                     # noqa: E402
 import precision_round as pr                                    # noqa: E402
 import real_motion_authorize as rma                             # noqa: E402
+import home_pose as hp                                          # noqa: E402
 import stage4_clear_model as cm                                 # noqa: E402
 import stage4_clear_run as cr                                   # noqa: E402
 import stage4_layouts as lay                                    # noqa: E402
@@ -1555,7 +1556,8 @@ class Round:
             print("  块 %-2s %-11s 摆位 (%6.1f, %6.1f) mm yaw %5.1f° → 格 %d"
                   % (bid, blk["color"], blk["x"] * 1000, blk["y"] * 1000,
                      blk["yaw"], cell_map[bid]))
-        print("  跑前机位：pick / pad    跑后机位：pick / free / pad")
+        print("  跑前机位：pick / pad    跑后机位：pick / free / pad"
+              "    跑后回 HOME（%s）" % (hp.HOME_JOINTS_DEG,))
         print("  失败即停：预检红 / 解垫不过 / 探针无解 / 任一计划预检不过 / "
               "令牌不足")
         print("=" * 62)
@@ -1841,6 +1843,31 @@ class Round:
         vplans, q = cr.plan_views(chain, q, cr.E9_VIEWS, plan_dir, start=idx,
                                   validator=getattr(self, "_validator", None))
         all_plans.extend(vplans)
+        # 跑后回 HOME（2026-11-15 用户定：所有任务跑完都回标准停靠位姿）——
+        # **计划内的收尾动作**，随整轮授权执行（不是轮后偏离）。段级裁决同样
+        # 盖章；闸门（限位/奇异/缠绕/高度护栏/大跳插点）在 hp.plan_park 内。
+        park, _pk = hp.plan_park(chain, q)
+        if getattr(self, "_validator", None) is not None:
+            vok, vwhy = self._validator(q, park["waypoints"][-1]["q"])
+            if not vok:
+                raise RoundError(EXIT_PLAN, "compute",
+                                 "回 HOME 的段级碰撞裁决拒绝：%s —— 不写计划"
+                                 % vwhy)
+            park["meta"]["collision_validator"] = True
+        pname = "%02d-home.json" % (idx + len(vplans) + 1)
+        ppath = os.path.join(plan_dir, pname)
+        write_json(ppath, park)
+        all_plans.append({"index": idx + len(vplans) + 1, "name": pname,
+                          "path": ppath, "kind": "park", "block": None,
+                          "slot": None, "from_xy": None,
+                          "grasp_yaw_deg": 0.0,
+                          "grasp_yaw_equiv180": False,
+                          "place_yaw_equiv180": False,
+                          "gap_check": "n/a",
+                          "n_waypoints": len(park["waypoints"])})
+        log("  跑后回 HOME（%s）：%d 个航点%s"
+            % (hp.HOME_JOINTS_DEG, len(park["waypoints"]),
+               "，段级裁决已盖章" if park["meta"]["collision_validator"] else ""))
         self.timing["plan_s"] = round(float(self.deps["now"]()) - t_plan, 1)
 
         # ---- 执行脚本 + 估时 + R2

@@ -280,6 +280,7 @@ check("三个布局自检（区内 + 间距 ≥60 mm）", errs == [], repr(errs)
 print("--- C. 阶段编排（FakeBoard + 打桩规划） ---")
 
 PLAN_CALLS = []
+PARK_CALLS = []
 DEVIATION_CALLS = []
 
 
@@ -706,6 +707,18 @@ def patched(deps):
     setm(r.cr, "actions_from_attempt", fake_actions_from_attempt)
     setm(r.cr, "compare_layout",
          lambda man, post, **kw: {"ok": True, "n_blocks": len(post)})
+    # park（2026-11-15 轮尾回 HOME）也是真几何 ⇒ 桩掉：单航点计划，记调用。
+    PARK_CALLS.clear()
+
+    def fake_plan_park(chain_, q_start, name="home", table_z=0.0):
+        PARK_CALLS.append(list(q_start))
+        return ({"version": 2, "meta": {"kind": "park",
+                                        "collision_validator": False},
+                 "q_start": list(q_start),
+                 "waypoints": [{"name": name, "q": [0.0, 0.0],
+                                "duration": 5.0}]}, [{"name": name}])
+
+    setm(r.hp, "plan_park", fake_plan_park)
 
     def undo():
         for (_, _), (obj, name, val) in saves.items():
@@ -832,7 +845,9 @@ def base_deps(**over):
 def run(td, board, deps=None, **over):
     write_expect(td)
     global PLAN_CALLS, DEVIATION_CALLS, TRUTH_CALLS
+    global PARK_CALLS
     PLAN_CALLS = []
+    PARK_CALLS = []
     DEVIATION_CALLS = []
     TRUTH_CALLS = []
     undo = patched(deps)
@@ -879,6 +894,13 @@ with tempfile.TemporaryDirectory() as td:
     check("板上分析：2D 标定（pad-mat）随轮推一次、md5 走 push",
           [p for p in b.pushed if p.endswith("analysis/stage2-mat.json")] ==
           ["/b/analysis/stage2-mat.json"], repr(b.pushed))
+    # 2026-11-15 轮尾回 HOME：park 计划进 plans.json 与 run.sh（授权内收尾）
+    pushd = [p for p in b.pushed if p.endswith("home.json")]
+    check("轮尾回 HOME：park 计划推上板（home.json）",
+          len(pushd) == 1 and PARK_CALLS, repr((pushd, PARK_CALLS)))
+    check("run.sh 里含 home 航点（收尾在授权窗口内）",
+          "home" in runsh and "park" not in runsh.split("home")[0][-80:],
+          runsh[-200:])
 
 # ---- C1c 抓点：实测块位姿必须进 plan_sequence（不是标称坐标）
 # 回归 2026-11-12 S0:1 r1 attempt5：跑前 burst 量出实测（写进 e9.from_xy），
