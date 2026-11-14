@@ -79,10 +79,12 @@ export ROS_DOMAIN_ID=99
 . "$HOME/yolo_ros_original/ros2_ws/install/setup.bash"
 exec python3 "$@"
 """
-# 拾取区（米）。y_min 从 0.22 收到 0.25 是**实测**定的：巡检位地面足迹只到
+# 巡检位可见区（米）—— **不是**拾取区 gen_scene.ZONE：名字别混（2026-11-14
+# 审计：原名 PICK_ZONE 与拾取区同名不同值，是将来抄错的高危样板，故改名）。
+# y_min 从 0.22 收到 0.25 是**实测**定的：巡检位地面足迹只到
 # y=225.0 mm（2026-10-25，survey_footprint.py），0.22 那一角在画面外 15.5 px。
 # 板上 yaml 写的 pick_zone 是 y≥0.00 —— 那段相机根本看不见，照抄就会悄悄漏块。
-PICK_ZONE = (0.38, 0.62, 0.25, 0.45)     # x_min, x_max, y_min, y_max（米）
+PATROL_ZONE = (0.38, 0.62, 0.25, 0.45)   # x_min, x_max, y_min, y_max（米）
 MAX_CAND_MM = 12.0
 # 夹持帧（在 lift 停一下抓一帧）**作废**：腕部相机看不到夹着的块，理由与实测见
 # `measure_held.py` 文件头。留着常量只为了让 --held-capture 的拒绝信息能引用它。
@@ -316,7 +318,7 @@ def pick_next(analysis, state):
 
     不按 GraspNet 分数选 —— 分数没标定过（round 144 的高分落在平板上）。
     """
-    x0, x1, y0, y1 = PICK_ZONE
+    x0, x1, y0, y1 = PATROL_ZONE
     used, slot_classes = state["used"], state["slot_classes"]
 
     def room(cls):
@@ -426,7 +428,7 @@ def do_cycle(args, board, state):
     # 没 --go 时臂不在巡检位，这个判据没有意义，所以只记录、不拦。
     fjson = os.path.join(fdir, "footprint.json")
     rf = sh([PY_SELF, os.path.join(HERE, "survey_footprint.py"),
-             "--frame", fdir, "--zone", ",".join("%.3f" % v for v in PICK_ZONE),
+             "--frame", fdir, "--zone", ",".join("%.3f" % v for v in PATROL_ZONE),
              "--json", fjson], check=False)
     foot_ok = None
     if os.path.exists(fjson):
@@ -434,7 +436,7 @@ def do_cycle(args, board, state):
     if args.go and rf.returncode != 0:
         state["stop_reason"] = "拾取区出了画面（survey_footprint rc=%d）" % rf.returncode
         save_state(args.state, state)
-        print("\n!! %s —— 调整巡检位或缩小 PICK_ZONE，不发轨迹。" % state["stop_reason"])
+        print("\n!! %s —— 调整巡检位或缩小 PATROL_ZONE，不发轨迹。" % state["stop_reason"])
         return rf.returncode
 
     # 2c) 光照闸门：太暗就停下来开灯，别让类别一路变成 unknown 再以别的名义收工

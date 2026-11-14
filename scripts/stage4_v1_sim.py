@@ -51,6 +51,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import numpy as np                                                # noqa: E402
+import stage4_clear_model as cm                                   # noqa: E402
 
 #: 实例 ↔ 真值块的匹配半径（mm）。块边长 29.5、相邻块心 ≥31 mm ⇒ 15 mm
 #: 不会把邻块算成本块。
@@ -69,10 +70,12 @@ DEDUPE_TOP_MM = 15.0
 #: ``stage4_wrist_survey.survey_tool0`` 唯一算出。偏移量有离线探针（2026-11-11）：
 #: 拾取区八角余量 ≥37 px、IK 从中心位可达；再大就压到 0.5 m 高度下的画幅边。
 VIEWS = (
-    {"name": "pick", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500},
-    {"name": "pick-out", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500,
+    # 拾取区界 = 单一出处 gen_scene.ZONE（经 cm.PICK_ZONE）；2026-11-14 审计
+    # 前这里是三份字面拷贝，改区界漏改就是「两套区」。
+    {"name": "pick", "zone": tuple(cm.PICK_ZONE), "height": 0.500},
+    {"name": "pick-out", "zone": tuple(cm.PICK_ZONE), "height": 0.500,
      "shift": (-0.100, +0.030)},
-    {"name": "pick-in", "zone": (0.250, 0.575, 0.170, 0.420), "height": 0.500,
+    {"name": "pick-in", "zone": tuple(cm.PICK_ZONE), "height": 0.500,
      "shift": (+0.100, -0.030)},
     {"name": "free", "zone": (0.280, 0.750, 0.460, 0.620), "height": 0.450},
     {"name": "pad", "zone": (0.310, 0.610, -0.300, 0.000), "height": 0.500},
@@ -80,8 +83,9 @@ VIEWS = (
 #: 同区三视点（V1 的默认口径）；free/pad 是跑后判分的分区机位，留作别用。
 VANTAGE_VIEWS = ("pick", "pick-out", "pick-in")
 PICK_VIEW = "pick"
-#: 真值块参与 V1 的空间范围 = 拾取区（与 ``stage4_specify.ZONE_M`` 一致）。
-PICK_ZONE_M = (0.25, 0.575, 0.17, 0.42)
+#: 真值块参与 V1 的空间范围 = 拾取区。单一出处 gen_scene.ZONE（经
+#: cm.PICK_ZONE，与 stage4_specify.ZONE_M 同源）；2026-11-14 审计前是字面拷贝。
+PICK_ZONE_M = tuple(cm.PICK_ZONE)
 
 
 def view_pose(name):

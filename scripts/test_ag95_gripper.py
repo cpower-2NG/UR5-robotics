@@ -483,10 +483,14 @@ def main():
               got is not None and got[0] == OK, f"回调 {got}")
 
     # ------------------------------------------------------------------
-    # 速度寄存器 0x0104（2026-10-27 查大寰公开手册确认；阶段 2 松手弹滑要用它）。
-    # 写它**本身不动手指**，但决定下一次位置动作有多快 —— 所以三件事都要钉住：
-    #   ① dry-run 一个字节都不写；② 真写时地址/值/位置都对；③ 回读不一致必须抛错。
-    print("\n--- 5c. 速度寄存器 0x0104 ---")
+    # 速度寄存器 0x0104（2026-10-27 查大寰公开手册确认）。
+    # **2026-11-14 起通路关闭**：`ag95_speed_probe.py` 五档实测（1/20/50/75/100）
+    # 写 0x0104 行程耗时全部不变、回读恒 100 —— 寄存器写了没用（状态层 §5）。
+    # set_speed 现在只校验参数 + 记账 + 打日志，**任何模式下一个字节都不写**
+    # —— 旧「写后回读核对」必不一致 ⇒ 执行期 RuntimeError，会把夹着块的轮打红。
+    # 钉住：① dry-run 零流量（旧契约不变）；② 真实模式**也**零流量（新契约）；
+    # ③ 越界参数照旧拒；④ 日志说明「要了速度但忽略」。
+    print("\n--- 5c. 速度寄存器 0x0104（2026-11-14 起通路关闭） ---")
     for addr_name, addr in (("AG95_REG_SPEED", g.AG95_REG_SPEED),
                             ("探针 REG_SPEED", getattr(probe, "REG_SPEED", None))):
         check(f"{addr_name} == 0x{addr:04X}" if addr is not None
@@ -498,8 +502,8 @@ def main():
         check("dry-run 下 set_speed() **零流量**（写没有、读也没有）",
               slave.writes == [] and slave.seen == [],
               f"写={slave.writes} 读={slave.seen}")
-        check("dry-run 下日志说明「本应写速度多少」",
-              "本应写 速度 40 %" in node.log.text("info"),
+        check("dry-run 下日志说明「忽略 + 依据」",
+              "忽略" in node.log.text("info") and "0x0104" in node.log.text("info"),
               node.log.text("info")[-200:] or "（没有 info）")
 
     for bad in (0, 101, "50%"):
@@ -516,52 +520,14 @@ def main():
 
     with rig(dry_run=False) as (gr, slave, node, box):
         gr.set_speed(25)
-        check("真写：速度写到 0x0104，值 25",
-              (g.AG95_REG_SPEED, 25) in slave.writes, f"写={slave.writes}")
-        check("真写：set_speed **不碰**位置寄存器（手指不会因此动）",
-              all(a != g.AG95_REG_TARGET_POS for a, _ in slave.writes),
-              f"写={slave.writes}")
-        check("真写：回读核对一致后有 info 说明",
-              "速度已设 25 %" in node.log.text("info"),
+        check("★ 真实模式 set_speed() **也零流量**（0x0104 实测无效，不再写）",
+              slave.writes == [] and slave.seen == [],
+              f"写={slave.writes} 读={slave.seen}")
+        check("★ 记账仍在：gr._speed == 25（谁在要求速度这件事可见）",
+              gr._speed == 25, gr._speed)
+        check("★ 日志说明「按出厂速度执行」",
+              "出厂速度" in node.log.text("info"),
               node.log.text("info")[-200:] or "（没有 info）")
-
-    # 回读被固件吞掉（写进去、读回还是旧值）⇒ 必须抛错，不许「当作设好了」。
-    with rig(dry_run=False) as (gr, slave, node, box):
-        gr._speed = None
-        orig = slave._handle
-
-        def swallow(req):
-            sid, fc, addr = req[0], req[1], (req[2] << 8) | req[3]
-            if fc == 6 and addr == g.AG95_REG_SPEED:
-                slave.seen.append((fc, addr))
-                os.write(slave.fd, req)        # 回显成功，但**不**记进 regs
-                return
-            orig(req)
-
-        slave._handle = swallow
-        try:
-            gr.set_speed(30)
-        except RuntimeError as exc:
-            check("★ 速度写入后回读不一致 ⇒ 抛错（不静默按「已设」继续跑）",
-                  "回读" in str(exc) and "0x0104" in str(exc), str(exc)[:200])
-        else:
-            check("★ 速度写入后回读不一致 ⇒ 抛错", False, "居然静默通过了")
-
-    # 设过速度之后，位置指令必须**带**速度、且**排在力之后、位置之前**。
-    with rig(dry_run=False, open_is_high=True,
-             regs={g.AG95_REG_INIT_STATUS: g.AG95_INIT_READY,
-                   g.AG95_REG_ACTUAL_POS: 1000, g.AG95_REG_TARGET_POS: 1000,
-                   g.AG95_REG_FORCE: 50}) as (gr, slave, node, box):
-        gr.set_speed(25)
-        slave.writes.clear()
-        gr.close(done_cb=cb(box))
-        got = wait_done(box)
-        addr_seq = [a for a, _ in slave.writes]
-        check("★ 设过速度后：写序列是 力 → 速度 → 位置",
-              addr_seq == [g.AG95_REG_FORCE, g.AG95_REG_SPEED,
-                           g.AG95_REG_TARGET_POS], f"写={slave.writes}")
-        check("  动作本身仍成功（速度不改变「写位置就动」的语义）",
-              got is not None and got[0] == OK, f"回调 {got}")
 
     # 没设过速度 ⇒ 一个速度字节都不写（A3 与既有流程逐字节不变）。
     with rig(dry_run=False, open_is_high=True,

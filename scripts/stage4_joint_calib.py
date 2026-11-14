@@ -37,12 +37,14 @@ from PIL import Image                                             # noqa: E402
 
 import graspnet_candidates as gc                                  # noqa: E402
 import stage2_pad as sp                                           # noqa: E402
+import stage4_clear_model as cm                                   # noqa: E402
 import topcam_marker_calib as tmc                                 # noqa: E402
 
 DEFAULT_MAT = os.path.expanduser(
     '~/robotics/notes/ur5-vision-grasp/stage2-mat/stage2-mat.json')
-#: 拾取区（base 系，米），与 ``stage2_round.py`` 的 ``pick_zone`` 同值。
-PICK_ZONE = [0.25, 0.575, 0.17, 0.42]
+#: 拾取区（base 系，米）—— 单一出处 gen_scene.ZONE（经 cm.PICK_ZONE）。
+#: 2026-11-14 审计前这里是字面拷贝；改区界漏改这里就是「两套区」。
+PICK_ZONE = list(cm.PICK_ZONE)
 #: 台面在 base 系的 z（mm，2026-10-02 实测 +3.88，≈0）。
 TABLE_Z_MM = 3.88
 

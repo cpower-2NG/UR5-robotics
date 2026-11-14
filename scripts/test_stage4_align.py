@@ -184,7 +184,9 @@ def render_scene(tool0_T, block_xy, block_top=0.0295, block_side=0.050,
 def hover_pose(th, uv=(0.435, 0.315), z=0.360, yaw=0.0):
     """IK 出一个**真的** tool0 位姿（悬停高度 z），返回 (T, q)。IK 不收敛返回 (None, None)。"""
     T = pp.target_matrix([uv[0], uv[1], z], yaw)
-    q, err_mm, err_deg, _it = th.ik(T, [0.0] * 6)
+    # A5 起 `Chain.ik` 返回 5 元组（末位 = converged 撞顶标志）；本文件在
+    # A5 落地时漏改，按 4 值解包当场 ValueError（2026-11-14 审计）。
+    q, err_mm, err_deg, _it, _conv = th.ik(T, [0.0] * 6)
     if q is None or err_mm > 2.0 or err_deg > 1.0:
         return None, None
     return th.fk(q), q

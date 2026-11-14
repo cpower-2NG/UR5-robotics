@@ -58,8 +58,23 @@ def test_zones_single_source():
                                            cm.FREE_Y[0], cm.FREE_Y[1]),
           views['free']['zone'])
 
-    # 源码级：字面拷贝不许回苗（变异 = 把某一处改回字面量 ⇒ 这里红）
-    for mod, path in (('stage4_specify', sp), ('stage4_wrist_survey', ws)):
+    # 源码级：字面拷贝不许回苗（变异 = 把某一处改回字面量 ⇒ 这里红）。
+    # 2026-11-14 审计：scan 名单原来只有 specify + wrist_survey 两个模块，
+    # joint_calib / v1_sim / precision_round 三处字面拷贝不在守卫范围。
+    import stage4_joint_calib as jc
+    import stage4_v1_sim as v1
+    check('joint_calib.PICK_ZONE 同源（cm.PICK_ZONE）',
+          list(jc.PICK_ZONE) == list(cm.PICK_ZONE),
+          (jc.PICK_ZONE, cm.PICK_ZONE))
+    check('v1_sim.PICK_ZONE_M 同源（cm.PICK_ZONE）',
+          tuple(v1.PICK_ZONE_M) == tuple(cm.PICK_ZONE),
+          (v1.PICK_ZONE_M, cm.PICK_ZONE))
+    import precision_round as prnd
+    check('precision_round 已无同名 PICK_ZONE（改名 PATROL_ZONE，语义不同）',
+          not hasattr(prnd, 'PICK_ZONE') and prnd.PATROL_ZONE ==
+          (0.38, 0.62, 0.25, 0.45), getattr(prnd, 'PICK_ZONE', None))
+    for mod, path in (('stage4_specify', sp), ('stage4_wrist_survey', ws),
+                      ('stage4_joint_calib', jc), ('stage4_v1_sim', v1)):
         src = inspect.getsource(path)
         check('%s 源码里没有拾取区字面拷贝' % mod,
               '(0.25, 0.575' not in src and '0.575, 0.17' not in src)

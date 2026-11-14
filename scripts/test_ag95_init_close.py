@@ -14,6 +14,7 @@
 
 import importlib.util
 import io
+import os
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -62,10 +63,12 @@ def run_script(argv):
 
 def with_slave(regs, *, actual_reg=None, target_reg=None, step=1000,
                init_sim=True):
-    """起一个 pty + 手写从站，把被测脚本的 PORT 指过去。
+    """起一个 pty + 手写从站，用 ``AG95_PORT`` 环境变量把被测脚本指过去。
 
-    用 ``with`` 语句进出；退出时**先停从站线程再关 pty**（顺序反了会有僵尸从站
-    抢 fd —— `_RtuSlave.stop()` 的文档里记了那个坑）。
+    脚本重构后没有模块级 ``PORT`` 了（``Gripper.open_port``：显式参数 >
+    ``AG95_PORT`` 环境变量 > by-id 自动选），所以注入口改成环境变量。
+    用 ``with`` 语句进出；退出时**先停从站线程再关 pty**（顺序反了会有僵尸
+    从站抢 fd —— `_RtuSlave.stop()` 的文档里记了那个坑）。
     """
     class _Ctx:
         def __enter__(self):
@@ -78,12 +81,15 @@ def with_slave(regs, *, actual_reg=None, target_reg=None, step=1000,
                 # 只加等待器、没让假从站跟着变，两条用例假红）。
                 init_cmd_reg=0x0100 if init_sim else None,
                 init_status_reg=0x0200 if init_sim else None).start()
-            self._old_port = SCRIPT.PORT
-            SCRIPT.PORT = self.pair.port
+            self._old_port = os.environ.get("AG95_PORT")
+            os.environ["AG95_PORT"] = self.pair.port
             return self.slave
 
         def __exit__(self, *exc):
-            SCRIPT.PORT = self._old_port
+            if self._old_port is None:
+                os.environ.pop("AG95_PORT", None)
+            else:
+                os.environ["AG95_PORT"] = self._old_port
             self.slave.stop()
             self.pair.close()
             return False
@@ -171,8 +177,11 @@ def main() -> int:
                   "不是 1000" in out, out)
 
         # ---- 6. 口打不开 → 退出码 2（不是 0）-----------------------------
-        SCRIPT.PORT = "/dev/definitely-not-a-port"
-        rc, out = run_script(["--go", "--init-timeout", "1.5"])
+        os.environ["AG95_PORT"] = "/dev/definitely-not-a-port"
+        try:
+            rc, out = run_script(["--go", "--init-timeout", "1.5"])
+        finally:
+            os.environ.pop("AG95_PORT", None)
         check("退出码 2：口打不开时明确失败（2 是「环境不满足」，不是 0）",
               rc == 2, f"rc={rc}\n{out}")
 

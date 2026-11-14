@@ -87,12 +87,18 @@ def make_pad_object(frame=mp.BASE):
     obj.id = PAD_ID
     box = SolidPrimitive()
     box.type = SolidPrimitive.BOX
-    box.dimensions = [cm.PAD_FOOTPRINT[0], cm.PAD_FOOTPRINT[1], cm.PAD_THICK]
+    # ⚠️ 每个值都过 float()：垫参数未实测时 cm 里是 `_UnmeasuredPad` 哨兵，
+    # 直接赋给 ROS msg 字段**不触发任何数值运算** ⇒ nan 静默进消息
+    # （2026-11-14 审计：真正的拦截当时只靠后面 pad_obb 的除法与调用顺序）。
+    # float() 走哨兵的 __float__ ⇒ 当场抛 PadNotMeasured，结构上防呆。
+    box.dimensions = [float(cm.PAD_FOOTPRINT[0]), float(cm.PAD_FOOTPRINT[1]),
+                      float(cm.PAD_THICK)]
     pose = Pose()
-    pose.position.x, pose.position.y = cm.PAD_CENTER
-    pose.position.z = cm.PAD_THICK / 2.0
-    pose.orientation.z = math.sin(cm.PAD_YAW_RAD / 2.0)
-    pose.orientation.w = math.cos(cm.PAD_YAW_RAD / 2.0)
+    pose.position.x, pose.position.y = (float(cm.PAD_CENTER[0]),
+                                        float(cm.PAD_CENTER[1]))
+    pose.position.z = float(cm.PAD_THICK) / 2.0
+    pose.orientation.z = math.sin(float(cm.PAD_YAW_RAD) / 2.0)
+    pose.orientation.w = math.cos(float(cm.PAD_YAW_RAD) / 2.0)
     obj.primitives = [box]
     obj.primitive_poses = [pose]
     obj.operation = CollisionObject.ADD

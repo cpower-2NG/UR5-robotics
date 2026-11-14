@@ -638,6 +638,13 @@ def main(argv=None):
         print("逐帧量测 %d 帧 / %d 进程：%.1f s（串行时约 %.1f s）"
               % (len(tasks), n_jobs, time.time() - t0,
                  (time.time() - t0) * n_jobs if n_jobs > 1 else 0.0))
+        if len(truths) < max(3, args.min_frames) and args.min_frames is None:
+            # 2026-11-14 审计：共识门 min_frames = max(3, ⌈n/2⌉) 在 n≤4 时
+            # 自锁死（min_frames > n ⇒ 全簇被剔 ⇒ 0 块），而 main 的 0 块
+            # 分支会误报「分割/颜色表不对」。burst 太短在这里就明说。
+            print("!! 帧数 %d < 3：共识门要求 ≥3 帧 —— burst 太短，"
+                  "补抓帧而不是查分割/颜色表" % len(truths), file=sys.stderr)
+            return 2
         truth = consensus(truths, radius_m=args.cluster_mm / 1000.0,
                           min_frames=args.min_frames)
         if not args.keep_outside:

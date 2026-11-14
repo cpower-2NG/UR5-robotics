@@ -208,12 +208,15 @@ def main(argv=None):
           % (spread['xy']['max'], spread['xy']['median'],
              spread['yaw']['max'], spread['yaw']['median']))
     bad = []
+    # 文案如实（2026-11-14 审计）：这里的门是「各帧到共识中位的最大偏差」，
+    # 不是字面「极差」（最大帧间差）。门值与 round_run 的 validate_pad_doc
+    # 读的是同一个量，自洽；契约文本里的「极差」口径以本量为准（更严）。
     if spread['xy']['max'] > args.max_spread_mm:
-        bad.append('xy 极差 %.3f mm > %.3f' % (spread['xy']['max'],
-                                               args.max_spread_mm))
+        bad.append('xy 到中位最大偏差 %.3f mm > %.3f'
+                   % (spread['xy']['max'], args.max_spread_mm))
     if spread['yaw']['max'] > args.max_spread_deg:
-        bad.append('yaw 极差 %.3f° > %.3f' % (spread['yaw']['max'],
-                                              args.max_spread_deg))
+        bad.append('yaw 到中位最大偏差 %.3f° > %.3f'
+                   % (spread['yaw']['max'], args.max_spread_deg))
     if bad:
         print('!! 离散超限：%s ⇒ 不写文件（垫位姿没有共识）' % '；'.join(bad))
         return 1

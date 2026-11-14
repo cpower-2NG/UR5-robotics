@@ -593,35 +593,22 @@ class Ag95Gripper(GripperBackend):
         return v
 
     def set_speed(self, pct) -> None:
-        """写速度寄存器（`0x0104`）。**不写 `0x0100`、不动手指。**
+        """速度请求**记账不写**（2026-11-14 起关闭 0x0104 通路）。
 
-        为什么需要它：阶段 2 松手时块会「弹滑一下」——手指在分离瞬间是满速的，
-        冲量把块带转。慢速张开能砍掉这部分冲量，而力已经贴着下限（45–160 N，
-        实跑 50 N），没有别的余量可调。
-
-        dry-run 时只打日志、不写（保持「从站一个寄存器都没收到」的契约）。
-        写完**回读核对**：读回值与写下去的不一致就抛错，免得以为设了速度其实没设。
+        为什么改：`ag95_speed_probe.py` 2026-10-27 五档实测（1/20/50/75/100），
+        写 `0x0104` 后 45 mm 行程耗时全部不变（0.35–0.36 s）、回读恒 100 ——
+        **这个寄存器写了没用**（状态层 §5、台账第一百五十四轮）。旧实现
+        写完回读核对，回读必不一致 ⇒ 抛 RuntimeError —— 任何场景只要配了
+        速度参数，一轮就在执行期被一条「实证无效的寄存器」打红，块还在爪里。
+        现在只校验参数、记账 `self._speed`、响亮打日志说明「要了速度但
+        0x0104 无效、没写」。真要控速，得先在空闲时段重新探针并拿到
+        「写下去真的变慢」的证据（未授权，未列入队列）。
         """
         v = self._check_speed(pct)
-        if self._dry_run:
-            self._node.get_logger().info(
-                f"AG-95 DRY-RUN 本应写 速度 {v} % → "
-                f"0x{AG95_REG_SPEED:04X}（未写）")
-            self._speed = v
-            return
-        ok, msg = self._write_raw(AG95_REG_SPEED, v)
-        if not ok:
-            raise RuntimeError(f"AG-95 写速度失败：{msg}")
-        ok, raw = self._read_raw(AG95_REG_SPEED)
-        if not ok:
-            raise RuntimeError(f"AG-95 速度写后回读失败（0x{AG95_REG_SPEED:04X}）：{raw}")
-        if int(raw) != v:
-            raise RuntimeError(
-                f"AG-95 速度回读 {raw} ≠ 写入的 {v}（0x{AG95_REG_SPEED:04X}）"
-                f"—— 寄存器地址或固件映射可能不对，**别按「已设速度」继续跑**")
         self._speed = v
         self._node.get_logger().info(
-            f"AG-95 速度已设 {v} %（0x{AG95_REG_SPEED:04X}，回读核对一致）")
+            f"AG-95 速度请求 {v} % —— **忽略**（0x0104 实测写了没用，"
+            f"2026-10-27 五档探针；状态层 §5）。本次动作按出厂速度执行")
 
     def _write_position(self, mm: float):
         """把**毫米**开口宽度写进 AG-95。
@@ -669,12 +656,9 @@ class Ag95Gripper(GripperBackend):
         ok, msg = self._write_raw(AG95_REG_FORCE, int(self._force))
         if not ok:
             raise RuntimeError(f"AG-95 写力失败：{msg}")
-        # 速度排在力之后、位置之前：位置一写手指就走，前两项必须已经到位。
-        # `None` = 从来没要求过速度 ⇒ 一个字节都不写（A3 与既有流程行为不变）。
-        if self._speed is not None:
-            ok, msg = self._write_raw(AG95_REG_SPEED, int(self._speed))
-            if not ok:
-                raise RuntimeError(f"AG-95 写速度失败：{msg}")
+        # 速度寄存器 0x0104 **不再写**（2026-11-14 关闭通路）：五档实测写了
+        # 没用、回读恒 100（`ag95_speed_probe.py`，状态层 §5）。`self._speed`
+        # 只记账（谁在要求速度仍可见），位置动作一律按出厂速度执行。
         ok, msg = self._write_raw(AG95_REG_TARGET_POS, permille)
         if not ok:
             raise RuntimeError(f"AG-95 写目标位置失败：{msg}")
