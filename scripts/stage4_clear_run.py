@@ -686,16 +686,20 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                 "seed": None}
         yaw_grasp_raw = float(act["grasp_yaw_deg"])
         yaw_grasp = pp.fold_yaw_180(yaw_grasp_raw)
-        # 抓取朝向的候选写法：原值先试；被分支链/单步上限拒了才试 ±180° 等价
-        # （平行两指绕工具轴转 180° 只是两根手指互换位置，抓的还是同一对面 ——
-        # 物理等价，见 `pp.fold_yaw_180`）。A3（90° 单步帽）下这条重试是把
-        # 「能救的链」救回来的第一道；两支都救不回来才 fail-closed。
-        grasp_variants = [yaw_grasp_raw, pp.fold_yaw_180(yaw_grasp_raw + 180.0)]
+        # 抓取朝向的候选写法：**两条物理等价**的写法（平行两指绕工具轴转 180°
+        # 只是两根手指互换位置，抓的还是同一对面 —— 见 `pp.fold_yaw_180`）：
+        # ① 折叠写法（默认，腕 3 行程最短）；② 同一位姿整体 +180°（给
+        # `build_pick` 传 ``fold_grasp_yaw=False``，**不再折叠**）。
+        # 2026-11-14 审计：旧写法两支都过 `fold_yaw_180` ⇒ 折叠后同一个
+        # 目标 yaw、同种子同解集 —— 第二支从未真正试过，重试是空转。
+        # 现在 +180° 的目标矩阵不同 ⇒ IK 支族不同，重试才有「救回链」的能力；
+        # 两支都救不回来才 fail-closed。
+        grasp_variants = [(yaw_grasp, True), (yaw_grasp + 180.0, False)]
         wps = checks = meta = None
         grasp_used = None
         yaw_used = None
         first_err = None
-        for g in grasp_variants:
+        for g, g_fold in grasp_variants:
             # 放置朝向的候选写法：默认（= 本变体的抓取朝向）先试，旗子开了才加
             # 180° 等价写法（`fold_yaw_180` 的物理等价：只换手指、不换面，
             # 方块/矩形块的落点与朝向逐字节相同）。
@@ -722,7 +726,9 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                         post_targets=(tail_targets if i == len(actions) else None),
                         # A2：段级碰撞裁决（板上 MoveIt /check_state_validity）；
                         # None = 本机离线排练（无裁决，只靠步长/护栏）
-                        validator=validator)
+                        validator=validator,
+                        # ② 整体 +180° 的变体不折叠（见 grasp_variants 注释）
+                        fold_grasp_yaw=g_fold)
                 except pp.BranchChainError as e:
                     first_err = first_err or e
                     continue
@@ -735,15 +741,26 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
             # 所有等价写法都被分支链/单步上限拒了 ⇒ 抛第一次（默认朝向）的原始
             # 报错：它才是「按实测朝向根本走不通」这件事本身。
             raise first_err
-        grasp_equiv = grasp_used != yaw_grasp_raw
+        grasp_equiv = grasp_used != yaw_grasp
         if yaw_used is not None:
             log("  !! 块 %s：默认放置朝向过不了分支链/单步上限，改用 180° 等价"
                 "写法（只换手指、不换面）：ψ_place %.3f° → %.3f°"
                 % (act["block"], yaw_grasp, yaw_grasp - 180.0))
         if grasp_equiv:
-            log("  !! 块 %s：原抓取朝向过不了分支链/单步上限，改用 180° 等价"
-                "写法（只换手指、不换面）：ψ_grasp %.3f° → %.3f°"
-                % (act["block"], yaw_grasp_raw, grasp_used))
+            log("  !! 块 %s：折叠写法（ψ=%.3f°）过不了分支链/单步上限，改用整体"
+                "+180° 等价写法（只换手指、不换面）：ψ_grasp %.3f° → %.3f°"
+                % (act["block"], yaw_grasp, yaw_grasp, grasp_used))
+        # 相邻航点的腕奇异跨零检查 + 大跳插点（与 stage3 / 机位计划同一道门；
+        # 2026-11-14 审计：stage4 抓放计划此前不经 split_jumps，中段穿 q5=0
+        # 无人查 —— 正是「动作扭曲」的来源之一）。
+        n_split = 0
+        try:
+            wps, n_split = pp.split_jumps(wps, chain, q_start=q)
+        except pp.JointSwingError as e:
+            raise pp.PlanError("块 %s 的计划分跳检查不过：%s" % (act["block"], e))
+        if n_split:
+            log("  块 %s：大跳插了 %d 个中间航点（指令变小，轨迹形状不变）"
+                % (act["block"], n_split))
         plan = {"version": 2,
                 "meta": dict(meta,
                              e9={"kind": act["kind"], "block": act["block"],
@@ -786,7 +803,7 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
     if wrist_survey:
         vplans, q = plan_views(
             chain, q, E9_VIEWS if views is None else views, out_dir,
-            start=int(start) + len(plans))
+            start=int(start) + len(plans), validator=validator)
         plans.extend(vplans)
     return plans, layout, q
 

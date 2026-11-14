@@ -713,25 +713,28 @@ def test_grasp_at_block_center_uses_the_centroid(chain):
 
 @case
 def test_speed_and_dwell_land_on_the_motion_they_describe(chain):
-    """速度写成**寄存器**要挂在正确的那一下动作上；dwell 只在 place 上。
+    """dwell 只在 place 上；速度参数**不再进计划**（0x0104 通路已关）。
 
-    速度挂错地方不会报错、只会「看起来快了」——所以逐条断言哪个航点带它、
-    哪个航点**不带**。默认三个参数都是 None/0，A3 计划必须逐字节不变。
+    2026-11-14 起 `_with_speed` 不再往动作上挂 ``speed``（0x0104 写了没用，
+    五档实测见状态层 §5）——速度请求只记账进 meta（谁在要求速度仍然可见），
+    不产生任何寄存器写。dwell 的挂法照旧逐条断言。
     """
     blocks, cand, q0 = scene(chain)
     wps, _, meta = pp.build_pick(chain, q0, cand, blocks[0], blocks, (0.45, -0.25),
                                  place_open_mm=50.0, grip_speed_pct=40,
                                  release_speed_pct=25, release_dwell_s=0.5)
     by = {w["name"]: w for w in wps}
-    assert by["grasp"]["after"] == {"gripper": "close", "readback": True,
-                                    "speed": 40}, by["grasp"]["after"]
-    assert by["place"]["after"] == {"gripper": "open_to", "mm": 50.0,
-                                    "speed": 25}, by["place"]["after"]
+    assert by["grasp"]["after"] == {"gripper": "close", "readback": True}, \
+        by["grasp"]["after"]
+    assert by["place"]["after"] == {"gripper": "open_to", "mm": 50.0}, \
+        by["place"]["after"]
     assert by["place"]["dwell_s"] == 0.5, by["place"]
-    # 挂错的三种典型：合拢速度串到松手、松手速度串到接近、dwell 串到所有点。
-    assert by["place"]["after"]["speed"] == 25, "松手用了合拢的速度"
-    assert "speed" not in by["approach"]["before"], by["approach"]["before"]
-    assert "speed" not in by["lift"]["after"], by["lift"]["after"]
+    # 速度请求保留在 meta 里（可追溯），且计划里任何一个动作都不带 speed
+    assert meta["grip_speed_pct"] == 40 and meta["release_speed_pct"] == 25, meta
+    assert "0x0104" in (meta.get("speed_note") or ""), meta.get("speed_note")
+    for w in wps:
+        spec = w.get("after") or w.get("before") or {}
+        assert "speed" not in spec, (w["name"], spec)
     for w in wps:
         if w["name"] != "place":
             assert "dwell_s" not in w, "%s 不该有 dwell" % w["name"]
@@ -935,6 +938,74 @@ def test_wrist_guard(chain):
         pass
     else:
         raise AssertionError("插值穿过腕 2 = 0，护栏没拦")
+
+
+@case
+def test_wrist_guard_catches_small_crossings(chain):
+    """≤1 rad 的跨零也要拦（2026-11-14 审计盲区）。
+
+    原式 `jump > max_jump 才查插值点` ⇒ q5 从 +0.3 到 −0.3 rad（跳 0.6 rad
+    ≤ 1.0）时**一个插值点都不查**，直线插值正好穿过奇异，没人拦。
+    """
+    i = chain.move_joints.index("wrist_2_joint")
+    wps = [{"name": "a", "q": [0.5] * i + [0.3] + [0.5] * (5 - i),
+            "duration": 2.0},
+           {"name": "b", "q": [0.5] * i + [-0.3] + [0.5] * (5 - i),
+            "duration": 2.0}]
+    try:
+        pp.split_jumps(wps, chain, max_jump=1.0)
+    except pp.PlanError:
+        pass
+    else:
+        raise AssertionError("≤1 rad 的插值跨零（0.6 rad）没被拦住")
+    # 对照：同样小的跳变、不跨零 ⇒ 不拦（门不是「见小跳就红」）
+    wps2 = [{"name": "a", "q": [0.5] * i + [0.3] + [0.5] * (5 - i),
+             "duration": 2.0},
+            {"name": "b", "q": [0.5] * i + [0.15] + [0.5] * (5 - i),
+             "duration": 2.0}]
+    out, added = pp.split_jumps(wps2, chain, max_jump=1.0)
+    assert added == 0 and len(out) == 2, (added, len(out))
+
+
+@case
+def test_add_move_validator_rejects(chain):
+    """add_move 的段级裁决（局部 IK 路径，如 build_move qs=None）：真撞即拒。"""
+    blocks, cand, q0 = scene(chain)
+
+    def bad_validator(qa, qb):
+        return False, "碰撞：forearm×ag95（测试注入）"
+
+    wps = []
+    try:
+        pp.add_move(wps, chain, "t0", (0.523, 0.331, 0.40), q0, 0.0,
+                    pp.TABLE_PLANE_Z, validator=bad_validator)
+    except pp.PlanError as e:
+        assert "碰撞裁决拒绝" in str(e) and "ag95" in str(e), str(e)
+    else:
+        raise AssertionError("validator 拒绝没有被 add_move 落成 PlanError")
+    assert wps == [], "被拒的航点不许写进计划"
+    # 对照：裁决放行 ⇒ 正常产出
+    pp.add_move(wps, chain, "t1", (0.523, 0.331, 0.40), q0, 0.0,
+                pp.TABLE_PLANE_Z,
+                validator=lambda qa, qb: (True, ""))
+    assert len(wps) == 1, wps
+
+
+@case
+def test_build_move_validator_rejects(chain):
+    """build_move(qs=None) 的局部 IK 路径带 validator：拒绝 = 不写计划。"""
+    blocks, cand, q0 = scene(chain)
+
+    def all_bad(qa, qb):
+        return False, "碰撞：ag95×upper_arm"
+
+    try:
+        pp.build_move(chain, q0, (0.523, 0.331, 0.40), name="hover",
+                      validator=all_bad)
+    except pp.PlanError as e:
+        assert "碰撞" in str(e), str(e)
+    else:
+        raise AssertionError("build_move 的 validator 没拦")
 
 
 # ---------------------------------------------------------------- 变异测试

@@ -711,11 +711,14 @@ def solve_path(chain, targets, q_start, yaw_deg=0.0, table_z=TABLE_PLANE_Z,
 
 def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
              duration=None, before=None, after=None, q=None, guard=None,
-             quat=None, max_iter=200):
+             quat=None, max_iter=200, validator=None):
     """解一个航点并跑单点预检，追加到 waypoints。返回该点的 q。
 
     ``q`` 已经解好（来自 `solve_path`）时直接用，只复核残差与各项预检。
     ``quat``（xyzw）给定时用它取代「竖直朝下 + yaw」，见 `target_matrix`。
+    ``validator``：段级碰撞裁决（A2），只给**没走 `solve_path`** 的调用方
+    （如 `build_move` 的局部 IK 路径）——`solve_path` 已经逐转移裁决过，
+    再传一遍是重复的服务调用，白白烧令牌窗口。
     """
     if q is None:
         q, pe, re, nfev, conv = solve_waypoint(chain, xyz, yaw_deg, q_seed,
@@ -752,6 +755,11 @@ def add_move(waypoints, chain, name, xyz, q_seed, yaw_deg, table_z,
                         "（下限 %.1f mm）"
                         % (name, worst[0], worst[1], worst[2] * 1000,
                            worst[3] * 1000))
+    if validator is not None:
+        vok, vwhy = validator(q_seed, q)
+        if not vok:
+            raise PlanError("航点 %s 的段级碰撞裁决拒绝：%s —— "
+                            "MoveIt 说了算（fail-closed）" % (name, vwhy))
     wp = {"name": name, "q": [float(v) for v in q],
           "duration": float(duration or duration_for(q_seed, q))}
     if before:
@@ -794,8 +802,12 @@ def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP, q_start=None):
             # 端点都远离奇异，**插值点**不一定：q5 一过零就落在奇异上。
             # 第一跳虽然不插点（见上），中间点一样要查 —— 否则「不插点」会
             # 顺手把这条检查一起跳过（2026-11-01 首跳 wrist_2 ±89.8° 翻越就是这么漏的）。
-            n = 8 if first else (int(np.ceil(jump / max_jump))
-                                 if jump > max_jump else 0)
+            # 2026-11-14 审计补洞：原式 `jump > max_jump 才查` ⇒ 跳变 ≤1 rad
+            # 的跨零（如 q5 +0.3→−0.3 rad，17°×2）**一个插值点都不查**，直线
+            # 插值正好穿过奇异。现在查点数至少 2（至少查中点），插点数仍按
+            # max_jump 算 —— 只加检查，不加插点。
+            n = 8 if first else max(2, int(np.ceil(jump / max_jump)))
+            n_ins = 8 if first else int(np.ceil(jump / max_jump))
             for i in range(1, n):
                 qi = prev_q + (q - prev_q) * (i / n)
                 ws = check_wrist(chain, qi)
@@ -803,7 +815,7 @@ def split_jumps(waypoints, chain, max_jump=MAX_JOINT_JUMP, q_start=None):
                     raise PlanError("插点 %s_split%d 的腕 2 只有 %.2f°，"
                                     "离奇异位形不足 %.2f°（下限）"
                                     % (w["name"], i, ws[0], ws[1]))
-                if first:
+                if first or i >= n_ins:
                     continue
                 out.append({"name": "%s_split%d" % (w["name"], i),
                             "q": [float(v) for v in qi],
@@ -835,7 +847,7 @@ def build_survey(chain, q_start, which):
 
 
 def build_move(chain, q_start, xyz, name="move", quat=None, transit_dz=None,
-               yaw_deg=0.0, qs=None):
+               yaw_deg=0.0, qs=None, validator=None):
     """一（或两）个航点的平动计划。
 
     ``quat``：tool0 目标朝向（xyzw）；缺省 = 竖直朝下、yaw 0（老行为）。
@@ -847,6 +859,8 @@ def build_move(chain, q_start, xyz, name="move", quat=None, transit_dz=None,
     ``qs``：**已经解好的关节角**，按本计划航点顺序（``transit`` 在前）。给定时
     不再局部 IK，只复核残差/限位/护栏 —— 一条链要跨好几个计划时，分支只能由
     **一次**全局 DP 选（``plan_views``），逐计划局部 IK 会各挑各的支。
+    ``validator``：段级碰撞裁决（A2）。``qs`` 来自 ``solve_path`` 时转移已经
+    裁决过，不要再传（重复服务调用）；局部 IK 路径（``qs=None``）必须给。
     """
     wps, checks = [], []
     q = q_start
@@ -859,11 +873,11 @@ def build_move(chain, q_start, xyz, name="move", quat=None, transit_dz=None,
         qy = (xyz[0], xyz[1], xyz[2] + float(transit_dz))
         q, c = add_move(wps, chain, name + "_transit", qy, q, yaw_deg,
                         TABLE_PLANE_Z, quat=quat,
-                        q=(qlist[k] if qlist else None))
+                        q=(qlist[k] if qlist else None), validator=validator)
         k += 1
         checks.append(c)
     q, c = add_move(wps, chain, name, xyz, q, yaw_deg, TABLE_PLANE_Z, quat=quat,
-                    q=(qlist[k] if qlist else None))
+                    q=(qlist[k] if qlist else None), validator=validator)
     checks.append(c)
     meta = {"kind": "move", "tool0": list(xyz)}
     if quat is not None:
@@ -917,11 +931,16 @@ def _open_action(mm):
 
 
 def _with_speed(action, speed):
-    if action is None or speed is None:
-        return action
-    a = dict(action)
-    a["speed"] = int(speed)
-    return a
+    """速度参数**不再写进计划**（2026-11-14 起忽略，不删参数保 API 兼容）。
+
+    依据：`ag95_speed_probe.py` 2026-10-27 实测 1/20/50/75/100 五档写 `0x0104`
+    行程耗时全部不变、回读恒 100 —— 寄存器**写了没用**（台账第一百五十四轮）。
+    旧路径把 speed 挂到夹爪动作上，执行端 `gripper.set_speed` 写后回读必不一致
+    ⇒ 场景一旦配了 `grasp_close_speed_pct`，整段在执行期 RuntimeError 判红
+    —— 「实证已死的通路」不该能打红一轮。参数与 meta 记录保留：谁在要求
+    速度这件事仍然可见，只是不再产生任何寄存器写。
+    """
+    return action
 
 
 def build_pick(chain, q_start, cand, block, blocks, slot,
@@ -931,7 +950,8 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
                release_dwell_s=0.0, surface_z=None, carry_z=None,
                survey_tool0=None, tower_box=None, held_half_edge=0.020,
                held_off_xy=None, place_clearance=None, block_h_m=None,
-               min_block_gap=None, post_targets=None, validator=None):
+               min_block_gap=None, post_targets=None, validator=None,
+               fold_grasp_yaw=True):
     """完整拾放循环：approach → grasp(闭合) → lift → to_slot → place_approach
     → place(张开) → retreat → survey_place。
 
@@ -1002,7 +1022,13 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             % ((block["h"] if block.get("h") is not None else block["top"]),
                MAX_TABLE_BLOCK_TOP_M * 1000.0))
     yaw_grasp_raw = float(yaw_grasp_deg)
-    yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg)
+    # ``fold_grasp_yaw=False`` 只给 ±180° 等价重试的第二支用（调用方传
+    # `fold_yaw_180(raw) + 180` 且带这个开关）：折叠会把两支塌缩成**同一个**
+    # 目标 yaw，重试就永远在原地打转（2026-11-14 审计：原写法两支等价，
+    # 第二支从未真正试过）。+180° 后的目标矩阵不同 ⇒ IK 支族不同，物理抓取
+    # 仍是同一个（两指互换位置，见 `fold_yaw_180`）。
+    yaw_grasp_deg = fold_yaw_180(yaw_grasp_deg) if fold_grasp_yaw \
+        else yaw_grasp_raw
     yaw_place = yaw_grasp_deg if yaw_place_deg is None else yaw_place_deg
 
     if grasp_at == "block_center":
@@ -1134,6 +1160,11 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
     qpath_all = solve_path(chain, targets_all, q_start,
                            yaws=yaws_all, guard=guard, max_step_deg=caps,
                            validator=validator)
+    if grip_speed_pct is not None or release_speed_pct is not None:
+        meta_speed_note = ("0x0104 实测无效（2026-10-27 五档探针），速度参数"
+                           "只记账不执行")
+    else:
+        meta_speed_note = None
     qpath = qpath_all[:len(specs)]
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
@@ -1169,6 +1200,7 @@ def build_pick(chain, q_start, cand, block, blocks, slot,
             "grasp_at": grasp_at,
             "grip_speed_pct": grip_speed_pct,
             "release_speed_pct": release_speed_pct,
+            "speed_note": meta_speed_note,
             "release_dwell_s": (round(float(release_dwell_s), 3)
                                 if release_dwell_s else 0.0),
             "place_target_mm": [round(sx * 1000, 2), round(sy * 1000, 2)],
@@ -1249,7 +1281,7 @@ def build_place(chain, q_start, block, slot, surface_z, carry_z,
                 yaw_place_deg=0.0, yaw_grasp_deg=0.0, open_mm=None,
                 survey_tool0=None, tower_box=None, held_half_edge=0.020,
                 held_off_xy=None, release_dwell_s=0.0, release_speed_pct=None,
-                place_clearance=None):
+                place_clearance=None, validator=None):
     """**放置后半段**：已夹着块停在 carry 高度 → to_slot → place_approach
     → place → retreat → survey_place。
 
@@ -1326,7 +1358,7 @@ def build_place(chain, q_start, block, slot, surface_z, carry_z,
             + [TRANSIT_STEP_CAP_DEG])
     qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
                        yaws=[y for _, _, y, _, _ in specs], guard=guard,
-                       max_step_deg=caps)
+                       max_step_deg=caps, validator=validator)
     wps, checks = [], []
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
@@ -1338,6 +1370,7 @@ def build_place(chain, q_start, block, slot, surface_z, carry_z,
             if w["name"] == "place":
                 w["dwell_s"] = round(float(release_dwell_s), 3)
     meta = {"kind": "place", "block_idx": block.get("idx"),
+            "collision_validator": bool(validator is not None),
             "block_h_mm": round(wz * 1000, 2),
             "grasp_depth_mm": round(grasp_depth_m * 1000, 2),
             "block_below_tip_mm": round((wz - grasp_depth_m) * 1000, 2),
@@ -1372,7 +1405,8 @@ NUDGE_BOX_TOP_TOL = 0.0005
 def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
                 surface_z=TABLE_PLANE_Z, yaw_block_deg=0.0, blocks=None,
                 open_mm=None, survey_tool0=None, tower_box=None,
-                held_half_edge=0.020, yaw_shift_deg=0.0, lift_mm=0.0):
+                held_half_edge=0.020, yaw_shift_deg=0.0, lift_mm=0.0,
+                validator=None):
     """放置后矫正：夹住块**抬最小一步**（默认 0 = 只夹不抬），先绕块心扭转、
     再平移，放回原高度松开。
 
@@ -1514,7 +1548,8 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
     qpath = solve_path(chain, [(n, xyz) for n, xyz, _, _, _ in specs], q_start,
                        yaws=[y for _, _, y, _, _ in specs], guard=guard,
                        max_step_deg=([MAX_JOINT_STEP_DEG] * (len(specs) - 1)
-                                     + [TRANSIT_STEP_CAP_DEG]))
+                                     + [TRANSIT_STEP_CAP_DEG]),
+                       validator=validator)
     wps, checks = [], []
     q = q_start
     for (name, xyz, yaw, after, before), q_solved in zip(specs, qpath):
@@ -1523,6 +1558,7 @@ def build_nudge(chain, q_start, block, shift_xy_mm=(0.0, 0.0), dyaw_deg=0.0,
         checks.append(c)
 
     meta = {"kind": "nudge", "block_idx": block.get("idx"),
+            "collision_validator": bool(validator is not None),
             "surface_z_mm": round(surf * 1000.0, 2),
             "block_top_abs_mm": round(top_abs * 1000.0, 2),
             "block_h_mm": round(wz * 1000.0, 2),

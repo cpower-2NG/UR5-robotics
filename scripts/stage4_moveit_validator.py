@@ -76,7 +76,10 @@ def make_segment_validator(joint_names, group="ur_manipulator",
     from sensor_msgs.msg import JointState
 
     if "node" not in _STATE:
-        rclpy.init()
+        # 2026-11-14 审计：裸 rclpy.init() 在宿主进程已 init 时（例如编排器
+        # 同进程先起过别的 ROS 客户端）直接 RuntimeError。幂等：已 init 就用。
+        if not rclpy.ok():
+            rclpy.init()
         _STATE["node"] = rclpy.create_node("stage4_moveit_validator")
         _STATE["client"] = _STATE["node"].create_client(GetStateValidity,
                                                         service)

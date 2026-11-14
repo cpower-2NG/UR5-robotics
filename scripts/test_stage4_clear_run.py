@@ -968,7 +968,8 @@ def section_place_yaw_equiv():
 
     def fake(*a, **kw):
         calls.append((round(float(kw.get('yaw_grasp_deg')), 4),
-                      kw.get('yaw_place_deg')))
+                      kw.get('yaw_place_deg'),
+                      bool(kw.get('fold_grasp_yaw', True))))
         if kw.get('yaw_place_deg') is None:
             raise pp.BranchChainError(
                 '这些航点的所有 IK 分支组合都过不了高度护栏或单步 170° 上限'
@@ -978,17 +979,25 @@ def section_place_yaw_equiv():
         kw = dict(kw, yaw_place_deg=None)
         return real(*a, **kw)
 
-    # A3：抓取朝向 ±180° 等价重试的两支候选（原值、折叠(raw+180)）
+    # 抓取朝向 ±180° 等价重试的两支（2026-11-14 修后语义）：
+    # ① 折叠写法（fold_yaw_180(raw)，fold_grasp_yaw=True）；
+    # ② 整体 +180°（fold_yaw_180(raw) + 180，fold_grasp_yaw=False —— 不再
+    #    折叠，目标矩阵才真的不同）。修前两支都过 fold ⇒ 塌缩成同一目标，
+    #    重试是空转（审计缺陷 3）。
     g_raw = [float(a['grasp_yaw_deg']) for a in acts]
-    g_alt = [pp.fold_yaw_180(g + 180.0) for g in g_raw]
+    g_folded = [pp.fold_yaw_180(g) for g in g_raw]
+    g_alt = [g + 180.0 for g in g_folded]
     try:
         pp.build_pick = fake
         out = tempfile.mkdtemp(prefix='e9-equiv-off-')
         ok, err = raises(cr.plan_sequence, ch, q0, acts, blocks, out)
         check('缺省不开旗子 ⇒ BranchChainError 原样上抛', ok and '测试注入' in err)
-        check('缺省不开旗子 ⇒ place 不换写法，抓取朝向两支各试一次（place 全 None）',
-              calls == [(round(g_raw[0], 4), None), (round(g_alt[0], 4), None)],
+        check('缺省不开旗子 ⇒ 抓取朝向两支各试一次（折叠 / +180 不折叠）',
+              calls == [(round(g_folded[0], 4), None, True),
+                        (round(g_alt[0], 4), None, False)],
               calls)
+        check('缺省不开旗子 ⇒ 两支的 yaw 真的不同（修前塌缩成同一个）',
+              abs(calls[0][0] - calls[1][0]) > 90.0, calls)
         check('缺省不开旗子 ⇒ 一份计划都不写',
               not any(f.endswith('.json') for f in os.listdir(out)), os.listdir(out))
 
@@ -1001,8 +1010,8 @@ def section_place_yaw_equiv():
         want = [pp.fold_yaw_180(g) - 180.0 for g in g_raw]
         expected = []
         for i in range(len(acts)):
-            expected += [(round(g_raw[i], 4), None),
-                         (round(g_raw[i], 4), want[i])]
+            expected += [(round(g_folded[i], 4), None, True),
+                         (round(g_folded[i], 4), want[i], True)]
         check('开了旗子 ⇒ 每个动作先默认抓取朝向、place 失败再试 180° 等价写法',
               calls == expected, calls)
         check('180° 等价写法 = 折叠后的抓取朝向 −180°',
@@ -1043,9 +1052,10 @@ def section_place_yaw_equiv():
         out4 = tempfile.mkdtemp(prefix='e9-equiv-plain-')
         ok, err = raises(cr.plan_sequence, ch, q0, acts, blocks, out4,
                          place_yaw_equiv=True)
+        ok2 = (len(calls) == 1 and calls[0][1] is None
+               and abs(calls[0][0] - g_folded[0]) < 1e-6)
         check('非 BranchChainError ⇒ 不重试（只试了默认写法）',
-              ok and calls == [(round(g_raw[0], 4), None)]
-              and '测试注入' in err, (calls, err))
+              ok and ok2 and '测试注入' in err, '%r / %r' % (calls, err))
     finally:
         pp.build_pick = real
 
@@ -1760,6 +1770,64 @@ def section_finish():
         check('round.json 完整 ⇒ 收尾按终态给 0', rc == 0, 'rc=%r' % rc)
 
 
+# ------------------------------------------ A2 接线（2026-11-14 补洞）
+def section_validator_passthrough():
+    print('\n[4d] A2 段级裁决：validator 从 plan_sequence 一路传到每个 DP')
+    truth, att = tower_truth(), tower_attempt()
+    acts, blocks = cr.actions_from_attempt(truth, att, cm.PAD_THICK)
+    ch = chain()
+    q0 = q_start_of(ch)
+    seen = []
+    vcalls = []
+
+    def sentinel(qa, qb):
+        # 必须**可调用**：solve_path 对每个转移真调它（这里放行，只记账）
+        vcalls.append(1)
+        return True, ""
+
+    real_solve = pp.solve_path
+
+    def spy(ch_, targets, q_start, **kw):
+        seen.append(kw.get('validator'))
+        return real_solve(ch_, targets, q_start, **kw)
+
+    real = pp.solve_path
+    try:
+        pp.solve_path = spy
+        out = tempfile.mkdtemp(prefix='e9-validator-')
+        plans, layout, q_end = cr.plan_sequence(
+            ch, q0, acts, blocks, out, wrist_survey=False,
+            place_yaw_equiv=True, validator=sentinel)
+        check('每个动作的 DP 都拿到同一个 validator（%d 次 solve_path）'
+              % len(seen),
+              len(seen) >= 2 and all(s is sentinel for s in seen), seen)
+        check('validator 真被 DP 逐转移调用（%d 次，放行）' % len(vcalls),
+              len(vcalls) >= 10, len(vcalls))
+        check('计划 meta 记录裁决在场（collision_validator=true）',
+              all(json.load(open(p['path']))['meta']['collision_validator']
+                  is True for p in plans))
+        seen.clear()
+        plans2, _l, _q = cr.plan_sequence(
+            ch, q0, acts, blocks, out, wrist_survey=True,
+            place_yaw_equiv=True, validator=sentinel)
+        check('末尾机位链（plan_views）也透传 validator（追加 3 份机位计划）',
+              len(plans2) == len(plans) + 3
+              and all(s is sentinel for s in seen), (len(plans2), seen))
+    finally:
+        pp.solve_path = real
+    # 不传（缺省 None）⇒ DP 拿 None、meta 如实记 false（审计：此前 None 静默）
+    out2 = tempfile.mkdtemp(prefix='e9-novalidator-')
+    seen.clear()
+    try:
+        pp.solve_path = spy
+        cr.plan_sequence(ch, q0, acts, blocks, out2, wrist_survey=False,
+                         place_yaw_equiv=True)
+    finally:
+        pp.solve_path = real
+    check('缺省（None）⇒ DP 全部收到 None',
+          seen and all(s is None for s in seen), seen)
+
+
 def main():
     print('=' * 68)
     # C1：模块缺省 = 未实测哨兵；本套件是模型世界（仿真几何），显式装模型常量。
@@ -1769,7 +1837,8 @@ def main():
                section_plans, section_multitarget,
                section_step_cap, section_seed_propagation,
                section_view_chain,
-               section_place_yaw_equiv, section_from_xy,
+               section_place_yaw_equiv, section_validator_passthrough,
+               section_from_xy,
                section_gap, section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
                section_align, section_view_gate, section_finish):
