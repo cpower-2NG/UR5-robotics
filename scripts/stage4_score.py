@@ -452,9 +452,14 @@ def score_round(obs, thresholds=None):
         "void_streak": _void_streak(rows),
         # 这一轮算不算「void 轮」：轮内连 3 次 void，或整轮全 void
         # （整轮全 void 在轮内数不出 3 连 —— 只有 2 块时永远数不到 3，
-        #   所以整轮口径单独算一条）。连续 3 个 void 轮 ⇒ 停，见 score_exit。
+        #   所以整轮口径单独算一条）。**全 missing（数据坏）不是 void**：
+        #   契约 §4.1 里 void = 外部原因、missing = 数据缺失，两种状态；
+        #   2026-11-14 审计前 den==0 把全 missing 轮也标成 void 轮，
+        #   污染 score_exit 的停轮计数。连续 3 个 void 轮 ⇒ 停，见 score_exit。
         "void_round": (_void_streak(rows) >= VOID_STREAK_STOP
-                       or (len(rows) > 0 and den == 0)),
+                       or (len(rows) > 0 and den == 0
+                           and not any(r["status"] == A_MISSING
+                                       for r in rows))),
         "counts": {"id_ok": n_id, "grasp_ok": n_grasp, "place_ok": n_place,
                    "auto_top1": n_auto, "terminal_ok": n_term},
         "rates": rates,

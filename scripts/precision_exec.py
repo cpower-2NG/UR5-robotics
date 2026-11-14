@@ -145,6 +145,46 @@ def _moves_fingers(spec):
     return _action_name(spec) in ("open", "close", "open_to")
 
 
+def validate_plan_doc(plan):
+    """计划 JSON v2 的**结构**校验（离线可测；发轨迹前的最后一道线）。
+
+    2026-11-14 审计：原来不查 version、不查 q 长度 —— v1 残留或截断的计划
+    会静默进 ``send()``，靠 JTC 拒 goal 兜底（运行时才失败，且已经过了
+    闸门/自检）。计划期就该拒。查的不变量：version=2、q_start 非空数字表、
+    航点名唯一、每点 q 长度与 q_start 一致、duration 为正数。
+    """
+    if not isinstance(plan, dict):
+        raise ValueError("计划不是 JSON 对象")
+    if plan.get("version") != 2:
+        raise ValueError("version=%r ≠ 2 —— 只认计划 JSON v2"
+                         % (plan.get("version"),))
+    q_start = plan.get("q_start")
+    if not isinstance(q_start, list) or not q_start \
+            or not all(isinstance(v, (int, float)) for v in q_start):
+        raise ValueError("q_start 必须是非空数字列表：%r" % (q_start,))
+    wps = plan.get("waypoints")
+    if not isinstance(wps, list) or not wps:
+        raise ValueError("waypoints 为空/缺失")
+    seen = set()
+    for w in wps:
+        if not isinstance(w, dict):
+            raise ValueError("航点不是对象：%r" % (w,))
+        name = w.get("name")
+        if not name or name in seen:
+            raise ValueError("航点名缺失或重复：%r" % (name,))
+        seen.add(name)
+        q = w.get("q")
+        if not isinstance(q, list) or len(q) != len(q_start):
+            got = ("缺" if q is None else
+                   (len(q) if isinstance(q, list) else "非列表"))
+            raise ValueError("航点 %s 的 q 长度 %s ≠ q_start 长度 %d"
+                             % (name, got, len(q_start)))
+        dur = w.get("duration")
+        if not isinstance(dur, (int, float)) or isinstance(dur, bool) \
+                or dur <= 0:
+            raise ValueError("航点 %s 的 duration 非法：%r" % (name, dur))
+
+
 def _action_str(spec):
     """把夹爪动作 spec（字符串或 ``{"gripper":..,"mm":..,"speed":..}``）变成一行字。"""
     if isinstance(spec, dict):
@@ -226,6 +266,11 @@ def main():
     jobs = []
     for path in plan_paths:
         plan = json.load(open(path))
+        try:
+            validate_plan_doc(plan)
+        except ValueError as e:
+            print("!! 计划 %s 结构不过：%s —— 一份坏整批不发" % (path, e))
+            return 2
         names = [w["name"] for w in plan["waypoints"]]
         if args.only:
             if args.only not in names:
@@ -543,8 +588,15 @@ def main():
                          error=str(exc), before_mm=_r2(before))
                 raise
         elif kind != "readback":
-            print("!! 不认识的夹爪动作 %r" % spec)
-            return None
+            # 2026-11-14 审计补洞：原来只打印 + return None ⇒ 调用方把 None
+            # 当「没做夹爪动作」继续发轨迹 —— after 拼错（如 "cloes"）就跳过
+            # 空夹检测，空手继续 lift/to_slot/place（2026-11-09 s3 空夹事故的
+            # 另一条入口）。改判红停轮：动作名只认 open/close/open_to/readback。
+            log_line(st["log"], event="gripper_fail", where=where,
+                     action=str(kind), error="unknown gripper action")
+            raise ga.GripperActionError(
+                "%s：不认识的夹爪动作 %r（只认 open/close/open_to/readback）"
+                % (where, kind))
         pos = wait_stable(g)
         dt = time.time() - t0
         target = (GRIP_OPEN_MM if kind == "open" else
@@ -599,13 +651,15 @@ def main():
         tj = goal.trajectory
         tj.joint_names = list(ARM)
         now = joints()
-        for p, t in ((now, 0.0), (target, dur)):
-            pt = JointTrajectoryPoint()
-            pt.positions = [float(v) for v in p]
-            pt.velocities = [0.0] * len(ARM)
-            pt.time_from_start = Duration(sec=int(t),
-                                          nanosec=int((t - int(t)) * 1e9))
-            tj.points.append(pt)
+        # t=0 起点：共享实现（traj_util，D3 —— 与 sim_bridge 同源，2026-11-14）
+        import traj_util
+        tj.points.append(traj_util.start_point(now))
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(v) for v in target]
+        pt.velocities = [0.0] * len(ARM)
+        pt.time_from_start = Duration(sec=int(dur),
+                                      nanosec=int((dur - int(dur)) * 1e9))
+        tj.points.append(pt)
         print("  发 %s（%.1fs，起点=当前实测）…" % (what, dur))
         fut = ac.send_goal_async(goal)
         rclpy.spin_until_future_complete(node, fut, timeout_sec=10)
@@ -758,6 +812,12 @@ def main():
                     print("!! 运动授权不成立（aborted_token）：%s" % why)
                     print("   本轮 void（aborted_token），不算抓取失败；"
                           "后面的计划一条都不发")
+                    # 结构化进执行日志：编排器此前只能靠 stdout 字符串匹配
+                    # 判 void；round_report 直接读 jsonl 时也能认出这条
+                    # （2026-11-14 审计：原来这条只活在 stdout）。
+                    log_line(jobs[i]["log"], event="aborted_token",
+                             reason=str(why), plan_index=i + 1,
+                             plans_total=len(jobs))
                     rc = 3
                     break
                 print("  运动授权仍在：握手在 %.0f 秒前完成" % age)

@@ -156,6 +156,11 @@ def exec_evidence(events):
         kind = ev.get("event")
         if kind == "gate" and ev.get("ok") is False:
             rc = max(rc, 2)
+        elif kind == "aborted_token":
+            # 令牌过期 ⇒ 本轮 void（契约 §4.6）：不算抓取失败、不进分母。
+            # 2026-11-14 起这条有结构化日志（precision_exec 写 event），
+            # 不再只活在 stdout 字符串里。
+            out["aborted_token"] = True
         elif kind in ("traj", "gripper_fail", "gripper_selftest"):
             if ev.get("event") == "gripper_fail":
                 rc = max(rc, 1)

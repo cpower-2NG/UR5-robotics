@@ -285,6 +285,17 @@ def section_round():
     check('整轮全 void 也算 void 轮（2 块永远数不到 3 连）',
           res["void_round"] is True)
 
+    # 2026-11-14 审计补的分界：全 **missing**（数据坏）不是 void 轮 ——
+    # 契约 §4.1 里 void = 外部原因、missing = 数据缺失，混进 void_round
+    # 会污染 score_exit 的停轮计数。
+    res = sc.score_round(obs([att(truth={"truth_source": "perception_3d"})] * 2))
+    check('全 missing（真值来源不白）⇒ missing_data 且**不是** void 轮',
+          res["verdict"] == "missing_data" and res["void_round"] is False,
+          '%s %s' % (res["verdict"], res["void_round"]))
+    res = sc.score_round(obs([att(), att(truth={"truth_source": "bogus"})]))
+    check('void + missing 混合轮也不算 void 轮',
+          res["void_round"] is False, str(res["void_round"]))
+
     res = sc.score_round(obs([att(), att()], safety={"estop": 1}))
     check('急停 1 次 → 判红', res["verdict"] == "fail"
           and '安全事件' in res["reason"], str(res["reason"]))

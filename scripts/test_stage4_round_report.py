@@ -169,6 +169,16 @@ def section_exec_evidence():
     check('夹爪动作判红 ⇒ exec_rc=1', ev['exec_rc'] == 1, str(ev))
 
     ev = rr.exec_evidence([
+        {'event': 'gate', 'ok': True},
+        {'event': 'aborted_token', 'reason': 'expired 33s ago'},
+    ])
+    check('令牌过期事件 ⇒ aborted_token=True（不算 traj/gripper 失败）',
+          ev.get('aborted_token') is True and ev['exec_rc'] == 0, str(ev))
+    ev = rr.exec_evidence([{'event': 'traj', 'ok': True}])
+    check('没有令牌事件 ⇒ 不写 aborted_token 键', 'aborted_token' not in ev,
+          str(ev))
+
+    ev = rr.exec_evidence([
         {'event': 'gripper', 'where': 'selftest.close', 'action': 'close',
          'position_mm': 0.1}])
     check('selftest 的 close 回读不算抓取回读', 'closed_mm' not in ev,
