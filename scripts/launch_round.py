@@ -122,7 +122,10 @@ def orchestrator_args(args, paths):
             "--board-repo", paths["repo"]]
     for k in ("expect", "pad_spec", "pad_mat", "facts", "bias"):
         if paths.get(k):
-            argv += ["--" + k.replace("_", "-"), paths[k]]
+            # bias 的编排器旗标是 --bias-estimate（裸 --bias 会歧义命中
+            # --bias-comp/--bias-seed，argparse 直接拒——b3demo 实测）
+            flag = "--bias-estimate" if k == "bias" else "--" + k.replace("_", "-")
+            argv += [flag, paths[k]]
     for extra in args.round_arg or []:
         if " " in extra or "'" in extra or '"' in extra:
             raise SystemExit("--round-arg 必须是单个旗标/值：%r" % extra)
