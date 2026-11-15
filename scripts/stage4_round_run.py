@@ -29,19 +29,21 @@
 ``--analysis local`` 只给离线排练（必须配 ``--dry-run``）。板上分析失败 =
 停轮（fail-closed），**不许偷偷回退到本机算**。
 
-时间闸门（600 s 硬窗口，见契约 §5）
+时间闸门（900 s 硬窗口，2026-11-15 契约 v0.8 由 600 扩到 900；见契约 §5）
 ──────────────────────────────────
 · **R1**（观察后、探针前）：`剩余 ≥ C_est + T_exec_est + 60 s`；
 · **R2**（执行起手）：`剩余 ≥ T_exec_est + max(45 s, 15%·T_exec_est)`；
 · 板端 ``run.sh`` 首行 ``--min-remaining`` 守卫，执行中过期记 ``aborted_token``
   —— 本轮 void、不计连续 streak，**不记抓取失败**。
 
-b̂ 偏置补偿（契约 §4.7，继承阶段三）
+b̂ 偏置补偿（契约 §4.7，继承阶段三；2026-11-15 v0.8 降级为**记录项**）
 ──────────────────────────────────────
 `命令落点 = 格心 − b̂`，整轮 ``fixed`` 一个值；种子优先级
-``--bias-seed`` > ``<run>/bias_estimate.json``；两者都没有且未显式
-``--bias-comp none`` ⇒ 停轮（阶段三教训：缺种子会「以为在补、其实没补」）。
-逐块 ``b̂_round = 彩色质心 − 命令`` 在判分阶段算，``|b̂| > 15 mm`` 按**失败**
+``--bias-seed`` > ``<run>/bias_estimate.json``；两者都没有 ⇒ **不再停轮**，
+自动按未补偿跑（mode ``none``、source ``none-unseeded``），报告与 facts 标
+「未补偿」—— b̂ 对 30 mm 判格容差是 ~3 mm 量级的锦上添花，为它停一轮真机
+的代价远大于收益。显式 ``--bias-comp none`` 行为不变。逐块
+``b̂_round = 彩色质心 − 命令`` 在判分阶段算，``|b̂| > 15 mm`` 按**失败**
 记，不当偏置。判分口径不变：仍比实际块心 vs 格心。
 
 退出码
@@ -115,7 +117,7 @@ PHASE_ERROR = {"preflight": EXIT_MISSING, "views": EXIT_PLAN,
 #: 206 s、实际 440 s —— R1/R2 用这种估时等于没有闸门（2026-11-12 实测）。
 PLAN_OVERHEAD_S = 30.0       # 每份计划：停稳 / 夹爪开合 / 进程启动
 PER_PLAN_S = 1.0             # 执行器逐条建链 / 日志开销
-BURST_OVERHEAD_S = 6.0       # 每组腕部 burst 20 帧
+BURST_OVERHEAD_S = 6.0       # 每组腕部 burst（v0.8 起 10 帧，原 20）
 R1_MARGIN_S = 60.0           # R1 的固定余量
 R2_MIN_MARGIN_S = 45.0       # R2 的最小余量
 R2_MARGIN_FRAC = 0.15        # R2 的按比例余量
@@ -350,7 +352,8 @@ def r2_gate(remaining, exec_est_s, margin=None):
 def bias_setup(mode, seed_spec, estimate_path):
     """``--bias-comp`` / ``--bias-seed`` / ``<run>/bias_estimate.json`` → 本轮 b̂。
 
-    缺种子且未显式 ``none`` ⇒ 抛 ``RoundError(2)`` 停轮（契约 §4.7）。
+    缺种子且未显式 ``none`` ⇒ **不再停轮**（2026-11-15 契约 v0.8 降级为记录项）：
+    自动按未补偿跑，``source="none-unseeded"``、报告与 facts 标「未补偿」。
     返回 ``{mode, seed_mm, applied_mm, source, note}``。
     """
     mode = (mode or "fixed").strip().lower()
@@ -368,21 +371,25 @@ def bias_setup(mode, seed_spec, estimate_path):
         if seed is not None:
             source = estimate_path
     if seed is None:
-        raise RoundError(
-            EXIT_MISSING, "compute",
-            "没有 b̂ 种子：--bias-seed 没给，%s 也没有可用的 v%d 估计 —— "
-            "停轮。要么显式给种子（阶段三先验 -2.791,-0.248），要么显式 "
-            "--bias-comp none（并在报告里标「未补偿」）"
-            % (estimate_path or "<run>/bias_estimate.json",
-               gb.BIAS_ESTIMATE_VERSION))
+        return {"mode": "none", "seed_mm": None, "applied_mm": [0.0, 0.0],
+                "source": "none-unseeded",
+                "note": gb.bias_note("none") + "；缺 b̂ 种子（--bias-seed 没给，"
+                        "%s 也没有可用的 v%d 估计）⇒ 本轮未补偿，只记录不停轮"
+                        "（2026-11-15 契约 v0.8）"
+                        % (estimate_path or "<run>/bias_estimate.json",
+                           gb.BIAS_ESTIMATE_VERSION)}
     applied = gb.applied_bias([], mode, seed=seed)
     return {"mode": mode, "seed_mm": [float(seed[0]), float(seed[1])],
             "applied_mm": [float(applied[0]), float(applied[1])],
             "source": source, "note": gb.bias_note(mode)}
 
 
-def validate_pad_doc(doc, min_frames=20, max_spread_mm=2.0, max_spread_deg=0.5):
-    """解垫文档是否够格当本轮计划与判分的**同一份**垫位姿。返回问题列表。"""
+def validate_pad_doc(doc, min_frames=10, max_spread_mm=2.0, max_spread_deg=0.5):
+    """解垫文档是否够格当本轮计划与判分的**同一份**垫位姿。返回问题列表。
+
+    ``min_frames`` 缺省 10（2026-11-15 v0.8：burst 20→10，用户拍板；共识下限
+    5 帧之上仍有 2× 余量）。
+    """
     probs = []
     if not isinstance(doc, dict):
         return ["解垫输出不是 JSON 对象"]
@@ -453,6 +460,24 @@ def evaluate_preflight(got, expect):
     if expect.get("tree_files") and tree.get("files") != expect["tree_files"]:
         probs.append("板上代码树文件数 %r ≠ 期望 %r"
                      % (tree.get("files"), expect["tree_files"]))
+
+    # ~/precision 可执行副本（precision_exec / capture / 授权 / traj_util…）：
+    # 树哈希不覆盖它，attempt3/4 两次事故都来自副本过期 ⇒ 2026-11-15 起它的
+    # md5 也是预检的一部分。fail-closed 双向：期望值没有这一段（旧 expect）或
+    # 板上预检脚本太旧（got 缺字段）都算红，不许静默放行。
+    want_md5 = expect.get("precision_md5")
+    got_md5 = got.get("precision_md5")
+    if not want_md5:
+        probs.append("期望值缺 precision_md5（旧 expect 文件）—— 重跑 "
+                     "stage4_preflight_expect.py 重算，别手改 JSON")
+    elif not isinstance(got_md5, dict):
+        probs.append("板上预检没回 precision_md5（~/precision 副本的 md5；"
+                     "板上预检脚本版本旧）—— 先同步 scripts 再跑")
+    else:
+        bad = sorted(k for k, v in want_md5.items() if got_md5.get(k) != v)
+        if bad:
+            probs.append("~/precision 可执行副本与本地不一致：%s —— 先推脚本"
+                         "（push 流程 md5 自带核对）再跑" % ", ".join(bad))
 
     g = got.get("gripper") or {}
     if not g.get("ok"):
@@ -582,6 +607,7 @@ def scan_tree(repo):
     return {"sha256": h.hexdigest(), "files": n}
 '''
 
+_PRECISION_FILES = tuple(pr.BOARD_PY_FILES) + ("run.sh",)
 PREFLIGHT_PY = r'''
 import glob
 import hashlib
@@ -589,7 +615,8 @@ import json
 import os
 import subprocess
 import sys
-''' + PREFLIGHT_TREE_CODE + r'''
+''' + "PRECISION_FILES = %r\n" % (_PRECISION_FILES,) \
+    + PREFLIGHT_TREE_CODE + r'''
 
 repo = sys.argv[1] if len(sys.argv) > 1 else "~/stage4-entry"
 # 参数是 shell 引号过的（shlex.quote），``~`` 不会被远端 shell 展开 ⇒ 自己展开。
@@ -607,6 +634,21 @@ except OSError as exc:
 
 # 树哈希（算法见 `PREFLIGHT_TREE_CODE`：全仓唯一实现，本机重算期望值也用它）。
 out["tree"] = scan_tree(repo)
+
+# ~/precision 可执行副本的 md5。预检树哈希只覆盖 board-repo（~/stage4-entry），
+# 不覆盖这条部署通道；attempt3/4 两次真机事故都来自「板上副本停在旧版」
+# （argparse 旧签名 / 旧安装树没有 set_stall_detect）。2026-11-15 起它纳入预检：
+# 与期望值逐文件比对，缺文件记 "missing"（fail-closed，由 evaluate_preflight 判）。
+_md5s = {}
+for _name in PRECISION_FILES:
+    _h = hashlib.md5()
+    try:
+        with open(os.path.join(os.path.expanduser("~/precision"), _name), "rb") as _fh:
+            _h.update(_fh.read())
+        _md5s[_name] = _h.hexdigest()
+    except OSError:
+        _md5s[_name] = "missing"
+out["precision_md5"] = _md5s
 
 try:
     sys.path.insert(0, os.path.join(repo, "scripts"))
@@ -1194,7 +1236,7 @@ class LocalBoard(BoardPort):
 # =====================================================================
 # 默认依赖（测试里整包替换成假的，不碰 SSH / ROS / 相机）
 # =====================================================================
-def default_solve_pad(burst, out, min_frames=20, max_spread_mm=2.0,
+def default_solve_pad(burst, out, min_frames=10, max_spread_mm=2.0,
                       max_spread_deg=0.5):
     return pfb.main([burst, "--out", out,
                      "--min-frames", str(int(min_frames)),
@@ -2518,7 +2560,8 @@ def build_parser():
     ap.add_argument("--cells", default=None, help="块 id 升序 → 格：8,6,4,2,0")
     ap.add_argument("--expect", default=None,
                     help="预检期望值 JSON（serial / tree_sha256 / tree_files / "
-                         "wrist_usb3 / stack）；不给 ⇒ 预检判红")
+                         "precision_md5 / wrist_usb3 / stack）；不给 ⇒ 预检判红，"
+                         "缺 precision_md5（旧基线）也判红")
     ap.add_argument("--facts", default=None,
                     help="人给的安全 / 干预 / 人眼复核 JSON（缺 ⇒ 判分不完整）")
     ap.add_argument("--pad-spec", default=None,
@@ -2554,12 +2597,15 @@ def build_parser():
 
     ap.add_argument("--timing-prior", default=None,
                     help="Round 0 实测的 timing.json（标定 R1/R2）")
-    # 2026-11-12 实测（S0:1 r1 真机）：解垫 2.0 + 探针 28.1 + 规划 9.1 + 推板
-    # ≈ 47.7 s；**抓点改实测**后还要拉跑前 pick burst（~10 s）再跑 20 帧共识
-    # 真值（本机 32 s）⇒ ~90 s。取 100。
+    # 估时依据：2026-11-12 实测（S0:1 r1 真机，规划还在开发机）解垫 2.0 +
+    # 探针 28.1 + 规划 9.1 + 推板 ≈ 47.7 s；抓点改实测后再加跑前 pick burst
+    # 与共识真值 ⇒ ~90 s，取 100。**B3-lite（2026-11-14）之后规划搬上 6 核板**，
+    # 该分量未复测（attempt8 compute 实测 131.8 s，但含块 4 规划失败的额外
+    # 分支扫描，不是干净值）⇒ 首个干净轮的 timing.json 出来后回填校准；
+    # 偏保守方向（估大了闸门更严），不危险。
     ap.add_argument("--compute-est", type=float, default=100.0,
-                    help="R1 用的轮内计算估时（秒；缺省 100 = 实测 ~90 的 1.1×，"
-                         "含跑前 pick burst 回传与实测真值）")
+                    help="R1 用的轮内计算估时（秒；缺省 100 = 开发机规划时代的 "
+                         "实测 ~90 × 1.1；板上规划分量待首轮 timing.json 校准）")
     ap.add_argument("--exec-est", type=float, default=400.0,
                     help="无 timing-prior 时的执行估时（秒；缺省 400 = 实测 run.sh "
                          "~390 s）")
@@ -2574,16 +2620,18 @@ def build_parser():
                     help="实测块心离布局表超过它就不抓（不是判分容差，是"
                          "「布局表与台面是不是同一场景」的兜底；缺省 %.0f）"
                          % PICK_OFFSET_LIMIT_MM)
-    ap.add_argument("--pad-min-frames", type=int, default=20)
+    ap.add_argument("--pad-min-frames", type=int, default=10,
+                    help="解垫 burst 最少帧数（2026-11-15 v0.8 起 burst 20→10，"
+                         "缺省随之 20→10；共识下限 5）")
     ap.add_argument("--pad-max-spread-mm", type=float, default=2.0)
     ap.add_argument("--pad-max-spread-deg", type=float, default=0.5)
     ap.add_argument("--colour-search-mm", type=float, default=25.0)
     ap.add_argument("--auth-timeout", type=float, default=1800.0)
     ap.add_argument("--auth-poll", type=float, default=2.0)
-    ap.add_argument("--auth-fresh-min", type=float, default=540.0,
+    ap.add_argument("--auth-fresh-min", type=float, default=840.0,
                     help="令牌剩余秒数下限：低于它就算「不是这一次签发的」，"
-                         "继续等新的 STOP→PLAY（600 s TTL 留 60 s 余量；"
-                         "缺省挡住沿用上一次授权，红线 6）")
+                         "继续等新的 STOP→PLAY（900 s TTL 留 60 s 余量，"
+                         "2026-11-15 v0.8；缺省挡住沿用上一次授权，红线 6）")
 
     ap.add_argument("--from", dest="from_", default=None, choices=PHASES,
                     help="从哪个阶段开始（单步重跑）")

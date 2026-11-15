@@ -19,7 +19,7 @@ C 阶段编排：
   3) R1 不足 ⇒ 停在 compute（rc 3），一条执行都没发；
   4) R1 够、R2 不足 ⇒ 同样不发执行（rc 3）；
   5) 预检红（夹爪未初始化）⇒ rc 2，连授权都不进入；
-  6) 缺 b̂ 种子 ⇒ rc 2，不发执行；
+  6) 缺 b̂ 种子 ⇒ 未补偿跑（v0.8 记录项），source=none-unseeded；
   7) 执行失败 ⇒ rc 5，**不自动重试**（run.sh 只调一次）；
   8) 执行中令牌过期 ⇒ rc 3 且本轮 ``void=true``（aborted_token，不记抓取失败）；
   9) 判分不完整 ⇒ rc 6；
@@ -117,11 +117,11 @@ b0 = r.bias_setup("none", "-2.791,-0.248", None)
 check("b̂ none：显式给种子也不补（[0,0] + 标未补偿）",
       b0["mode"] == "none" and b0["applied_mm"] == [0.0, 0.0]
       and "none" in b0["note"], repr(b0))
-try:
-    r.bias_setup("fixed", None, "/no/such/estimate.json")
-    check("b̂ 缺种子且非 none ⇒ 停轮（RoundError 2）", False)
-except r.RoundError as e:
-    check("b̂ 缺种子且非 none ⇒ 停轮（RoundError 2）", e.code == r.EXIT_MISSING)
+b_miss = r.bias_setup("fixed", None, "/no/such/estimate.json")
+check("b̂ 缺种子 ⇒ 不停轮、按未补偿跑（v0.8 降级为记录项）",
+      b_miss["mode"] == "none" and b_miss["applied_mm"] == [0.0, 0.0]
+      and b_miss["source"] == "none-unseeded" and "未补偿" in b_miss["note"],
+      repr(b_miss))
 try:
     r.bias_setup("adaptive", "1,1", None)
     check("b̂ 不收 adaptive（与整轮一次成脚本冲突）", False)
@@ -138,11 +138,10 @@ with tempfile.TemporaryDirectory() as td:
           b2["applied_mm"] == [-2.5, -0.1] and b2["source"] == est_path, repr(b2))
     with open(est_path, "w") as f:
         json.dump({"version": 1, "bias_mm": [-2.5, -0.1], "n": 40}, f)
-    try:
-        r.bias_setup("fixed", None, est_path)
-        check("b̂ 版本不符的估计当没有 ⇒ 停轮", False)
-    except r.RoundError:
-        check("b̂ 版本不符的估计当没有 ⇒ 停轮", True)
+    b_bad = r.bias_setup("fixed", None, est_path)
+    check("b̂ 版本不符的估计当没有 ⇒ 未补偿跑、标注来源（不停轮）",
+          b_bad["source"] == "none-unseeded" and b_bad["applied_mm"] == [0.0, 0.0],
+          repr(b_bad))
 
 pad_ok = {"kind": "stage2-grid", "n_frames_ok": 20, "n_frames_total": 20,
           "spread_xy_mm": {"max": 1.0}, "spread_yaw_deg": {"max": 0.2},
@@ -154,7 +153,7 @@ pad_ok = {"kind": "stage2-grid", "n_frames_ok": 20, "n_frames_total": 20,
 check("解垫文档合格 ⇒ 无问题", r.validate_pad_doc(pad_ok) == [])
 check("解垫：帧数不足 ⇒ 红",
       any("帧" in x for x in
-          r.validate_pad_doc(dict(pad_ok, n_frames_ok=10))))
+          r.validate_pad_doc(dict(pad_ok, n_frames_ok=4, n_frames_total=4))))
 check("解垫：xy 极差超限 ⇒ 红",
       any("xy" in x for x in
           r.validate_pad_doc(dict(pad_ok, spread_xy_mm={"max": 5.0}))))
@@ -162,8 +161,10 @@ check("解垫：kind 不对 ⇒ 红",
       any("kind" in x for x in r.validate_pad_doc(dict(pad_ok, kind="x"))))
 
 EXPECT = {"serial": "SN-1", "tree_sha256": "abc123", "tree_files": 7,
+          "precision_md5": {"precision_exec.py": "m1", "run.sh": "m2"},
           "stack": {"ur_robot_driver": True}}
 GOT = {"serial": "SN-1", "tree": {"sha256": "abc123", "files": 7},
+       "precision_md5": {"precision_exec.py": "m1", "run.sh": "m2"},
        "gripper": {"ok": True, "init_state": 1},
        "realsense": [{"dev": "1-1", "speed": "5000"}],
        "dashboard": {"ok": True, "state": "PLAYING"},
@@ -200,6 +201,20 @@ check("预检：空树（路径对不上）⇒ 红，不靠期望值蒙过去",
       any("0 个文件" in x for x in r.evaluate_preflight(
           dict(GOT, tree={"sha256": "e3b0c442", "files": 0}),
           {"serial": "SN-1", "stack": {"ur_robot_driver": True}})))
+
+# ~/precision 可执行副本 md5（attempt3/4 两次事故都来自副本过期 ⇒ 2026-11-15
+# 起纳入预检，fail-closed 双向：期望值缺 / got 缺 / 不一致都算红）。
+_old_expect = {k: v for k, v in EXPECT.items() if k != "precision_md5"}
+check("预检：期望值缺 precision_md5（旧基线）⇒ 红，不许静默放行",
+      any("precision_md5" in x for x in r.evaluate_preflight(GOT, _old_expect)))
+check("预检：板上预检没回 precision_md5（脚本旧）⇒ 红",
+      any("precision_md5" in x for x in r.evaluate_preflight(
+          {k: v for k, v in GOT.items() if k != "precision_md5"}, EXPECT)))
+check("预检：~/precision 副本 md5 不符 ⇒ 红（点名文件）",
+      any("precision_exec.py" in x for x in r.evaluate_preflight(
+          dict(GOT, precision_md5={"precision_exec.py": "stale",
+                                   "run.sh": "m2"}),
+          EXPECT)))
 
 # 树哈希只覆盖源码：板子上跑一次 import 就多个 .pyc、跑一次构建就变一堆产物，
 # 这些都不该让「这棵树是哪棵」变味（2026-11-11 实测：`--help` 跑一次，
@@ -409,6 +424,7 @@ class FakeBoard:
         self.pushed = []
         self.preflight_doc = {
             "serial": "SN-1", "tree": {"sha256": "abc123", "files": 7},
+            "precision_md5": {"precision_exec.py": "m1", "run.sh": "m2"},
             "gripper": {"ok": True, "init_state": 1},
             "realsense": [{"dev": "1-1", "speed": "5000"}],
             "dashboard": {"ok": True, "state": "PLAYING"},
@@ -728,7 +744,7 @@ def patched(deps):
 
 
 def fake_solve_pad_writer():
-    def f(burst, out, min_frames=20, max_spread_mm=2.0, max_spread_deg=0.5):
+    def f(burst, out, min_frames=10, max_spread_mm=2.0, max_spread_deg=0.5):
         with open(out, "w") as fh:
             json.dump(pad_ok, fh)
         return 0
@@ -1111,16 +1127,18 @@ with tempfile.TemporaryDirectory() as td:
     check("预检红 ⇒ 不进入授权、不跑任何脚本",
           not any(c[0] in ("wait_token", "run_script") for c in b.calls))
 
-# ---- C6 缺 b̂ 种子
+# ---- C6 缺 b̂ 种子 ⇒ 未补偿跑（2026-11-15 契约 v0.8：降级为记录项，不停轮）
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
     rc, out, rd = run(td, b, bias_seed=False)
-    check("缺 b̂ 种子且未显式 none ⇒ rc 2、停在 compute",
-          rc == r.EXIT_MISSING and phases_of(rd)[-1] == "compute",
-          repr((rc, phases_of(rd))))
-    check("缺 b̂ 种子 ⇒ 不发执行",
-          not any(c[0] == "run_script" and c[1].endswith("run.sh")
-                  for c in b.calls))
+    bias_doc = json.load(open(rd.p("bias.json")))
+    check("缺 b̂ 种子 ⇒ 不停轮、按未补偿跑（source=none-unseeded）",
+          rc == r.EXIT_OK and bias_doc["mode"] == "none"
+          and bias_doc["applied_mm"] == [0.0, 0.0]
+          and bias_doc["source"] == "none-unseeded"
+          and "未补偿" in bias_doc["note"], repr((rc, bias_doc)))
+    check("缺 b̂ 种子 ⇒ 整轮照常跑完（compute 起就是 none 语义）",
+          phases_of(rd)[-1] in ("score", "archive"), repr(phases_of(rd)))
 
 # ---- C7 执行失败不重试
 with tempfile.TemporaryDirectory() as td:

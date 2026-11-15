@@ -1530,8 +1530,8 @@ def section_align():
                              burst_dirs={'pick': '$W/pick'},
                              align_burst_dir='$T/r1',
                              held_burst_dir='$T/held')
-    i_align = txt.index('--camera topcam --burst 20 $T/r1')
-    i_held = txt.index('--camera topcam --burst 20 $T/held')
+    i_align = txt.index('--camera topcam --burst 10 $T/r1')
+    i_held = txt.index('--camera topcam --burst 10 $T/held')
     i_upto = txt.index('--upto lift')
     i_from = txt.index('--from to_slot --holding-block')
     check('对中 burst 在悬停计划之后、清障之前',
@@ -1580,7 +1580,7 @@ def section_align():
           'rc=$rc"' in txt3, txt3[-400:])
     i_exec_pick = txt3.index('--plan $BD/13-view-pick.json')
     check('机位 burst 紧跟它自己的 exec（中间不插别的计划）',
-          i_exec_pick < txt3.index('--camera wrist --burst 20 $W/pick')
+          i_exec_pick < txt3.index('--camera wrist --burst 10 $W/pick')
           < txt3.index('--plan $BD/14-view-pad.json'), txt3[-600:])
     # 切开的目标计划**不与邻居合并**（切口必须留在两段之间）
     txt4 = cr.run_script_text(

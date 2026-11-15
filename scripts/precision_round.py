@@ -61,14 +61,20 @@ from grasp_planner.slot_routing import pick_slot                # noqa: E402
 PY_SELF = sys.executable
 PY_GRASPNET = os.path.expanduser("~/robotics/venvs/graspnet/bin/python")
 BOARD_DIR = "~/precision"
-#: 板上 STOP→PLAY 两步握手的产物（real_motion_authorize.py 写，600 秒过期）。
+#: 板上 STOP→PLAY 两步握手的产物（real_motion_authorize.py 写，900 秒过期，
+#: 2026-11-15 契约 v0.8 由 600 扩到 900：观察+计算+执行在 600 s 里没有余量，
+#: attempt6 正是死在 R1 闸门的数学死结上）。
 AUTH_TOKEN_FILE = "~/.config/ur5-vision-grasp/motion-auth.json"
 BOARD_SCRATCH = "/tmp/precision"
 #: ``real_motion_authorize.py`` 也必须推：板上的 ``precision_exec.py --go`` 会
 #: import 它核令牌，缺了就 import 失败 —— 那是"一条轨迹都不发"，但日志读起来
 #: 更像环境坏了。
+#: ``traj_util.py`` 也必须推：``precision_exec.send()`` 无条件 import 它
+#: （2026-11-14 D3 收敛 t=0 起点），缺了 = 第一次发轨迹就 ImportError。
+#: 这份清单同时被预检的 ``precision_md5`` 用作副本新鲜度判据（attempt3/4
+#: 两次真机事故都来自板上副本停在旧版）。
 BOARD_PY_FILES = ("precision_capture.py", "precision_exec.py",
-                  "real_motion_authorize.py",
+                  "real_motion_authorize.py", "traj_util.py",
                   "gripper_action.py", "precision_grip_check.py")
 RUN_SH = """#!/bin/bash
 # 板上入口：把所有 ROS 环境一次性装好。ROS_DOMAIN_ID=99 是现场值。

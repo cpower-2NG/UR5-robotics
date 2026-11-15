@@ -251,14 +251,16 @@ with tempfile.TemporaryDirectory() as td:
           repr((rem, why)))
 
     # CLI 的 --min-remaining：剩余不够就在**发执行之前**退 2。
+    # 负例阈值要跟着 TTL 走（2026-11-15 v0.8：600 → 900），取 TTL+50。
     rc0, out0 = quiet(rma.main, ['--check-token', tok, '--auth-dir', td,
                                  '--min-remaining', '500'])
-    check('CLI --min-remaining 500（剩 ≈600）⇒ 0', rc0 == 0, repr(out0))
+    check('CLI --min-remaining 500（剩 = TTL）⇒ 0', rc0 == 0, repr(out0))
+    over = '%d' % int(rma.TOKEN_TTL_S + 50)
     rc2, out2 = quiet(rma.main, ['--check-token', tok, '--auth-dir', td,
-                                 '--min-remaining', '700'])
-    check('CLI --min-remaining 700 ⇒ 2（不让它跑到一半过期）', rc2 == 2,
+                                 '--min-remaining', over])
+    check('CLI --min-remaining %s ⇒ 2（不让它跑到一半过期）' % over, rc2 == 2,
           repr(out2))
-    check('不足时提示写清还剩多少', '只剩' in out2 and '700' in out2, repr(out2))
+    check('不足时提示写清还剩多少', '只剩' in out2 and over in out2, repr(out2))
 
     doc2 = dict(doc)
     doc2.pop('stop_at')

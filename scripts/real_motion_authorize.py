@@ -32,7 +32,9 @@
 fail-closed 判据与 ``--step stop/--step play`` 逐条一致；``wait_token`` 的
 fresh_min 核验照旧是独立的一道。它仍然**从不发送 play/stop**。
 
-令牌写在 ``~/.config/ur5-vision-grasp/motion-auth.json``（仓外），**10 分钟**过期。
+令牌写在 ``~/.config/ur5-vision-grasp/motion-auth.json``（仓外），**15 分钟**过期
+（2026-11-15 契约 v0.8 由 10 分钟扩到 15 分钟：观察+计算+执行塞不进 600 s，
+attempt6 死在 R1 闸门的数学死结上；STOP→PLAY 两步观测门与逐次授权语义不变）。
 上一次的授权不覆盖下一次：每个动臂段落都要重新握手。
 
 退出码：0 = 看到并写盘；2 = 超时/数据缺失/次序不对（都不授权）。
@@ -52,7 +54,7 @@ DEFAULT_AUTH_DIR = os.path.join(os.path.expanduser('~'), '.config',
 STOP_FILE = 'motion-auth-stop.json'
 TOKEN_FILE = 'motion-auth.json'
 STOP_REQUEST_FILE = os.path.join(DEFAULT_AUTH_DIR, 'stop-request.json')
-TOKEN_TTL_S = 600.0        # 令牌有效期：10 分钟
+TOKEN_TTL_S = 900.0        # 令牌有效期：15 分钟（2026-11-15 v0.8，原 600）
 STOP_WINDOW_S = 600.0      # PLAY 必须在 STOP 之后这么久以内
 DASHBOARD_PORT = 29999
 

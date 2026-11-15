@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """``stage4_preflight_expect.py`` 自检（离线，不碰板子 / 不碰臂）。
 
-钉住三件事：
+钉住四件事：
 1. 期望值里的 ``tree`` 两项由**本地检出**算出，且用的是与板上预检同一份代码
    （``PREFLIGHT_TREE_CODE``），不是另写一份口径；
 2. 身份字段（``serial`` / ``stack`` / 备注）**原样继承**旧基线 —— 重算树哈希
    不该顺手把「认亲」判据改宽；
-3. 坏输入（旧基线没 serial / 目录空了 / 文件不存在）必须非 0，且不写半成品。
+3. ``precision_md5``（``~/precision`` 可执行副本的新鲜度锚，2026-11-15 起）
+   从本地检出的 ``BOARD_PY_FILES`` 算出；缺任何一个文件 ⇒ 非 0 且不写半成品；
+4. 坏输入（旧基线没 serial / 目录空了 / 文件不存在）必须非 0，且不写半成品。
 
 跑法：``python3 scripts/test_stage4_preflight_expect.py``；退出码 0 = 全通过。
 """
@@ -22,6 +24,7 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import precision_round as pr_r                                   # noqa: E402
 import stage4_round_run as rr                                    # noqa: E402
 
 N_PASS = N_FAIL = 0
@@ -61,7 +64,8 @@ print('--- A. 正常生成 ---')
 with tempfile.TemporaryDirectory() as tt:
     repo = os.path.join(tt, 'repo')       # out 必须写在 repo **外**，否则自己进哈希
     os.makedirs(os.path.join(repo, 'scripts'))
-    for name, body in (('a.py', 'x = 1\n'), ('b.py', 'y = 2\n')):
+    names = ['a.py', 'b.py'] + list(pr_r.BOARD_PY_FILES)
+    for name, body in [(n, 'x = 1\n') for n in names]:
         with open(os.path.join(repo, 'scripts', name), 'w') as f:
             f.write(body)
     old = os.path.join(tt, 'old.json')
@@ -75,7 +79,7 @@ with tempfile.TemporaryDirectory() as tt:
     check('serial 原样继承', got.get('serial') == 'SN-TEST', repr(got))
     check('stack 原样继承', got.get('stack') == OLD['stack'], repr(got))
     check('note 原样继承', got.get('note') == 'baseline', repr(got))
-    check('tree_files = 2', got.get('tree_files') == 2,
+    check('tree_files = %d' % len(names), got.get('tree_files') == len(names),
           repr(got.get('tree_files')))
     ref = _local_scan(repo)
     check('tree_sha256 与板上预检同一份代码算出的一致',
@@ -83,6 +87,18 @@ with tempfile.TemporaryDirectory() as tt:
           '%r vs %r' % (got.get('tree_sha256'), ref['sha256']))
     check('共享代码串确实在 PREFLIGHT_PY 里（不是第二份实现）',
           rr.PREFLIGHT_TREE_CODE in rr.PREFLIGHT_PY)
+
+    # precision_md5：与本地检出的文件逐字节对应；run.sh 从 pr_r.RUN_SH 常量算
+    want_md5 = {n: hashlib.md5(open(os.path.join(repo, 'scripts', n), 'rb')
+                               .read()).hexdigest()
+                for n in pr_r.BOARD_PY_FILES}
+    want_md5['run.sh'] = hashlib.md5(pr_r.RUN_SH.encode('utf-8')).hexdigest()
+    check('precision_md5 = BOARD_PY_FILES + run.sh，逐文件与本地一致',
+          got.get('precision_md5') == want_md5, repr(got.get('precision_md5')))
+    _want = 'PRECISION_FILES = %r' % ((tuple(pr_r.BOARD_PY_FILES)
+                                       + ('run.sh',)),)
+    check('PRECISION_FILES 注入进板上预检脚本（同一份清单，不是抄一份）',
+          _want in rr.PREFLIGHT_PY)
 
     # 改一个字节 ⇒ 哈希必须变
     with open(os.path.join(repo, 'scripts', 'a.py'), 'w') as f:
@@ -117,6 +133,23 @@ with tempfile.TemporaryDirectory() as tt:
     check('.git 文件不进哈希（本地 worktree 与板上目录才可比）',
           got4['tree_sha256'] == got3['tree_sha256']
           and got4['tree_files'] == got3['tree_files'], repr(got4))
+
+print('--- A2. 本地缺部署清单文件 ⇒ fail-closed ---')
+with tempfile.TemporaryDirectory() as tt:
+    repo = os.path.join(tt, 'repo')
+    os.makedirs(os.path.join(repo, 'scripts'))
+    for name in ('a.py',):
+        with open(os.path.join(repo, 'scripts', name), 'w') as f:
+            f.write('x = 1\n')
+    old = os.path.join(tt, 'old.json')
+    out = os.path.join(tt, 'new.json')
+    with open(old, 'w') as f:
+        json.dump(OLD, f)
+    r = _run(repo, old, out)
+    check('缺 BOARD_PY_FILES 里的脚本 ⇒ 非 0', r.returncode != 0,
+          repr(r.returncode) + r.stderr[-200:])
+    check('缺 BOARD_PY_FILES 里的脚本 ⇒ 不写文件', not os.path.exists(out),
+          repr(out))
 
 print('--- B. 坏输入 fail-closed ---')
 with tempfile.TemporaryDirectory() as tt:

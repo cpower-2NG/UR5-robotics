@@ -138,6 +138,12 @@ E9_VIEWS = (
 #: home 起点上逼出 236° 的整圈翻转（``unwrap`` 的 180° 上限）。改它要重测。
 VIEW_TRANSIT_DZ = 0.06
 
+#: 每组腕部 burst 的帧数（2026-11-15 契约 v0.8 由 20 降到 10，用户拍板）：
+#: 共识真值的下限是 5 帧（``--min-frames``），10 帧仍有 2× 余量；直接省一半
+#: 跨机搬运与抓帧时间（第 321 轮实测 20 帧 = 44 MB / 2×20 帧，60–95 s/轮）。
+#: 改它要同步 ``run_script_text`` 的回显文案与 ``exec_estimate`` 的 burst 开销。
+BURST_FRAMES = 10
+
 
 def log(*a):
     print(*a, flush=True)
@@ -1539,7 +1545,7 @@ def _exec_cmd_multi(board_dir, log_dir, names):
             % (" ".join("%s/%s" % (board_dir, n) for n in names), log_dir))
 
 
-def _burst_cmd(camera, out_dir, n=20):
+def _burst_cmd(camera, out_dir, n=BURST_FRAMES):
     return ('~/precision/run.sh ~/precision/precision_capture.py '
             '--camera %s --burst %d %s' % (camera, n, out_dir))
 
@@ -1561,9 +1567,10 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
     切开是为了让块**还夹在爪里、臂静止**时拍；跑完整条就没块了。
 
     ``token_min_remaining``（秒）：非 ``None`` 时在脚本**开头**插一行板端守卫
-    —— 令牌剩余不够就把整份脚本判失败（rc 9），一条轨迹都不发。600 s 令牌从
-    STOP→PLAY 起算，观察/解垫/探针/规划都在里面耗；执行起手时剩多少，只有板子
-    自己知道。最后一道仍是 ``precision_exec --require-auth``（逐条计划前查），
+    —— 令牌剩余不够就把整份脚本判失败（rc 9），一条轨迹都不发。900 s 令牌
+    （2026-11-15 v0.8，原 600 s）从 STOP→PLAY 起算，观察/解垫/探针/规划都在
+    里面耗；执行起手时剩多少，只有板子自己知道。最后一道仍是
+    ``precision_exec --require-auth``（逐条计划前查），
     但它过期发生在**跑到一半**，那时块可能已经夹在爪里 —— 所以先拦一道。
 
     **合并**（2026-11-12）：相邻、中间不插拍帧的计划写进**同一条**
@@ -1625,7 +1632,8 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
             lines.append('[ $rc -eq 0 ] || fail "%s --upto lift rc=$rc"'
                          % p["name"])
             lines.append('sleep 1')
-            lines.append('echo "===== 抓后偏心 %s : 俯视 burst 20"' % p["name"])
+            lines.append('echo "===== 抓后偏心 %s : 俯视 burst %d"'
+                         % (p["name"], BURST_FRAMES))
             lines.append(_burst_cmd("topcam", held_burst_dir))
             lines.append('rc=$?')
             lines.append('[ $rc -eq 0 ] || fail "抓后偏心 burst rc=$rc"')
@@ -1653,13 +1661,13 @@ def run_script_text(plans, board_dir, log_dir, burst_dirs=None,
         if p.get("kind") == "view" and view in burst_dirs:
             # 判分帧：臂刚停在这个机位上，就地拍（换机位就拍不到了）。
             lines.append('sleep 1')     # 等臂停稳再拍（原来是每条计划后都睡）
-            lines.append('echo "===== 判分机位 %s : burst 20"' % view)
+            lines.append('echo "===== 判分机位 %s : burst %d"' % (view, BURST_FRAMES))
             lines.append(_burst_cmd("wrist", burst_dirs[view]))
             lines.append('rc=$?')
             lines.append('[ $rc -eq 0 ] || fail "机位 %s burst rc=$rc"' % view)
         else:
             lines.append('sleep 1')
-            lines.append('echo "===== 对中悬停 : 俯视 burst 20"')
+            lines.append('echo "===== 对中悬停 : 俯视 burst %d"' % BURST_FRAMES)
             lines.append(_burst_cmd("topcam", align_burst_dir))
             lines.append('rc=$?')
             lines.append('[ $rc -eq 0 ] || fail "对中 burst rc=$rc"')
