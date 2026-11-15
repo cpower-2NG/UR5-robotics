@@ -2597,15 +2597,14 @@ def build_parser():
 
     ap.add_argument("--timing-prior", default=None,
                     help="Round 0 实测的 timing.json（标定 R1/R2）")
-    # 估时依据：2026-11-12 实测（S0:1 r1 真机，规划还在开发机）解垫 2.0 +
-    # 探针 28.1 + 规划 9.1 + 推板 ≈ 47.7 s；抓点改实测后再加跑前 pick burst
-    # 与共识真值 ⇒ ~90 s，取 100。**B3-lite（2026-11-14）之后规划搬上 6 核板**，
-    # 该分量未复测（attempt8 compute 实测 131.8 s，但含块 4 规划失败的额外
-    # 分支扫描，不是干净值）⇒ 首个干净轮的 timing.json 出来后回填校准；
-    # 偏保守方向（估大了闸门更严），不危险。
-    ap.add_argument("--compute-est", type=float, default=100.0,
-                    help="R1 用的轮内计算估时（秒；缺省 100 = 开发机规划时代的 "
-                         "实测 ~90 × 1.1；板上规划分量待首轮 timing.json 校准）")
+    # 估时依据：**2026-11-15 attempt11 首个干净全链轮**（B3-lite 板上规划）：
+    # compute_s = 94.9 s = 解垫 2.4 + 跑前 pick 真值 5.8 + 探针 6.6 + 规划 80.0。
+    # 旧缺省 100 来自开发机规划时代（解垫 2.0 + 探针 28.1 + 规划 9.1 ≈ 47.7 s 的
+    # ~90 ×1.1）；attempt8 的 131.8 s 含块 4 规划失败的分支扫描，不是干净值。
+    # 取 95（向上取整 0.1 s）——估大了闸门更严，不危险。
+    ap.add_argument("--compute-est", type=float, default=95.0,
+                    help="R1 用的轮内计算估时（秒；缺省 95 = attempt11 干净实测 "
+                         "94.9，板上解垫/真值/探针/规划四段合计）")
     ap.add_argument("--exec-est", type=float, default=400.0,
                     help="无 timing-prior 时的执行估时（秒；缺省 400 = 实测 run.sh "
                          "~390 s）")

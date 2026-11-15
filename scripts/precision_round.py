@@ -83,6 +83,20 @@ RUN_SH = """#!/bin/bash
 export ROS_DOMAIN_ID=99
 . /opt/ros/humble/setup.bash
 . "$HOME/yolo_ros_original/ros2_ws/install/setup.bash"
+# ``grasp_planner.gripper.Ag95Gripper.set_stall_detect`` 只存在于 **stage-4
+# 部署树**的安装里（yolo 旧安装树缺它 ⇒ attempt4 / attempt9 两次
+# ``AttributeError``，执行段第 1 句夹爪自检就停）。
+# ⚠️ 必须**在 source yolo setup 之后**前置：workspace 的 setup.bash 会把
+#    自己的路径重新插到最前，先 export 会被盖掉（2026-11-15 只读复证）。
+# 2026-11-15 之前这是板上的手工热修；v0.8 的 run.sh 整份重推 + precision_md5
+# 强校验把它覆盖回去过 ⇒ 收进本常量，成为唯一出处。
+# glob 不写 Python 版本号（板上实测 3.10，路径随镜像变）。
+for _d in "$HOME"/stage4-entry/ros2_ws/install/grasp_planner/lib/python3*/site-packages; do
+    if [ -d "$_d" ]; then
+        export PYTHONPATH="$_d${PYTHONPATH:+:$PYTHONPATH}"
+        break
+    fi
+done
 exec python3 "$@"
 """
 # 巡检位可见区（米）—— **不是**拾取区 gen_scene.ZONE：名字别混（2026-11-14

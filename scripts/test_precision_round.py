@@ -144,6 +144,20 @@ check('ControlPath 用 %C（按主机+端口+用户区分）',
 check('ControlPersist 给了（整轮只握两次手）',
       any(v.startswith('ControlPersist=') for v in o), o)
 
+print('--- F. 板上 run.sh：stage-4 安装树的 grasp_planner 必须前置 ---')
+# attempt4 / attempt9 两次 AttributeError：yolo 旧安装树的 Ag95Gripper 没有
+# set_stall_detect。板上热修会被 v0.8 的 run.sh 整份重推 + precision_md5
+# 强校验覆盖 ⇒ 修复只能住在 RUN_SH 常量里。
+_yolo = '. "$HOME/yolo_ros_original/ros2_ws/install/setup.bash"'
+_pre = 'stage4-entry/ros2_ws/install/grasp_planner'
+check('RUN_SH 源 yolo 安装树', _yolo in pr.RUN_SH, pr.RUN_SH)
+check('RUN_SH 前置 stage4-entry 的 grasp_planner', _pre in pr.RUN_SH, pr.RUN_SH)
+check('前置发生在 source yolo **之后**（setup 会重插自身路径）',
+      pr.RUN_SH.index(_yolo) < pr.RUN_SH.index(_pre), pr.RUN_SH)
+check('run.sh 仍是 bash + exec python3',
+      pr.RUN_SH.startswith('#!/bin/bash') and 'exec python3 "$@"' in pr.RUN_SH,
+      pr.RUN_SH)
+
 print()
 print('通过 %d，失败 %d' % (N_PASS, N_FAIL))
 if FAILS:
