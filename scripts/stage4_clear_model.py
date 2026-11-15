@@ -261,15 +261,25 @@ FREE_ANCHOR = (0.515, 0.54)   # 落点排序锚点（带中央）
 #: 这是**轮级决定**，不由探针或布局各自现编（同一布局两次重复要能逐格对照）。
 DEFAULT_CELLS = (8, 6, 4, 2, 0)
 
+#: 按批缺省格（2026-11-15 S1/S2 接入编排器）：S0 五格不变；S1/S2 六块六格 ——
+#: 第 6 格取边中格 **1**（与 0/2 相邻各 60 mm，29.5 mm 块物理不挤；执行次序
+#: 仍是远格先填 8,6,4,2 → 1 → 0）。S3（7 块）/S4（9 块）进阶批等接入时再定。
+DEFAULT_CELLS_BY_BATCH = {"S0": DEFAULT_CELLS,
+                          "S1": (8, 6, 4, 2, 1, 0),
+                          "S2": (8, 6, 4, 2, 1, 0)}
 
-def parse_cells(spec, n=None):
+
+def parse_cells(spec, n=None, batch=None):
     """``"8,6,4,2,0"``（允许中文逗号）→ ``[8, 6, 4, 2, 0]``。
 
-    ``spec`` 为空 ⇒ 取 ``DEFAULT_CELLS``；``n`` 给了就要求个数正好等于 ``n``
-    （少一个格＝有一个目标无处可放，宁可现在停）。格号重复 / 越界一律报错。
+    ``spec`` 为空 ⇒ 取按批缺省（``DEFAULT_CELLS_BY_BATCH[batch]``，未知批次
+    回退 ``DEFAULT_CELLS``）；``n`` 给了就要求个数正好等于 ``n``（少一个格＝
+    有一个目标无处可放，宁可现在停）。格号重复 / 越界一律报错。显式 ``spec``
+    优先于按批缺省（行为不变）。
     """
     if spec is None or (isinstance(spec, str) and not spec.strip()):
-        cells = list(DEFAULT_CELLS[:n] if n is not None else DEFAULT_CELLS)
+        base = DEFAULT_CELLS_BY_BATCH.get(batch, DEFAULT_CELLS)
+        cells = list(base[:n] if n is not None else base)
     else:
         text = str(spec).strip().replace("，", ",")
         try:

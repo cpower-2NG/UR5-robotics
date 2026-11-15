@@ -137,6 +137,19 @@ def section_cell_plan():
     except ValueError:
         ok = True
     check('parse_cells: 越界格号 ⇒ 报错', ok)
+    # 按批缺省格（2026-11-15 S1/S2 接入编排器：六块六格，S0 不变）
+    check('parse_cells: 按批缺省 S1/S2 = 8,6,4,2,1,0；S0/未知/无批 = 旧五格',
+          cm.parse_cells(None, 6, batch='S1') == [8, 6, 4, 2, 1, 0] and
+          cm.parse_cells(None, 6, batch='S2') == [8, 6, 4, 2, 1, 0] and
+          cm.parse_cells(None, 5, batch='S0') == [8, 6, 4, 2, 0] and
+          cm.parse_cells(None, 5, batch='S9') == [8, 6, 4, 2, 0] and
+          cm.parse_cells(None) == [8, 6, 4, 2, 0])
+    check('parse_cells: 显式 spec 优先于按批缺省（行为不变）',
+          cm.parse_cells('8,5,2', 3, batch='S1') == [8, 5, 2])
+    check('DEFAULT_CELLS_BY_BATCH: S1 六格互不重复、都在 0–8、S0 同旧值',
+          len(set(cm.DEFAULT_CELLS_BY_BATCH['S1'])) == 6 and
+          all(0 <= c < 9 for c in cm.DEFAULT_CELLS_BY_BATCH['S1']) and
+          cm.DEFAULT_CELLS_BY_BATCH['S0'] == tuple(cm.DEFAULT_CELLS))
 
     ids = ['03', '01', '05', '02', '04']          # 故意乱序
     mapping = cm.assign_cells(ids)

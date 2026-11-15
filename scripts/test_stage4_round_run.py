@@ -42,6 +42,10 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+#: S1/S2 干跑用：fake_truth / FakeBoard.probe_report 按它取布局（make_args 填）。
+#: 放在文件头 —— make_args 在 fake_truth 之前执行，模块顺序不能反。
+FAKE_BATCH = ["S0"]
+
 import stage4_clear_model as cm                                 # noqa: E402
 import stage4_clear_run as cr                                   # noqa: E402
 import stage4_layouts as lay                                    # noqa: E402
@@ -109,6 +113,19 @@ ok, _ = r.r2_gate(144, 100)
 check("R2 剩 144 < 145 ⇒ 不过", not ok)
 ok, _ = r.r2_gate(None, 100)
 check("R2 没有令牌 ⇒ 不过", not ok)
+
+check("gap 口径按批：S0=60mm/layout_gap；S1/S2=0/probe_verified（贴面判据）",
+      r.gap_policy("S0") == (0.06, "layout_gap") and
+      r.gap_policy("S1") == (0.0, "probe_verified") and
+      r.gap_policy("S2") == (0.0, "probe_verified") and
+      r.gap_policy("S9") == (0.0, "probe_verified"),
+      repr((r.gap_policy("S0"), r.gap_policy("S1"))))
+check("摆块提示：S0 无接触 / S1 异色贴合对 / S2 同色贴合对",
+      "互相摆散" in r.placement_hint("S0", lay.layout_blocks("S0", 1)) and
+      "贴住成一对（异色）" in r.placement_hint("S1", lay.layout_blocks("S1", 1)) and
+      "同色 red 两块贴住" in r.placement_hint("S2", lay.layout_blocks("S2", 1)) and
+      "自由摆" in r.placement_hint("S1", lay.layout_blocks("S1", 1)),
+      repr(r.placement_hint("S2", lay.layout_blocks("S2", 1))))
 
 b = r.bias_setup("fixed", "-2.791,-0.248", None)
 check("b̂ fixed 显式种子：命令偏置 = 种子",
@@ -284,12 +301,59 @@ except r.RoundError:
 
 # =====================================================================
 print("--- B. 布局表 = gen_scene（布局即真值的唯一出处） ---")
-check("布局表与 gen_scene 逐块一致", lay.compare_with_gen_scene("S0") == [],
+check("布局表与 gen_scene 逐块一致",
+      lay.compare_with_gen_scene("S0") == [],
       repr(lay.compare_with_gen_scene("S0")))
 errs = []
 for k in sorted(lay.BATCHES["S0"]):
     errs += lay.validate_layout("S0", k)
 check("三个布局自检（区内 + 间距 ≥60 mm）", errs == [], repr(errs))
+
+# S1/S2（2026-11-15 接入）：对拍 + 自检 + 贴合判定矩阵
+check("S1/S2 布局表与 gen_scene 逐块一致",
+      lay.compare_with_gen_scene("S1") == [] and
+      lay.compare_with_gen_scene("S2") == [],
+      repr(lay.compare_with_gen_scene("S1") +
+           lay.compare_with_gen_scene("S2")))
+errs = []
+for batch in ("S1", "S2"):
+    for k in sorted(lay.BATCHES[batch]):
+        errs += lay.validate_layout(batch, k)
+check("S1/S2 六个布局自检（区内 + 恰好 1 个贴合对）", errs == [], repr(errs))
+check("S1 贴合对全异色 / S2 贴合对全同色（批次定义）",
+      all((lay.layout_blocks("S1", k)[0]["color"] !=
+           lay.layout_blocks("S1", k)[1]["color"])
+          for k in sorted(lay.BATCHES["S1"])) and
+      all((lay.layout_blocks("S2", k)[0]["color"] ==
+           lay.layout_blocks("S2", k)[1]["color"])
+          for k in sorted(lay.BATCHES["S2"])))
+
+
+def _with_moved(blocks, bid, x_mm, y_mm):
+    """临时块表：把某块挪到 (x_mm, y_mm)（变异用，不动原表）。"""
+    out = [dict(b) for b in blocks]
+    for b in out:
+        if str(b["id"]) == str(bid):
+            b["x"], b["y"] = x_mm / 1000.0, y_mm / 1000.0
+    return out
+
+
+_s1 = lay.layout_blocks("S1", 1)
+_s1_two = _with_moved(_s1, 5, _s1[0]["x"] * 1000.0 + 29.5,
+                      _s1[0]["y"] * 1000.0)          # 块 5 挪进块 0 的贴合带
+_s1_overlap = _with_moved(_s1, 1, _s1[0]["x"] * 1000.0 + 10.0,
+                          _s1[0]["y"] * 1000.0)   # 块 1 挪到块 0 旁 10 mm（重叠）
+check("贴合判定矩阵：贴合带过 / 双贴合对红 / 重叠红 / S0 见贴合红",
+      lay.validate_blocks("S1", _s1) == [] and
+      lay.contact_pairs(_s1) == [(0, 1)] and
+      any("贴合对" in e for e in lay.validate_blocks("S1", _s1_two)) and
+      any("重叠" in e for e in lay.validate_blocks("S1", _s1_overlap)) and
+      any("接触" in e for e in lay.validate_blocks("S0", _s1)),
+      repr(lay.validate_blocks("S1", _s1_two)))
+check("contact_pairs 吃实测块表同口径（对标称/实测一致）",
+      lay.contact_pairs(_with_moved(_s1, 1, 60.0, 0.0)) == [] and
+      lay.contact_pairs(_s1_two) == [(0, 1), (0, 5)],
+      repr(lay.contact_pairs(_s1_two)))
 
 # =====================================================================
 print("--- C. 阶段编排（FakeBoard + 打桩规划） ---")
@@ -508,9 +572,10 @@ class FakeBoard:
         return Rc(0)
 
     def probe_report(self):
-        blocks = lay.layout_blocks("S0", 1)
+        blocks = lay.layout_blocks(FAKE_BATCH[0], 1)
         ids = r._sorted_ids([b["id"] for b in blocks])
-        cmap = cm.assign_cells(ids, cm.parse_cells("8,6,4,2,0"))
+        cmap = cm.assign_cells(ids, cm.parse_cells(None, len(ids),
+                                                   batch=FAKE_BATCH[0]))
         attempts = [{"id": int(i), "ok": True, "cell": cmap[i],
                      "clearing_steps": [], "reason": None,
                      "terminal": {"ok": True}}
@@ -527,10 +592,12 @@ class FakeBoard:
 
 def make_args(td, **over):
     layout = over.pop("layout", 1)
+    batch = over.pop("batch", "S0")
     bias_seed = over.pop("bias_seed", "-2.791,-0.248")
-    argv = ["--batch", "S0", "--layout", str(layout),
+    FAKE_BATCH[0] = batch
+    argv = ["--batch", batch, "--layout", str(layout),
             "--run", "1",
-            "--out-dir", os.path.join(td, "run", "s0-1-r1"),
+            "--out-dir", os.path.join(td, "run", "%s-1-r1" % batch.lower()),
             "--urdf", os.path.join(td, "robot.urdf"),
             "--board", "fake", "--board-repo", "/repo",
             "--board-dir", "/b",
@@ -762,7 +829,7 @@ def fake_truth(burst, out, allow_empty=False):
     if not allow_empty:
         blocks = [{"id": b["id"], "color": b["color"], "x": b["x"],
                    "y": b["y"], "yaw": b["yaw"], "size": b["size"],
-                   "top": b["top"]} for b in lay.layout_blocks("S0", 1)]
+                   "top": b["top"]} for b in lay.layout_blocks(FAKE_BATCH[0], 1)]
     with open(out, "w") as f:
         json.dump({"blocks": blocks}, f)
     return 0
@@ -917,6 +984,29 @@ with tempfile.TemporaryDirectory() as td:
     check("run.sh 里含 home 航点（收尾在授权窗口内）",
           "home" in runsh and "park" not in runsh.split("home")[0][-80:],
           runsh[-200:])
+
+# ---- C1b S1 干跑：接触批接线（六格缺省、贴面 gap 口径、贴合对块全出计划）
+# 2026-11-15 S1/S2 接入编排器：批次只多「定义层」——链路本身（探针候选 →
+# 抓取朝向 → plan_sequence）不变；这条干跑钉住三处批次感知都真的接上了。
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    rc, out, rd = run(td, b, batch="S1", dry_run=True)
+    check("S1 干跑：rc 0 且停在 compute", rc == 0 and
+          phases_of(rd) == ["preflight", "views", "authorize", "observe",
+                            "compute"], repr((rc, phases_of(rd))))
+    check("S1：探针收到六格缺省（8,6,4,2,1,0）",
+          any(c[0] == "probe" and c[1] == "8,6,4,2,1,0" for c in b.calls),
+          repr([c for c in b.calls if c[0] == "probe"]))
+    mans = sorted(f for f in os.listdir(rd.p("plan"))
+                  if f.startswith("manifest"))
+    gcs = {json.load(open(rd.p("plan", m))).get("gap_check") for m in mans}
+    check("S1：manifest gap_check = probe_verified（判得有来源）",
+          len(mans) == 6 and gcs == {"probe_verified"},
+          repr((len(mans), gcs)))
+    ids_in_plans = {n.split("block-")[1].split(".")[0]
+                    for n in os.listdir(rd.p("plan")) if "block-" in n}
+    check("S1：六个目标全出计划", ids_in_plans == {"0", "1", "2", "3", "4", "5"},
+          repr(ids_in_plans))
 
 # ---- C1c 抓点：实测块位姿必须进 plan_sequence（不是标称坐标）
 # 回归 2026-11-12 S0:1 r1 attempt5：跑前 burst 量出实测（写进 e9.from_xy），

@@ -349,6 +349,42 @@ def r2_gate(remaining, exec_est_s, margin=None):
                    float(exec_est_s), m))
 
 
+#: 按批的邻块粗判据（``build_pick`` 的 ``min_block_gap`` / 判决来源）。
+#: S0 无接触布局仍走 60 mm 表级粗判，判决来源 = 布局表自检（layout_gap）；
+#: S1/S2 的贴合对（中心距 ≈29.5 mm）过不了 60 mm ⇒ 放宽到 0，判决来源 =
+#: **探针 OBB 已逐邻块核隙**（probe_verified）。判得必须有来源落盘
+#: （``cr.plan_sequence`` 文档同句；manifest 的 ``gap_check`` 字段照记）。
+GAP_POLICY_BY_BATCH = {"S0": (0.06, "layout_gap")}
+
+
+def gap_policy(batch):
+    """批次 → ``(min_block_gap_m, gap_check)``。未知批次（S1/S2/…）= 贴面口径。"""
+    return GAP_POLICY_BY_BATCH.get(batch, (0.0, "probe_verified"))
+
+
+def placement_hint(batch, layout_blocks):
+    """现场摆块提示（契约 v0.8：真机自由摆位，位置/yaw 不要求照标称）。
+
+    贴合对颜色从布局表读（S1「X 与 Y 两块贴住（异色）」/ S2「同色 X 两块
+    贴住成一对」）；其余块互相摆散。
+    """
+    n = len(layout_blocks)
+    if batch == "S0":
+        return ("%d 块自由摆：拾取区内、互相摆散（无接触）" % n)
+    pair_ids = lay.contact_pairs(layout_blocks)
+    if len(pair_ids) == 1:
+        colors = []
+        for pid in pair_ids[0]:
+            blk = next(b for b in layout_blocks if str(b["id"]) == str(pid))
+            colors.append(str(blk["color"]))
+        word = ("同色 %s 两块贴住成一对" % colors[0] if colors[0] == colors[1]
+                else "%s 与 %s 两块贴住成一对（异色）" % (colors[0], colors[1]))
+        return ("%d 块自由摆：%s，其余 %d 块互相摆散（离贴合对和彼此都留空隙）"
+                % (n, word, n - 2))
+    return ("%d 块自由摆：颜色集合照本轮清单，位置 / yaw 不要求（贴合对未在表"
+            "中标出，按 %s 场景描述摆）" % (n, batch))
+
+
 def bias_setup(mode, seed_spec, estimate_path):
     """``--bias-comp`` / ``--bias-seed`` / ``<run>/bias_estimate.json`` → 本轮 b̂。
 
@@ -1591,13 +1627,17 @@ class Round:
         print("  布局 %s:%d  第 %d 次  轮次 %s"
               % (self.args.batch, int(self.args.layout), int(self.args.run),
                  self.round_id))
-        cells = cm.parse_cells(self.args.cells, len(layout_blocks))
+        cells = cm.parse_cells(self.args.cells, len(layout_blocks),
+                               batch=self.args.batch)
         cell_map = cm.assign_cells([b["id"] for b in layout_blocks], cells)
+        print("  摆块（契约 v0.8 自由摆位，不要求照标称坐标）：%s"
+              % placement_hint(self.args.batch, layout_blocks))
         for bid in _sorted_ids([b["id"] for b in layout_blocks]):
             blk = [b for b in layout_blocks if str(b["id"]) == bid][0]
-            print("  块 %-2s %-11s 摆位 (%6.1f, %6.1f) mm yaw %5.1f° → 格 %d"
-                  % (bid, blk["color"], blk["x"] * 1000, blk["y"] * 1000,
-                     blk["yaw"], cell_map[bid]))
+            print("  块 %-2s %-11s → 格 %d   (标称 %6.1f, %6.1f mm / %5.1f°，"
+                  "仅参考)"
+                  % (bid, blk["color"], cell_map[bid], blk["x"] * 1000,
+                     blk["y"] * 1000, blk["yaw"]))
         print("  跑前机位：pick / pad    跑后机位：pick / free / pad"
               "    跑后回 HOME（%s）" % (hp.HOME_JOINTS_DEG,))
         print("  失败即停：预检红 / 解垫不过 / 探针无解 / 任一计划预检不过 / "
@@ -1616,7 +1656,7 @@ class Round:
                    {"at": self.deps["now"](), "token_remaining_s": round(rem, 1),
                     "source": "板上 %s（STOP→PLAY 两步握手）"
                               % pr.AUTH_TOKEN_FILE,
-                    "note": "不记令牌值；600 s 从 play_at 起算，用板上时钟判"})
+                    "note": "不记令牌值；900 s 从 play_at 起算，用板上时钟判"})
         self._token = tok
         self._token_remaining = rem
         return EXIT_OK
@@ -1788,7 +1828,7 @@ class Round:
         write_json(truth_path, truth)
 
         ids = _sorted_ids([b["id"] for b in layout_blocks])
-        cells = cm.parse_cells(self.args.cells, len(ids))
+        cells = cm.parse_cells(self.args.cells, len(ids), batch=self.args.batch)
         cell_map = cm.assign_cells(ids, cells)
 
         # ---- 探针（板上一趟，只读）。``--probe-report``：复用一份**已经跑过**
@@ -1854,12 +1894,13 @@ class Round:
                 truth, attempt, cm.PAD_THICK, bias_mm=bias["applied_mm"])
             q_before = list(q)
             try:
+                gap_m, gap_check = gap_policy(self.args.batch)
                 plans_k, layout, q = cr.plan_sequence(
                     chain, q, actions, layout, plan_dir,
                     place_clearance=self.args.place_clearance,
                     wrist_survey=False,
                     place_yaw_equiv=bool(self.args.place_yaw_equiv180),
-                    start=idx, min_block_gap=0.06, gap_check="layout_gap",
+                    start=idx, min_block_gap=gap_m, gap_check=gap_check,
                     # 最后一个块要为**随后追加的三机位**选收尾分支：只参与选支、
                     # 不写进它的计划（见 cr.view_targets / build_pick 的
                     # post_targets）。不给的话两条链可能差整整 360°，compute 时
@@ -2054,7 +2095,7 @@ class Round:
             "pad_pose": cr.pad_pose_record(grid_path),
             "pad_thick": cm.PAD_THICK,
             "survey_tool0": list(cr.E9_SURVEY_TOOL0),
-            "gap_check": "layout_gap",
+            "gap_check": gap_policy(self.args.batch)[1],
             "place_yaw_equiv180": bool(self.args.place_yaw_equiv180),
             # 可追溯（改造方案 §3 不变量 3）：这轮计划是谁规划的、有没有带着
             # 段级碰撞裁决出闸（2026-11-14 审计：此前 manifest 层答不了这两问）
@@ -2658,7 +2699,8 @@ def prepare(ap, args):
             os.path.dirname(os.path.abspath(args.out_dir)),
             gb.BIAS_ESTIMATE_FILE)
     if args.cells is None:
-        args.cells = ",".join(str(c) for c in cm.DEFAULT_CELLS)
+        args.cells = ",".join(str(c) for c in
+                              cm.parse_cells(None, None, batch=args.batch))
     if args.batch not in lay.BATCHES:
         ap.error("未知批次 %r（可选 %s）" % (args.batch, sorted(lay.BATCHES)))
     if int(args.layout) not in lay.BATCHES[args.batch]:
