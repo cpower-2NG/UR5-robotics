@@ -418,7 +418,10 @@ def fake_plan_sequence(chain_, q, actions, blocks, out_dir,
         path = os.path.join(out_dir, name)
         _write_plan(path)
         plans.append({"name": name, "path": path, "kind": a["kind"],
-                      "slot": a.get("slot"), "n_waypoints": 2})
+                      "slot": a.get("slot"), "n_waypoints": 2,
+                      # 第 342 轮：释放扫掠检查吃这个字段定位释放轴（与真
+                      # plan_sequence 同构——真实现也把它放在计划顶层）
+                      "commanded_center_mm": a.get("commanded_center_mm")})
     new_blocks = [dict(b) for b in blocks]
     for a in actions:
         if a["kind"] == "target":
@@ -1007,6 +1010,13 @@ with tempfile.TemporaryDirectory() as td:
                     for n in os.listdir(rd.p("plan")) if "block-" in n}
     check("S1：六个目标全出计划", ids_in_plans == {"0", "1", "2", "3", "4", "5"},
           repr(ids_in_plans))
+    # 第 342 轮：释放扫掠检查进 manifest（探针看不见已就位块，编排器补判）
+    sweeps = [json.load(open(rd.p("plan", m))).get("sweep_check") for m in mans]
+    check("S1：manifest sweep_check 记录口径且逐目标无冲突",
+          len(sweeps) == 6 and all(
+              s is not None and s["opening_mm"] == 50.0 and s["conflicts"] == []
+              and s["n_placed_before"] == i
+              for i, s in enumerate(sweeps)), repr(sweeps))
 
 # ---- C1c 抓点：实测块位姿必须进 plan_sequence（不是标称坐标）
 # 回归 2026-11-12 S0:1 r1 attempt5：跑前 burst 量出实测（写进 e9.from_xy），

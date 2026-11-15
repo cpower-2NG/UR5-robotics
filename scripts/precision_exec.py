@@ -121,6 +121,26 @@ def close_reaction(pos):
 
 GRIP_OPEN_MM = 95.0
 GRIP_CLOSE_MM = 0.0
+#: 起手自检护闸的开口下限（台账第三百四十一轮）：正常收尾轮爪停在 95 mm；
+#: 中断轮（抓完没放）停在 ~25 mm ⇒ 爪里可能有块。低于它就拒发自检
+#: （round-17：空夹自检会挤块 + 空中掉块），指向 --holding-block 显式接管。
+SELFTEST_OPEN_MIN_MM = 80.0
+
+
+def selftest_opening_error(pos_mm, min_mm=SELFTEST_OPEN_MIN_MM):
+    """起手自检护闸：返回拒绝文案（``None`` = 放行）。
+
+    ``pos_mm`` 为 ``None``（读不到开口）不拦——自检本身就会证明链路通不通，
+    别把「读数失败」升级成「拒绝服务」。
+    """
+    if pos_mm is None:
+        return None
+    if float(pos_mm) < float(min_mm):
+        return ("起手自检拒发：夹爪开口 %.1f mm（< %.0f mm）——爪里可能有块。"
+                "round-17 口径：空夹自检会挤块 + 空中掉块。先人工确认取块，"
+                "或确属 carry 场景用 --holding-block 显式接管。"
+                % (float(pos_mm), float(min_mm)))
+    return None
 
 
 def log_line(path, **rec):
@@ -629,6 +649,16 @@ def main():
         「夹爪没夹」记成「抓取失败」。空夹闭合在巡检位是安全的（指尖离台面
         还有 160 mm，两指之间没有东西），代价只有一次全行程。
         """
+        # 护闸（台账第三百四十一轮，round-17 教训的自动形态）：开口不是全开
+        # ⇒ 爪里**可能有块**，空夹自检会挤块、自检里的 open 会空中掉块。
+        # 正常收尾轮爪停在 95 mm；中断轮（抓完没放）停在 ~25 mm ⇒ 当场拒发，
+        # 指向 --holding-block 显式接管（真在 carry 场景）或人工取块。
+        pos0 = gripper().current_position()
+        err = selftest_opening_error(pos0)
+        if err:
+            log_line(st["log"], event="gripper_selftest", ok=False,
+                     opening_mm=pos0)
+            raise ga.GripperActionError(err)
         print("  夹爪自检：空夹闭合 → 张开（指尖此时悬空）")
         do_gripper("close", "selftest.close")
         do_gripper("open", "selftest.open")

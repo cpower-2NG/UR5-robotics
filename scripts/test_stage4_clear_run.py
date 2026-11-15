@@ -305,10 +305,20 @@ def section_plans():
     check('指尖高于块底 5 mm 下限',
           m1['fingertip_z_mm'] - m1['block_bottom_mm']
           >= pp.FINGERTIP_MIN_ABOVE_BLOCK_BOTTOM * 1000 - 1e-9)
-    check('塔块放下高度 ≈ 220.2 mm（按 29.5 mm 挂长算）',
-          abs(m1['place_z'] - 0.2202) < 1e-3)
+    check('塔块放下高度 ≈ 218.2 mm（29.5 mm 挂长 + 3 mm 落差，第 342 轮'
+          '对齐阶段 3 口径；5 mm 时代是 220.2）',
+          abs(m1['place_z'] - 0.2182) < 1e-3)
     check('gap 判据被显式放宽（记录在案）',
           p1['meta']['e9']['gap_check'] == 'probe_verified')
+    # 第 342 轮（开爪推挤复盘）：接近/释放半开 50 mm + 释放静置 0.5 s——
+    # 阶段 2/3 拍板值，阶段 4 此前没传 ⇒ 全开 95 mm 释放推飞邻格的黄绿块。
+    w_approach, w_place = p1['waypoints'][0], p1['waypoints'][5]
+    check('接近/释放半开 50 mm（build_pick 的 pick/place_open_mm）',
+          w_approach.get('before') == {'gripper': 'open_to', 'mm': 50.0}
+          and w_place.get('after') == {'gripper': 'open_to', 'mm': 50.0},
+          repr((w_approach.get('before'), w_place.get('after'))))
+    check('释放静置 0.5 s 挂在 place 航点（阶段 3 第 244 轮口径）',
+          w_place.get('dwell_s') == 0.5, repr(w_place.get('dwell_s')))
     check('清障那一步按块 8 的 yaw+90° 抓（ψ=−26.653° 折叠后）',
           abs(p1['meta']['yaw_grasp_deg'] - pp.fold_yaw_180(243.35)) < 1e-3)
     check('终态布局：块 8 落到 (0.52, 0.54)、台面',

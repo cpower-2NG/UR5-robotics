@@ -144,6 +144,20 @@ VIEW_TRANSIT_DZ = 0.06
 #: 改它要同步 ``run_script_text`` 的回显文案与 ``exec_estimate`` 的 burst 开销。
 BURST_FRAMES = 10
 
+#: 接近 / 释放的开爪宽度（毫米）——阶段 2/3 的拍板经验，值**必须跟调用方走**：
+#: ``build_pick`` 的这两个参数缺省 ``None`` = 全开 95 mm（A3 行为），阶段 4 此前
+#: 没传 ⇒ 2026-11-15 s1-1-r1-attempt2 放置释放 25→95 mm 全开，指尖扫进 60 mm
+#: 格距的邻格 2.3 mm，把黄绿块推离格心 ~8.6 mm（台账第三百四十一轮）。
+#: 50 mm 与 stage2_round scene 缺省、阶段 3 沿用值一致（``build_pick`` docstring
+#: 原话：「避免全开 95 mm 的指尖伸进 60 mm 格距的邻格」）。
+PICK_OPEN_MM = 50.0
+PLACE_OPEN_MM = 50.0
+#: 放置落差与释放静置（阶段 3 第 244 轮拍板：**间隙 3 mm、静置 0.5 s**；阶段 2
+#: 入口实测 5 mm 已是「自由落体砸在垫子上」——落 3.8 mm、落定 xy/yaw 散乱）。
+#: ``build_pick`` 缺省 5 mm / 0 s（阶段 2 口径），阶段 4 对齐阶段 3 的最终版。
+PLACE_CLEARANCE_M = 0.003
+RELEASE_DWELL_S = 0.5
+
 
 def log(*a):
     print(*a, flush=True)
@@ -630,7 +644,9 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                   survey_tool0=E9_SURVEY_TOOL0, place_clearance=None,
                   wrist_survey=True, views=None, place_yaw_equiv=False,
                   start=0, min_block_gap=0.0, gap_check="probe_verified",
-                  tail_targets=None, validator=None):
+                  tail_targets=None, validator=None,
+                  pick_open_mm=None, place_open_mm=None,
+                  release_dwell_s=None):
     """逐步生成计划；任何一步预检失败就抛 ``pp.PlanError``，不写半份序列。
 
     ``wrist_survey=True``（缺省）在序列末尾依次平动到 ``views`` 里的每个
@@ -718,7 +734,16 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                         chain, q, cand, to_pp_block(blk), pp_blocks, act["slot"],
                         yaw_grasp_deg=g, grasp_at="block_center",
                         surface_z=act["surface_z"], survey_tool0=tuple(survey_tool0),
-                        place_clearance=place_clearance,
+                        # 开爪/落差/静置：阶段 2/3 拍板值（常量处注释有出处与
+                        # 事故依据）；显式传 None 时才回落到这里的三件套。
+                        pick_open_mm=(PICK_OPEN_MM if pick_open_mm is None
+                                      else float(pick_open_mm)),
+                        place_open_mm=(PLACE_OPEN_MM if place_open_mm is None
+                                       else float(place_open_mm)),
+                        release_dwell_s=(RELEASE_DWELL_S if release_dwell_s is None
+                                         else float(release_dwell_s)),
+                        place_clearance=(PLACE_CLEARANCE_M if place_clearance
+                                         is None else float(place_clearance)),
                         yaw_place_deg=yaw_place,
                         yaw_source=("place-equiv180" if yaw_place is not None
                                     else "zero"),

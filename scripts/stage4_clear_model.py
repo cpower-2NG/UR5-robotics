@@ -558,6 +558,35 @@ def terminal_report(blocks, pen_tol=PEN_TOL, pair_pen_tol=None):
             "illegal": n_bad, "blocks": rows}
 
 
+def release_sweep_conflicts(place_xy, opening_mm, placed_blocks):
+    """释放扫掠与**已就位块**的冲突（计划期静态判；台账第三百四十一轮）。
+
+    探针的 ``check_placement`` 每次尝试都从**原始布局**重来——其余块留在
+    拾取位，「先放的目标已经在格上」从未进过探针场景 ⇒ 全开爪包络检查
+    形同虚设：s1-1-r1-attempt2 的 95 mm 释放就是这样漏过去的（张开时指尖
+    扫进 60 mm 格距的邻格 2.3 mm，把黄绿块推离格心 ~8.6 mm）。
+
+    圆盘近似：邻块**中心**距释放轴 < 开爪半径 + 半块边 ⇒ 指尖扫掠会碰到它
+    （偏保守：邻块近缘其实还要再远半个块）。50 mm 开爪对 60 mm 格距恒
+    25 + 14.75 = 39.75 < 60 不冲突；谁把开爪改回 95（62.25 ≥ 60）就当场红。
+
+    ``place_xy`` 释放轴 (x, y)（米）；``placed_blocks`` = 已就位块表
+    （吃 ``x``/``y``/``size``/``id``）。返回冲突列表（空 = 通过）。
+    """
+    r = float(opening_mm) / 2000.0
+    out = []
+    for b in placed_blocks:
+        half = float(b.get("size", 0.0295)) / 2.0
+        d = math.hypot(float(b["x"]) - place_xy[0],
+                       float(b["y"]) - place_xy[1])
+        if d < r + half:
+            out.append({"id": b.get("id"),
+                        "dist_mm": round(d * 1000.0, 1),
+                        "limit_mm": round((r + half) * 1000.0, 1),
+                        "opening_mm": float(opening_mm)})
+    return out
+
+
 def dependents(blocks, bid, tol=0.001):
     """压在块 ``bid`` 上的块 id 列表（必须**先**挪走，才能动它）。
 

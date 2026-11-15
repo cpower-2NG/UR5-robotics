@@ -1914,11 +1914,37 @@ class Round:
                                  "块 %s 的计划预检不过：%s —— run.sh 不写、"
                                  "整轮不执行" % (tid, e))
             tgt_plans = [p for p in plans_k]
+            # 释放扫掠 vs 已就位块（台账第三百四十一轮）：探针从原始布局重来、
+            # 看不见「先放的目标已经在格上」；这里按每份计划的**命令落点**
+            # （commanded_center_mm = 格心 − b̂，就是释放轴）补一道静态判。
+            # 50 mm 开爪对 60 mm 格距恒不冲突；开爪回 95 当场红。
+            placed = []
+            for p in all_plans:
+                c = p.get("commanded_center_mm")
+                if c:
+                    placed.append({"x": float(c[0]) / 1000.0,
+                                   "y": float(c[1]) / 1000.0,
+                                   "size": float(cm.BLOCK_M),
+                                   "id": p.get("index")})
+            cur = tgt_plans[-1].get("commanded_center_mm") \
+                if tgt_plans else None
+            sweep = (cm.release_sweep_conflicts(
+                (float(cur[0]) / 1000.0, float(cur[1]) / 1000.0),
+                cr.PLACE_OPEN_MM, placed) if cur else [])
+            if sweep:
+                raise RoundError(EXIT_PLAN, "compute",
+                                 "块 %s 的释放扫掠会碰到已就位块 %s"
+                                 "（开爪 %.0f mm）—— 计划期拒发"
+                                 % (tid, sweep, cr.PLACE_OPEN_MM))
             idx += len(tgt_plans)
             all_plans.extend(tgt_plans)
             manifest = self._manifest(tid, attempt, actions, tgt_plans,
                                       q_before, q, layout, truth_path,
                                       probe_path, grid_path, bias)
+            # 只增字段：扫掠检查口径与结果（冲突已在上面 fail-closed）
+            manifest["sweep_check"] = {"opening_mm": cr.PLACE_OPEN_MM,
+                                       "n_placed_before": len(placed),
+                                       "conflicts": sweep}
             write_json(self.p("plan", "manifest-%s.json" % tid), manifest)
             log("  目标 %s：%d 个动作 → 计划 %s"
                 % (tid, len(actions), [p["name"] for p in tgt_plans]))

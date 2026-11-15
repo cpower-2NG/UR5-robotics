@@ -340,6 +340,25 @@ def section_pair_tol():
           cm._pair_ids([lower, upper]) == set(), cm._pair_ids([lower, upper]))
 
 
+# ------------------------------------------------------------------ [5c]
+def section_sweep():
+    """释放扫掠冲突（台账第三百四十一轮）：探针看不见「先放的块已经在格上」，
+    这里按圆盘近似在计划期补判——50 mm 开爪对 60 mm 格距恒过，95 当场红。"""
+    print('\n[5c] 释放扫掠冲突：50 mm 恒过、95 当场红、距离够远放过')
+    neighbour = {"id": 1, "x": 0.500, "y": 0.360, "z": cm.BLOCK_M / 2.0,
+                 "size": cm.BLOCK_M}
+    place_xy = (0.500, 0.300)                      # 释放轴 = 相邻格心
+    check('50 mm 开爪对 60 mm 格距不冲突（25+14.75 = 39.75 < 60）',
+          cm.release_sweep_conflicts(place_xy, 50.0, [neighbour]) == [])
+    hit = cm.release_sweep_conflicts(place_xy, 95.0, [neighbour])
+    check('95 mm 开爪当场红（limit ≈62.25 > dist 60）',
+          len(hit) == 1 and hit[0]['dist_mm'] == 60.0
+          and abs(hit[0]['limit_mm'] - 62.25) < 0.1, str(hit))
+    far = dict(neighbour, y=0.420)                 # 120 mm：全开也够不到
+    check('距离 120 mm ⇒ 即使全开也不冲突',
+          cm.release_sweep_conflicts(place_xy, 95.0, [far]) == [])
+
+
 # ------------------------------------------------------------------ [6]
 def section_blockers():
     print('\n[6] 遮挡归属：只数「夹爪真的碰到」的位姿')
@@ -560,6 +579,7 @@ def main():
     section_blocks()
     section_terminal()
     section_pair_tol()
+    section_sweep()
     section_blockers()
     section_mutation()
     section_pad_pose()

@@ -453,6 +453,12 @@ def build_attempt(manifest, facts, log_dir, post_blocks, colour, pad):
     if pl is None:
         miss.extend(pl_miss)
     else:
+        # 只增：垫上实测坐标 + 目标格心（扰动嫌疑检测要吃这两样，见
+        # ``disturbance_suspects``；判分逻辑只读三个布尔，不受影响）
+        if isinstance(colour, dict) and colour.get("xy_mm"):
+            pl["xy_mm"] = [round(float(v), 1) for v in colour["xy_mm"]]
+        if cell is not None:
+            pl["cell"] = int(cell)
         attempt["place"] = pl
         arrived = pl["in_slot"] and not pl["over_line"] and not pl["out_of_bounds"]
         if grasp.get("postrun") is not None:
@@ -483,6 +489,50 @@ def build_attempt(manifest, facts, log_dir, post_blocks, colour, pad):
         attempt["failure"] = {"class": _failure_class(
             attempt, (facts.get("failure_class") or {}).get(target))}
     return attempt, miss
+
+
+def disturbance_suspects(attempts, min_mm=5.0):
+    """邻块扰动嫌疑（台账第三百四十一轮判分盲区的补账；**只记录，不判红**）。
+
+    判分只评每块自己的格位：s1-1-r1-attempt2 里黄绿被紫块的释放推离格心
+    ~8.6 mm 仍 ``place_ok``。这里对**按放置次序**的每一对（先 i 后 j）：
+    若 i 的落点相对自己格心的偏移在「i 格心 → j 格心」方向上的投影
+    > ``min_mm``，记一条嫌疑（i 疑似被后放的 j 推开）。方向对得上才算——
+    任意方向的自身放置误差不该被算成推挤。
+
+    输入：``build_attempt`` 装的 attempts（place 里要有 ``xy_mm`` 与
+    ``cell``）。返回嫌疑列表（空 = 无嫌疑 / 证据不足）。
+    """
+    pts = []
+    for i, a in enumerate(attempts):
+        p = a.get("place") or {}
+        xy, cell = p.get("xy_mm"), p.get("cell")
+        if not (isinstance(xy, (list, tuple)) and len(xy) == 2) \
+                or cell is None:
+            continue
+        try:
+            cx, cy = cm.cell_center(int(cell))
+        except (KeyError, ValueError, TypeError):
+            continue
+        pts.append({"i": i,
+                    "target": (a.get("target") or {}).get("block_id"),
+                    "x": float(xy[0]), "y": float(xy[1]),
+                    "cx": float(cx) * 1000.0, "cy": float(cy) * 1000.0})
+    out = []
+    for a in pts:
+        for b in pts:
+            if b["i"] <= a["i"]:
+                continue                     # 只看「后被放」的块
+            dx, dy = a["x"] - a["cx"], a["y"] - a["cy"]
+            ux, uy = b["cx"] - a["cx"], b["cy"] - a["cy"]
+            n = math.hypot(ux, uy)
+            if n < 1e-9:
+                continue
+            proj = (dx * ux + dy * uy) / n
+            if proj > float(min_mm):
+                out.append({"pushed": a["target"], "by": b["target"],
+                            "offset_mm": round(proj, 1)})
+    return out
 
 
 def build_round(manifests, facts, log_dir, view_truths, colours, pad,
@@ -544,6 +594,7 @@ def build_round(manifests, facts, log_dir, view_truths, colours, pad,
         "human_review": hr,
         "pad": pad,
         "attempts": attempts,
+        "disturbance_suspects": disturbance_suspects(attempts),
         "truth_provenance": prov,
         "complete": not miss,
         "missing": miss,

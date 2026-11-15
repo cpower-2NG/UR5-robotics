@@ -62,6 +62,19 @@ def expect_reject(name, mutate):
 
 def main():
     print("=" * 68)
+    print("[0] 起手自检护闸：开口不全开拒发（round-17 教训的自动形态）")
+    err = pe.selftest_opening_error(25.2)
+    check("中断轮开口 25.2 mm ⇒ 拒发且点名 --holding-block",
+          err is not None and "--holding-block" in err, str(err))
+    check("正常收尾轮开口 95 mm ⇒ 放行",
+          pe.selftest_opening_error(95.0) is None)
+    check("读不到开口（None）⇒ 不拦（自检自己证明链路）",
+          pe.selftest_opening_error(None) is None)
+    check("阈值取自 SELFTEST_OPEN_MIN_MM（80）",
+          pe.selftest_opening_error(80.0) is None
+          and pe.selftest_opening_error(79.9) is not None)
+
+    print("=" * 68)
     print("[1] validate_plan_doc：合法计划放行、坏计划点名")
     try:
         pe.validate_plan_doc(good_plan())

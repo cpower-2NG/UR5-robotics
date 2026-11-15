@@ -249,8 +249,11 @@ def section_happy():
           g['postrun']['target_left_origin'] is True
           and g['postrun']['arrived'] is True, str(g['postrun']))
     check('place 三键都是真布尔',
-          a['place'] == {'in_slot': True, 'over_line': False,
-                         'out_of_bounds': False}, str(a.get('place')))
+          [a['place'][k] for k in ('in_slot', 'over_line', 'out_of_bounds')]
+          == [True, False, False], str(a.get('place')))
+    check('place 附带实测坐标与格心（扰动检测要吃，第 342 轮）',
+          a['place'].get('xy_mm') is not None
+          and a['place'].get('cell') is not None, str(a.get('place')))
     check('成功尝试不硬塞失败类', a['failure'] == {'class': None},
           str(a.get('failure')))
 
@@ -482,13 +485,43 @@ def section_s11_replay():
           res['verdict'] == 'missing_data', res['verdict'])
 
 
+def section_disturbance():
+    """邻块扰动嫌疑（台账第三百四十一轮）：沿「i 格心→j 格心」方向推 >5 mm
+    记一条；垂直偏移与次序不符不记（自身放置误差 ≠ 推挤）。"""
+    print('\n[7] 邻块扰动嫌疑：方向 + 次序都对才算')
+    c0, c1 = cm.cell_center(0), cm.cell_center(1)      # 相邻格（60 mm）
+    ux, uy = c1[0] - c0[0], c1[1] - c0[1]
+    n = math.hypot(ux, uy)
+    ux, uy = ux / n, uy / n
+
+    def att(tid, cell, xy_mm, i_text=''):
+        return {'target': {'block_id': tid},
+                'place': {'in_slot': True, 'over_line': False,
+                          'out_of_bounds': False, 'cell': cell,
+                          'xy_mm': [round(v * 1000.0, 1) for v in xy_mm]}}
+
+    pushed = att('A', 0, (c0[0] + ux * 0.008, c0[1] + uy * 0.008))
+    pusher = att('B', 1, (c1[0], c1[1]))
+    s = rr.disturbance_suspects([pushed, pusher])
+    check('沿推挤方向偏 8 mm ⇒ 记嫌疑（A 被 B 推，8 mm）',
+          len(s) == 1 and s[0]['pushed'] == 'A' and s[0]['by'] == 'B'
+          and abs(s[0]['offset_mm'] - 8.0) < 0.2, str(s))
+    s2 = rr.disturbance_suspects([pusher, pushed])
+    check('放置次序反了（后放的偏）⇒ 不记', s2 == [], str(s2))
+    side = att('A', 0, (c0[0] - uy * 0.008, c0[1] + ux * 0.008))
+    s3 = rr.disturbance_suspects([side, pusher])
+    check('垂直于格心连线的偏移 ⇒ 不记（自身放置误差）', s3 == [], str(s3))
+    s4 = rr.disturbance_suspects([pushed])
+    check('只有一个有证据的块 ⇒ 无从谈推挤', s4 == [], str(s4))
+
+
 def main():
     print('=' * 68)
     # C1：模块缺省 = 未实测哨兵；模型世界用例显式装模型常量。
     cm.install_model_pad_defaults()
     for fn in (section_exec_evidence, section_happy, section_missing,
                section_pad_constant, section_pad_thickness_unmeasured,
-               section_void_and_class,
+               section_void_and_class, section_disturbance,
                section_s11_replay):
         try:
             fn()
