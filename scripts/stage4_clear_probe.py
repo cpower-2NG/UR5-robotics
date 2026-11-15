@@ -325,7 +325,11 @@ def run_attempt(node, clients, truth, target_id, cell, pool,
         return out
     out["place_hit"] = plac["row"]
 
-    rep = cm.terminal_report(plac["final"])
+    # 贴合对终态穿插容差 2 mm（PAIR_PEN_TOL）：手摆贴合对的真值有拆分边界
+    # 内偏（S1:1 实测 3.84 mm「穿插」）与拆分片 yaw 噪声（s1-4 残余 −1.45 mm，
+    # 台账第三百三十九轮），物理上它们本就贴着、终态保持接触合法。
+    # 打分/报告的终态检查**不传**这个参数，口径不变。
+    rep = cm.terminal_report(plac["final"], pair_pen_tol=cm.PAIR_PEN_TOL)
     out["terminal"] = rep
     trow = _find_block(rep["blocks"], target_id)
     ok = bool(rep["ok"] and trow and trow["zone"] == "slot" and trow["legal"])

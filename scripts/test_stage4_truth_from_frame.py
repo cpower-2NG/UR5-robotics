@@ -564,6 +564,61 @@ def section_s11_free_colour_split():
               0.0355 <= sep <= 0.0375, round(sep * 1000.0, 2))
 
 
+# ------------------------------------------------- 贴合对修复（S1 首轮）
+def section_contact_pair_fixes():
+    """台账第三百三十九轮修复的口径钉（S1 首轮两种阻塞）。
+
+    ④ build_truth 丢「未拆混合簇」（票面双类 ≥25%，位置在两块中间——放进
+    共识会把整簇心与两块心并成 Chimera）；① 颜色拆分触发门 1.5→1.1×块边
+    （缩水掩码的贴合对不再被挡在门外）；② 质心钳制在 ``find_blocks`` 内，
+    用 s1-1 / s1-4 真帧重放钉（``zcode_replay_pair_fix.py``），合成侧不重复。
+    """
+    print('\n[14] 贴合对修复：④ 未拆混合簇丢弃 / ① 触发门放宽')
+    mixed = row(0, cls="cyan")
+    mixed["class_share"] = 0.59
+    mixed["mixed_pair_unsplit"] = True
+    t = tf.build_truth([mixed], CAM)
+    check("④ 标记行不进真值、计数 1",
+          t["blocks"] == [] and t["dropped_unsplit_pair"] == 1,
+          t["dropped_unsplit_pair"])
+    clean = row(1, cls="cyan")
+    clean["class_share"] = 0.95
+    t2 = tf.build_truth([clean], CAM)
+    check("④ 干净行照常进真值、计数 0",
+          len(t2["blocks"]) == 1 and t2["dropped_unsplit_pair"] == 0,
+          t2["dropped_unsplit_pair"])
+
+    # ① 触发门：合成两色顶面点集，min-area rect 长边 40 mm —— 旧门
+    # （1.5×29.5 = 44.25）拒拆、新门（1.1×29.5 = 32.45）放行。
+    import graspnet_candidates as gc
+    n_half = 120
+    rng = np.random.default_rng(7)
+    xs = np.concatenate([rng.normal(0.0, 0.004, n_half),
+                         rng.normal(0.020, 0.004, n_half)])
+    F = np.stack([xs, np.zeros(2 * n_half), np.full(2 * n_half, 0.03)], axis=1)
+    # 色板两格：cyan hue≈193°、yellowgreen hue≈54°（对齐 MEASURED_HUE_DEG）。
+    color = np.array([[[0, 200, 255], [201, 180, 0]]], dtype=np.uint8)
+    qpix = np.stack([np.concatenate([np.zeros(n_half, int),
+                                     np.ones(n_half, int)]),
+                     np.zeros(2 * n_half, int)], axis=1)
+    rect = {"ext_mm": [40.0, 20.0], "yaw_deg": 0.0, "fill": 1.0}
+    pieces = gc.split_top_face_by_colour(F, qpix, color, rect)
+    check("① 长边 40 mm（<1.5×、≥1.1×块边）拆出 2 片",
+          len(pieces) == 2, [len(p) for p in pieces])
+    if len(pieces) == 2:
+        med = sorted(float(np.median(F[p_, 0])) for p_ in pieces)
+        check("① 两片沿长轴分开 ~20 mm（≥ sep 门 13.3 mm）",
+              abs(med[1] - med[0]) > 0.015, round((med[1] - med[0]) * 1000, 1))
+    old = gc.COLOUR_SPLIT_GATE
+    try:
+        gc.COLOUR_SPLIT_GATE = 1.5
+        pieces_old = gc.split_top_face_by_colour(F, qpix, color, rect)
+    finally:
+        gc.COLOUR_SPLIT_GATE = old
+    check("① 同一输入在旧门（1.5×）下不拆（A/B 口径钉）",
+          len(pieces_old) == 1, [len(p) for p in pieces_old])
+
+
 def main():
     section_ray_plane()
     section_depth_immunity()
@@ -579,6 +634,7 @@ def main():
     section_consensus_yaw()
     section_camera()
     section_s11_free_colour_split()
+    section_contact_pair_fixes()
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('失败项：' + ', '.join(FAILS))

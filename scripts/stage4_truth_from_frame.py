@@ -198,7 +198,11 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
     """``find_blocks`` 的行 → ``scene_truth.json`` 的形状（射线 ∩ 平面）。
 
     ``cam`` 给 ``{'K','R_bc','t_bc'}``（``graspnet_candidates.load_frame`` 的
-    字段）。``low=True`` 的行（5 mm…min_h 的诊断簇）不是块，丢掉。
+    字段）。``low=True`` 的行（5 mm…min_h 的诊断簇）不是块，丢掉；
+    ``mixed_pair_unsplit`` 的行（没拆开且票面双类 ≥25% —— 并成一簇的贴合对，
+    位置落在两块中间）同样丢掉：它进共识会把「整簇心 + 两块心」并成一个
+    Chimera（S1:4 实测，台账第三百三十九轮），宁可这帧少一个观测也不污染
+    共识。丢失数记 ``dropped_unsplit_pair``。
 
     **叠放（E9 的塔）**：``layers=True`` 时，一个簇的实测 ``h`` 若是层高的整数倍
     （见 ``layer_count``），就把它展开成 n 块。位置口径：
@@ -217,6 +221,7 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
     blocks = []
     n_out = 0
     n_unknown = 0
+    n_unsplit = 0
     for r in rows:
         if r.get("low"):
             continue
@@ -227,6 +232,9 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
             continue
         if float(r.get("class_share") or 0.0) < float(min_class_share):
             n_unknown += 1
+            continue
+        if r.get("mixed_pair_unsplit"):
+            n_unsplit += 1
             continue
         size = float(block_size)
         h_mm = float(r.get("h", 0.0))
@@ -303,6 +311,7 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
         "blocks": blocks,
         "dropped_out_of_zone": n_out,
         "dropped_not_block": n_unknown,
+        "dropped_unsplit_pair": n_unsplit,
         "zone_m": list(sp.ZONE_M if zone_m is None else zone_m),
     }
 

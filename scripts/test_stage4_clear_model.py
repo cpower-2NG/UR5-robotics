@@ -301,6 +301,45 @@ def section_terminal():
           not rep7['ok'] and any('压格' in r['reasons'] for r in rep7['blocks']))
 
 
+# ------------------------------------------------------------------ [5b]
+def section_pair_tol():
+    """贴合对终态容差（台账第三百三十九轮方案③）：``pair_pen_tol`` 只放行
+    贴合带内的对，容差按真机回放残余定 2 mm（位置残差 −0.56 / yaw 噪声
+    −1.45），超出（质心偏差 −3.2、带外穿插）仍拦——偏差是方案②（钳制）的活。"""
+    print('\n[5b] 贴合对终态容差：带内放行、带外照拦、只吃测量伪影')
+    def blk(bid, y):
+        return {"id": bid, "x": 0.500, "y": y, "z": cm.BLOCK_M / 2.0,
+                "yaw": 0.0, "size": cm.BLOCK_M}
+
+    # 残余噪声口径：中心距 28.8 mm（sep −0.7 mm）—— 默认 0.2 mm 容差拦、
+    # 贴合带（0.72–1.02×块边 = 21.2–30.1 mm）内、pair_pen_tol=2 mm 放行。
+    near = [blk(0, 0.300), blk(1, 0.3288)]
+    rep = cm.terminal_report(near)
+    check('默认口径：28.8 mm 贴合对判穿插（sep −0.7 < −0.2 mm）',
+          not rep['ok'] and rep['overlaps'] == 1, rep['overlap_pairs'])
+    rep2 = cm.terminal_report(near, pair_pen_tol=cm.PAIR_PEN_TOL)
+    check('pair_pen_tol=2 mm：带内对放行、整桌合法',
+          rep2['ok'] and rep2['overlap_pairs'] == [], rep2['overlap_pairs'])
+    check('放行决定记进 pair_tol_pairs（含 sep）',
+          rep2['pair_tol_pairs'] == [[0, 1, -0.7]], rep2['pair_tol_pairs'])
+    # S1:1 基线口径：26.3 mm（sep −3.2 mm）在带内但超出 2 mm——仍拦。
+    # 容差只吸收测量伪影，质心偏差由方案②在感知端钳回块边解决。
+    rep3 = cm.terminal_report([blk(0, 0.300), blk(1, 0.3263)],
+                              pair_pen_tol=cm.PAIR_PEN_TOL)
+    check('带内但 sep −3.2 mm 超容差 → 仍判穿插',
+          not rep3['ok'] and rep3['overlaps'] == 1, rep3['overlap_pairs'])
+    # 带外真穿插照拦：20 mm（< 0.72×块边）不进贴合带。
+    rep4 = cm.terminal_report([blk(0, 0.300), blk(1, 0.320)],
+                              pair_pen_tol=cm.PAIR_PEN_TOL)
+    check('20 mm 间距（带外）→ 照判穿插',
+          not rep4['ok'] and rep4['overlaps'] == 1, rep4['overlap_pairs'])
+    # 不同层的块不进贴合带（带内距离但差一层高度 —— 叠放塔的上下层）。
+    lower = dict(blk(0, 0.300), z=cm.BLOCK_M / 2.0)
+    upper = dict(blk(1, 0.3288), z=cm.BLOCK_M * 1.5)
+    check('_pair_ids 同层口径：带内距离但不同高不算贴合对',
+          cm._pair_ids([lower, upper]) == set(), cm._pair_ids([lower, upper]))
+
+
 # ------------------------------------------------------------------ [6]
 def section_blockers():
     print('\n[6] 遮挡归属：只数「夹爪真的碰到」的位姿')
@@ -340,7 +379,7 @@ def section_mutation():
     print('\n[7] 变异：把「接触 vs 穿插」的口径改坏，用例必须红')
     blocks = s4_blocks(0)
     real = cm.terminal_report(blocks)
-    mut = _mut('if sep < -pen_tol:', 'if sep <= 0.0:')
+    mut = _mut('if sep < -tol:', 'if sep <= 0.0:')
     # 变异模块是重新 exec 的一份源码 ⇒ import 时回到「未实测」哨兵；
     # 它和正身一样跑模型世界的用例，显式装模型常量（C1）。
     mut['install_model_pad_defaults']()
@@ -350,7 +389,7 @@ def section_mutation():
           str(bad['overlaps']))
 
     # 容差判反了：把「离得近」当成「穿插」（接触对就被判红）
-    mut = _mut('if sep < -pen_tol:', 'if sep < 0.001:')
+    mut = _mut('if sep < -tol:', 'if sep < 0.001:')
     bad = mut['terminal_report'](blocks)
     check('变异「间隙 < 1 mm 也算穿插」：真实合法、改坏后贴面被判穿插',
           real['ok'] and not bad['ok'])
@@ -520,6 +559,7 @@ def main():
     section_free()
     section_blocks()
     section_terminal()
+    section_pair_tol()
     section_blockers()
     section_mutation()
     section_pad_pose()

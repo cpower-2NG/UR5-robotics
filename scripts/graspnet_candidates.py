@@ -100,6 +100,21 @@ EDGE_MARGIN_PX = 16
 #: 同一碎片在上一轮读 14.84 mm，被高度阈值挡掉——**它就在阈值上下翻**，只靠 h 不可靠。
 #: 真块顶面即使被挡掉一半也有 ~15 mm（本轮实测 20.1–30.7 mm），取半块宽。
 MIN_BLOCK_EXT_MM = 15.0
+#: 颜色拆分的触发门（合并簇 min-area rect 长边 ≥ gate×块边才试颜色拆分）。
+#: 旧值 1.5 在 S1 首轮真机被证伪（台账第三百三十九轮）：顶面掩码普遍缩水
+#: （孤立块实测每边只有 19–23 mm，4 mm 网格 + 闭运算 + 顶面 3 mm 带 + 斜视角），
+#: S1:4 黄绿+青贴合对合并簇长边 34.5–44.0 mm，6/10 帧被 1.5×29.5=44.25 mm
+#: 的门挡在颜色拆分之外 ⇒ 两块并成一块（fail-closed，5 块 vs 期望 6）。
+#: 实测分布：单块 parent 长边 ≤ 25.6 mm，贴合对 ≥ 34.5 mm ⇒ 取 1.1×
+#: （32.45 mm）落在两条分布之间。拆分本身仍受 min_share / sep / min_points
+#: 三道门把守（见 ``split_top_face_by_colour``），门只是「值不值得试」的预算。
+COLOUR_SPLIT_GATE = 1.1
+#: 颜色拆分恰好两片、且两心距 < 块边时，沿连线对称推开到块边（台账第三百
+#: 三十九轮方案②）。几何恒等式：两个等尺寸立方体面面贴合，中心距恒等于
+#: 块边；拆分边界内偏（S1:1 红/橙测得 26.3 mm，每片质心被拉向对方 ~1.6 mm）
+#: 是贴合边颜色分裂的系统性伪影。**只在测得「穿插」时动手**——两心距已
+#: ≥ 块边的对（真留了缝）不动，不会把留缝摆放的对硬捏到贴面。
+PAIR_CLAMP_TO_BLOCK = True
 GRASPNET_ROOT = os.path.expanduser("~/robotics/third_party/graspness_unofficial")
 CKPT = os.path.expanduser("~/robotics/third_party/graspnet-baseline/logs/checkpoint-rs.tar")
 
@@ -422,7 +437,7 @@ def split_top_face_by_colour(F, qpix, color, rect, block_mm=29.5,
     用颜色分裂**同色**接触块 —— 那种情况这里找不到第二类，会原样返回。
 
     条件（任一不满足就整份返回，绝不硬切）：
-      · 外接矩形长边 ≥ 1.5 块边（尺寸上确实不止一块）；
+      · 外接矩形长边 ≥ ``COLOUR_SPLIT_GATE``×块边（尺寸上确实不止一块）；
       · 至少两类颜色的饱和度权重份额 ≥ ``min_share``（同色块只有一类）；
       · 每份点数 ≥ ``min_points``；
       · 沿长边方向，各类的重心彼此分开 ≥ ``sep_frac`` 块边（单块内的颜色
@@ -435,7 +450,7 @@ def split_top_face_by_colour(F, qpix, color, rect, block_mm=29.5,
     if n < 2 * min_points:
         return [np.arange(n)]
     long_mm, _short_mm = rect["ext_mm"]
-    if long_mm < 1.5 * block_mm:
+    if long_mm < COLOUR_SPLIT_GATE * block_mm:
         return [np.arange(n)]
     qpix = np.asarray(qpix, dtype=np.int64)
     if len(qpix) != n:
@@ -607,19 +622,38 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
             pieces = (split_top_face(Q[rows_all], rect_all) if split
                       else [np.arange(len(rows_all))])
             split_src = "size" if split else "none"
-            # 尺寸先验切不动、但外接矩形明显超过一块 ⇒ 再按颜色类试一次。
+            # 尺寸先验切不动、但外接矩形超过一块 ⇒ 再按颜色类试一次。
             # 同色接触块在这里找不到第二类，会原样返回（契约 §2）。
+            # 门槛是 ``COLOUR_SPLIT_GATE``×块边（旧 1.5 在 S1:4 被缩水的顶面
+            # 掩码卡死，见常量处注释）。
             if (split and len(pieces) == 1
-                    and rect_all["ext_mm"][0] >= 1.5 * 29.5):
+                    and rect_all["ext_mm"][0] >= COLOUR_SPLIT_GATE * 29.5):
                 by_colour = split_top_face_by_colour(
                     Q[rows_all], qpix[rows_all], color, rect_all,
                     hue_table=hue_table)
                 if len(by_colour) > 1:
                     pieces, split_src = by_colour, "colour"
+            # 台账第三百三十九轮方案②：颜色拆出的两片来自**同一个连通域**，
+            # 物理上是贴合对 ⇒ 中心距应恰为块边。拆分边界内偏时测得 < 块边
+            # （S1:1 红/橙 26.3、S1:4 黄绿/青 23.0–23.7），沿连线对称推开到
+            # 块边，中点不动；已 ≥ 块边（真留缝）的对不动。
+            clamp_shift = None
+            clamp_from_mm = None
+            if (PAIR_CLAMP_TO_BLOCK and split_src == "colour"
+                    and len(pieces) == 2):
+                cen2 = [Q[rows_all[p_]][:, :2].mean(0) for p_ in pieces]
+                gap = float(np.linalg.norm(cen2[1] - cen2[0]))
+                if 1e-9 < gap < 0.0295:
+                    u = (cen2[1] - cen2[0]) / gap
+                    push = (0.0295 - gap) / 2.0
+                    clamp_shift = [-u * push, u * push]
+                    clamp_from_mm = round(gap * 1000.0, 2)
             for piece_i, piece_rows in enumerate(pieces):
                 rows = rows_all[piece_rows]
                 F = Q[rows]
                 c = F[:, :2].mean(0)
+                if clamp_shift is not None:
+                    c = c + clamp_shift[piece_i]
                 d = F[:, :2] - c
                 evals, evecs = np.linalg.eigh(d.T @ d / len(d))
                 yaw = float(np.degrees(np.arctan2(evecs[1, -1], evecs[0, -1])))
@@ -663,6 +697,17 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                 else:
                     cls = max(votes, key=votes.get)
                     share = votes[cls] / wsum
+                # 台账第三百三十九轮方案④：**没拆开**的簇票面双类都 ≥25%
+                # （同 split_top_face_by_colour.min_share 口径）⇒ 这是并成一簇
+                # 的贴合对。位置落在两块中间，放进共识会把「整簇心 + 两块心」
+                # 并成一个 Chimera（S1:4 实测：13 点一个簇、5 块 vs 期望 6）。
+                # 标出来，由 build_truth 按「未拆」丢掉——宁可这帧少一个观测，
+                # 不污染共识；下一帧拆开了自然补上。
+                mixed_pair_unsplit = False
+                if wsum > 0 and len(pieces) == 1:
+                    top2 = sorted(votes.values(), reverse=True)[:2]
+                    if len(top2) == 2 and top2[1] / wsum >= 0.25:
+                        mixed_pair_unsplit = True
                 votes = {k: int(v) for k, v in votes.items()}
 
                 # 顶面中心投到图像上：块贴边时 GraspNet 几乎给不出候选（实测 live-04
@@ -696,6 +741,10 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                     "split_src": split_src,
                     "parent_ext_rect": [round(v, 1)
                                         for v in rect_all["ext_mm"]],
+                    # 方案②溯源：钳制前的两心距（没钳制/没拆开时为 None）
+                    "pair_clamp_from_mm": clamp_from_mm,
+                    # 方案④标记：未拆开且票面双类 ≥25%（build_truth 会丢掉）
+                    "mixed_pair_unsplit": bool(mixed_pair_unsplit),
                 }
                 # O1 离线评估用：顶面像素集（图像坐标，u,v）。默认不生成，生产
                 # 路径的返回结构不变；评估器用同一份分割结果算实例 IoU。

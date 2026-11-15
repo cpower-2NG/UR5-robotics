@@ -246,6 +246,16 @@ TABLE_YMAX = TABLE_CENTER[1] + TABLE_SIZE[1] / 2.0
 PEN_TOL = 0.0002      # 终态判「穿插」的容差 0.2 mm。S4 的接触对是精确贴面
                       # （数值上贴 0），任何真实叠放至少差几 mm —— 0.2 mm 把
                       # 浮点噪声和真穿插分得很开。
+#: 声明贴合对（中心距 ∈ 贴合带，见 ``_pair_ids``）的终态穿插容差 2 mm。
+#: 背景（台账第三百三十九轮）：S1:1 红/橙贴合对的真值质心各被拆分边界内偏
+#: ~1.6 mm ⇒ 探针终态这对 OBB 测得 3.84 mm「穿插」，把 4 个无关目标的终态
+#: 全判非法。物理上贴合对本来就贴着，终态「保持接触」合法。质心钳制（方案②）
+#: 后真机回放的残余还有两类：① 位置残差 s1-1 −0.56 mm（钳制在深度系做、
+#: 共识按 x/y 各自取中位）；② 拆分片形状被扭曲 ⇒ 彩色掩码 yaw 噪声
+#: （s1-4 cyan 共识 yaw 0.1° vs 场上其余块 49–88°，±3° yaw 对贴面对就是
+#: ~1.5 mm 表观穿插）。容差按这两条实测残余取 2 mm；超出仍是真穿插。
+#: 只在显式传 ``pair_pen_tol`` 的调用方生效（探针），打分/报告的旧口径不动。
+PAIR_PEN_TOL = 0.002
 FREE_CLEAR = 0.005    # 挪到自由区的块，离别的块至少 5 mm（不贴面，免得又被算遮挡）
 # 自由区：拾取区北侧的空台面（拾取区 y ≤ 0.42，垫在 y ≤ 0.038，都不碰）
 FREE_X = (0.28, 0.75)
@@ -413,7 +423,30 @@ def place_in_cell(block, index):
 
 
 # ---------------------------------------------------------------- 终态
-def terminal_report(blocks, pen_tol=PEN_TOL):
+def _pair_ids(blocks, lo=0.72, hi=1.02):
+    """块表里**贴合对**的下标对集合（探针终态的贴合对豁免用）。
+
+    口径与 ``stage4_layouts.contact_pairs`` 同一贴合带（中心距 ∈ lo–hi×块边、
+    同层同高）—— 那边是「摆块提示/布局校验」的家；这里不直接 import 它，
+    因为 layouts 反向 import 本模块，会环。
+    """
+    out = set()
+    for i in range(len(blocks)):
+        for j in range(i + 1, len(blocks)):
+            a, c = blocks[i], blocks[j]
+            size = float(a["size"])
+            if abs(a.get("layer", 0) - c.get("layer", 0)) >= 1:
+                continue
+            if abs((float(a["z"]) - float(a["size"]) / 2.0)
+                   - (float(c["z"]) - float(c["size"]) / 2.0)) > 0.001:
+                continue                       # 不同高：不是并排贴合对
+            d = math.hypot(a["x"] - c["x"], a["y"] - c["y"])
+            if lo * size <= d <= hi * size:
+                out.add((i, j))
+    return out
+
+
+def terminal_report(blocks, pen_tol=PEN_TOL, pair_pen_tol=None):
     """全桌终态合法性（契约 §4.3 的那条）。
 
     每块：``zone`` ∈ {slot, free}、``in_bounds``、``legal``；整桌：
@@ -422,6 +455,11 @@ def terminal_report(blocks, pen_tol=PEN_TOL):
 
     「有支撑」三种都算：落台面、落垫面、**压在另一块上**（S4 的塔本来就
     叠着 —— 只看台面会把合法的塔判成悬空）。
+
+    ``pair_pen_tol`` 给了（探针传 ``PAIR_PEN_TOL``）⇒ 终态里中心距落在贴合带
+    的对（``_pair_ids``，物理上本就贴着的手摆贴合对）用这个放宽容差判穿插，
+    其余对仍用 ``pen_tol``；用了宽容差的对记在返回值 ``pair_tol_pairs``。
+    缺省 ``None`` = 行为与旧版完全一致（打分/报告口径不动）。
     """
     obbs = [sm.block_obb(b, 0.0, name="block-%s" % b.get("id")) for b in blocks]
     tops = [float(b["z"]) + float(b["size"]) / 2.0 for b in blocks]
@@ -493,19 +531,29 @@ def terminal_report(blocks, pen_tol=PEN_TOL):
 
     overlaps = 0
     pairs = []
+    tol_pairs = []
+    declared = (_pair_ids(blocks) if pair_pen_tol is not None else set())
     for i in range(len(obbs)):
         for j in range(i + 1, len(obbs)):
+            is_pair = (i, j) in declared
+            tol = pair_pen_tol if is_pair else pen_tol
             sep = sm.separation(obbs[i], obbs[j])
-            if sep < -pen_tol:
+            if sep < -tol:
                 overlaps += 1
                 pairs.append([blocks[i].get("id"), blocks[j].get("id"),
                               round(sep * 1000.0, 2)])
+            elif is_pair:
+                # 豁免且通过的对（sep ≥ −pair_pen_tol）：记下来供人复核——
+                # 若某天这里出现大负值，说明贴合对的真值质量在恶化。
+                tol_pairs.append([blocks[i].get("id"), blocks[j].get("id"),
+                                  round(sep * 1000.0, 2)])
 
     n_bad = len([r for r in rows if not r["legal"]])
     n_off = len([r for r in rows if "不在台面" in r["reasons"]])
     n_out = len([r for r in rows if "出桌" in r["reasons"]])
     ok = (overlaps == 0 and n_bad == 0)
     return {"ok": ok, "overlaps": overlaps, "overlap_pairs": pairs,
+            "pair_tol_pairs": tol_pairs,
             "off_table": n_off, "out_of_bounds": n_out,
             "illegal": n_bad, "blocks": rows}
 

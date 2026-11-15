@@ -530,9 +530,16 @@ def test_colour_split_refuses_same_colour():
 
 @case
 def test_colour_split_refuses_single_block_size():
-    """外接矩形长边 < 1.5 块边 ⇒ 尺寸上就是一块，颜色噪声不许切。"""
+    """外接矩形长边 < 1.1×块边 ⇒ 尺寸上就是一块，颜色噪声不许切。
+
+    旧门 1.5× 在 S1:4 真机被证伪（台账第三百三十九轮）：顶面掩码普遍缩水
+    （孤立块每边 19–23 mm），贴合对合并簇长边 34.5–44.0 mm，1.5×（44.25）
+    把颜色拆分挡在门外 ⇒ 两块并成一块。门降到 1.1×（32.45，落在实测分布
+    「单块 parent ≤ 25.6 / 贴合对 ≥ 34.5」之间）后，这里钉的是新下界：
+    30 mm（≥ 一整块、< 1.1×）即便有两色证据也不许切。
+    """
     F, qp, color, rect = _two_block_scene()
-    rect = dict(rect, ext_mm=[40.0, 29.5])
+    rect = dict(rect, ext_mm=[30.0, 25.0])
     assert len(gc.split_top_face_by_colour(F, qp, color, rect)) == 1
 
 
