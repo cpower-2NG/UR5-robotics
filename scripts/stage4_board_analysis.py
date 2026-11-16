@@ -59,7 +59,7 @@ def cmd_pad(a):
 def cmd_truth(a):
     argv = ["--frame", a.burst, "--consensus",
             "--min-frames", str(int(a.min_frames)),
-            "--camera", a.camera, "--out", a.out]
+            "--camera", a.camera, "--seg", a.seg, "--out", a.out]
     if a.zone:
         argv += ["--zone", a.zone]
     if a.allow_empty:
@@ -121,6 +121,9 @@ def build_parser():
     t.add_argument("--burst", required=True)
     t.add_argument("--out", required=True)
     t.add_argument("--camera", choices=sorted(tf.CAMERAS), default="wrist")
+    t.add_argument("--seg", choices=("grid", "sam"), default="sam",
+                   help="分割/身份感知链（第 345 轮 SAM 立项、347 轮回放"
+                        "达标后缺省 sam；grid=网格链回退/对照）")
     t.add_argument("--zone", default=None, metavar="X0,X1,Y0,Y1",
                    help="真值保留区（米）；区外的「块」按幻影丢")
     t.add_argument("--min-frames", type=int, default=5)

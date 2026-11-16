@@ -576,10 +576,11 @@ def main(argv=None):
                     help="用哪路相机：wrist=腕部（默认，规划感知 + 跑后三机位"
                          "判分；要当帧关节在帧目录里）；topcam=已退出阶段 4，"
                          "只用于复现旧证据，必须同时给 --allow-topcam")
-    ap.add_argument("--seg", choices=("grid", "sam"), default="grid",
-                    help="分割/身份走哪条感知链（第 345 轮立项）：grid=现行"
-                         "网格链（缺省），sam=SAM 感知层（sam_blocks，权重在"
-                         " ~/robotics/third_party/weights/mobile_sam.pt）")
+    ap.add_argument("--seg", choices=("grid", "sam"), default="sam",
+                    help="分割/身份走哪条感知链（第 345 轮立项、347 轮回放"
+                         "达标后翻缺省）：sam=SAM 感知层（sam_blocks，权重 "
+                         "~/robotics/third_party/weights/mobile_sam.pt），"
+                         "grid=网格链（回退/对照）")
     ap.add_argument("--allow-topcam", action="store_true",
                     help="显式允许用俯视相机复现旧证据（不给它却传 "
                          "--camera topcam ⇒ 退出码 2）")

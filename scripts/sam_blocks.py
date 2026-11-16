@@ -167,12 +167,14 @@ def _iou_idx(ia, ib):
 
 
 # ---------------------------------------------------------------- 主入口
-def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False):
+def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
+                    max_h_mm=70.0):
     """SAM 版 ``find_blocks``：同 schema 行输出（``return_masks`` 带掩码像素）。"""
     depth, color, K = frame["depth"], frame["color"], frame["K"]
     H, W = depth.shape
     grid_rows, _ = gc.find_blocks(frame, split=False, return_masks=True,
-                                  hue_table=hue_table)
+                                  hue_table=hue_table,
+                                  max_h_mm=max_h_mm)
 
     P, pix = gc.backproject(depth, K)
     Pb = P @ frame["R_bc"].T + frame["t_bc"]

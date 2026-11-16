@@ -1280,15 +1280,19 @@ def default_solve_pad(burst, out, min_frames=10, max_spread_mm=2.0,
                      "--max-spread-deg", str(float(max_spread_deg))])
 
 
-def default_truth_from_view(burst, out, allow_empty=False):
+def default_truth_from_view(burst, out, allow_empty=False, seg="sam"):
     """量一个机位的真值。
 
     ``allow_empty`` 只给**跑后三机位**用：干净的机位（该区域确实没有块）是
     合法结果，不能退化成「没有证据」被剔出溯源。跑前 pick 机位不传它 ——
     那里本来就必须有块，零块就是分割/相机坏了，该红。
+
+    ``seg``：感知链选择（第 345 轮 SAM 立项、第 347 轮回放达标后缺省
+    ``sam``；``grid`` = 网格链回退/对照）。
     """
     argv = ["--frame", burst, "--consensus", "--min-frames", "5",
             "--camera", "wrist", "--zone", truth_zone_for(burst),
+            "--seg", seg,
             "--out", out]
     if allow_empty:
         argv.append("--allow-empty")
@@ -1432,9 +1436,11 @@ class Round:
         """
         if self.args.analysis == "local":
             return int(self.deps["truth_from_view"](
-                burst_local, out_local, allow_empty=allow_empty) or 0)
+                burst_local, out_local, allow_empty=allow_empty,
+                seg=self.args.seg) or 0)
         opts = ["--burst", burst_remote,
                 "--camera", "wrist",
+                "--seg", self.args.seg,
                 "--zone", truth_zone_for(burst_remote),
                 "--min-frames", "5"]
         if allow_empty:
@@ -2686,6 +2692,10 @@ def build_parser():
                     help="实测块心离布局表超过它就不抓（不是判分容差，是"
                          "「布局表与台面是不是同一场景」的兜底；缺省 %.0f）"
                          % PICK_OFFSET_LIMIT_MM)
+    ap.add_argument("--seg", choices=("sam", "grid"), default="sam",
+                    help="感知链（第 345 轮 SAM 立项、347 轮回放达标后缺省 "
+                         "sam；grid=网格链回退/对照）。SAM 权重在板上 "
+                         "~/robotics/third_party/weights/mobile_sam.pt")
     ap.add_argument("--pad-min-frames", type=int, default=10,
                     help="解垫 burst 最少帧数（2026-11-15 v0.8 起 burst 20→10，"
                          "缺省随之 20→10；共识下限 5）")

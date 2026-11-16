@@ -824,7 +824,7 @@ def fake_solve_pad_writer():
 TRUTH_CALLS = []
 
 
-def fake_truth(burst, out, allow_empty=False):
+def fake_truth(burst, out, allow_empty=False, seg='sam'):
     TRUTH_CALLS.append((burst, allow_empty))
     # 跑前 pick burst 现在喂**实测抓点**（``--truth-source measured``）：
     # 返回与布局表一一对应的块（偏移 0），否则计算段会按「量不出块」停轮。
@@ -840,7 +840,7 @@ def fake_truth(burst, out, allow_empty=False):
 
 def fake_truth_offset(dx_mm, dy_mm):
     """跑前 pick burst 的实测块位姿 = 布局表 + 固定偏移（手摆偏差的替身）。"""
-    def f(burst, out, allow_empty=False):
+    def f(burst, out, allow_empty=False, seg="sam"):
         TRUTH_CALLS.append((burst, allow_empty))
         blocks = []
         if not allow_empty:
