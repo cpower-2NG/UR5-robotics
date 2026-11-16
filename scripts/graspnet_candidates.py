@@ -206,7 +206,9 @@ def load_frame(frame_dir, tip=TIP, chain=CHAIN, idx=None):
     joints = json.load(open(js_path)) if os.path.exists(js_path) else None
     return {"dir": frame_dir, "depth": depth, "color": color,
             "K": camera_k(frame_dir, idx=idx), "R_bc": R, "t_bc": t,
-            "joints": joints}
+            "joints": joints,
+            # 只增：本帧彩色图路径（SAM 预测器按路径缓存嵌入用，sam_blocks）
+            "image_path": _frame_path(frame_dir, "color", ".png", idx)}
 
 
 def backproject(depth, K):

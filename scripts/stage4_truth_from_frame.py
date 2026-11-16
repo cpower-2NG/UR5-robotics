@@ -326,7 +326,7 @@ CAMERAS = {
 
 
 def measure_dir(frame_dir, index=None, split=True, yaw_method="colour",
-                camera="wrist"):
+                camera="wrist", seg="grid"):
     """一帧 → (frame, find_blocks 行, 台面 z)。
 
     ``camera``：``'wrist'``（默认，规划感知 + 跑后三机位判分）或
@@ -335,12 +335,23 @@ def measure_dir(frame_dir, index=None, split=True, yaw_method="colour",
 
     ``yaw_method='colour'``（默认）把每行的 yaw 换成彩色像素掩码矩形
     （见 ``colour_yaw_rows``）；``'depth'`` 是旧口径（PCA），只为复现旧证据。
+
+    ``seg='sam'``：分割/身份改走 SAM 感知层（``sam_blocks.find_blocks_sam``，
+    第 345 轮立项）；``'grid'``（缺省）= 现行网格链。其余下游
+    （build_truth/consensus/判分）对两种行同构消费。
     """
     if camera not in CAMERAS:
         raise ValueError("camera 只能是 %s，收到 %r" % (sorted(CAMERAS), camera))
+    if seg not in ("grid", "sam"):
+        raise ValueError("seg 只能是 grid / sam，收到 %r" % (seg,))
     tip, chain = CAMERAS[camera]
     frame = gc.load_frame(frame_dir, tip=tip, chain=chain, idx=index)
-    rows, table_z = gc.find_blocks(frame, split=split)
+    if seg == "sam":
+        import sam_blocks
+        predictor = sam_blocks.load_predictor()
+        rows, table_z = sam_blocks.find_blocks_sam(frame, predictor)
+    else:
+        rows, table_z = gc.find_blocks(frame, split=split)
     if yaw_method == "colour":
         colour_yaw_rows(frame, rows)
     else:
@@ -359,7 +370,7 @@ def _measure_index(job):
     kw = job
     fr, rows, _ = measure_dir(kw["frame_dir"], index=kw["index"],
                               split=kw["split"], yaw_method=kw["yaw_method"],
-                              camera=kw["camera"])
+                              camera=kw["camera"], seg=kw.get("seg", "grid"))
     return build_truth(rows, fr, table_top=kw["table_top"],
                        block_size=kw["block_size"],
                        batch=kw["batch"], index=kw["index"],
@@ -495,13 +506,14 @@ def consensus(truths, radius_m=0.020, min_frames=None):
 
 
 def survey(frame_dir, split=True, table_top=0.0, yaw_method="colour",
-           camera="topcam"):
+           camera="topcam", seg="grid"):
     idxs = gc.list_frame_indices(frame_dir)
-    print("帧数 %d（yaw 口径：%s，相机：%s）"
-          % (len(idxs), yaw_method, camera))
+    print("帧数 %d（yaw 口径：%s，相机：%s，分割：%s）"
+          % (len(idxs), yaw_method, camera, seg))
     for idx in idxs:
         frame, rows, table_z = measure_dir(frame_dir, index=idx, split=split,
-                                           yaw_method=yaw_method, camera=camera)
+                                           yaw_method=yaw_method, camera=camera,
+                                           seg=seg)
         t = build_truth(rows, frame, table_top=table_top)
         print("  idx=%-3s 深度台面=%8.2f mm  块数=%2d  区外=%2d  非积木=%2d"
               % (idx, table_z * 1000.0, len(t["blocks"]),
@@ -564,6 +576,10 @@ def main(argv=None):
                     help="用哪路相机：wrist=腕部（默认，规划感知 + 跑后三机位"
                          "判分；要当帧关节在帧目录里）；topcam=已退出阶段 4，"
                          "只用于复现旧证据，必须同时给 --allow-topcam")
+    ap.add_argument("--seg", choices=("grid", "sam"), default="grid",
+                    help="分割/身份走哪条感知链（第 345 轮立项）：grid=现行"
+                         "网格链（缺省），sam=SAM 感知层（sam_blocks，权重在"
+                         " ~/robotics/third_party/weights/mobile_sam.pt）")
     ap.add_argument("--allow-topcam", action="store_true",
                     help="显式允许用俯视相机复现旧证据（不给它却传 "
                          "--camera topcam ⇒ 退出码 2）")
@@ -603,7 +619,7 @@ def main(argv=None):
         survey(args.frame, split=not args.no_split,
                table_top=args.table_top,
                yaw_method="depth" if args.yaw_depth else "colour",
-               camera=args.camera)
+               camera=args.camera, seg=args.seg)
         return 0
 
     yaw_method = "depth" if args.yaw_depth else "colour"
@@ -626,6 +642,7 @@ def main(argv=None):
         jobs = {k: v for k, v in (
             ("frame_dir", args.frame), ("split", not args.no_split),
             ("yaw_method", yaw_method), ("camera", args.camera),
+            ("seg", args.seg),
             ("table_top", args.table_top), ("block_size", args.block_size),
             ("batch", batch), ("drop_unknown", not args.keep_unknown),
             ("min_class_share", args.min_class_share),
@@ -682,7 +699,7 @@ def main(argv=None):
         frame, rows, table_z = measure_dir(args.frame, index=idx,
                                            split=not args.no_split,
                                            yaw_method=yaw_method,
-                                           camera=args.camera)
+                                           camera=args.camera, seg=args.seg)
         truth = build_truth(rows, frame, table_top=args.table_top,
                             block_size=args.block_size,
                             batch=os.path.basename(args.frame.rstrip("/")),

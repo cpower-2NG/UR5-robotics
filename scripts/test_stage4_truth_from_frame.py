@@ -301,7 +301,7 @@ def section_consensus_parallel():
         real_m, real_b = tf.measure_dir, tf.build_truth
 
         def fake_measure(frame_dir, index=None, split=True, yaw_method='colour',
-                         camera='wrist'):
+                         camera='wrist', seg='grid'):
             return {'idx': index}, [], 0.0
 
         def fake_build(rows, frame, table_top=0.0, block_size=0.0295,
