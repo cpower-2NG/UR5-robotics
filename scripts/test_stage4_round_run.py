@@ -1699,6 +1699,29 @@ else:
           False, "竟然给出来了")
 
 # =====================================================================
+# 落格判据：SAM 跑后 pad 真值优先（2026-11-17 用户拍板）
+# ---------------------------------------------------------------------
+_b1 = {"color": "purple", "x": 0.5426, "y": -0.1471,
+       "meas": {"n_frames": 10}}
+_r = r.pad_truth_place_block([_b1], [538.6, -147.1])
+check("SAM 真值块在格心附近 ⇒ 选中且距离正确",
+      _r is not None and _r["block"] is _b1
+      and abs(_r["dist_mm"] - 4.0) < 0.2, _r)
+_b2 = {"color": "yellow", "x": 0.5437, "y": -0.0882}          # 邻格 ~59 mm
+_r2 = r.pad_truth_place_block([_b1, _b2], [538.6, -147.1])
+check("邻格块不被选中（最近块优先）",
+      _r2 is not None and _r2["block"] is _b1, _r2)
+check("45 mm 门外没有块 ⇒ None（不跨格）",
+      r.pad_truth_place_block([_b2], [538.6, -147.1]) is None)
+check("空表 ⇒ None", r.pad_truth_place_block([], [0, 0]) is None)
+check("缺 x/y 的块被跳过",
+      r.pad_truth_place_block([{"color": "purple"}], [0, 0]) is None)
+check("多块时取最近的那块",
+      r.pad_truth_place_block(
+          [{"x": 0.5486, "y": -0.1471},
+           {"x": 0.5386, "y": -0.1471}], [538.6, -147.1])["dist_mm"] < 0.2)
+
+# =====================================================================
 print()
 print("通过 %d，失败 %d" % (N_PASS, N_FAIL))
 if FAILS:

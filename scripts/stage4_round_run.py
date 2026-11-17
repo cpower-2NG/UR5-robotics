@@ -261,6 +261,36 @@ def merge_measured_truth(truth_doc, measured_doc,
     return doc, recs
 
 
+#: 落格判据：SAM 跑后 pad 真值里「格内块」与期望格心的最大距离。
+#: 格距 60 mm、邻块最近角距 45.25 mm ⇒ 45 mm 不会跨格，又能容忍摆位/测量误差。
+PAD_TRUTH_PLACE_MAX_MM = 45.0
+
+
+def pad_truth_place_block(pad_blocks, xy_des_mm,
+                          max_mm=PAD_TRUTH_PLACE_MAX_MM):
+    """SAM 跑后 pad 真值 → 离期望格心最近的块（``None`` = 该格附近没块）。
+
+    2026-11-17 用户拍板：落格判据改吃这条**独立跑后测量链**（SAM 2D 分割给
+    块颜色/位置），不再依赖彩色窗量「窗内主色相簇」——后者在垫面印刷/暖光下
+    会被小暖色块骗走（s1-1-attempt5：紫块物理落点离格心 4.0 mm，彩色窗量却
+    报 26.6 mm / 色相 18° / 191 px，把落格判红）。返回
+    ``{"block": 真值块, "dist_mm": 距离}``；距离是水平欧氏（mm）。
+    """
+    best = None
+    for b in pad_blocks or []:
+        try:
+            x = float(b["x"]) * 1000.0
+            y = float(b["y"]) * 1000.0
+        except (KeyError, TypeError, ValueError):
+            continue
+        d = math.hypot(x - float(xy_des_mm[0]), y - float(xy_des_mm[1]))
+        if best is None or d < best[1]:
+            best = (b, d)
+    if best is None or float(best[1]) > float(max_mm):
+        return None
+    return {"block": best[0], "dist_mm": float(best[1])}
+
+
 def log(*a):
     print("  " + " ".join(str(x) for x in a), flush=True)
 
@@ -2277,7 +2307,17 @@ class Round:
             else:
                 log("  !! 跑后真值 %-5s 失败（rc=%r）—— 记缺证据" % (v["name"], rc))
 
-        # 逐目标彩色顶面质心（窗 25 mm；期望色相只交叉核对，不改 ok）
+        # SAM 跑后 pad 真值：落格判据的主来源（2026-11-17 用户拍板）。
+        # 彩色窗量降为回退（pad 真值没看见该格时）与交叉核对。
+        pad_truth_blocks = []
+        for _name, _path in view_truth:
+            if _name == "pad":
+                pad_truth_blocks = (read_json(_path).get("blocks") or [])
+                break
+        if not pad_truth_blocks:
+            log("  !! 跑后 pad 真值里没有块 —— 落格回退到彩色窗量")
+
+        # 逐目标落格位置（SAM pad 真值优先；回退彩色窗量）
         colour_paths = []
         bias = read_json(self.p("bias.json"))
         samples, bfail = [], []
@@ -2299,9 +2339,33 @@ class Round:
             blk = [b for b in layouts if str(b["id"]) == tid][0]
             top_z = cm.PAD_THICK + float(blk["size"])
             cpath = os.path.join(colour_dir, "%s.json" % tid)
-            colour = self._colour(
-                self.b("wrist-post", "pad"), xy_des, top_z, blk["color"],
-                bc.MEASURED_HUE_DEG.get(blk["color"]), cpath)
+            sam = pad_truth_place_block(pad_truth_blocks, xy_des)
+            if sam is not None:
+                sb = sam["block"]
+                got_color = str(sb.get("color") or "")
+                colour = {
+                    "ok": True,
+                    "source": "sam-pad-truth",
+                    "xy_mm": [round(float(sb["x"]) * 1000.0, 2),
+                              round(float(sb["y"]) * 1000.0, 2)],
+                    "hue_deg": bc.MEASURED_HUE_DEG.get(got_color),
+                    "truth_color": got_color,
+                    "expected_class": blk["color"],
+                    "class_match": got_color == str(blk["color"]),
+                    "n_frames": (sb.get("meas") or {}).get("n_frames"),
+                    "n_missed": 0,
+                    "nearest_mm": round(sam["dist_mm"], 2),
+                    "search_mm": None,
+                    "top_z": top_z,
+                }
+            else:
+                # 回退：SAM pad 真值没看见该格附近的块 ⇒ 用旧的彩色窗量，
+                # 并在文档里标来源（判分记录仍可追溯是哪条链出的数）。
+                colour = self._colour(
+                    self.b("wrist-post", "pad"), xy_des, top_z, blk["color"],
+                    bc.MEASURED_HUE_DEG.get(blk["color"]), cpath)
+                colour["source"] = colour.get("source") or "colour-window"
+                colour["fallback_no_pad_truth"] = True
             colour["target"] = tid
             colour["cell"] = cell
             colour["desired_center_mm"] = [round(v, 3) for v in xy_des]
@@ -2317,16 +2381,20 @@ class Round:
                                   "commanded_mm": cmd_mm})
                 else:
                     samples.append({"target": tid, "bias_mm": b})
-            log("  彩色量 块 %-2s 格 %d：%s"
-                % (tid, cell, ("(%+.1f, %+.1f) mm  色相 %.0f°  匹配 %s"
-                               % (colour["xy_mm"][0], colour["xy_mm"][1],
-                                  colour.get("hue_deg") or -1.0,
-                                  colour.get("class_match")))
-                   if colour.get("ok") else
-                   "!! 量不出（%d/%d 帧）"
-                   % (colour.get("n_frames") or 0,
-                      (colour.get("n_frames") or 0)
-                      + (colour.get("n_missed") or 0))))
+            if colour.get("ok"):
+                log("  落格量 块 %-2s 格 %d：(%+.1f, %+.1f) mm  颜色 %s  匹配 %s"
+                    "（来源 %s）"
+                    % (tid, cell, colour["xy_mm"][0], colour["xy_mm"][1],
+                       colour.get("truth_color")
+                       or colour.get("measured_class") or "?",
+                       colour.get("class_match"),
+                       colour.get("source") or "?"))
+            else:
+                log("  落格量 块 %-2s 格 %d：!! 量不出（%d/%d 帧，来源 %s）"
+                    % (tid, cell, colour.get("n_frames") or 0,
+                       (colour.get("n_frames") or 0)
+                       + (colour.get("n_missed") or 0),
+                       colour.get("source") or "?"))
 
         # 本轮 b̂ 估计（只记账 + 定下一轮种子，不改本轮已执行命令）
         run_dir = os.path.dirname(self.out)
