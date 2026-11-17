@@ -48,8 +48,10 @@ UA, UB = 45, 63          # A（orange）u 45..62
 UC, UD = 63, 81          # B（tan）u 63..80
 VA, VB = 35, 53
 
-ORANGE = np.array([255, 87, 0])    # hue ≈ 20.5°
-TAN = np.array([255, 121, 0])      # hue ≈ 28.5°
+# 真机实测渲染色（第 349 轮测量）：rel_sat orange≈215 / tan≈132 —— tan 是
+# 低饱和米色，与 orange 的区分靠 (hue, rel_sat) 2D 二义消除，不靠纯 hue。
+ORANGE = np.array([230, 66, 0])     # hue ≈ 20.5°  rel_sat ≈ 255
+TAN = np.array([200, 146, 96])      # hue ≈ 28.6°  rel_sat ≈ 132（低饱和米色）
 
 
 def make_frame():

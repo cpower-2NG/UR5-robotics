@@ -102,7 +102,13 @@ def discover_prompts(row, cam):
 
 
 def piece_stats(idx, Pb, pix, color):
-    """一片顶面像素（``Pb`` 下标）→ (质心 base xy, PCA yaw, ext, rect, 票)。"""
+    """一片顶面像素（``Pb`` 下标）→ 身份/票 + (质心 base xy, PCA yaw, ext, rect)。
+
+    身份 = 掩码内色相投票（饱和度加权），**外加 orange/tan 二义的 2D 消除**
+    （``bc.disambiguate_orange_tan``：低饱和米色的 tan 在光照/白平衡变化下
+    色相漂进 orange 带——2026-11-17 s1-3-att2 实证，纯色相投票无解；饱和度
+    中位反而把两类分得更开）。返回 ``cls``/``share`` 已按二义结果修正。
+    """
     F = Pb[idx]
     c = F[:, :2].mean(0)
     d = F[:, :2] - c
@@ -112,15 +118,34 @@ def piece_stats(idx, Pb, pix, color):
     rect = gc.min_area_rect_2d(F[:, :2])
     px = color[pix[idx, 1], pix[idx, 0]].astype(float)
     votes, wsum = {}, 0.0
+    hue_samples, sat_samples = [], []
     for p in px[::max(1, len(px) // 400)]:
         h, s, v = gc.rgb_to_hsv255(p)
-        if s < 60 or v < 40:
+        if v < 40:
+            continue
+        hue_samples.append(h)
+        sat_samples.append(s)
+        if s < 60:
             continue
         name, _ = bc.nearest_class_by_hue(h)
         votes[name] = votes.get(name, 0.0) + s
         wsum += s
+    hue_med = float(np.median(hue_samples)) if hue_samples else None
+    rel_sat_med = float(np.median(sat_samples)) if sat_samples else None
+    cls = max(votes, key=votes.get) if wsum > 0 else "unknown"
+    if wsum > 0 and cls in ("orange", "tan"):
+        fixed = bc.disambiguate_orange_tan(hue_med, rel_sat_med)
+        if fixed is not None and fixed != cls:
+            # 票面质量随二义结果重新归属（该片的饱和像素本属 tan）
+            votes[fixed] = votes.get(fixed, 0.0) + votes.pop(cls)
+            cls = fixed
+    share = (votes.get(cls, 0.0) / wsum) if wsum > 0 else 0.0
     return {"c": c, "yaw": yaw, "ext": ext, "rect": rect,
-            "votes": votes, "wsum": wsum, "px": px}
+            "votes": votes, "wsum": wsum, "px": px,
+            "cls": cls, "share": round(share, 3),
+            "hue_med": None if hue_med is None else round(hue_med, 1),
+            "rel_sat_med": None if rel_sat_med is None
+            else round(rel_sat_med, 1)}
 
 
 def mixed_votes(votes, wsum):
@@ -240,15 +265,14 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
             union = np.concatenate([hit["idx"], pc["idx"]])
             rest = piece_stats(union, Pb, pix, color)
             hit.update({k: rest[k] for k in
-                        ("c", "yaw", "ext", "rect", "votes", "wsum", "px")})
+                        ("c", "yaw", "ext", "rect", "votes", "wsum", "px",
+                         "cls", "share", "hue_med", "rel_sat_med")})
             hit["n"] = int(len(union))
 
         picked = []
         for pc in merged:
-            wsum = pc["wsum"]
-            cls = max(pc["votes"], key=pc["votes"].get) \
-                if wsum > 0 else "unknown"
-            share = (pc["votes"].get(cls, 0) / wsum) if wsum > 0 else 0.0
+            cls = pc.get("cls", "unknown")
+            share = float(pc.get("share", 0.0))
             if cls == "unknown" or share < PIECE_SHARE_MIN:
                 continue                     # 剩余像素身份不纯 ⇒ 丢（可见）
             picked.append(dict(pc, cls=cls, share=share))

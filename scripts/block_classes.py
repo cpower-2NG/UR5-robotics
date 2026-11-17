@@ -55,6 +55,7 @@ names 与这里对照，作为交付前的关卡。
 # 为什么限制：类别名会进 `data.yaml`、进 ROS 话题里的 `class_id` 字符串、
 # 进日志。带空格或逗号的类别名会把 `--class-names a,b,c` 这个最常用的
 # 传参形式直接切错，而症状是「类别数莫名其妙少了一个」。
+import math
 import re
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -192,6 +193,52 @@ MEASURED_HUE_DEG = {
     "cyan": 191.0,
     "purple": 308.0,
 }
+
+
+def hue_distance(a, b):
+    """两个色相（度）的环形距离，恒在 [0, 180]。"""
+    d = abs((float(a) - float(b)) % 360.0)
+    return min(d, 360.0 - d)
+
+
+# orange/tan 二义消除的 **2D 原型**（hue 中位, 相对饱和度中位；饱和度 =
+# rgb_to_hsv255 的 s，与投票门槛 s≥60 同定义）。
+#
+# 为什么需要（2026-11-17 真机 s1-3-att2）：tan 是低饱和米色，色相随光照/白平衡
+# 漂移最大——同一次摆位，11-16 晨读得 hue 28.6（= 表值，正确），11-17 晚读得
+# **23.1**（nearest = orange，2.6° < tan 的 5.4°）⇒ tan 被记成 orange，纯色相
+# 投票无解。而饱和度反而把两类分开得更远（tan 132→138，orange 215→250）：
+# 2D 最近原型在两次光照下都正确。
+# 原型取自 11-16 晨（读对的那轮）burst 实测（台账第 349 轮测量）。换光照/换
+# 相机/换批次块后必须用当次数据复核（同 SIM_HUE_DEG 的纪律）。
+ORANGE_TAN_PROTOS = {
+    "orange": (20.8, 215.0),
+    "tan": (28.6, 132.0),
+}
+#: 二义带（hue 中位落在这之间才走 2D 判；带外沿用纯色相投票——red 5–8、
+#: yellow 41–43 都在带外，不受影响）。
+ORANGE_TAN_BAND = (14.0, 32.0)
+
+
+def disambiguate_orange_tan(hue_med, rel_sat_med):
+    """orange/tan 二义消除：hue 中位落在二义带内 ⇒ 按 (hue, 相对饱和度) 的
+    2D 最近原型判；带外或饱和度缺失时返回 ``None``（调用方沿用原判）。
+
+    ``hue_med``/``rel_sat_med`` = 片段内 v>40 像素的色相/相对饱和度**中位**
+    （与投票同口径的量法）。只 orange/tan 二义使用——red(5–8)/yellow(41–43)
+    在带外，纯色相已足够。
+    """
+    if hue_med is None or rel_sat_med is None:
+        return None
+    lo, hi = ORANGE_TAN_BAND
+    if not (lo <= hue_med <= hi):
+        return None
+    best, best_d = None, None
+    for name, (ph, ps) in ORANGE_TAN_PROTOS.items():
+        d = math.hypot(float(hue_med) - ph, float(rel_sat_med) - ps)
+        if best_d is None or d < best_d:
+            best, best_d = name, d
+    return best
 
 
 def hue_distance(a, b):
