@@ -113,20 +113,28 @@ def main():
                    'class_share', 'votes', 'split_src', 'split_n',
                    'mixed_pair_unsplit', 'low')),
               str(sorted(rows[0])))
-        check('split_src = sam、low = False',
-              all(r['split_src'] == 'sam' and r['low'] is False
-                  for r in rows))
-    check('提示点被记录（预测器收到长轴两端）',
-          len(pred.calls) == 1 and len(pred.calls[0]) == 2,
-          str(pred.calls))
+        check('split_src ∈ {sam, grid+size}、low = False',
+              all(r['split_src'] in ('sam', 'grid+size')
+                  and r['low'] is False for r in rows),
+              [r['split_src'] for r in rows])
+    # 预拆路径（grid+size）可能在 SAM 之前就把对拆开了（合成块很小，
+    # 达不到 SAM 簇的 2×PIECE_MIN_PX 门）⇒ 调用可以为空；有调用时必是两端点。
+    check('SAM 调用（若有）每次收到长轴两端',
+          all(len(c) == 2 for c in pred.calls), str(pred.calls))
 
-    print('\n[3] 单掩码盖两块 ⇒ 混合票标记（build_truth 会丢）')
+    print('\n[3] 单掩码盖两块 ⇒ 尺寸先验拆开（同色/异色同一路径）')
     fr = make_frame()
     pred = FakeSam([(30, 30, 100, VB + 5)])            # 一片盖两块
     rows, _ = sb.find_blocks_sam(fr, pred)
-    check('单片 ⇒ 1 行且 mixed_pair_unsplit = True',
-          len(rows) == 1 and rows[0]['mixed_pair_unsplit'] is True,
-          [(r['class'], r['mixed_pair_unsplit']) for r in rows])
+    # 2026-11-17：单片盖两块不再只靠「混合票 ⇒ 丢」；先按外接矩形长边/块边
+    # 做尺寸先验几何拆分（S2:1 同色对真机数据点），拆不动才保留混合票。
+    check('单片盖两块 ⇒ 尺寸先验拆成两行、身份 orange/tan',
+          len(rows) == 2
+          and {r['class'] for r in rows} == {'orange', 'tan'},
+          [(r['class'], r['split_src']) for r in rows])
+    check('拆分来源 = grid+size / sam+size',
+          all(r['split_src'] in ('grid+size', 'sam+size') for r in rows),
+          [r['split_src'] for r in rows])
 
     print('\n[4] 预测器无掩码 ⇒ 回退网格行（fail-closed 同现状）')
     fr = make_frame()
@@ -176,6 +184,39 @@ def main():
               str(e))
     except Exception as e:                            # noqa: BLE001
         check('seg=bogus ⇒ ValueError', False, repr(e))
+
+    print('\n[8] 同色贴合对的尺寸先验拆分（S2:1 真机数据点）')
+
+    def _pair_piece(n=30, shift=0.0295):
+        xs = np.linspace(-0.01475, 0.01475, n)
+        ys = np.linspace(-0.01475, 0.01475, n)
+        gx, gy = np.meshgrid(xs, ys)
+        base = np.column_stack([gx.ravel(), gy.ravel(),
+                                np.full(gx.size, 0.03)])
+        second = base.copy()
+        second[:, 0] += shift
+        Pb = np.vstack([base, second]) if shift else base
+        W, H = 200, 200
+        pix = np.array([(i % W, i // W) for i in range(len(Pb))], int)
+        color = np.zeros((H, W, 3), np.uint8)
+        color[..., 0], color[..., 1], color[..., 2] = 200, 20, 20  # red
+        rect = sb.gc.min_area_rect_2d(Pb[:, :2])
+        return {"idx": np.arange(len(Pb)), "rect": rect}, Pb, pix, color
+
+    pc, Pb, pix, color = _pair_piece()
+    pieces = sb.split_same_colour_piece(pc, Pb, pix, color)
+    check('同色贴合对（29.5×59 mm 顶面）⇒ 拆成两片', len(pieces) == 2,
+          [p.get('n') for p in pieces])
+    if len(pieces) == 2:
+        d = math.hypot(pieces[0]['c'][0] - pieces[1]['c'][0],
+                       pieces[0]['c'][1] - pieces[1]['c'][1]) * 1000.0
+        check('两片中心距 ≈ 块边（29.5 mm）', abs(d - 29.5) <= 2.0,
+              round(d, 2))
+        check('两片身份都是 red', all(p.get('cls') == 'red' for p in pieces),
+              [p.get('cls') for p in pieces])
+    pc1, Pb1, pix1, color1 = _pair_piece(shift=0.0)
+    check('单块（29.5×29.5）⇒ 原样一片（不硬切）',
+          len(sb.split_same_colour_piece(pc1, Pb1, pix1, color1)) == 1)
 
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:

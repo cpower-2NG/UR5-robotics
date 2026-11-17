@@ -154,6 +154,118 @@ def mixed_votes(votes, wsum):
     return len(top2) == 2 and wsum > 0 and top2[1] / wsum >= 0.25
 
 
+def split_same_colour_piece(pc, Pb, pix, color, block_size=0.0295):
+    """同色贴合对的**尺寸先验几何拆分**（S2:1 实证：SAM 把两块同色盖成一整片）。
+
+    颜色拆不了同色对（契约 §2；E6 的 S2 帧两块红并排 = 29.9 × 59.2 mm），只能按
+    外接矩形「长边 / 块边 ≈ 整数、短边 ≈ 块边」切（复用 ``gc.split_top_face``，
+    与网格链同一实现）。SAM 主路径原只靠掩码层级 + 同块合并：掩码把贴合对盖成
+    一片时，纯色票面会把它当成一块（``mixed_pair_unsplit`` 只抓**双类**混合，
+    同色不触发）⇒ 6→5 块、编排器 fail-closed（2026-11-17 S2:1 实测）。
+
+    拆不动就原样返回，绝不硬切。返回新的 piece 列表；单片 ⇒ ``[pc]``。
+    """
+    F = Pb[pc["idx"]]
+    # 短边门 22% → 35%：同色对的顶面掩码在真机上会被侵蚀（S2:1 实测
+    # 50×21，短边差 2 mm；E6 原帧 29.9×59.2 不侵蚀）。单块仍由「长边/块边
+    # < 1.5 ⇒ 不切」挡住假拆（split_top_face 的 long_ok k≥2）。
+    subs = gc.split_top_face(F, pc["rect"], block_mm=block_size * 1000.0,
+                             tol=0.35)
+    if len(subs) <= 1:
+        return [pc]
+    out = []
+    for sub in subs:
+        idx = pc["idx"][sub]
+        if len(idx) < PIECE_MIN_PX:
+            return [pc]              # 有一片太小 ⇒ 是噪声，不切
+        st = piece_stats(idx, Pb, pix, color)
+        out.append(dict(st, idx=idx, px=pix[idx], n=int(len(idx)),
+                        split_src="sam+size"))
+    return out
+
+
+def _rec_from_piece(pc, row, frame, color, pix, split_src, split_n, split_i,
+                    return_masks):
+    """一个 piece → 行（与 SAM 主路径同 schema；回退行的拆分复用）。"""
+    med_rgb = np.median(color[pix[pc["idx"], 1], pix[pc["idx"], 0]], axis=0)
+    rec = dict(row)
+    rec.update({
+        "cx": round(float(pc["c"][0]) * 1000, 4),
+        "cy": round(float(pc["c"][1]) * 1000, 4),
+        "uv": base_to_uv(pc["c"][0], pc["c"][1],
+                         float(row["top"]) / 1000.0, frame),
+        "ext": [round(float(v), 1) for v in pc["ext"]],
+        "yaw": round(float(pc["yaw"]), 2), "n": pc["n"],
+        "yaw_rect": round(float(pc["rect"]["yaw_deg"]), 2),
+        "ext_rect": [round(float(v), 1) for v in pc["rect"]["ext_mm"]],
+        "rect_fill": round(float(pc["rect"]["fill"]), 3),
+        "yaw_trusted": bool(float(pc["rect"]["fill"]) >= 0.85),
+        "rgb": [round(float(v)) for v in med_rgb],
+        "hsv": [round(float(v), 1) for v in gc.rgb_to_hsv255(med_rgb)],
+        "class": pc["cls"], "class_share": round(float(pc["share"]), 3),
+        "votes": {k: int(v) for k, v in pc["votes"].items()},
+        "cells": pc["n"],
+        "split_n": split_n, "split_i": split_i, "split_src": split_src,
+        "pair_clamp_from_mm": None,
+        "mixed_pair_unsplit": (split_n == 1
+                               and mixed_votes(pc["votes"], pc["wsum"])),
+    })
+    if return_masks:
+        rec["mask_uv"] = pix[pc["idx"]].astype(np.int32)
+    return rec
+
+
+def pre_split_size_rows(row, Pb, pix, pix_map, color, frame,
+                        block_size=0.0295):
+    """**SAM 之前**的几何预拆（尺寸先验、颜色无关）。
+
+    S2:1 实测：同色 red 对的 SAM 掩码只剩 49.5×21.6 的残片（短边差 1.4 mm，
+    事后尺寸先验过不了 22% 门）；合并证据在网格行里（63.7×31.2）。所以在
+    掩码/回退之前先按外接矩形长边/块边≈整数把簇拆开，SAM 再逐片清身份
+    （与 E6/S2 的 size prior 同源）。拆不动原样返回。子行带 ``mask_uv``（SAM 用）。
+    """
+    muv = row.get("mask_uv")
+    if muv is None or len(muv) < 2 * PIECE_MIN_PX:
+        return [row]
+    idx = pix_map[muv[:, 1], muv[:, 0]]
+    idx = idx[idx >= 0]
+    if len(idx) < 2 * PIECE_MIN_PX:
+        return [row]
+    pc = {"idx": idx, "rect": gc.min_area_rect_2d(Pb[idx][:, :2])}
+    pieces = split_same_colour_piece(pc, Pb, pix, color, block_size)
+    if len(pieces) <= 1:
+        return [row]
+    return [_rec_from_piece(p, row, frame, color, pix, "grid+size",
+                            len(pieces), i, True)
+            for i, p in enumerate(pieces)]
+
+
+def split_grid_fallback_row(row, Pb, pix, pix_map, color, frame,
+                            return_masks=False):
+    """**网格回退行**也过尺寸先验（同色贴合对 SAM 没盖住时的缺口）。
+
+    S2:1 实测：红对同时产出一行 SAM 片（49.5×21.6，短边差 1.4 mm 没过 22%
+    门）和一行**网格回退**（63.7×31.2，从未拆）——两行在共识里被 20 mm 并簇。
+    回退行同样按 ``gc.split_top_face`` 拆；拆不动原样返回。
+    """
+    if row.get("low"):
+        return [row]
+    muv = row.get("mask_uv")
+    if muv is None or len(muv) < 2 * PIECE_MIN_PX:
+        return [row]
+    idx = pix_map[muv[:, 1], muv[:, 0]]
+    idx = idx[idx >= 0]
+    if len(idx) < 2 * PIECE_MIN_PX:
+        return [row]
+    pc = {"idx": idx, "rect": gc.min_area_rect_2d(Pb[idx][:, :2])}
+    pieces = split_same_colour_piece(pc, Pb, pix, color)
+    if len(pieces) <= 1:
+        return [row]
+    return [_rec_from_piece(p, row, frame, color, pix, "grid+size",
+                            len(pieces), i, return_masks)
+            for i, p in enumerate(pieces)]
+
+
 def clamp_pairs(rows, cam, block_size=0.0295):
     """贴合对钳制（与色相无关；至多一对取最小距，钳前快照上判）。
 
@@ -208,15 +320,24 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
     pix_map[pix[:, 1], pix[:, 0]] = np.arange(len(pix))
     image_path = frame.get("image_path") or _frame_image(frame)
 
-    out = []
+    rows_in = []
     for row in grid_rows:
+        if row.get("low"):
+            rows_in.append(row)
+            continue
+        # SAM 之前的几何预拆（同色贴合对）：见 pre_split_size_rows 的实证。
+        rows_in.extend(pre_split_size_rows(row, Pb, pix, pix_map, color, frame))
+
+    out = []
+    for row in rows_in:
         if row.get("low"):
             out.append(row)
             continue
         muv = row.get("mask_uv")
         if muv is None or len(muv) < 2 * PIECE_MIN_PX:
             row["sam_fallback"] = "no_mask_uv_or_too_small"
-            out.append(row)
+            out.extend(split_grid_fallback_row(row, Pb, pix, pix_map, color,
+                                               frame, return_masks))
             continue
 
         prompts = discover_prompts(row, frame)
@@ -224,7 +345,8 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
         muv = row["mask_uv"]
         if masks is None or len(masks) == 0:
             row["sam_fallback"] = "no_masks"
-            out.append(row)
+            out.extend(split_grid_fallback_row(row, Pb, pix, pix_map, color,
+                                               frame, return_masks))
             continue
 
         # ── 掩码层级处理（SAM 常给「部分-整体」层级：小掩码贴单块、大掩码
@@ -269,6 +391,13 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
                          "cls", "share", "hue_med", "rel_sat_med")})
             hit["n"] = int(len(union))
 
+        # ── 同色贴合对的尺寸先验拆分（SAM 掩码把两块同色盖成一整片；S2:1
+        #    实测：纯 red 票面被当成一块 ⇒ 6→5 块 fail-closed）。拆不动原样保留。
+        merged2 = []
+        for pc in merged:
+            merged2.extend(split_same_colour_piece(pc, Pb, pix, color))
+        merged = merged2
+
         picked = []
         for pc in merged:
             cls = pc.get("cls", "unknown")
@@ -281,7 +410,8 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
         if not picked or covered < COVER_MIN * len(muv):
             row["sam_fallback"] = "cover=%.2f pieces=%d" % (
                 covered / max(1, len(muv)), len(picked))
-            out.append(row)
+            out.extend(split_grid_fallback_row(row, Pb, pix, pix_map, color,
+                                               frame, return_masks))
             continue
 
         for pi, pc in enumerate(picked):
@@ -311,7 +441,8 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
                 "cells": pc["n"],
                 "low": False,
                 "split_n": len(picked), "split_i": pi,
-                "split_src": "sam",
+                "split_src": (pc.get("split_src") or row.get("split_src")
+                              or "sam"),
                 "parent_ext_rect": list(row.get("ext_rect", [0.0, 0.0])),
                 "pair_clamp_from_mm": None,
                 "mixed_pair_unsplit": (len(picked) == 1
