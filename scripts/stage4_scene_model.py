@@ -354,6 +354,34 @@ def grasp_candidates(block, table_top_z=0.0, grasp_depth=GRASP_DEPTH):
     return out
 
 
+def pick_best_hit(ok_rows, vertical_only=True):
+    """从「已过 SAT / IK / 有效性」的候选行里选最终抓手。
+
+    2026-11-17（s1-4 真机空夹/别住）：E9 原来**命中即停**——候选按
+    (prefer_closing, axis, -sign, closing, variant) 排序，贴合对里 partner
+    间隙只有 **1.6 mm** 的 closing 0 先过就胜出；物理抓取时手指贴着/别住邻块，
+    空夹回读 3.2 mm。竖直 4 候选全测后，改按**离其他块的最小间隙**取最大
+    （行里的 ``per_other`` 最小值；没有就用 ``gap_others_mm``），平手才回落到
+    传入顺序（即原排序，含 ``prefer_closing``）。这是「**选支口径**」的修正，
+    不放过任何碰撞判据：所有候选照样逐条过 SAT/IK/状态有效性。
+
+    ``vertical_only=False``（E7 全 24 候选）保持「命中即停」的原语义。
+    """
+    if not ok_rows:
+        return None
+    if vertical_only and len(ok_rows) > 1:
+        def _room(r):
+            g = r.get("per_other") or {}
+            vals = [float(v) for v in g.values() if v is not None]
+            if vals:
+                return min(vals)
+            if r.get("gap_others_mm") is not None:
+                return float(r["gap_others_mm"])
+            return float("inf")
+        return max(ok_rows, key=_room)     # max 取第一个最大值 ⇒ 平手回原序
+    return ok_rows[0]
+
+
 def fingertip(base_pose, q=0.0):
     """两指尖外沿的连线中点（tool0 系 z=tip_z），闭合时为一点。
 

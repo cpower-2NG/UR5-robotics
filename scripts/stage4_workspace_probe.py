@@ -187,11 +187,15 @@ def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
     在这套几何下没有额外信息量，清障规划不把它当前提）。
     ``other_names`` 透传给 :func:`evaluate_candidate`，给 E9 做遮挡归因。
 
-    ``prefer_closing``（0/1）：把该合拢轴的候选排到最前 —— 因为「命中即停」，
-    排序就是选择。E9 用它让目标块按**不挡俯视视线**的朝向被抓（2026-11-10）：
-    块是 29.5 mm 立方，两个合拢轴在夹持几何上等价，但夹爪绕 z 差 90° ⇒ 俯视
-    看到的指位完全不同。**注意这只改顺序不改判据**：偏好的候选照样要过 SAT +
-    IK + 状态有效性，过不了会回落到其它候选并由 ``hit`` 如实报出。
+    ``prefer_closing``（0/1）：把该合拢轴的候选排到最前。E9 用它让目标块按
+    **不挡俯视视线**的朝向被抓（2026-11-10）：块是 29.5 mm 立方，两个合拢轴在
+    夹持几何上等价，但夹爪绕 z 差 90° ⇒ 俯视看到的指位完全不同。**这只改排序
+    不改判据**：偏好的候选照样要过 SAT + IK + 状态有效性。
+
+    **选择口径（2026-11-17）**：``vertical_only``（E9）下 4 个竖直候选全测，
+    再按离其他块的最小间隙取最大（``sm.pick_best_hit``）；贴合对里「手指贴着
+    partner」的候选不再因为排序靠前而胜出（s1-4 空夹/别住实证）。平手才回落到
+    上面的排序；E7 的 24 候选仍是命中即停。
     """
     cands = sm.grasp_candidates(block_truth, mp.TABLE_TOP)
     if vertical_only:
@@ -202,11 +206,14 @@ def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
                               c["closing"], c["variant"]))
     reasons = {}
     rows = []
+    ok_rows = []
     b_ok = c_ok = False
-    hit = None
     n_eval = 0
     for cand in cands:
-        if c_ok and not full_scan:
+        # E9 竖直 4 候选**全测**再选（贴合对要按离邻块的间隙挑，不能命中即停；
+        # 2026-11-17 s1-4 空夹/别住：closing 0 的 partner 间隙 1.6 mm 先过就
+        # 胜出，物理手指贴住邻块）。E7 的 24 候选仍保持命中即停。
+        if c_ok and not full_scan and not vertical_only:
             break
         n_eval += 1
         verdict, detail = evaluate_candidate(
@@ -222,12 +229,12 @@ def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
             c_ok = True
             if cand["vertical"]:
                 b_ok = True
-            if hit is None:
-                hit = row
+            ok_rows.append(row)
             sol = detail["sol"]
             if not any(mp.same_joints(g, sol) for g in pool):
                 pool.insert(0, sol)
                 del pool[GOOD_SEED_CAP:]
+    hit = sm.pick_best_hit(ok_rows, vertical_only=vertical_only)
     return {"b_ok": b_ok, "c_ok": c_ok, "n_eval": n_eval,
             "n_total": len(cands), "hit": hit, "reasons": reasons,
             "rows": rows}

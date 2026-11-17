@@ -495,6 +495,31 @@ def section_mutation():
           'bad_z=%s' % np.round(bad_z, 3))
 
 
+def section_best_hit():
+    print('\n-- 抓取候选选择：竖直 4 候选按离邻块间隙取最大（2026-11-17）')
+    # 贴合对真机实证：closing 0 的 partner 间隙 1.6 mm（空夹/别住），
+    # closing 1 的 20 mm —— 必须选后者。
+    near = {"axis": 2, "sign": -1, "closing": 0, "variant": 0,
+            "per_other": {"1": 0.0016, "2": 0.05}}
+    far = {"axis": 2, "sign": -1, "closing": 1, "variant": 0,
+           "per_other": {"1": 0.020, "2": 0.05}}
+    check('间隙大的候选胜出（不再选贴 partner 的 closing）',
+          sm.pick_best_hit([near, far], vertical_only=True) is far)
+    check('单候选原样返回',
+          sm.pick_best_hit([near], vertical_only=True) is near)
+    check('空表 ⇒ None', sm.pick_best_hit([]) is None)
+    a = {"closing": 0, "gap_others_mm": 0.002}
+    b = {"closing": 1, "gap_others_mm": 0.030}
+    check('无 per_other ⇒ 用 gap_others_mm',
+          sm.pick_best_hit([a, b], vertical_only=True) is b)
+    check('vertical_only=False（E7 24 候选）⇒ 保持原序',
+          sm.pick_best_hit([near, far], vertical_only=False) is near)
+    t1 = {"closing": 0, "per_other": {"1": 0.02}}
+    t2 = {"closing": 1, "per_other": {"1": 0.02}}
+    check('间隙平手 ⇒ 回落到传入顺序（prefer_closing 仍生效）',
+          sm.pick_best_hit([t1, t2], vertical_only=True) is t1)
+
+
 def main():
     print('=' * 68)
     section_quat()
@@ -507,6 +532,7 @@ def main():
     section_gripper()
     section_mat_quat()
     section_grasp()
+    section_best_hit()
     section_urdf_sync()
     section_mutation()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
