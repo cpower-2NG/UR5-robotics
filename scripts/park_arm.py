@@ -204,8 +204,12 @@ def main(argv=None):
                 'print(d.get("play_at",""), int(float(d.get("expires",0))'
                 '-time.time()))\'')
         parts = (c.stdout or "").split()
+        # 只认**本次**新令牌：play_at 变化 + 未过期。**不要**再写上界——旧
+        # 600 s TTL 时代的 ``<= 600`` 会在 v0.8 的 900 s TTL 下把刚按出来的
+        # 新令牌（剩 ~899 s）当成「太新」拒掉，白等倒计时到 600 s（2026-11-17
+        # 实测：用户按了 PLAY 却以为没生效）。
         if len(parts) == 2 and parts[0] and parts[0] != old_play \
-                and parts[1].lstrip("-").isdigit() and 0 < int(parts[1]) <= 600:
+                and parts[1].lstrip("-").isdigit() and 0 < int(parts[1]):
             print("   本次新令牌就绪（剩 %s s）—— 执行" % parts[1])
             break
         time.sleep(3)
