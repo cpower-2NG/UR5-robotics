@@ -456,6 +456,13 @@ def consensus(truths, radius_m=0.020, min_frames=None):
         for b in t["blocks"]:
             best, best_d = None, None
             for c in clusters:
+                # 同一帧的两块不可能属于**同一个物理块**：一块在一帧里只出现
+                # 一次。同色贴合对拆开的两片是两块；没拆开时是一片、只算一块。
+                # 不禁止的话，未拆帧的「中点片」会把两侧拆分片串成一簇——
+                # 2026-11-18 S2:5-att2 实测：yellow 对 7/10 帧拆开、3 帧并片，
+                # 20 mm 漂移中心把 17 片聚成 1 块 ⇒ 布局 6、实测 5，fail-closed。
+                if fi in c["frames"]:
+                    continue
                 cx = _median([p["x"] for p in c["pts"]])
                 cy = _median([p["y"] for p in c["pts"]])
                 cz = _median([p["z"] for p in c["pts"]])

@@ -687,6 +687,42 @@ def section_image_center_switch():
 
 
 
+
+def section_consensus_one_block_per_frame():
+    """同一帧的两片不进同一簇（2026-11-18 S2:5-att2 实证）。"""
+    print('\n[24] 共识：一帧两片不并簇（同色贴合对拆/不拆混合）')
+    import math
+
+    def blk(x, y, color='yellow'):
+        return {'x': x, 'y': y, 'z': 0.01475, 'size': 0.0295,
+                'top': 0.0295, 'layer': 0, 'color': color, 'yaw': 0.0,
+                'meas': {'from': 'measured_top_face',
+                         'yaw_source': 'colour_rect', 'h_mm': 29.5}}
+    truths = []
+    for _ in range(10):
+        truths.append({'batch': 'S2', 'index': 1, 'block_size_m': 0.0295,
+                       'table_top_m': 0.0,
+                       'zone_m': [0.25, 0.575, 0.17, 0.42],
+                       'n_frames': 10, 'source': 'test', 'blocks': []})
+    for i, t in enumerate(truths):
+        if i in (0, 1, 6):                     # 未拆帧：中点一片
+            t['blocks'] = [blk(0.480, 0.280)]
+        else:                                  # 拆开帧：两片，相距 29 mm
+            t['blocks'] = [blk(0.480, 0.2655), blk(0.480, 0.2945)]
+    doc = tf.consensus(truths, radius_m=0.020, min_frames=5)
+    ys = [b for b in doc['blocks'] if b['color'] == 'yellow']
+    check('两块 yellow 都留下（中点片不串簇）', len(ys) == 2,
+          [(b['color'], round(b['y'] * 1000, 1)) for b in doc['blocks']])
+    if len(ys) == 2:
+        d = math.hypot(ys[0]['x'] - ys[1]['x'], ys[0]['y'] - ys[1]['y'])
+        check('两簇距离 ≈29.5（贴合对钳制后）',
+              abs(d * 1000.0 - 29.5) < 0.5, round(d * 1000, 2))
+        check('两簇都过 min_frames（≥5 帧）',
+              all(b['meas']['n_frames'] >= 5 for b in ys),
+              [b['meas']['n_frames'] for b in ys])
+
+
+
 def main():
     section_ray_plane()
     section_depth_immunity()
@@ -699,6 +735,7 @@ def main():
     section_consensus_parallel()
     section_consensus_pair_clamp()
     section_image_center_switch()
+    section_consensus_one_block_per_frame()
     section_layers()
     section_colour_yaw()
     section_consensus_yaw()
