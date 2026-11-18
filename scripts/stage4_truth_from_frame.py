@@ -191,6 +191,21 @@ def colour_yaw_rows(frame, rows):
     return n_ok, n
 
 
+def _row_img_xy(r):
+    """行 → 图像块心 ``(x_mm, y_mm)``；没有合格读数返回 None。
+
+    ``sam_blocks`` 行写 ``img_cx/img_cy``；真值/测试夹具也可能直接给
+    ``img_xy_mm`` —— 两种都认。
+    """
+    if not r.get("img_ok"):
+        return None
+    if r.get("img_xy_mm"):
+        return float(r["img_xy_mm"][0]), float(r["img_xy_mm"][1])
+    if r.get("img_cx") is not None and r.get("img_cy") is not None:
+        return float(r["img_cx"]), float(r["img_cy"])
+    return None
+
+
 def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                 batch="REAL", index=0, keep_outside=False,
                 drop_unknown=True, min_class_share=0.0, layers=True,
@@ -242,8 +257,17 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                                 if layers else (1, None))
         # 顶层顶面 = table_top + n·size；射线 ∩ 的就是这个平面
         plane_z = float(table_top) + n_layers * size
-        xy = ray_plane_xy(r["uv"], cam["K"], cam["R_bc"], cam["t_bc"],
-                          plane_z)
+        # 块心来源（2026-11-18 用户拍板「先切再跑」）：图像空间读数为准，
+        # 没有合格读数（弱边/贴界 fail-closed）才逐块退回深度射线∩平面。
+        # 深度值仍记在 meas.depth_xy_mm，便于对账。
+        img_xy = _row_img_xy(r)
+        if img_xy:
+            xy = (img_xy[0] / 1000.0, img_xy[1] / 1000.0)
+            center_source = "image"
+        else:
+            xy = ray_plane_xy(r["uv"], cam["K"], cam["R_bc"], cam["t_bc"],
+                              plane_z)
+            center_source = "depth_fallback"
         if xy is None:
             continue                      # 射线打不到平面上：不是块
         if not keep_outside and not in_zone_xy(xy[0], xy[1], zone_m):
@@ -268,6 +292,7 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
             if k == n_layers:                     # 顶层：实测的那个
                 entry["meas"] = {
                     "from": "measured_top_face",
+                    "center_source": center_source,
                     "h_mm": round(h_mm, 2),
                     "uv": r.get("uv"),
                     "depth_xy_mm": [round(float(r["cx"]), 1),
@@ -287,12 +312,12 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                 # 图像空间块心（只记录；2026-11-18 块心精度，见
                 # sam_blocks.attach_image_centers）。规划中心仍是 x/y。
                 if r.get("img_ok") is not None or r.get("img_why"):
-                    entry["meas"]["img_ok"] = bool(r.get("img_ok"))
+                    _ixy = _row_img_xy(r)
+                    entry["meas"]["img_ok"] = bool(_ixy is not None)
                     entry["meas"]["img_why"] = r.get("img_why")
-                    if r.get("img_ok"):
+                    if _ixy:
                         entry["meas"]["img_xy_mm"] = [
-                            round(float(r["img_cx"]), 2),
-                            round(float(r["img_cy"]), 2)]
+                            round(_ixy[0], 2), round(_ixy[1], 2)]
                         entry["meas"]["img_shift_mm"] = r.get("img_shift_mm")
                         entry["meas"]["img_support"] = r.get("img_support")
                 if abs(h_mm - n_layers * size * 1000.0) > 6.0:
@@ -482,7 +507,12 @@ def consensus(truths, radius_m=0.020, min_frames=None):
         imgs = [(float(p["meas"]["img_xy_mm"][0]),
                  float(p["meas"]["img_xy_mm"][1]))
                 for p in pts if p["meas"].get("img_xy_mm")]
-        img_meas = {"img_frames": len(imgs)}
+        csrc = {}
+        for p in pts:
+            s = p["meas"].get("center_source")
+            if s:
+                csrc[s] = csrc.get(s, 0) + 1
+        img_meas = {"img_frames": len(imgs), "center_sources": csrc}
         if imgs:
             img_meas["img_xy_mm"] = [
                 round(_median([v[0] for v in imgs]), 2),

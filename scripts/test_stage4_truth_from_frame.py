@@ -650,6 +650,43 @@ def section_consensus_pair_clamp():
     check('远离的第三块不动', abs(red['x'] - 0.6) < 1e-9, red['x'])
 
 
+
+def section_image_center_switch():
+    """块心来源（2026-11-18 用户拍板「先切再跑」）：图像优先、失败退回深度。"""
+    print('\n[23] 块心来源：图像优先 / 深度兜底')
+    base = row(0, uv=(355.0, 275.0), cx=400.0, cy=300.0)
+    depth_only = tf.build_truth([dict(base)], CAM)["blocks"][0]
+    r_img = dict(base)
+    r_img.update({"img_ok": True, "img_xy_mm": [405.0, 310.0]})
+    img = tf.build_truth([r_img], CAM)["blocks"][0]
+    check('有图像读数 ⇒ x/y 用图像值（mm→m）',
+          abs(img["x"] - 0.405) < 1e-9 and abs(img["y"] - 0.310) < 1e-9,
+          (img["x"], img["y"]))
+    check('center_source=image', img["meas"]["center_source"] == "image",
+          img["meas"].get("center_source"))
+    check('深度值仍记在 depth_xy_mm',
+          abs(img["meas"]["depth_xy_mm"][0] - 400.0) < 1e-6
+          and abs(img["meas"]["depth_xy_mm"][1] - 300.0) < 1e-6,
+          img["meas"].get("depth_xy_mm"))
+    check('图像值与深度值确实不同（不是同一条射线）',
+          abs(img["x"] - depth_only["x"]) > 1e-6, (img["x"],
+                                                    depth_only["x"]))
+    r_bad = dict(base)
+    r_bad.update({"img_ok": False, "img_why": "weak edge"})
+    fallback = tf.build_truth([r_bad], CAM)["blocks"][0]
+    check('图像失败 ⇒ 退回深度射线∩平面',
+          abs(fallback["x"] - depth_only["x"]) < 1e-12
+          and abs(fallback["y"] - depth_only["y"]) < 1e-12,
+          (fallback["x"], fallback["y"]))
+    check('center_source=depth_fallback',
+          fallback["meas"]["center_source"] == "depth_fallback",
+          fallback["meas"].get("center_source"))
+    check('没有 img 字段的旧行也走深度',
+          depth_only["meas"].get("center_source") == "depth_fallback",
+          depth_only["meas"].get("center_source"))
+
+
+
 def main():
     section_ray_plane()
     section_depth_immunity()
@@ -661,6 +698,7 @@ def main():
     section_consensus()
     section_consensus_parallel()
     section_consensus_pair_clamp()
+    section_image_center_switch()
     section_layers()
     section_colour_yaw()
     section_consensus_yaw()
