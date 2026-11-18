@@ -45,8 +45,11 @@ PIECE_IOU_MAX = 0.3
 PIECE_SHARE_MIN = 0.6
 #: SAM 覆盖率下限（低于则该簇回退网格行）
 COVER_MIN = 0.7
-#: 贴合对带（块边比例；与 stage4_layouts 的贴合带同族口径）
-PAIR_LO, PAIR_HI = 0.55, 0.95
+#: 贴合对带（块边比例；上界与 stage4_layouts 的接触带 1.02 对齐）。
+#: 2026-11-18 S2:5 实证：yellow 对实测 28.7 mm（0.973×块边）落在旧上界
+#: 0.95（28.0）窗外 ⇒ 没钳回 29.5，两块中心各偏 ~0.4 mm；抓取偏心把
+#: partner 一起带起。下界保留 0.55（测量侧拆分片可以比标称贴得更近）。
+PAIR_LO, PAIR_HI = 0.55, 1.02
 
 
 # ---------------------------------------------------------------- 模型加载
@@ -102,7 +105,12 @@ def discover_prompts(row, cam):
 
 
 def piece_stats(idx, Pb, pix, color):
-    """一片顶面像素（``Pb`` 下标）→ 身份/票 + (质心 base xy, PCA yaw, ext, rect)。
+    """一片顶面像素（``Pb`` 下标）→ 身份/票 + (块心 base xy, PCA yaw, ext, rect)。
+
+    块心 = **方框中心**（``rect.center_mm``，分位裁剪边界的中点）；点云均值
+    保留为 ``c_centroid``（只做对照/回归）。2026-11-18 S2:5 实证：均值对
+    单侧缺边/贴合接触边敏感（yellow 对各向对方偏 ~0.4 mm）；方框中心由四条
+    边的 2–98% 分位边界定，块心精度主要靠这一项（用户要求的块心准出闸门）。
 
     身份 = 掩码内色相投票（饱和度加权），**外加 orange/tan 二义的 2D 消除**
     （``bc.disambiguate_orange_tan``：低饱和米色的 tan 在光照/白平衡变化下
@@ -110,12 +118,15 @@ def piece_stats(idx, Pb, pix, color):
     中位反而把两类分得更开）。返回 ``cls``/``share`` 已按二义结果修正。
     """
     F = Pb[idx]
-    c = F[:, :2].mean(0)
-    d = F[:, :2] - c
+    c_centroid = F[:, :2].mean(0)
+    d = F[:, :2] - c_centroid
     _, evecs = np.linalg.eigh(d.T @ d / max(1, len(d)))
     yaw = float(np.degrees(np.arctan2(evecs[1, -1], evecs[0, -1])))
     ext = (d @ evecs).max(0) - (d @ evecs).min(0)
     rect = gc.min_area_rect_2d(F[:, :2])
+    # 块心 = 方框中心（mm → m）；退化（点数不足/中心缺失）回落到点云均值。
+    _cc = rect.get("center_mm")
+    c = (np.asarray(_cc, float) / 1000.0) if _cc else c_centroid
     px = color[pix[idx, 1], pix[idx, 0]].astype(float)
     votes, wsum = {}, 0.0
     hue_samples, sat_samples = [], []
@@ -140,7 +151,8 @@ def piece_stats(idx, Pb, pix, color):
             votes[fixed] = votes.get(fixed, 0.0) + votes.pop(cls)
             cls = fixed
     share = (votes.get(cls, 0.0) / wsum) if wsum > 0 else 0.0
-    return {"c": c, "yaw": yaw, "ext": ext, "rect": rect,
+    return {"c": c, "c_centroid": c_centroid,
+            "yaw": yaw, "ext": ext, "rect": rect,
             "votes": votes, "wsum": wsum, "px": px,
             "cls": cls, "share": round(share, 3),
             "hue_med": None if hue_med is None else round(hue_med, 1),
@@ -192,6 +204,8 @@ def _rec_from_piece(pc, row, frame, color, pix, split_src, split_n, split_i,
     rec.update({
         "cx": round(float(pc["c"][0]) * 1000, 4),
         "cy": round(float(pc["c"][1]) * 1000, 4),
+        "cx_centroid": round(float(pc["c_centroid"][0]) * 1000, 4),
+        "cy_centroid": round(float(pc["c_centroid"][1]) * 1000, 4),
         "uv": base_to_uv(pc["c"][0], pc["c"][1],
                          float(row["top"]) / 1000.0, frame),
         "ext": [round(float(v), 1) for v in pc["ext"]],
@@ -303,6 +317,46 @@ def _iou_idx(ia, ib):
     return inter / max(1, len(sa | sb))
 
 
+def attach_image_centers(rows, frame, block_size_m=0.0295, grad=None):
+    """给每行补一个**图像空间块心**（只记录，不改 ``cx/cy`` —— 2026-11-18）。
+
+    为什么：深度链的块心是「顶面深度点」的方框中心；S2:5 实测顶面点集只
+    有 18–25 mm 见方（真值 29.5），方框中心被**单侧缺边**（可见侧面方向）
+    拉偏 1–3.5 mm（6 块里 5 块同向，4× 放大目视可辨）。图像拟合只看彩色
+    顶面边线，是独立的第二读数（``stage4_image_center.refine_center``）。
+    规划中心暂不切换 —— 先累计真机数据、过人眼准出闸门（队列条目）。
+
+    记录字段：``img_ok`` / ``img_cx`` / ``img_cy`` / ``img_yaw`` /
+    ``img_shift_mm`` / ``img_support`` / ``img_why``。失败（弱边/贴搜索
+    边界）也留 ``img_ok=False`` 与原因，别静默丢。
+    """
+    cand = [r for r in (rows or [])
+            if not r.get("low")
+            and r.get("class") not in (None, "unknown")
+            and r.get("top") is not None]
+    if not cand:
+        return rows
+    import stage4_image_center as ic
+    if grad is None:
+        grad = ic._color_gradient(frame["color"])
+    for r in cand:
+        ref = ic.refine_center(
+            None, frame["color"], frame["K"], frame["R_bc"], frame["t_bc"],
+            float(r["top"]) / 1000.0, block_size_m=block_size_m,
+            cx0_mm=float(r["cx"]), cy0_mm=float(r["cy"]),
+            yaw0_deg=float(r.get("yaw_rect") or r.get("yaw") or 0.0),
+            grad=grad)
+        r["img_ok"] = bool(ref.get("ok"))
+        r["img_why"] = ref.get("why") or ""
+        r["img_support"] = ref.get("support")
+        r["img_shift_mm"] = ref.get("shift_mm")
+        if ref.get("ok"):
+            r["img_cx"] = float(ref["x_mm"])
+            r["img_cy"] = float(ref["y_mm"])
+            r["img_yaw"] = float(ref["yaw_deg"])
+    return rows
+
+
 # ---------------------------------------------------------------- 主入口
 def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
                     max_h_mm=70.0):
@@ -387,8 +441,9 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
             union = np.concatenate([hit["idx"], pc["idx"]])
             rest = piece_stats(union, Pb, pix, color)
             hit.update({k: rest[k] for k in
-                        ("c", "yaw", "ext", "rect", "votes", "wsum", "px",
-                         "cls", "share", "hue_med", "rel_sat_med")})
+                        ("c", "c_centroid", "yaw", "ext", "rect", "votes",
+                         "wsum", "px", "cls", "share", "hue_med",
+                         "rel_sat_med")})
             hit["n"] = int(len(union))
 
         # ── 同色贴合对的尺寸先验拆分（SAM 掩码把两块同色盖成一整片；S2:1
@@ -423,6 +478,9 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
             rec = {
                 "cx": round(float(pc["c"][0]) * 1000, 4),
                 "cy": round(float(pc["c"][1]) * 1000, 4),
+                # 点云均值（只做块心精度对照；块心 cx/cy 已是方框中心）
+                "cx_centroid": round(float(pc["c_centroid"][0]) * 1000, 4),
+                "cy_centroid": round(float(pc["c_centroid"][1]) * 1000, 4),
                 "top": row["top"], "h": row["h"],
                 "uv": base_to_uv(pc["c"][0], pc["c"][1],
                                  float(row["top"]) / 1000.0, frame),
@@ -454,6 +512,7 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
             out.append(rec)
 
     clamp_pairs(out, frame)
+    attach_image_centers(out, frame)
     out.sort(key=lambda r: (r["cx"], r["cy"]))
     for i, r in enumerate(out):
         r["idx"] = i

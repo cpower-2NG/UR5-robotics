@@ -284,6 +284,17 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                 }
                 if r.get("yaw_note"):
                     entry["meas"]["yaw_note"] = r["yaw_note"]
+                # 图像空间块心（只记录；2026-11-18 块心精度，见
+                # sam_blocks.attach_image_centers）。规划中心仍是 x/y。
+                if r.get("img_ok") is not None or r.get("img_why"):
+                    entry["meas"]["img_ok"] = bool(r.get("img_ok"))
+                    entry["meas"]["img_why"] = r.get("img_why")
+                    if r.get("img_ok"):
+                        entry["meas"]["img_xy_mm"] = [
+                            round(float(r["img_cx"]), 2),
+                            round(float(r["img_cy"]), 2)]
+                        entry["meas"]["img_shift_mm"] = r.get("img_shift_mm")
+                        entry["meas"]["img_support"] = r.get("img_support")
                 if abs(h_mm - n_layers * size * 1000.0) > 6.0:
                     entry["warn_h_mm"] = round(
                         h_mm - n_layers * size * 1000.0, 2)
@@ -466,6 +477,19 @@ def consensus(truths, radius_m=0.020, min_frames=None):
         else:
             yaw = _yaw_square([v for v, _ in pairs])
             yaw_source = "depth_pca"
+        # 图像空间块心（只记录；2026-11-18）：跨帧取中位，附上与该块
+        # 深度方框中心（x/y）的差 —— 规划中心暂不切换（队列条目）。
+        imgs = [(float(p["meas"]["img_xy_mm"][0]),
+                 float(p["meas"]["img_xy_mm"][1]))
+                for p in pts if p["meas"].get("img_xy_mm")]
+        img_meas = {"img_frames": len(imgs)}
+        if imgs:
+            img_meas["img_xy_mm"] = [
+                round(_median([v[0] for v in imgs]), 2),
+                round(_median([v[1] for v in imgs]), 2)]
+            img_meas["img_minus_xy_mm"] = [
+                round(_median([v[0] for v in imgs]) - mx * 1000, 2),
+                round(_median([v[1] for v in imgs]) - my * 1000, 2)]
         blocks.append({
             "id": 0,
             "color": color,
@@ -486,8 +510,40 @@ def consensus(truths, radius_m=0.020, min_frames=None):
                      "y_spread_mm": round((max(ys) - min(ys)) * 1000, 2),
                      "colors": colors,
                      "h_mm_median": round(_median(
-                         [p["meas"].get("h_mm", 0.0) for p in pts]), 2)},
+                         [p["meas"].get("h_mm", 0.0) for p in pts]), 2),
+                     **img_meas},
         })
+    # 共识后的**贴合对再钳一次**：逐块的 x/y 各自取中位会把成对几何（距离/
+    # 朝向）揉掉——S2:5 实测逐帧 29.50 mm → 共识 29.22。这里只对「同层、最小
+    # 距、落在贴合带 0.55–1.02×块边」的那一对沿连线对称推开到块边，中点不动；
+    # 与 sam_blocks.clamp_pairs 同口径（2026-11-18 块心精度）。
+    if len(blocks) >= 2:
+        best = None
+        for i in range(len(blocks)):
+            for j in range(i + 1, len(blocks)):
+                a, b = blocks[i], blocks[j]
+                if int(a.get("layer", 0)) != int(b.get("layer", 0)):
+                    continue
+                d = math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+                side = float(a.get("size") or BLOCK_SIZE_M)
+                if 0.55 * side <= d <= 1.02 * side \
+                        and (best is None or d < best[0]):
+                    best = (d, a, b, side)
+        if best is not None:
+            d, a, b, side = best
+            ux, uy = (b["x"] - a["x"]) / d, (b["y"] - a["y"]) / d
+            push = (side - d) / 2.0
+            for blk, sign in ((a, -1.0), (b, 1.0)):
+                blk["x"] = round(blk["x"] + sign * ux * push, 6)
+                blk["y"] = round(blk["y"] + sign * uy * push, 6)
+                blk["meas"]["pair_clamp_from_mm"] = round(d * 1000.0, 2)
+    # 钳制后再算一次图像块心对 x/y 的差（钳制会移动 ≤0.4 mm）。
+    for b in blocks:
+        im = b["meas"].get("img_xy_mm")
+        if im:
+            b["meas"]["img_minus_xy_mm"] = [
+                round(im[0] - b["x"] * 1000.0, 2),
+                round(im[1] - b["y"] * 1000.0, 2)]
     blocks.sort(key=lambda b: (b["x"], b["y"]))
     for i, b in enumerate(blocks):
         b["id"] = i

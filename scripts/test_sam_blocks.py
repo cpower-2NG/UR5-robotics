@@ -164,8 +164,20 @@ def main():
          "low": False}
     d2 = sb.clamp_pairs([c, e], cam)
     got2 = math.hypot(c['cx'] - e['cx'], c['cy'] - e['cy'])
-    check('35 mm 带外（>0.95×块边）⇒ 不钳', d2 is None
+    check('35 mm 带外（>1.02×块边）⇒ 不钳', d2 is None
           and abs(got2 - 35.0) < 0.01, (d2, round(got2, 2)))
+
+    # 2026-11-18 S2:5 回归：28.7 mm（0.973×块边）必须钳回 29.5（旧上界 0.95
+    # 让它漏网，两块中心各偏 ~0.4 mm ⇒ 抓取偏心带起 partner）。
+    f = {"cx": -10.0, "cy": 0.0, "top": 29.5, "uv": [60.0, 50.0],
+         "low": False}
+    g = {"cx": -10.0, "cy": 28.7, "top": 29.5, "uv": [60.0, 31.0],
+         "low": False}
+    d3 = sb.clamp_pairs([f, g], cam)
+    got3 = math.hypot(f['cx'] - g['cx'], f['cy'] - g['cy'])
+    check('28.7 mm（S2:5 实证）⇒ 钳到 29.5（旧上界漏钳的回归）',
+          d3 is not None and abs(got3 - 29.5) < 0.01,
+          (d3, round(got3, 2)))
 
     print('\n[6] mixed_votes：25% 口径')
     check('双类 60/40 ⇒ True',

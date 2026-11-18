@@ -347,19 +347,28 @@ def min_area_rect_2d(pts, trim_pct=(2.0, 98.0), step_deg=0.5,
             continue
         area = w * h
         if best is None or area < best[0] - 1e-9:
-            best = (area, float(deg), w, h)
+            best = (area, float(deg), w, h, k)
     if best is None:
         return {'yaw_deg': 0.0, 'ext_mm': [0.0, 0.0], 'fill': 0.0,
-                'hull_area_mm2': 0.0}
-    area, deg, w, h = best
+                'hull_area_mm2': 0.0, 'center_mm': [0.0, 0.0]}
+    area, deg, w, h, k = best
     yaw = deg if w >= h else deg + 90.0
     yaw %= 180.0
+    # 方框中心（分位裁剪后的**边界中点**，旋转系 → base；2026-11-18 块心
+    # 精度：点云均值对单侧缺边/接触边敏感，方框中心只由四条边的 2–98%
+    # 分位边界决定 —— 与 piece_stats 的 c_centroid 对照用）。
+    uc = 0.5 * (float(qx[0][k]) + float(qx[1][k]))
+    vc = 0.5 * (float(qy[0][k]) + float(qy[1][k]))
+    ca, sa = cas[k], sas[k]
+    cx = uc * ca - vc * sa
+    cy = uc * sa + vc * ca
     hull = convex_hull_2d(P)
     x, y = hull[:, 0], hull[:, 1]
     hull_area = 0.5 * abs(float(np.dot(x, np.roll(y, -1))
                                 - np.dot(y, np.roll(x, -1))))
     return {'yaw_deg': float(yaw),
             'ext_mm': [max(w, h), min(w, h)],
+            'center_mm': [float(cx), float(cy)],
             'fill': float(hull_area / area) if area > 0 else 0.0,
             'hull_area_mm2': float(hull_area)}
 
@@ -653,10 +662,8 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
             for piece_i, piece_rows in enumerate(pieces):
                 rows = rows_all[piece_rows]
                 F = Q[rows]
-                c = F[:, :2].mean(0)
-                if clamp_shift is not None:
-                    c = c + clamp_shift[piece_i]
-                d = F[:, :2] - c
+                c_centroid = F[:, :2].mean(0)
+                d = F[:, :2] - c_centroid
                 evals, evecs = np.linalg.eigh(d.T @ d / len(d))
                 yaw = float(np.degrees(np.arctan2(evecs[1, -1], evecs[0, -1])))
                 ext = (d @ evecs).max(0) - (d @ evecs).min(0)
@@ -666,6 +673,11 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                     rect = rect_all
                 else:
                     rect = min_area_rect_2d(F[:, :2])
+                # 块心 = 方框中心（分位裁剪边界中点；2026-11-18 与 SAM 链同口径）
+                _cc = rect.get("center_mm")
+                c = (np.asarray(_cc, float) / 1000.0) if _cc else c_centroid
+                if clamp_shift is not None:
+                    c = c + clamp_shift[piece_i]
                 f_pix = qpix[rows]
                 px = color[f_pix[:, 1], f_pix[:, 0]].astype(float)
                 med_rgb = np.median(px, axis=0) if len(px) else np.zeros(3)

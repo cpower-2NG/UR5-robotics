@@ -619,6 +619,37 @@ def section_contact_pair_fixes():
           len(pieces_old) == 1, [len(p) for p in pieces_old])
 
 
+def section_consensus_pair_clamp():
+    """共识后贴合对再钳到块边（2026-11-18 S2:5：逐帧 29.50 → 共识 29.22）。"""
+    print('\n[22] 共识后贴合对再钳到块边')
+
+    def blk(x, y, color='yellow'):
+        return {'x': x, 'y': y, 'z': 0.01475, 'size': 0.0295,
+                'top': 0.0295, 'layer': 0, 'color': color, 'yaw': 0.0,
+                'meas': {'from': 'measured_top_face',
+                         'yaw_source': 'colour_rect', 'h_mm': 29.5}}
+    truths = [{'batch': 'S2', 'index': 1, 'block_size_m': 0.0295,
+               'table_top_m': 0.0,
+               'zone_m': [0.25, 0.575, 0.17, 0.42],
+               'n_frames': 5, 'source': 'test',
+               'blocks': [blk(0.4825, 0.3062), blk(0.4924, 0.3339),
+                          blk(0.6000, 0.1000, 'red')]}
+              for _ in range(5)]
+    doc = tf.consensus(truths, min_frames=3)
+    ys = [b for b in doc['blocks'] if b['color'] == 'yellow']
+    check('两块 yellow 都在共识里', len(ys) == 2, len(ys))
+    if len(ys) == 2:
+        import math
+        d = math.hypot(ys[0]['x'] - ys[1]['x'], ys[0]['y'] - ys[1]['y'])
+        check('贴合对钳到 29.5 mm（x/y 各自取中位会把成对几何揉掉）',
+              abs(d - 0.0295) < 1e-6, round(d * 1000, 2))
+        check('pair_clamp_from_mm 记录钳前距离',
+              ys[0]['meas'].get('pair_clamp_from_mm') is not None,
+              ys[0]['meas'])
+    red = [b for b in doc['blocks'] if b['color'] == 'red'][0]
+    check('远离的第三块不动', abs(red['x'] - 0.6) < 1e-9, red['x'])
+
+
 def main():
     section_ray_plane()
     section_depth_immunity()
@@ -629,6 +660,7 @@ def main():
     section_empty()
     section_consensus()
     section_consensus_parallel()
+    section_consensus_pair_clamp()
     section_layers()
     section_colour_yaw()
     section_consensus_yaw()

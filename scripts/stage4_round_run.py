@@ -178,9 +178,13 @@ def match_measured_blocks(manifest_blocks, measured_blocks,
                           limit_mm=PICK_OFFSET_LIMIT_MM):
     """布局表 ↔ 实测块 一一配对，返回 ``[(manifest, measured, dx_mm, dy_mm)]``。
 
-    先按**颜色**配（正式布局里五块颜色互不相同）；颜色重复或缺失时退回**最近
-    位置**贪心配对，每个实测块只用一次。配不出 1:1、或某一块离标称超过
-    ``limit_mm``，都抛 ``ValueError`` —— 抓点没有可信来源就不发计划。
+    先按**颜色**配；颜色重复（S2 同色对）时取**同色且仍自由**的最近块——
+    2026-11-18 S2:5 实证：旧逻辑对重复颜色直接跨色「最近位置」贪心，第二个
+    yellow 会抢到更近的 red（48 mm < 剩下的 yellow 88 mm），连锁错配成
+    yellow→red、red→yellow，最后两个计划都去抓 yellow 那一对（偏心/抓空）。
+    只有在**没有同色自由块**时才跨色兜底，每个实测块只用一次。配不出 1:1、
+    或某一块离标称超过 ``limit_mm``，都抛 ``ValueError`` —— 抓点没有可信来源
+    就不发计划。
     """
     man = [dict(b) for b in (manifest_blocks or [])]
     obs = [dict(b) for b in (measured_blocks or [])]
@@ -194,13 +198,16 @@ def match_measured_blocks(manifest_blocks, measured_blocks,
     free = list(obs)
     for m in man:
         c = str(m.get("color"))
-        cand = by_col.get(c) or []
-        pick = None
-        if len(cand) == 1 and cand[0] in free:
-            pick = cand[0]
-        if pick is None and free:       # 颜色不可靠 ⇒ 按位置最近
-            pick = min(free, key=lambda o: math.hypot(
-                float(o["x"]) - float(m["x"]), float(o["y"]) - float(m["y"])))
+
+        def _d(o):
+            return math.hypot(float(o["x"]) - float(m["x"]),
+                              float(o["y"]) - float(m["y"]))
+        # ① 同色且仍自由：取最近（重复颜色也走这里，不再跨色抢）
+        cand = [o for o in (by_col.get(c) or []) if o in free]
+        pick = min(cand, key=_d) if cand else None
+        # ② 没有同色自由块 ⇒ 才按位置跨色兜底（颜色不可靠的场合）
+        if pick is None and free:
+            pick = min(free, key=_d)
         if pick is None:
             raise ValueError("块 %s（%s）没有对应的实测块" % (m.get("id"), c))
         free.remove(pick)
