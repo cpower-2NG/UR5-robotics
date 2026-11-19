@@ -52,6 +52,10 @@ IK_TIMEOUT = 0.5     # 每个种子的裸 IK 时限（短超时只会把「能�
                      # 保守方向；拿不到才换种子）
 IK_CAP = 3           # 种子池上限
 GOOD_SEED_CAP = 3    # 池里保留的「已验证有效解」个数
+#: 指与障碍物允许的重叠上限（米）。AG-95 指宽 30 vs 块边 29.5 ⇒ 每侧
+#: 0.25 mm 的外溢是机械公差内、S2:5 黄对实测可抓；再留 0.35 mm 余量。
+#: 超过它才是真碰撞（S2:2 tan 对「朝 partner 合拢」插入 ~10 mm）。
+OVERLAP_TOL_M = 0.0006
 
 
 def log(*a):
@@ -98,52 +102,82 @@ def gripper_gaps(node, fk_client, js, target, others, table, q, other_names=None
     ``other_names``（可选，与 ``others`` 同序）：给了就额外返回
     ``per_other``（名字 → 该障碍物的最小间隙，米）。E9 靠它把「整块不可抓」
     归因到**具体是哪一块挡住了**；不给时行为与之前逐位相同。
+
+    **2026-11-19（S2:2 tan 对撞块）**：同时给**带符号**的量
+    （``min_raw`` / ``per_other_signed``）。``gap()`` 把重叠钳成 0，选支时
+    「伸进 partner 10 mm」与「指宽外溢 0.25 mm」并列，无法区分；带符号后
+    0.25 mm 外溢留在负的小值、10 mm 插入是负的大值。
     """
     fk = mp.fk_tool(node, fk_client, js)
     if fk is None:
         return None
     obbs = sm.gripper_obbs(fk[mp.IK_LINK], q)
-    out = {"target": None, "others": None, "table": None}
+    out = {"target": None, "others": None, "table": None, "min_raw": None}
     per = ({n: None for n in other_names}
            if other_names is not None else None)
+    per_signed = ({n: None for n in other_names}
+                  if other_names is not None else None)
     for lk in obbs:
-        g = sm.gap(lk, target)
+        raw = sm.separation(lk, target)
+        g = max(0.0, raw)
         out["target"] = g if out["target"] is None else min(out["target"], g)
-        g = sm.gap(lk, table)
+        out["min_raw"] = raw if out["min_raw"] is None else min(out["min_raw"], raw)
+        raw = sm.separation(lk, table)
+        g = max(0.0, raw)
         out["table"] = g if out["table"] is None else min(out["table"], g)
+        out["min_raw"] = min(out["min_raw"], raw)
         for i, o in enumerate(others):
-            g = sm.gap(lk, o)
+            raw = sm.separation(lk, o)
+            g = max(0.0, raw)
             out["others"] = g if out["others"] is None else min(out["others"], g)
+            out["min_raw"] = min(out["min_raw"], raw)
             if per is not None:
                 nm = other_names[i]
                 per[nm] = g if per[nm] is None else min(per[nm], g)
+                per_signed[nm] = (raw if per_signed[nm] is None
+                                  else min(per_signed[nm], raw))
     if out["others"] is None:
         out["others"] = float("inf")
     out["per_other"] = per
+    out["per_other_signed"] = per_signed
     out["min"] = min(out["target"], out["others"], out["table"])
     return out
 
 
 def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
-                       target, others, table, pool, other_names=None):
-    """一个候选位姿的判定。返回 (verdict, detail)；成功时 detail 里带解。"""
+                       target, others, table, pool, other_names=None,
+                       open_half_m=None):
+    """一个候选位姿的判定。返回 (verdict, detail)；成功时 detail 里带解。
+
+    ``open_half_m``：判指-邻块间隙时夹爪的**半开量（米）**。缺省 ``OPEN_Q``
+    （全开 47.5 mm）保持 E7 旧口径；E9 真机路径必须传**执行的接近开度**
+    （`pick_open_mm/2`，当前 25 mm）——2026-11-19 S2:2 实测：探针按全开算
+    partner 还剩 2.7 mm，执行按半开接近时指尖已伸进 partner 约 10 mm，
+    下降即撞块。
+    """
     ps = mp.pose_stamped(*cand["pos"], cand["quat"])
     sol, seed_i = mp.solve_ik(node, ik_client, ps, pool, avoid=False,
                               timeout=IK_TIMEOUT, cap=IK_CAP)
     if sol is None:
         return "unreachable", {"seed": None}
 
-    gaps = gripper_gaps(node, fk_client, sol, target, others, table, mp.OPEN_Q,
+    q_open = mp.OPEN_Q if open_half_m is None else float(open_half_m)
+    gaps = gripper_gaps(node, fk_client, sol, target, others, table, q_open,
                         other_names=other_names)
     if gaps is None:
         return "fk_failed", {"seed": seed_i}
     detail = {"seed": seed_i,
+              "q_open_mm": round(q_open * 1000.0, 1),
               "gap_target_mm": round(gaps["target"] * 1000.0, 1),
               "gap_others_mm": (None if gaps["others"] == float("inf")
                                 else round(gaps["others"] * 1000.0, 1)),
               "gap_table_mm": round(gaps["table"] * 1000.0, 1)}
+    if gaps.get("min_raw") is not None:
+        detail["gap_min_raw_mm"] = round(gaps["min_raw"] * 1000.0, 2)
     if gaps["per_other"] is not None:
         detail["per_other"] = gaps["per_other"]
+    if gaps.get("per_other_signed") is not None:
+        detail["per_other_signed"] = gaps["per_other_signed"]
 
     vreq = GetStateValidity.Request()
     vreq.robot_state.joint_state = sol
@@ -155,8 +189,12 @@ def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
     detail["valid"] = valid
     detail["contacts"] = ["%s×%s" % p for p in pairs][:4]
 
-    if gaps["min"] <= 0.0:
-        # 我们自己的几何就不答应（MoveIt 若说有效，那就是漏判 —— 记下来）
+    min_raw = gaps.get("min_raw")
+    if min_raw is not None and min_raw < -OVERLAP_TOL_M:
+        # 我们自己的几何就不答应（MoveIt 若说有效，那就是漏判 —— 记下来）。
+        # 用**带符号**的最小分离量 + 公差：指宽外溢 0.25 mm 放行，真插入拦下。
+        return "gripper_collide", detail
+    if min_raw is None and gaps["min"] <= 0.0:
         return "gripper_collide", detail
     if valid:
         detail["sol"] = sol
@@ -176,7 +214,7 @@ def evaluate_candidate(node, ik_client, fk_client, validity_client, cand,
 def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
                    target, others, table, pool, full_scan=False,
                    vertical_only=False, other_names=None,
-                   prefer_closing=None):
+                   prefer_closing=None, open_half_m=None):
     """一个块：先试 B 档（竖直向下）4 个位姿，再试其余 20 个；命中即停。
 
     「命中即停」只影响统计粒度（有多少个位姿可行），不影响两个布尔量：
@@ -218,7 +256,8 @@ def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
         n_eval += 1
         verdict, detail = evaluate_candidate(
             node, ik_client, fk_client, validity_client, cand,
-            target, others, table, pool, other_names=other_names)
+            target, others, table, pool, other_names=other_names,
+            open_half_m=open_half_m)
         reasons[verdict] = reasons.get(verdict, 0) + 1
         row = {"axis": cand["axis"], "sign": cand["sign"],
                "closing": cand["closing"], "variant": cand["variant"],
@@ -241,7 +280,8 @@ def evaluate_block(node, ik_client, fk_client, validity_client, block_truth,
 
 
 # ------------------------------------------------------------------ 单场
-def run_scene(node, clients, truth, use_solo, full_scan=False):
+def run_scene(node, clients, truth, use_solo, full_scan=False,
+              open_half_m=None):
     scene_client, get_scene = clients["scene"], clients["getscene"]
     ik_client, fk_client = clients["ik"], clients["fk"]
     validity_client = clients["validity"]
@@ -264,7 +304,8 @@ def run_scene(node, clients, truth, use_solo, full_scan=False):
     for b, ob in zip(truth["blocks"], blocks):
         others = [o for n, o in by_name.items() if n != "block-%s" % b["id"]]
         r = evaluate_block(node, ik_client, fk_client, validity_client, b,
-                           ob, others, table, pool, full_scan)
+                           ob, others, table, pool, full_scan,
+                           open_half_m=open_half_m)
         r.update({"id": b["id"], "layer": b.get("layer", 0),
                   "x": b["x"], "y": b["y"], "z": b.get("z"),
                   "yaw": b.get("yaw"), "color": b.get("color")})
@@ -288,7 +329,8 @@ def run_scene(node, clients, truth, use_solo, full_scan=False):
                                       mp.make_block_object(b)])
             time.sleep(0.2)
             solo = evaluate_block(node, ik_client, fk_client, validity_client,
-                                  b, ob, [], table, pool, full_scan)
+                                  b, ob, [], table, pool, full_scan,
+                                  open_half_m=open_half_m)
             solo["id"] = b["id"]
             solo_rows.append(solo)
             log("  [solo] block-%-2s B=%-5s C=%-5s → %s"

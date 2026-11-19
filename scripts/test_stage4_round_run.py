@@ -1748,6 +1748,29 @@ except ValueError as e:
     check("重复颜色（S2:5 实证）⇒ 每个布局块配到同色实测块", False, str(e))
 
 # =====================================================================
+# 颜色集合不符（2026-11-19 S2:2 实证）：橙块被判成 tan ⇒ fail-closed，
+# 不跨色换块（旧兜底会把 orange↔黄绿↔对块连锁错配）。
+# ---------------------------------------------------------------------
+_lay2 = [{"id": 0, "color": "tan", "x": 0.40, "y": 0.34},
+         {"id": 1, "color": "tan", "x": 0.41, "y": 0.37},
+         {"id": 2, "color": "purple", "x": 0.56, "y": 0.33},
+         {"id": 3, "color": "orange", "x": 0.31, "y": 0.28},
+         {"id": 4, "color": "yellowgreen", "x": 0.41, "y": 0.20},
+         {"id": 5, "color": "red", "x": 0.54, "y": 0.19}]
+_obs2 = [{"color": "tan", "x": 0.383, "y": 0.330},
+         {"color": "tan", "x": 0.473, "y": 0.313},
+         {"color": "tan", "x": 0.480, "y": 0.285},
+         {"color": "purple", "x": 0.559, "y": 0.326},
+         {"color": "yellowgreen", "x": 0.410, "y": 0.205},
+         {"color": "red", "x": 0.535, "y": 0.191}]
+try:
+    r.match_measured_blocks(_lay2, _obs2, limit_mm=1000.0)
+    check("颜色集合不符（缺 orange）⇒ fail-closed", False, "没有抛错")
+except ValueError as e:
+    check("颜色集合不符（缺 orange）⇒ fail-closed",
+          "orange" in str(e), str(e))
+
+# =====================================================================
 print()
 print("通过 %d，失败 %d" % (N_PASS, N_FAIL))
 if FAILS:

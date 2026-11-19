@@ -313,12 +313,38 @@ def section_mutation():
           '还是抛了 —— 说明变异没生效')
 
 
+
+def section_orange_tan_disambiguation():
+    """orange/tan 二义：三天实测样本（色相可分、饱和度不可靠）。"""
+    print('\n[二义] orange/tan 色相分割（2026-11-19 S2:2 复核）')
+    # 11-16 晨（原型来源）/ 11-17 att2（tan 漂到 23.1）/ 11-19 S2:2（橙 sat 122）
+    samples = [
+        ("11-16 orange", 20.8, 215.0, "orange"),
+        ("11-16 tan", 28.6, 132.0, "tan"),
+        ("11-17 orange", 17.7, 250.0, "orange"),
+        ("11-17 tan", 23.1, 138.0, "tan"),
+        ("11-19 orange", 18.0, 122.0, "orange"),
+        ("11-19 tan", 28.6, 110.0, "tan"),
+        ("11-19 tan2", 29.4, 115.0, "tan"),
+    ]
+    for name, h, sat, want in samples:
+        got = block_classes.disambiguate_orange_tan(h, sat)
+        check('%s (h=%.1f,s=%.0f) ⇒ %s' % (name, h, sat, want),
+              got == want, got)
+    # 窄带回退（21–23°）仍走 2D 原型；带外返回 None
+    check('21.9°（窄带内，sat 138）⇒ 2D 判 tan',
+          block_classes.disambiguate_orange_tan(21.9, 138.0) == "tan",
+          block_classes.disambiguate_orange_tan(21.9, 138.0))
+    check('带外（hue 41）⇒ None', block_classes.disambiguate_orange_tan(41.0, 200.0) is None)
+    check('缺量 ⇒ None', block_classes.disambiguate_orange_tan(None, 200.0) is None)
+
 def main():
     print('=' * 68)
     section_palette()
     section_hue_table()
     section_datasets()
     section_mutation()
+    section_orange_tan_disambiguation()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('未通过：' + '; '.join(FAILS))

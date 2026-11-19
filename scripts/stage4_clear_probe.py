@@ -52,6 +52,7 @@ sys.path.insert(0, HERE)
 
 import rclpy                                                  # noqa: E402
 import stage4_clear_model as cm                               # noqa: E402
+import stage4_clear_run as cr                                 # noqa: E402
 import stage4_moveit_joints as mj                             # noqa: E402
 import stage4_moveit_probe as mp                              # noqa: E402
 import stage4_scene_model as sm                               # noqa: E402
@@ -68,6 +69,11 @@ GATE = 0.80          # 契约：S4 全桌合法终态率 ≥80%
 MAX_DEPTH = 3        # 递归清障深度上限（S4 最多叠 2 层，3 足够且能兜住环）
 MAX_CLEAR = 6        # 每层最多「挪走一块 → 重测」的次数
 DEST_SCAN = 6        # 每个遮挡块最多试几个几何上可行的落点（IK 失败就换下一个）
+#: 探测「指 vs 邻块」间隙用的夹爪半开量（米）= **执行接近开度**。
+#: 2026-11-19 S2:2 tan 对实证：探针按全开 47.5 mm 算 partner 还剩 2.7 mm，
+#: 执行却按 pick_open 50 mm 接近（半开 25 mm），指尖已伸进 partner 约 10 mm
+#: ——下降即撞块。探针必须和执行同一开度。
+APPROACH_OPEN_HALF_M = cr.PICK_OPEN_MM / 2000.0
 PAD_ID = "pad"
 
 
@@ -152,7 +158,8 @@ def eval_block(node, clients, block, blocks, pool, prefer_closing=None):
     return wp.evaluate_block(node, clients["ik"], clients["fk"],
                              clients["validity"], block, target, others, table,
                              pool, vertical_only=True, other_names=names,
-                             prefer_closing=prefer_closing)
+                             prefer_closing=prefer_closing,
+                             open_half_m=APPROACH_OPEN_HALF_M)
 
 
 def inside_table(block, margin=cm.FREE_CLEAR):

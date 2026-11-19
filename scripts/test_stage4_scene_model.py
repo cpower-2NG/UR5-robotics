@@ -518,6 +518,45 @@ def section_best_hit():
     t2 = {"closing": 1, "per_other": {"1": 0.02}}
     check('间隙平手 ⇒ 回落到传入顺序（prefer_closing 仍生效）',
           sm.pick_best_hit([t1, t2], vertical_only=True) is t1)
+    # 2026-11-19 S2:2：带符号间隙优先——「朝 partner 插 10 mm」与「指宽外溢
+    # 0.25 mm」在 gap() 里都钳成 0，必须靠符号量区分。
+    bad = {"closing": 1, "per_other": {"1": 0.0},
+           "per_other_signed": {"1": -0.010}}
+    good = {"closing": 0, "per_other": {"1": 0.0},
+            "per_other_signed": {"1": -0.00025}}
+    check('带符号：外溢 0.25 mm 胜过插入 10 mm',
+          sm.pick_best_hit([bad, good], vertical_only=True) is good)
+
+
+def section_gripper_open_width():
+    print('\n-- 指-邻块间隙必须按**执行开度**算（2026-11-19 S2:2 撞块）')
+    target = sm.block_obb({"id": "t", "x": 0.0, "y": 0.0, "z": 0.01475,
+                           "size": 0.0295, "yaw": 0.0}, 0.0)
+    partner = sm.block_obb({"id": "p", "x": 0.0, "y": 0.0295, "z": 0.01475,
+                            "size": 0.0295, "yaw": 0.0}, 0.0)
+    down = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], float)   # 工具朝下
+
+    def min_sep(finger_q, rotz_deg):
+        c, s = (math.cos(math.radians(rotz_deg)),
+                math.sin(math.radians(rotz_deg)))
+        rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], float)
+        quat = sm.mat_to_quat(rz @ down)
+        obbs = sm.gripper_obbs(((0.0, 0.0, 0.20), quat), finger_q)
+        return min(sm.separation(o, partner) for o in obbs)
+
+    free = min_sep(0.025, 0.0)          # 合拢轴 = 世界 x（自由侧）
+    toward = min_sep(0.025, 90.0)       # 合拢轴 = 世界 y（朝 partner）
+    toward_full = min_sep(0.0475, 90.0)
+    check('自由侧合拢（半开 25 mm）对 partner 余量 >5 mm', free > 0.005,
+          round(free * 1000, 2))
+    check('朝 partner 合拢（半开 25 mm）插进 partner（负分离）',
+          toward < -0.005, round(toward * 1000, 2))
+    check('同一朝向按全开 47.5 mm 算是正间隙（旧口径的假安全）',
+          toward_full > 0.0, round(toward_full * 1000, 2))
+    check('目标块本身在两开度下都不碰（只拦邻块）',
+          min(sm.separation(o, target) for o in
+              sm.gripper_obbs(((0.0, 0.0, 0.20),
+                               sm.mat_to_quat(down)), 0.025)) > 0.005)
 
 
 def main():
@@ -533,6 +572,7 @@ def main():
     section_mat_quat()
     section_grasp()
     section_best_hit()
+    section_gripper_open_width()
     section_urdf_sync()
     section_mutation()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))

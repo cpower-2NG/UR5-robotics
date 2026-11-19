@@ -366,12 +366,17 @@ def pick_best_hit(ok_rows, vertical_only=True):
     不放过任何碰撞判据：所有候选照样逐条过 SAT/IK/状态有效性。
 
     ``vertical_only=False``（E7 全 24 候选）保持「命中即停」的原语义。
+
+    **2026-11-19（S2:2 tan 对撞块）**：间隙改优先用 ``per_other_signed``
+    （**带符号**的重叠量，米；负=重叠）。原来的 ``per_other`` 被 ``gap()``
+    钳在 0，重叠的候选全部并列 0，选支只能回落到排序；带符号后「沿 partner
+    侧合拢（伸入约 10 mm）」与「自由侧指宽外溢（0.25 mm）」能区分开。
     """
     if not ok_rows:
         return None
     if vertical_only and len(ok_rows) > 1:
         def _room(r):
-            g = r.get("per_other") or {}
+            g = r.get("per_other_signed") or r.get("per_other") or {}
             vals = [float(v) for v in g.values() if v is not None]
             if vals:
                 return min(vals)

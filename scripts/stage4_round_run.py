@@ -191,6 +191,22 @@ def match_measured_blocks(manifest_blocks, measured_blocks,
     if len(man) != len(obs):
         raise ValueError("布局表 %d 块、实测 %d 块 —— 不是同一个场景"
                          % (len(man), len(obs)))
+    # 2026-11-19（S2:2）：**颜色集合不符 ⇒ fail-closed**，不换色配对。
+    # 实测橙块被判成 tan 时，下面的跨色「最近位置」兜底会把
+    # orange↔黄绿↔对块连锁错配（真实一轮：计划去抓错块、对块被拆成两个目标）。
+    # 缺任何一个布局颜色就停，交给人核对（第 349 轮挂起的决策，本次落定）。
+    man_counts, obs_counts = {}, {}
+    for b in man:
+        man_counts[str(b.get("color"))] = man_counts.get(str(b.get("color")), 0) + 1
+    for b in obs:
+        obs_counts[str(b.get("color"))] = obs_counts.get(str(b.get("color")), 0) + 1
+    missing = sorted(c for c, n in man_counts.items()
+                     if obs_counts.get(c, 0) < n)
+    if missing:
+        raise ValueError(
+            "实测颜色集合不含布局所需：%s（布局 %s / 实测 %s）—— "
+            "识别不可靠，fail-closed 不换色配对"
+            % (", ".join(missing), man_counts, obs_counts))
     by_col = {}
     for b in obs:
         by_col.setdefault(str(b.get("color")), []).append(b)

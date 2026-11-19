@@ -215,24 +215,39 @@ ORANGE_TAN_PROTOS = {
     "orange": (20.8, 215.0),
     "tan": (28.6, 132.0),
 }
-#: 二义带（hue 中位落在这之间才走 2D 判；带外沿用纯色相投票——red 5–8、
+#: 二义带（hue 中位落在这之间才走二义判；带外沿用纯色相投票——red 5–8、
 #: yellow 41–43 都在带外，不受影响）。
 ORANGE_TAN_BAND = (14.0, 32.0)
+#: 色相分割（度）。三天的实测样本：orange ≤20.8（11-16 20.8 / 11-17 17.7 /
+#: 11-19 18.0），tan ≥23.1（28.6 / 23.1 / 28.6、29.4）——**色相可分**。
+#: 2026-11-19（S2:2）：橙块实拍 sat 只有 122，落进 tan 原型(132)附近，纯 2D
+#: 原型把它判成 tan（3 tan/0 orange）；饱和度随光照/批次漂 110–250，不可靠。
+ORANGE_TAN_HUE_SPLIT = 22.0
+#: 分割附近的回退窄带（±度）：带内没有样本、色相不足以定，沿用 2D 原型。
+ORANGE_TAN_HUE_GATE = 1.0
 
 
 def disambiguate_orange_tan(hue_med, rel_sat_med):
-    """orange/tan 二义消除：hue 中位落在二义带内 ⇒ 按 (hue, 相对饱和度) 的
-    2D 最近原型判；带外或饱和度缺失时返回 ``None``（调用方沿用原判）。
+    """orange/tan 二义消除：先按**色相分割**判，窄带内回退 2D 最近原型。
 
     ``hue_med``/``rel_sat_med`` = 片段内 v>40 像素的色相/相对饱和度**中位**
     （与投票同口径的量法）。只 orange/tan 二义使用——red(5–8)/yellow(41–43)
     在带外，纯色相已足够。
+
+    判序（2026-11-19 改）：
+    1. ``hue ≤ SPLIT−GATE`` ⇒ orange；``hue ≥ SPLIT+GATE`` ⇒ tan（三天样本全可分）；
+    2. 21–23° 窄带（目前无样本）⇒ 2D 最近原型（(hue, sat)，11-16 标定）；
+    3. 带外/缺量 ⇒ ``None``（调用方沿用纯色相投票）。
     """
     if hue_med is None or rel_sat_med is None:
         return None
     lo, hi = ORANGE_TAN_BAND
     if not (lo <= hue_med <= hi):
         return None
+    if hue_med <= ORANGE_TAN_HUE_SPLIT - ORANGE_TAN_HUE_GATE:
+        return "orange"
+    if hue_med >= ORANGE_TAN_HUE_SPLIT + ORANGE_TAN_HUE_GATE:
+        return "tan"
     best, best_d = None, None
     for name, (ph, ps) in ORANGE_TAN_PROTOS.items():
         d = math.hypot(float(hue_med) - ph, float(rel_sat_med) - ps)
