@@ -192,11 +192,25 @@ def exec_evidence(events):
 
 
 def _target_plan(manifest):
-    """manifest 里 kind=target 的那份计划（E9 每条指令一份计划）。"""
+    """manifest 里**本目标**的那份 ``kind=target`` 计划。
+
+    S3 的 manifest 可能还带着「被吸收的清障」动作 —— 它是**别的块**的目标
+    动作（只是由本次尝试触发），不能当成本次的 target 计划。按
+    ``plan.block == manifest.target`` 选；旧 manifest 没有 ``block`` 字段时
+    退回第一份 target 计划（S0–S2 行为不变）。
+    """
+    target = str(manifest.get("target"))
+    fallback = None
     for p in manifest.get("plans") or []:
-        if p.get("kind") == "target":
+        if p.get("kind") != "target":
+            continue
+        if p.get("block") is None:
+            if fallback is None:
+                fallback = p
+            continue
+        if str(p.get("block")) == target:
             return p
-    return None
+    return fallback
 
 
 def _plan_meta(plan):

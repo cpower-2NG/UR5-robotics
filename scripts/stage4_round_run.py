@@ -2884,7 +2884,12 @@ class Round:
                                  "缺 manifest %s" % man_path)
             man = read_json(man_path)
             manifests.append(man)
-            tgt = [a for a in man["actions"] if a["kind"] == "target"]
+            # 本目标的目标动作：S3 的 manifest 可能还带「被吸收的清障」动作
+            # （它是别的块的目标动作）⇒ 按 block 选，不能数个数。
+            tgt = [a for a in man["actions"] if a["kind"] == "target"
+                   and str(a.get("block")) == str(tid)]
+            if not tgt:
+                tgt = [a for a in man["actions"] if a["kind"] == "target"]
             if len(tgt) != 1:
                 raise RoundError(EXIT_SCORE, "score",
                                  "块 %s 的 actions 里目标动作不是 1 个" % tid)

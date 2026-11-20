@@ -584,6 +584,16 @@ def section_s3_report():
     check('扰动嫌疑把清障落格也算进来（按 action_index）',
           len(s) == 1 and s[0]['pushed'] == 'C' and s[0]['by'] == 'B', str(s))
 
+    man2 = {'target': '0',
+            'plans': [{'kind': 'target', 'block': '6', 'name': 'clear6'},
+                      {'kind': 'target', 'block': '0', 'name': 'target0'}]}
+    check('_target_plan 按 block 选本目标（不被吸收的清障顶替）',
+          rr._target_plan(man2)['name'] == 'target0',
+          str(rr._target_plan(man2)))
+    man3 = {'target': '0', 'plans': [{'kind': 'target', 'name': 'old'}]}
+    check('_target_plan 旧 manifest 无 block ⇒ 退回第一份',
+          rr._target_plan(man3)['name'] == 'old')
+
 
 def main():
     print('=' * 68)
