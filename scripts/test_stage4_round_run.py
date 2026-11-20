@@ -1167,6 +1167,7 @@ with tempfile.TemporaryDirectory() as td:
     with open(df, "w", encoding="utf-8") as f:
         f.write("# S3 结构化指定\n")
         f.write("\n".join(c for _bid, c in cmds) + "\n")
+    cm.reset_pad()          # 模拟新进程：垫参数是「未实测」哨兵（2026-11-20 轮 A 实测）
     rc, out, rd = run(td, b, batch="S3", layout=0, dry_run=True,
                       designate_file=df)
     check("S3 干跑：rc 0 且停在 compute",

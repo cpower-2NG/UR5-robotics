@@ -2167,6 +2167,10 @@ class Round:
             raise RoundError(EXIT_PLAN, "compute",
                              "解垫失败（rc=%r）：垫位姿没有共识，停" % (rc,))
         pad_doc = read_json(grid_path)
+        # 先装垫位姿再校验：S3 的色序/格心几何校验要调 ``cm.cell_center``，
+        # 而新进程里垫参数是「未实测」哨兵 —— 校验前不装就会抛 PadNotMeasured
+        # （2026-11-20 轮 A 实测：tests 里装了模型默认值，所以没暴露）。
+        self._apply_pad(pad_doc, grid_path)
         probs = validate_pad_doc(pad_doc, self.args.pad_min_frames,
                                  self.args.pad_max_spread_mm,
                                  self.args.pad_max_spread_deg,
@@ -2175,7 +2179,6 @@ class Round:
         if probs:
             raise RoundError(EXIT_PLAN, "compute",
                              "解垫不过：%s" % "；".join(probs))
-        self._apply_pad(pad_doc, grid_path)
         log("垫心 (%.1f, %.1f) mm / yaw %.3f°（%d/%d 帧）"
             % (pad_doc["grid_center_base_mm"][0],
                pad_doc["grid_center_base_mm"][1], pad_doc["grid_yaw_base_deg"],
