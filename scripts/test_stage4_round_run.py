@@ -46,6 +46,7 @@ sys.path.insert(0, HERE)
 #: S1/S2 干跑用：fake_truth / FakeBoard.probe_report 按它取布局（make_args 填）。
 #: 放在文件头 —— make_args 在 fake_truth 之前执行，模块顺序不能反。
 FAKE_BATCH = ["S0"]
+FAKE_LAYOUT = [1]
 
 import stage4_clear_model as cm                                 # noqa: E402
 import stage4_clear_run as cr                                   # noqa: E402
@@ -384,17 +385,17 @@ def _tower_of(blocks):
     return lo, hi
 
 
-_b1 = lay.layout_blocks("S3", 1)
-_b2 = lay.layout_blocks("S3", 2)
+_b1 = lay.layout_blocks("S3", 0)
+_b2 = lay.layout_blocks("S3", 1)
 _lo1, _hi1 = _tower_of(_b1)
 _lo2, _hi2 = _tower_of(_b2)
-check("S3:1 塔上下同色 / S3:2 塔上下异色（用户「都要有」）",
+check("S3:0 塔上下同色 / S3:1 塔上下异色（用户「都要有」）",
       _lo1["color"] == _hi1["color"] and _lo2["color"] != _hi2["color"],
       "%s/%s vs %s/%s" % (_lo1["color"], _hi1["color"],
                           _lo2["color"], _hi2["color"]))
 _cell1 = cm.assign_cells_by_colour(_b1, cm.DEFAULT_GRID_ORDER)
 _cell2 = cm.assign_cells_by_colour(_b2, cm.DEFAULT_GRID_ORDER)
-check("S3:1 两个备用格都用上 / S3:2 七个色格全用",
+check("S3:0 两个备用格都用上 / S3:1 七个色格全用",
       {7, 8} <= set(_cell1.values()) and len(set(_cell1.values())) == 7 and
       set(_cell2.values()) == set(range(7)), "%s vs %s" % (_cell1, _cell2))
 check("S3 格位与颜色一致（色格或备用格）",
@@ -570,7 +571,7 @@ finally:
 
 def _s3_probe_report(blocks, ids):
     """S3 假累积报告：塔底目标带一步清障，塔顶被**吸收**到它自己的格。"""
-    order = [str(bid) for bid, _cmd in lay.commands_for_layout("S3", 1)]
+    order = [str(bid) for bid, _cmd in lay.commands_for_layout("S3", FAKE_LAYOUT[0])]
     grid_order = list(cm.DEFAULT_GRID_ORDER)
     cmap = cm.assign_cells_by_colour(blocks, grid_order)
     hit = {"axis": 2, "sign": -1, "closing": 0, "variant": 0,
@@ -711,7 +712,7 @@ class FakeBoard:
         return Rc(0)
 
     def probe_report(self, extra=()):
-        blocks = lay.layout_blocks(FAKE_BATCH[0], 1)
+        blocks = lay.layout_blocks(FAKE_BATCH[0], FAKE_LAYOUT[0])
         ids = r._sorted_ids([b["id"] for b in blocks])
         if FAKE_BATCH[0] == "S3":
             return _s3_probe_report(blocks, ids)
@@ -736,6 +737,7 @@ def make_args(td, **over):
     batch = over.pop("batch", "S0")
     bias_seed = over.pop("bias_seed", "-2.791,-0.248")
     FAKE_BATCH[0] = batch
+    FAKE_LAYOUT[0] = int(layout)
     argv = ["--batch", batch, "--layout", str(layout),
             "--run", "1",
             "--out-dir", os.path.join(td, "run", "%s-1-r1" % batch.lower()),
@@ -971,7 +973,7 @@ def fake_truth(burst, out, allow_empty=False, seg='sam'):
         blocks = [{"id": b["id"], "color": b["color"], "x": b["x"],
                    "y": b["y"], "yaw": b["yaw"], "size": b["size"],
                    "top": b["top"], "layer": int(b.get("layer", 0))}
-                  for b in lay.layout_blocks(FAKE_BATCH[0], 1)]
+                  for b in lay.layout_blocks(FAKE_BATCH[0], FAKE_LAYOUT[0])]
     with open(out, "w") as f:
         json.dump({"blocks": blocks}, f)
     return 0
@@ -1161,11 +1163,11 @@ with tempfile.TemporaryDirectory() as td:
 with tempfile.TemporaryDirectory() as td:
     b = FakeBoard()
     df = os.path.join(td, "designate.txt")
-    cmds = lay.commands_for_layout("S3", 1)
+    cmds = lay.commands_for_layout("S3", 0)
     with open(df, "w", encoding="utf-8") as f:
-        f.write("# S3:1 结构化指定\n")
+        f.write("# S3 结构化指定\n")
         f.write("\n".join(c for _bid, c in cmds) + "\n")
-    rc, out, rd = run(td, b, batch="S3", layout=1, dry_run=True,
+    rc, out, rd = run(td, b, batch="S3", layout=0, dry_run=True,
                       designate_file=df)
     check("S3 干跑：rc 0 且停在 compute",
           rc == 0 and phases_of(rd)[-1] == "compute",
@@ -2036,13 +2038,13 @@ check("S3 层一致时严格配对照常过",
       and all(int(o["layer"]) == int(m["layer"]) for m, o, _, _ in _pairs_ok))
 
 # ---- S3 结构化指定解析（2026-11-20）
-_b1 = lay.layout_blocks("S3", 1)
-_cmds = [c for _bid, c in lay.commands_for_layout("S3", 1)]
+_b1 = lay.layout_blocks("S3", 0)
+_cmds = [c for _bid, c in lay.commands_for_layout("S3", 0)]
 try:
     _got = r.resolve_designation(_cmds, _b1, _b1)
     check("resolve_designation：7 条 1:1，order = 命令顺序",
           _got["order"] == [str(bid) for bid, _c
-                            in lay.commands_for_layout("S3", 1)]
+                            in lay.commands_for_layout("S3", 0)]
           and _got["n_ok"] == 7 and _got["accuracy"] == 1.0,
           repr(_got.get("order")))
 except ValueError as e:

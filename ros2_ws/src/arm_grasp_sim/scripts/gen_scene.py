@@ -115,15 +115,15 @@ LAYOUTS_PER_BATCH = 5
 
 #: S3 固定颜色计划（2026-11-20 用户拍板：塔与贴合对可同可异，其余块互异；
 #: 7 色可用 ⇒ 最多 2 个重复色，正好由垫纸的 2 个备用格吸收）。
-#: 元组 = (塔下, 塔上, 对a, 对b, 孤立1, 孤立2, 孤立3)。
-#: S3:1 = 真机轮 A（同色塔 + 同色对，两个备用格都用上）；
-#: S3:2 = 真机轮 B（异色塔 + 异色对，7 色格全用）。
+#: 元组 = (塔下, 塔上, 对a, 对b, 孤立1, 孤立2, 孤立3)。**索引 0–4**（与 CLI 一致）。
+#: S3:0 = 真机轮 A（同色塔 + 同色对，两个备用格都用上）；
+#: S3:1 = 真机轮 B（异色塔 + 异色对，7 色格全用）。
 S3_COLOUR_PLANS = {
-    1: ("red", "red", "cyan", "cyan", "orange", "yellow", "yellowgreen"),
-    2: ("cyan", "purple", "yellow", "yellowgreen", "red", "orange", "tan"),
-    3: ("tan", "tan", "cyan", "purple", "red", "orange", "yellow"),
-    4: ("orange", "purple", "red", "red", "yellow", "yellowgreen", "cyan"),
-    5: ("purple", "purple", "yellow", "yellow", "red", "orange", "cyan"),
+    0: ("red", "red", "cyan", "cyan", "orange", "yellow", "yellowgreen"),
+    1: ("cyan", "purple", "yellow", "yellowgreen", "red", "orange", "tan"),
+    2: ("tan", "tan", "cyan", "purple", "red", "orange", "yellow"),
+    3: ("orange", "purple", "red", "red", "yellow", "yellowgreen", "cyan"),
+    4: ("purple", "purple", "yellow", "yellow", "red", "orange", "cyan"),
 }
 
 # 顶面相机（真机旧支架实测，base_link 系；见 docs/calib/extrinsics-2026-10-03-base_link.json）
