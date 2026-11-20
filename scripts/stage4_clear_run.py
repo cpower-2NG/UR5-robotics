@@ -1083,7 +1083,8 @@ def _match_blocks(exp, post):
     **不能按 id 配对**：id 只是同一份真值内部的序号，两份真值各自按位置重排
     （2026-11-08 实测：跑后真值的 id 顺序和计划里的 ``final_layout`` 完全不同，
     按 id 对齐会把紫塔的块配到橙塔上、报出 240 mm 的假位移）。
-    配对之后也不比颜色 —— 塔底块的颜色取自塔顶面，真值里写着塔顶的颜色。
+    塔的上下层 xy 相同 ⇒ 层不一致的候选**排在后面**（S3 的 29.5 mm 层差不会
+    让上下层互换）；仍按三维距离贪心、一对一。
     """
     pairs = []
     for ei, e in exp.items():
@@ -1091,10 +1092,11 @@ def _match_blocks(exp, post):
             d = math.sqrt((float(p["x"]) - float(e["x"])) ** 2
                           + (float(p["y"]) - float(e["y"])) ** 2
                           + (float(p["z"]) - float(e["z"])) ** 2) * 1000.0
-            pairs.append((d, ei, pi))
+            lm = 0 if int(e.get("layer", 0)) == int(p.get("layer", 0)) else 1
+            pairs.append((lm, d, ei, pi))
     pairs.sort()
     used_e, used_p, match = set(), set(), {}
-    for d, ei, pi in pairs:            # 全局按距离贪心，一对一
+    for _lm, d, ei, pi in pairs:            # 同层优先，再全局按距离贪心
         if ei in used_e or pi in used_p:
             continue
         used_e.add(ei)

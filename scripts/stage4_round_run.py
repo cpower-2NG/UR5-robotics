@@ -876,7 +876,8 @@ def build_facts(round_id, batch, layout, spec_blocks, bias, human=None):
         "scene": {"batch": batch, "layout": int(layout), "seed": None},
         "truth_source": "layout-manifest+postrun-wrist",
         "specs": {str(b["id"]): {"color": b["color"],
-                                 "size_m": float(b["size"])}
+                                 "size_m": float(b["size"]),
+                                 "layer": int(b.get("layer", 0))}
                   for b in spec_blocks},
         "auto_top1": None,      # S0 是结构化指定，不是自动 top-1 ⇒ N/A
         "bias": dict(bias),
@@ -885,6 +886,14 @@ def build_facts(round_id, batch, layout, spec_blocks, bias, human=None):
               "failure_class"):
         if isinstance(human, dict) and k in human:
             facts[k] = human[k]
+    if isinstance(human, dict) and isinstance(human.get("designation"),
+                                              dict):
+        facts["designation"] = human["designation"]
+        cmds = {str(c.get("manifest_id")): c.get("raw")
+                for c in human["designation"].get("commands") or []}
+        for bid, sp in facts["specs"].items():
+            if cmds.get(bid):
+                sp["command"] = cmds[bid]
     return facts
 
 
@@ -2651,6 +2660,7 @@ class Round:
                  "cell": actions[i].get("cell"),
                  "absorbed": actions[i].get("absorbed"),
                  "absorbed_by": actions[i].get("absorbed_by"),
+                 "plan": plans[i].get("name"),
                  "from_xy": actions[i].get("from_xy"),
                  "desired_center_mm": actions[i].get("desired_center_mm"),
                  "commanded_center_mm": actions[i].get("commanded_center_mm")}
@@ -2950,6 +2960,11 @@ class Round:
                              "计数，拿不到就不判（补好证据后 --from score）"
                              % self.args.facts)
         human = read_json(self.args.facts) if self.args.facts else {}
+        if self.args.batch == "S3":
+            dpath = self.p("truth", "designation.json")
+            if os.path.exists(dpath):
+                human = dict(human or {})
+                human["designation"] = read_json(dpath)
         # 执行中令牌过期的机器证据（phase_execute 落盘 void.json）自动并入：
         # 契约 §4.6「本轮 void、不计 streak、不记抓取失败」。人填的同键文案
         # 优先，但键本身不会被人的漏填抹掉 —— 机器证据是事实，不是默认值。

@@ -91,6 +91,11 @@ MOVE_TOL_M = 0.040
 #: 合并三机位真值时的去重口径（米）。同 ``merge_truth_blocks`` 缺省。
 DEDUP_M = 0.040
 
+#: 「同一块」的最大层高差（米）。塔的上下层只差一个块边（29.5 mm），
+#: 只按 3-D 40 mm 近邻会把邻层当成原块（动塔顶、塔底留在原地被误判成
+#: 「目标已离开」）。与 ``merge_truth_blocks`` 的 layer_m 同源。
+LAYER_M = 0.015
+
 SAFETY_KEYS = ("collisions", "drops", "unexpected_motion", "estop")
 
 
@@ -229,8 +234,17 @@ def terminal_from_blocks(blocks, truth_source):
 
 
 def _near(a, b):
-    return math.sqrt((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2
-                     + (a["z"] - b["z"]) ** 2) <= MOVE_TOL_M
+    """同一位置（水平 40 mm 且**层高差 ≤15 mm**；缺 z 时退回旧 3-D 口径）。
+
+    S3 的两层塔上下只差 29.5 mm：只看 3-D 距离会把邻层当成原块。
+    """
+    d = math.sqrt((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2
+                  + (a["z"] - b["z"]) ** 2)
+    if d > MOVE_TOL_M:
+        return False
+    if "z" in a and "z" in b:
+        return abs(float(a["z"]) - float(b["z"])) <= LAYER_M
+    return True
 
 
 def _find_at(blocks, pos):
@@ -238,7 +252,12 @@ def _find_at(blocks, pos):
     for b in blocks:
         d = math.sqrt((b["x"] - pos["x"]) ** 2 + (b["y"] - pos["y"]) ** 2
                       + (b["z"] - pos["z"]) ** 2)
-        if d <= MOVE_TOL_M and (best is None or d < best[0]):
+        if d > MOVE_TOL_M:
+            continue
+        if "z" in b and "z" in pos and \
+                abs(float(b["z"]) - float(pos["z"])) > LAYER_M:
+            continue
+        if best is None or d < best[0]:
             best = (d, b)
     return best[1] if best else None
 
@@ -304,8 +323,15 @@ def load_pad(grid_path, spec_path, thickness_override=None):
 
 
 # ---------------------------------------------------------------- 放置判定
-def place_verdict(colour, cell, size, pad):
-    """彩色顶面质心 → ``place{in_slot, over_line, out_of_bounds}`` 或 ``(None, 缺失)``。"""
+def place_verdict(colour, cell, size, pad, target_color=None,
+                  grid_order=None, cell_color=None):
+    """彩色顶面质心 → ``place{in_slot, over_line, out_of_bounds[, colour_cell]}``
+    或 ``(None, 缺失)``。
+
+    ``target_color`` + ``grid_order`` 给了就附加 ``colour_cell``（S3 颜色归格）：
+    落格必须**是该颜色的格**；同色重复块的第二块允许落备用格（``spare``）。
+    主判据 ``in_slot/over_line/out_of_bounds`` 口径不变。
+    """
     if not isinstance(pad, dict):
         return None, ["垫参数缺失（--pad + --pad-spec）：放置格判不了"]
     if not isinstance(colour, dict):
@@ -323,10 +349,30 @@ def place_verdict(colour, cell, size, pad):
     u, v = cm.to_pad_frame(x, y)
     half = size / 2.0
     out = (abs(u) + half > hu) or (abs(v) + half > hv)
-    return {"in_slot": (got is not None and cell is not None
-                        and int(got) == int(cell)),
-            "over_line": not inside,
-            "out_of_bounds": bool(out)}, []
+    res = {"in_slot": (got is not None and cell is not None
+                       and int(got) == int(cell)),
+           "over_line": not inside,
+           "out_of_bounds": bool(out)}
+    if target_color and cell is not None and (grid_order or cell_color):
+        try:
+            want_cell = (str(grid_order[int(cell)]) if grid_order
+                         else str(cell_color))
+        except (IndexError, TypeError, ValueError):
+            want_cell = None
+        got_color = (colour.get("truth_color")
+                     or colour.get("measured_color") or "")
+        cc = {"expected_cell_color": want_cell,
+              "target_color": str(target_color),
+              "measured_color": (str(got_color) if got_color else None),
+              "cell_valid_for_colour": (want_cell in (str(target_color),
+                                                      "spare")
+                                        if want_cell else None),
+              "block_color_match": (str(got_color) == str(target_color)
+                                    if got_color else None)}
+        cc["ok"] = bool(cc["cell_valid_for_colour"]
+                        and cc["block_color_match"])
+        res["colour_cell"] = cc
+    return res, []
 
 
 def _failure_class(attempt, facts_cls):
@@ -360,6 +406,8 @@ def build_attempt(manifest, facts, log_dir, post_blocks, colour, pad):
     miss = []
     target = str(manifest.get("target"))
     attempt = {"target": {"block_id": target}}
+    if manifest.get("action_index") is not None:
+        attempt["action_index"] = int(manifest["action_index"])
 
     spec = (facts.get("specs") or {}).get(target)
     if spec is not None:
@@ -448,7 +496,9 @@ def build_attempt(manifest, facts, log_dir, post_blocks, colour, pad):
     if size is None:
         size = cm.PAD_PITCH
     cell = manifest.get("cell")
-    pl, pl_miss = place_verdict(colour, cell, size, pad)
+    pl, pl_miss = place_verdict(colour, cell, size, pad,
+                                target_color=manifest.get("target_color"),
+                                cell_color=manifest.get("cell_color"))
     arrived = None
     if pl is None:
         miss.extend(pl_miss)
@@ -481,6 +531,31 @@ def build_attempt(manifest, facts, log_dir, post_blocks, colour, pad):
         # 三机位确认不全（例如没有 readback 或 postrun）⇒ 判分器会进 person_review
         attempt["grasp"] = grasp
 
+    # ---- 清障记录（S3）：谁被搬、搬到哪、被谁触发、执行证据
+    clearing = []
+    for c in manifest.get("clearing") or []:
+        rec = {"block": str(c.get("block")), "kind": c.get("kind"),
+               "cell": c.get("cell"),
+               "absorbed": bool(c.get("absorbed")),
+               "absorbed_by": c.get("absorbed_by"),
+               "plan": c.get("plan")}
+        ev_c = None
+        if log_dir and rec["plan"]:
+            lp = find_exec_log(log_dir, rec["plan"])
+            if lp is not None:
+                ev_c = exec_evidence(read_events(lp))
+        if ev_c is not None:
+            rec["exec"] = {"exec_rc": ev_c["exec_rc"],
+                           "lifted": ev_c.get("lifted"),
+                           "closed_mm": ev_c.get("closed_mm"),
+                           "slipped": ev_c.get("slipped")}
+        else:
+            # 清障计划缺日志只记账，不把整轮判成不完整（硬证据仍看目标计划）
+            rec["missing"] = True
+        clearing.append(rec)
+    if clearing:
+        attempt["clearing"] = clearing
+
     void_reason = (facts.get("voids") or {}).get(target)
     if void_reason:
         attempt = {"target": {"block_id": target}, "spec": attempt.get("spec"),
@@ -491,7 +566,7 @@ def build_attempt(manifest, facts, log_dir, post_blocks, colour, pad):
     return attempt, miss
 
 
-def disturbance_suspects(attempts, min_mm=5.0):
+def disturbance_suspects(attempts, min_mm=5.0, extra_places=None):
     """邻块扰动嫌疑（台账第三百四十一轮判分盲区的补账；**只记录，不判红**）。
 
     判分只评每块自己的格位：s1-1-r1-attempt2 里黄绿被紫块的释放推离格心
@@ -500,12 +575,27 @@ def disturbance_suspects(attempts, min_mm=5.0):
     > ``min_mm``，记一条嫌疑（i 疑似被后放的 j 推开）。方向对得上才算——
     任意方向的自身放置误差不该被算成推挤。
 
+    ``extra_places``：清障落格（S3）—— ``{action_index, block,
+    desired_center_mm, cell}``，与目标一起按 ``action_index`` 全局排序。
     输入：``build_attempt`` 装的 attempts（place 里要有 ``xy_mm`` 与
     ``cell``）。返回嫌疑列表（空 = 无嫌疑 / 证据不足）。
     """
-    pts = []
+    rows = []
     for i, a in enumerate(attempts):
-        p = a.get("place") or {}
+        order = a.get("action_index")
+        rows.append((i if order is None else order,
+                     (a.get("target") or {}).get("block_id"),
+                     a.get("place") or {}))
+    for j, e in enumerate(extra_places or []):
+        order = e.get("action_index")
+        rows.append((len(attempts) + j if order is None else order,
+                     e.get("block"),
+                     {"xy_mm": e.get("desired_center_mm"),
+                      "cell": e.get("cell")}))
+    rows.sort(key=lambda r: (r[0] if r[0] is not None else 10 ** 9,
+                             str(r[1])))
+    pts = []
+    for i, (_order, target, p) in enumerate(rows):
         xy, cell = p.get("xy_mm"), p.get("cell")
         if not (isinstance(xy, (list, tuple)) and len(xy) == 2) \
                 or cell is None:
@@ -514,8 +604,7 @@ def disturbance_suspects(attempts, min_mm=5.0):
             cx, cy = cm.cell_center(int(cell))
         except (KeyError, ValueError, TypeError):
             continue
-        pts.append({"i": i,
-                    "target": (a.get("target") or {}).get("block_id"),
+        pts.append({"i": i, "target": target,
                     "x": float(xy[0]), "y": float(xy[1]),
                     "cx": float(cx) * 1000.0, "cy": float(cy) * 1000.0})
     out = []
@@ -582,6 +671,18 @@ def build_round(manifests, facts, log_dir, view_truths, colours, pad,
     if post_blocks is not None:
         terminal = terminal_from_blocks(post_blocks, src)
 
+    clearing_all = [c for m in manifests for c in (m.get("clearing") or [])]
+    clearing_summary = {
+        "n_moves": len(clearing_all),
+        "n_absorbed": sum(1 for c in clearing_all if c.get("absorbed")),
+        "n_free": sum(1 for c in clearing_all if not c.get("absorbed")),
+        "missing": sum(1 for c in clearing_all if c.get("missing")),
+    }
+    extra_places = [{"action_index": c.get("index"),
+                     "block": c.get("block"),
+                     "desired_center_mm": c.get("desired_center_mm"),
+                     "cell": c.get("cell")} for c in clearing_all]
+
     doc = {
         "version": 1, "kind": "stage4-round",
         "round_id": round_id or facts.get("round_id"),
@@ -594,7 +695,10 @@ def build_round(manifests, facts, log_dir, view_truths, colours, pad,
         "human_review": hr,
         "pad": pad,
         "attempts": attempts,
-        "disturbance_suspects": disturbance_suspects(attempts),
+        "disturbance_suspects": disturbance_suspects(
+            attempts, extra_places=extra_places),
+        "designation": facts.get("designation"),
+        "clearing_summary": clearing_summary,
         "truth_provenance": prov,
         "complete": not miss,
         "missing": miss,

@@ -487,6 +487,45 @@ def section_mutation():
           not real["ok"] and bad["ok"], '%s → %s' % (real, bad))
 
 
+def section_report_only():
+    print('\n[6] 报告制（S3）：四条率照算但不改 verdict；安全/缺失仍硬判')
+    bad_id = att(selected={"instance_id": 9},
+                 failure={"class": "perception"})
+    r = sc.score_round(obs([bad_id, att()], batch="S3"))
+    check('S3 低 ID 率 ⇒ verdict=report、would_fail 有内容、退出码 0',
+          r["verdict"] == "report" and bool(r["would_fail"])
+          and sc.exit_code(r) == 0, str((r["verdict"], r["would_fail"])))
+    check('阈值表未被报告制改动（仍 90/80/90/90）',
+          r["thresholds"] == sc.DEFAULT_THRESHOLDS, str(r["thresholds"]))
+    r0 = sc.score_round(obs([bad_id], batch="S0"))
+    check('同样的低率在 S0 仍是硬门（fail）', r0["verdict"] == "fail",
+          r0["verdict"])
+    r1 = sc.score_round(obs([att()], batch="S3",
+                            safety={"collisions": 1, "drops": 0,
+                                    "unexpected_motion": 0, "estop": 0}))
+    check('S3 安全事件仍硬判 fail', r1["verdict"] == "fail", r1["verdict"])
+    r2 = sc.score_round(obs([att()], batch="S3", complete=False,
+                            missing=["x"]))
+    check('S3 数据缺失仍 missing_data', r2["verdict"] == "missing_data",
+          r2["verdict"])
+    pl = {"in_slot": True, "over_line": False, "out_of_bounds": False,
+          "colour_cell": {"ok": True}}
+    r3 = sc.score_round(obs([att(place=pl)], batch="S3"))
+    check('colour_cell_rate 计入输出',
+          r3["colour_cell_rate"] == 1.0 and r3["n_colour_cell_ok"] == 1,
+          str((r3["colour_cell_rate"], r3["n_colour_cell_ok"])))
+    r4 = sc.score_round(obs([att(place=dict(
+        pl, colour_cell={"ok": False}))], batch="S3"))
+    check('颜色放错格 ⇒ colour_cell_rate 0（不改 place_ok 口径）',
+          r4["colour_cell_rate"] == 0.0, str(r4["colour_cell_rate"]))
+    r5 = sc.score_round(obs([att()], batch="S3",
+                            designation={"order": ["b0"]},
+                            clearing_summary={"n_moves": 1}))
+    check('designation / clearing_summary 原样带出',
+          r5["designation"] == {"order": ["b0"]}
+          and r5["clearing_summary"] == {"n_moves": 1})
+
+
 def main():
     print('=' * 68)
     section_const()
@@ -494,6 +533,7 @@ def main():
     section_round()
     section_exit()
     section_mutation()
+    section_report_only()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('未通过：' + '; '.join(FAILS))

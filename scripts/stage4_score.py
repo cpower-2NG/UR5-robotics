@@ -64,6 +64,15 @@ DEFAULT_THRESHOLDS = {
 FAIL_CLASSES = ("perception", "candidate", "ik", "planning",
                 "execution", "placement", "human")
 
+#: 报告制批次（契约 §4.4：S3/S4 = 1–2 轮演示，阈值由用户看完数据后拍板）。
+#: 这些批次四条率照算、低率记进 ``would_fail``，但**不改 verdict**；
+#: 数据缺失 / 安全事件 / 人工干预仍然硬判。阈值表一个字不改。
+REPORT_ONLY_BATCHES = ("S3",)
+
+
+def report_only_for(batch):
+    return str(batch or "") in REPORT_ONLY_BATCHES
+
 # 契约 §12.1（v0.6）：抓取成功 = 回读 + 抬升滑动 + 跑后腕部三机位。
 # 人眼不在与门里；它只在 person_review 时当放行人。
 CONFIRMS = ("readback", "slip", "postrun-wrist-3view")
@@ -84,7 +93,8 @@ A_OK, A_FAIL, A_REVIEW, A_VOID, A_MISSING = (
     "ok", "fail", "person_review", "void", "missing_data")
 
 # 轮级 verdict → 退出码
-_EXIT = {"ok": 0, "fail": 1, "person_review": 1, "missing_data": 2}
+_EXIT = {"ok": 0, "report": 0, "fail": 1, "person_review": 1,
+         "missing_data": 2}
 
 VOID_STREAK_STOP = 3
 
@@ -278,6 +288,10 @@ def score_attempt(rec, i=0):
     row["place_ok"] = (pl["in_slot"] is True
                        and pl["over_line"] is not True
                        and pl["out_of_bounds"] is not True)
+    cc = pl.get("colour_cell")
+    if isinstance(cc, dict) and cc.get("ok") is not None:
+        row["colour_cell_ok"] = bool(cc.get("ok"))
+        row["colour_cell"] = cc
 
     # ---- 失败必须分类
     failed = row["id_ok"] is False or row["grasp_ok"] is False \
@@ -356,13 +370,20 @@ def _void_streak(rows):
     return best
 
 
-def score_round(obs, thresholds=None):
-    """一轮 → 判分结果（不写文件）。"""
+def score_round(obs, thresholds=None, report_only=None):
+    """一轮 → 判分结果（不写文件）。
+
+    ``report_only``：报告制（缺省按批次：S3 是）。四条率照算、低率进
+    ``would_fail``，但 verdict 记 ``report``；数据缺失 / 安全 / 干预仍硬判。
+    """
     th = dict(DEFAULT_THRESHOLDS)
     th.update(thresholds or {})
     scene = obs.get("scene") or {}
     round_id = obs.get("round_id") or obs.get("round")
     batch = obs.get("batch") or scene.get("batch")
+    if report_only is None:
+        report_only = report_only_for(batch)
+    would_fail = []
     layout = obs.get("layout") or scene.get("layout")
     repeat = obs.get("repeat", scene.get("repeat"))
     raw = obs.get("attempts") or []
@@ -430,6 +451,10 @@ def score_round(obs, thresholds=None):
                 verdict, reason = "missing_data", "%s 分母为 0（全 void？）" % label
                 break
             if v < th[key]:
+                if report_only:
+                    would_fail.append("%s %.1f%% < %.0f%%" % (
+                        label, 100 * v, 100 * th[key]))
+                    continue
                 verdict, reason = "fail", "%s %.1f%% < %.0f%%" % (
                     label, 100 * v, 100 * th[key])
                 break
@@ -440,6 +465,10 @@ def score_round(obs, thresholds=None):
                         or review.get("required") is True)
         if needs_review and review.get("approved") is not True:
             verdict, reason = "person_review", "有尝试需人眼复核，未批准"
+
+    if verdict == "ok" and report_only:
+        verdict = "report"
+    n_cc = sum(1 for r in scored if r.get("colour_cell_ok") is True)
 
     return {
         "version": 2, "kind": "stage4-score",
@@ -470,6 +499,12 @@ def score_round(obs, thresholds=None):
         "pad": pad,
         "attempts": rows,
         "verdict": verdict, "reason": reason,
+        "report_only": bool(report_only),
+        "would_fail": would_fail,
+        "colour_cell_rate": _rate(n_cc, den),
+        "n_colour_cell_ok": n_cc,
+        "designation": obs.get("designation"),
+        "clearing_summary": obs.get("clearing_summary"),
     }
 
 
@@ -607,6 +642,9 @@ def main(argv=None):
     ap.add_argument("--need", type=int, default=3)
     ap.add_argument("--out-prefix", default=None,
                     help="写出 <prefix>-score.json/.md（单轮用）")
+    ap.add_argument("--report-only", action="store_true",
+                    help="报告制：四条率照算、低率记 would_fail，但不改 verdict"
+                         "（S3/S4；缺省按批次自动开）")
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
@@ -616,7 +654,8 @@ def main(argv=None):
         print("读不了轮次文件：%s" % e, file=sys.stderr)
         return 2
 
-    results = [score_round(o) for o in obs_list]
+    ro = True if args.report_only else None
+    results = [score_round(o, report_only=ro) for o in obs_list]
     if args.exit:
         res = score_exit(results, need=args.need)
         print(_md(res))

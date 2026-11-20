@@ -515,6 +515,76 @@ def section_disturbance():
     check('只有一个有证据的块 ⇒ 无从谈推挤', s4 == [], str(s4))
 
 
+def section_s3_report():
+    """S3：层感知邻近 / 颜色格判定 / 清障记录 / 扰动含清障 / designation 透传。"""
+    print('\n[8] S3 报告：层感知 + 颜色格 + 清障记录')
+    lo = {'x': 0.40, 'y': 0.30, 'z': 0.01475}
+    hi = {'x': 0.40, 'y': 0.30, 'z': 0.04425}
+    check('_near：同 xy 但层差 29.5 mm ⇒ 不是同一块',
+          rr._near(lo, hi) is False)
+    check('_find_at：邻层不被当成目标块',
+          rr._find_at([hi], lo) is None)
+    check('_near：同层 5 mm ⇒ 同一块', rr._near(lo, dict(lo, x=0.405)))
+
+    cm.install_model_pad_defaults()
+    pad = {'thickness_m': 0.00016842, 'footprint_m': [0.30, 0.30],
+           'surface_z_m': 0.00016842}
+    cx, cy = cm.cell_center(0)                # 0 号格 = red
+    colour = {'ok': True, 'xy_mm': [cx * 1000.0, cy * 1000.0],
+              'truth_color': 'red', 'n_frames': 10, 'n_missed': 0}
+    p, _ = rr.place_verdict(colour, 0, 0.0295, pad, target_color='red',
+                            cell_color='red')
+    check('颜色格：红块进红色格 ⇒ colour_cell.ok',
+          p['colour_cell']['ok'] is True
+          and p['colour_cell']['cell_valid_for_colour'] is True)
+    p, _ = rr.place_verdict(colour, 0, 0.0295, pad, target_color='red',
+                            cell_color='spare')
+    check('重复色进备用格 ⇒ 合法', p['colour_cell']['ok'] is True)
+    p, _ = rr.place_verdict(colour, 0, 0.0295, pad, target_color='red',
+                            cell_color='cyan')
+    check('红块进青色格 ⇒ colour_cell.ok=False',
+          p['colour_cell']['ok'] is False)
+
+    man = {'target': '0', 'action_index': 0, 'cell': 0,
+           'target_color': 'red', 'cell_color': 'red',
+           'actions': [{'kind': 'target',
+                        'commanded_center_mm': [cx * 1000.0, cy * 1000.0]}],
+           'plans': [],
+           'clearing': [{'index': 1, 'block': '6', 'cell': 7,
+                         'absorbed': True, 'plan': '02-target-block-6.json',
+                         'desired_center_mm': [0.0, 0.0]}]}
+    facts = {'scene': {'batch': 'S3', 'layout': 1},
+             'truth_source': 'layout-manifest+postrun-wrist',
+             'designation': {'order': ['0'], 'n_ok': 1},
+             'safety': {k: 0 for k in ('collisions', 'drops',
+                                       'unexpected_motion', 'estop')},
+             'interventions': {'count': 0},
+             'human_review': {'required': False}}
+    doc, _miss = rr.build_round([man], facts, None, None, [colour], pad, [])
+    check('round.json 顶层带 designation 与 clearing_summary',
+          doc['designation'] == facts['designation']
+          and doc['clearing_summary']['n_moves'] == 1
+          and doc['clearing_summary']['n_absorbed'] == 1,
+          str(doc.get('clearing_summary')))
+    att = doc['attempts'][0]
+    check('attempt 带 action_index 与清障记录（缺日志只记 missing）',
+          att.get('action_index') == 0
+          and (att.get('clearing') or [{}])[0].get('missing') is True,
+          str(att.get('clearing')))
+
+    c0, c1 = cm.cell_center(0), cm.cell_center(1)
+    ux, uy = c1[0] - c0[0], c1[1] - c0[1]
+    n = math.hypot(ux, uy)
+    extra = [{'action_index': 0, 'block': 'C', 'cell': 0,
+              'desired_center_mm': [(c0[0] + ux / n * 0.008) * 1000.0,
+                                    (c0[1] + uy / n * 0.008) * 1000.0]},
+             {'action_index': 1, 'block': 'B', 'cell': 1,
+              'desired_center_mm': [c1[0] * 1000.0, c1[1] * 1000.0]}]
+    s = rr.disturbance_suspects([], extra_places=extra)
+    check('扰动嫌疑把清障落格也算进来（按 action_index）',
+          len(s) == 1 and s[0]['pushed'] == 'C' and s[0]['by'] == 'B', str(s))
+
+
 def main():
     print('=' * 68)
     # C1：模块缺省 = 未实测哨兵；模型世界用例显式装模型常量。
@@ -522,6 +592,7 @@ def main():
     for fn in (section_exec_evidence, section_happy, section_missing,
                section_pad_constant, section_pad_thickness_unmeasured,
                section_void_and_class, section_disturbance,
+               section_s3_report,
                section_s11_replay):
         try:
             fn()
