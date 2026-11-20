@@ -54,6 +54,17 @@ ORANGE = np.array([230, 66, 0])     # hue ≈ 20.5°  rel_sat ≈ 255
 TAN = np.array([200, 146, 96])      # hue ≈ 28.6°  rel_sat ≈ 132（低饱和米色）
 
 
+def make_big_frame():
+    """两块 40×40 px 的大顶面（像素数过 SAM 门，专测调用形态）。"""
+    depth = np.full((H, W), 1.0)
+    color = np.full((H, W, 3), 220, dtype=np.uint8)
+    for (u0, u1), col in (((10, 50), ORANGE), ((70, 110), TAN)):
+        depth[20:60, u0:u1] = 1.0 - 0.0295
+        color[20:60, u0:u1] = col
+    return {"depth": depth, "color": color, "K": K, "R_bc": R_BC,
+            "t_bc": T_BC, "dir": None}
+
+
 def make_frame():
     depth = np.full((H, W), 1.0)                       # 台面
     color = np.full((H, W, 3), 220, dtype=np.uint8)    # 浅灰桌面
@@ -229,6 +240,48 @@ def main():
     pc1, Pb1, pix1, color1 = _pair_piece(shift=0.0)
     check('单块（29.5×29.5）⇒ 原样一片（不硬切）',
           len(sb.split_same_colour_piece(pc1, Pb1, pix1, color1)) == 1)
+
+    print('\n[6] 提示点合并 + 图像块心并行（2026-11-20 计算段优化）')
+
+    class PointFake:
+        def __init__(self, batch):
+            if batch:
+                self.supports_batch = True
+            self.calls = []
+
+        def masks_for(self, points, image_path=None):
+            self.calls.append([(round(float(u), 1), round(float(v), 1))
+                               for u, v in points])
+            out = np.zeros((len(points), H, W), dtype=bool)
+            for i, (u, v) in enumerate(points):
+                u0, u1 = max(0, int(u) - 9), min(W, int(u) + 9)
+                v0, v1 = max(0, int(v) - 9), min(H, int(v) + 9)
+                out[i, v0:v1, u0:u1] = True
+            return out
+
+    def _k(rows):
+        return [(r.get('class'), round(float(r['cx']), 2),
+                 round(float(r['cy']), 2), r.get('img_ok')) for r in rows]
+
+    pa = PointFake(False)
+    ra, _ = sb.find_blocks_sam(make_big_frame(), pa)
+    pb = PointFake(True)
+    rb, _ = sb.find_blocks_sam(make_big_frame(), pb)
+    check('逐行调用 2 次 / 批处理只调 1 次',
+          len(pa.calls) == 2 and len(pb.calls) == 1,
+          (len(pa.calls), len(pb.calls)))
+    check('批处理与逐行输出一致（类/中心/img_ok）', _k(ra) == _k(rb),
+          (_k(ra), _k(rb)))
+    check('批处理一次收到全部提示点（2 行 × 2 点）',
+          len(pb.calls[0]) == 4, str(pb.calls))
+    r1, _ = sb.find_blocks_sam(make_big_frame(), PointFake(False), img_jobs=1)
+    r2, _ = sb.find_blocks_sam(make_big_frame(), PointFake(False), img_jobs=4)
+    check('图像块心并行与串行输出一致（img 字段）',
+          [(r.get('img_ok'), r.get('img_cx'), r.get('img_cy')) for r in r1]
+          == [(r.get('img_ok'), r.get('img_cx'), r.get('img_cy'))
+              for r in r2])
+    check('UltralyticsSam 声明支持批处理',
+          sb.UltralyticsSam.supports_batch is True)
 
     print('\n%d PASS / %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:

@@ -57,8 +57,11 @@ class UltralyticsSam:
     """ultralytics SAM 预测器包装：``masks_for(points) -> list[np.bool HxW]``。
 
     ultralytics 对同一张图缓存嵌入（热调用 ~0.09 s，第 346 轮实测），逐簇调用
-    不重复编码。
+    不重复编码。**支持一帧的提示点合并成一次调用**（``supports_batch``）：
+    2026-11-20 实测每次调用 ≈0.19 s，逐行调用 7–9 次/帧是纯浪费。
     """
+
+    supports_batch = True
 
     def __init__(self, weights=None):
         from ultralytics import SAM
@@ -77,7 +80,24 @@ class UltralyticsSam:
 
 
 def load_predictor(weights=None):
+    """新建一个预测器（测试/一次性用途；生产请用 ``get_predictor``）。"""
     return UltralyticsSam(weights)
+
+
+_PREDICTOR = None
+
+
+def get_predictor(weights=None):
+    """**进程级缓存**的预测器：一次 burst 只加载一次 MobileSAM。
+
+    2026-11-20 真机轮 A 实测：``measure_dir`` 原来每帧 ``load_predictor()``
+    ⇒ 10 帧重载 10 次模型，跑前真值 54 s（热跑单帧只要 3.4 s）。模型加载
+    约 2 s/帧，是那 ~20 s 差的来源。进程池下每个 worker 各自缓存一份。
+    """
+    global _PREDICTOR
+    if _PREDICTOR is None:
+        _PREDICTOR = UltralyticsSam(weights)
+    return _PREDICTOR
 
 
 # ---------------------------------------------------------------- 纯逻辑
@@ -317,7 +337,8 @@ def _iou_idx(ia, ib):
     return inter / max(1, len(sa | sb))
 
 
-def attach_image_centers(rows, frame, block_size_m=0.0295, grad=None):
+def attach_image_centers(rows, frame, block_size_m=0.0295, grad=None,
+                         jobs=1, skip_dup_mm=0.0):
     """给每行补一个**图像空间块心**（只记录，不改 ``cx/cy`` —— 2026-11-18）。
 
     为什么：深度链的块心是「顶面深度点」的方框中心；S2:5 实测顶面点集只
@@ -325,6 +346,10 @@ def attach_image_centers(rows, frame, block_size_m=0.0295, grad=None):
     拉偏 1–3.5 mm（6 块里 5 块同向，4× 放大目视可辨）。图像拟合只看彩色
     顶面边线，是独立的第二读数（``stage4_image_center.refine_center``）。
     规划中心暂不切换 —— 先累计真机数据、过人眼准出闸门（队列条目）。
+
+    ``jobs > 1``：每帧 7–9 个候选片的细化相互独立，用线程池并行（numpy /
+    OpenCV 会释放 GIL；不 fork，避免与 torch/CUDA 进程冲突）。2026-11-20
+    板上实测单次 0.085 s、≈0.7 s/帧，并行后按核数下降。
 
     记录字段：``img_ok`` / ``img_cx`` / ``img_cy`` / ``img_yaw`` /
     ``img_shift_mm`` / ``img_support`` / ``img_why``。失败（弱边/贴搜索
@@ -336,16 +361,37 @@ def attach_image_centers(rows, frame, block_size_m=0.0295, grad=None):
             and r.get("top") is not None]
     if not cand:
         return rows
+    # 片筛选：同色且被**更大**的同色片在 skip_dup_mm 内罩住的小片是碎片，
+    # 细化它不会改变共识（它的深度中心仍保留）。0 = 不过滤。
+    if float(skip_dup_mm or 0) > 0 and len(cand) > 1:
+        def _dup(r):
+            return any(o is not r and o.get("class") == r.get("class")
+                       and int(o.get("n") or 0) > int(r.get("n") or 0)
+                       and math.hypot(float(o["cx"]) - float(r["cx"]),
+                                      float(o["cy"]) - float(r["cy"]))
+                       < float(skip_dup_mm)
+                       for o in cand)
+        cand = [r for r in cand if not _dup(r)]
     import stage4_image_center as ic
     if grad is None:
         grad = ic._color_gradient(frame["color"])
-    for r in cand:
-        ref = ic.refine_center(
+
+    def _one(r):
+        return ic.refine_center(
             None, frame["color"], frame["K"], frame["R_bc"], frame["t_bc"],
             float(r["top"]) / 1000.0, block_size_m=block_size_m,
             cx0_mm=float(r["cx"]), cy0_mm=float(r["cy"]),
             yaw0_deg=float(r.get("yaw_rect") or r.get("yaw") or 0.0),
             grad=grad)
+
+    jobs = int(jobs or 1)
+    if jobs > 1 and len(cand) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            refs = list(ex.map(_one, cand))
+    else:
+        refs = [_one(r) for r in cand]
+    for r, ref in zip(cand, refs):
         r["img_ok"] = bool(ref.get("ok"))
         r["img_why"] = ref.get("why") or ""
         r["img_support"] = ref.get("support")
@@ -359,7 +405,7 @@ def attach_image_centers(rows, frame, block_size_m=0.0295, grad=None):
 
 # ---------------------------------------------------------------- 主入口
 def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
-                    max_h_mm=70.0):
+                    max_h_mm=70.0, img_jobs=1, img_skip_dup_mm=0.0):
     """SAM 版 ``find_blocks``：同 schema 行输出（``return_masks`` 带掩码像素）。"""
     depth, color, K = frame["depth"], frame["color"], frame["K"]
     H, W = depth.shape
@@ -383,6 +429,28 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
         rows_in.extend(pre_split_size_rows(row, Pb, pix, pix_map, color, frame))
 
     out = []
+    # ── 一帧的提示点合并成一次 SAM 调用（支持批处理的预测器才走；假预测器
+    #    没有 supports_batch ⇒ 保持逐行，单测行为不变）。每行 2 个点，按顺序切片。
+    batch_masks = None
+    if getattr(predictor, "supports_batch", False):
+        entries = []
+        for row in rows_in:
+            if row.get("low"):
+                continue
+            muv = row.get("mask_uv")
+            if muv is None or len(muv) < 2 * PIECE_MIN_PX:
+                continue
+            pts = discover_prompts(row, frame)
+            entries.append((id(row), len(pts), pts))
+        if entries:
+            all_pts = [p for _rid, _n, pts in entries for p in pts]
+            masks_all = predictor.masks_for(all_pts, image_path=image_path)
+            if masks_all is not None and len(masks_all) == len(all_pts):
+                batch_masks = {}
+                off = 0
+                for rid, n, _pts in entries:
+                    batch_masks[rid] = masks_all[off:off + n]
+                    off += n
     for row in rows_in:
         if row.get("low"):
             out.append(row)
@@ -394,8 +462,11 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
                                                frame, return_masks))
             continue
 
-        prompts = discover_prompts(row, frame)
-        masks = predictor.masks_for(prompts, image_path=image_path)
+        if batch_masks is not None:
+            masks = batch_masks.get(id(row))
+        else:
+            prompts = discover_prompts(row, frame)
+            masks = predictor.masks_for(prompts, image_path=image_path)
         muv = row["mask_uv"]
         if masks is None or len(masks) == 0:
             row["sam_fallback"] = "no_masks"
@@ -514,7 +585,8 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
             out.append(rec)
 
     clamp_pairs(out, frame)
-    attach_image_centers(out, frame)
+    attach_image_centers(out, frame, jobs=img_jobs,
+                         skip_dup_mm=img_skip_dup_mm)
     out.sort(key=lambda r: (r["cx"], r["cy"]))
     for i, r in enumerate(out):
         r["idx"] = i

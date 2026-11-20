@@ -362,7 +362,8 @@ CAMERAS = {
 
 
 def measure_dir(frame_dir, index=None, split=True, yaw_method="colour",
-                camera="wrist", seg="grid"):
+                camera="wrist", seg="grid", img_jobs=1,
+                img_skip_dup_mm=0.0):
     """一帧 → (frame, find_blocks 行, 台面 z)。
 
     ``camera``：``'wrist'``（默认，规划感知 + 跑后三机位判分）或
@@ -384,8 +385,11 @@ def measure_dir(frame_dir, index=None, split=True, yaw_method="colour",
     frame = gc.load_frame(frame_dir, tip=tip, chain=chain, idx=index)
     if seg == "sam":
         import sam_blocks
-        predictor = sam_blocks.load_predictor()
-        rows, table_z = sam_blocks.find_blocks_sam(frame, predictor)
+        # 进程级缓存：一次 burst 只加载一次模型（原先每帧重载 ≈2 s/帧）
+        predictor = sam_blocks.get_predictor()
+        rows, table_z = sam_blocks.find_blocks_sam(
+            frame, predictor, img_jobs=img_jobs,
+            img_skip_dup_mm=img_skip_dup_mm)
     else:
         rows, table_z = gc.find_blocks(frame, split=split)
     if yaw_method == "colour":
@@ -406,7 +410,9 @@ def _measure_index(job):
     kw = job
     fr, rows, _ = measure_dir(kw["frame_dir"], index=kw["index"],
                               split=kw["split"], yaw_method=kw["yaw_method"],
-                              camera=kw["camera"], seg=kw.get("seg", "grid"))
+                              camera=kw["camera"], seg=kw.get("seg", "grid"),
+                              img_jobs=kw.get("img_jobs", 1),
+                              img_skip_dup_mm=kw.get("img_skip_dup_mm", 0.0))
     return build_truth(rows, fr, table_top=kw["table_top"],
                        block_size=kw["block_size"],
                        batch=kw["batch"], index=kw["index"],
@@ -697,6 +703,11 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=None, metavar="N",
                     help="--consensus 逐帧量测的并行进程数（默认 min(CPU, 帧数)；"
                          "1 = 串行，用于对照/调试）")
+    ap.add_argument("--img-jobs", type=int, default=1, metavar="N",
+                    help="每帧图像块心细化的线程数（默认 1；SAM 前实测 0.085 s/片）")
+    ap.add_argument("--img-skip-dup-mm", type=float, default=0.0,
+                    help="片筛选：跳过被更大同色片罩住的小碎片（中心距 < N mm；"
+                         "0 = 不过滤）")
     ap.add_argument("--min-frames", type=int, default=None,
                     help="共识要求至少出现的帧数（默认 max(3, ⌈n/2⌉)）")
     ap.add_argument("--cluster-mm", type=float, default=20.0,
@@ -778,7 +789,8 @@ def main(argv=None):
         jobs = {k: v for k, v in (
             ("frame_dir", args.frame), ("split", not args.no_split),
             ("yaw_method", yaw_method), ("camera", args.camera),
-            ("seg", args.seg),
+            ("seg", args.seg), ("img_jobs", args.img_jobs),
+            ("img_skip_dup_mm", args.img_skip_dup_mm),
             ("table_top", args.table_top), ("block_size", args.block_size),
             ("batch", batch), ("drop_unknown", not args.keep_unknown),
             ("min_class_share", args.min_class_share),
