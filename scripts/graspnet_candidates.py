@@ -126,13 +126,15 @@ SIDE_BAND_INSET_M = 0.004
 #: 只取塔外圈这一环（块局部坐标 max(|u|,|v|) ∈ [size/2−ring, size/2+ring]）。
 #: 上层同心偏差 ≤3 mm 时下层侧面仍完整落在环内。
 SIDE_RING_M = 0.004
-#: 侧色置信门：点数、票面份额、中位色相到最近类中心的距离。
-#: （侧面比顶面暗，饱和度门与顶面同值；亮度下限降到 35，常量集中在这里。）
-SIDE_MIN_PX = 80
-SIDE_SHARE_MIN = 0.65
-SIDE_HUE_MAX_DEG = 15.0
-SIDE_S_MIN = 60.0
-SIDE_V_MIN = 35.0
+#: 侧色置信门（2026-11-20 按真机侧带数据重标定）：
+#: 真机侧面比顶面暗得多（顶部块在下方侧面上投影）、且受光角度会让色相偏移
+#: 20–30°（实测红色下面板 hue 8–16°、青色下方 160°）。旧的 80/0.65/15/60/35
+#: 在真机上把**红色**的侧面也大量挡掉；A/B（红塔 + 青塔存档帧）后放宽到：
+SIDE_MIN_PX = 50
+SIDE_SHARE_MIN = 0.5
+SIDE_HUE_MAX_DEG = 45.0
+SIDE_S_MIN = 40.0
+SIDE_V_MIN = 15.0
 GRASPNET_ROOT = os.path.expanduser("~/robotics/third_party/graspness_unofficial")
 CKPT = os.path.expanduser("~/robotics/third_party/graspnet-baseline/logs/checkpoint-rs.tar")
 
