@@ -1815,7 +1815,8 @@ class Round:
                 "--camera", "wrist",
                 "--seg", self.args.seg,
                 "--zone", truth_zone_for(burst_remote),
-                "--min-frames", "5", "--jobs", "1", "--img-jobs", "4"]
+                "--min-frames", "5", "--max-frames", "8",
+                "--jobs", "1", "--img-jobs", "4"]
         if allow_empty:
             opts.append("--allow-empty")
         name = os.path.basename(os.path.normpath(out_local))

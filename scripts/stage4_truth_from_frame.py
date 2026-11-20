@@ -710,6 +710,9 @@ def main(argv=None):
                          "0 = 不过滤）")
     ap.add_argument("--min-frames", type=int, default=None,
                     help="共识要求至少出现的帧数（默认 max(3, ⌈n/2⌉)）")
+    ap.add_argument("--max-frames", type=int, default=0, metavar="N",
+                    help="只用 burst 的前 N 帧（0 = 全部；2026-11-20 砍帧 A/B："
+                         "8/10 与 10/10 块数/身份/中心逐块一致）")
     ap.add_argument("--cluster-mm", type=float, default=20.0,
                     help="共识聚类的距离阈值（毫米），默认 20；按三维距离算"
                          "（塔的上下层 xy 相同，靠 z 分开）")
@@ -778,6 +781,8 @@ def main(argv=None):
 
     if args.consensus:
         idxs = gc.list_frame_indices(args.frame)
+        if args.max_frames:
+            idxs = idxs[:int(args.max_frames)]
         batch = os.path.basename(args.frame.rstrip("/"))
         # 逐帧**先不按区筛**：贴边界的块会因单帧噪声在区内/区外来回跳，
         # 先筛会把同一块在不同帧切掉 ⇒ 出现帧数虚低。区的判定留到合并之后，

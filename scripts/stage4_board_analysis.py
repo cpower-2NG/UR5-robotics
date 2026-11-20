@@ -66,6 +66,8 @@ def cmd_truth(a):
         argv.append("--allow-empty")
     if a.jobs is not None:
         argv += ["--jobs", str(int(a.jobs))]
+    if int(getattr(a, "max_frames", 0) or 0) > 0:
+        argv += ["--max-frames", str(int(a.max_frames))]
     argv += ["--img-jobs", str(int(a.img_jobs))]
     if float(a.img_skip_dup_mm or 0) > 0:
         argv += ["--img-skip-dup-mm", str(float(a.img_skip_dup_mm))]
@@ -149,6 +151,8 @@ def build_parser():
                    help="逐帧量测进程数（缺省 min(CPU, 帧数)）")
     t.add_argument("--img-jobs", type=int, default=1,
                    help="图像块心细化线程数")
+    t.add_argument("--max-frames", type=int, default=0,
+                   help="只用 burst 前 N 帧（0=全部）")
     t.add_argument("--img-skip-dup-mm", type=float, default=0.0,
                    help="片筛选：跳过被更大同色片罩住的小碎片（毫米，0=关）")
     t.set_defaults(func=cmd_truth)
