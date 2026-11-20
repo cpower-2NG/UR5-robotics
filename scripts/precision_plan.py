@@ -571,16 +571,50 @@ def ik_candidates(chain, xyz, yaw_deg=0.0, seeds=(), n_random=32,
     T = target_matrix(xyz, yaw_deg)
     key = int(round((float(xyz[0]) + float(xyz[1]) + float(xyz[2])) * 1e5)) \
         % (2 ** 31)
-    rng = np.random.default_rng(20261026 + key)
     all_seeds = [np.asarray(s, float) for s in seeds]
-    all_seeds += [rng.uniform(-np.pi, np.pi, 6) for _ in range(n_random)]
-    out = []
-    for s in all_seeds:
+
+    # **同一旋转姿态的 32 个随机种子解按链实例缓存**（2026-11-20 计算段优化）：
+    # 随机种子由位姿确定性生成，同一姿态（如每个动作末尾的 survey_place、
+    # 跑后三机位的同一批位姿）会反复解同一组 32 支 —— 和「每个分析进程重载
+    # SAM 模型」同类的重复劳动。缓存只存**随机种子那部分**（与 q_start 无关）；
+    # 每次调用仍单独解 q_start 种子并排在最前，输出顺序与原实现一致。
+    cache = getattr(chain, "_ik_base_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            chain._ik_base_cache = cache
+        except AttributeError:
+            cache = None                       # 不可写属性的假链：不缓存
+    ck = (round(float(xyz[0]), 6), round(float(xyz[1]), 6),
+          round(float(xyz[2]), 6), round(float(yaw_deg), 6),
+          int(n_random), int(max_iter), float(tol))
+    base = cache.get(ck) if cache is not None else None
+
+    def _solve_seed(s):
         q, pe, re, _, conv = chain.ik(T, s, max_iter=max_iter)
         if not conv or pe > 0.1 or re > 0.05:
-            continue
+            return None
         if check_limits(chain, q) or check_wrist(chain, q):
+            return None
+        return q
+
+    out = []
+    for s in all_seeds:
+        q = _solve_seed(s)
+        if q is None or any(joint_dist(q, u) < tol for u in out):
             continue
+        out.append(q)
+    if base is None:
+        rng = np.random.default_rng(20261026 + key)
+        base = []
+        for _ in range(n_random):
+            q = _solve_seed(rng.uniform(-np.pi, np.pi, 6))
+            if q is None or any(joint_dist(q, u) < tol for u in base):
+                continue
+            base.append(q)
+        if cache is not None:
+            cache[ck] = base
+    for q in base:
         if any(joint_dist(q, u) < tol for u in out):
             continue
         out.append(q)

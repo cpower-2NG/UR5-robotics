@@ -333,6 +333,30 @@ def test_ik_branch_selection_keeps_forearm_above_table(chain):
         ("place_approach", (sx, sy, paz)),
         ("place", (sx, sy, pz)),
     ]
+    # IK 位姿缓存（2026-11-20 计算量优化）：同一姿态的随机种子解只解一次；
+    # 第二次调用只补 q_start 种子，输出逐位一致（缓存不改变选支）。
+    _calls = {"n": 0}
+    _orig_ik = chain.ik
+
+    def _counted(T, s, **kw):
+        _calls["n"] += 1
+        return _orig_ik(T, s, **kw)
+    chain.ik = _counted
+    try:
+        set1 = pp.ik_candidates(chain, targets[0][1], 0.0,
+                                seeds=[q_start], n_random=8)
+        n1 = _calls["n"]
+        _calls["n"] = 0
+        set2 = pp.ik_candidates(chain, targets[0][1], 0.0,
+                                seeds=[q_start], n_random=8)
+        n2 = _calls["n"]
+    finally:
+        chain.ik = _orig_ik
+    assert n1 == 9 and n2 == 1, ("第二次仍解了随机种子", n1, n2)
+    assert (len(set1) == len(set2)
+            and all(np.allclose(a, b) for a, b in zip(set1, set2))), \
+        ("缓存改变了输出", len(set1), len(set2))
+
     q = list(q_start)
     naive_bad = None
     for name, xyz in targets:
