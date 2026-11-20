@@ -2116,6 +2116,28 @@ class Round:
 
         # ---- R1：观察后、探针前
         #
+        # **续跑（--from compute）没有 authorize 段**：令牌可能还没签发。
+        # 这里补一次**同样的物理两步握手**（只读核验 STOP→PLAY），否则续跑
+        # 会拿旧令牌/无令牌直接停。正常轮次 authorize 已把 _token 设好，不走这里。
+        if (not self.args.dry_run and not getattr(self, "_token", None)):
+            print("")
+            print(">>> 需要人动手：确认两指整个行程内无手无遮挡、急停在手，")
+            print(">>> 然后示教器先按 STOP，看到 STOPPED 后再按 PLAY。")
+            print("")
+            tok, rem = self.board.wait_token(
+                self.args.auth_timeout, self.args.auth_poll,
+                now=self.deps["now"], sleep=self.deps["sleep"],
+                fresh_min=self.args.auth_fresh_min)
+            self._token = tok
+            self._token_remaining = rem
+            write_json(self.p("motion-auth.json"),
+                       {"at": self.deps["now"](),
+                        "token_remaining_s": round(float(rem), 1),
+                        "source": "续跑 compute 段的 STOP→PLAY 两步握手"
+                                  "（板上 %s）" % pr.AUTH_TOKEN_FILE,
+                        "note": "不记令牌值；900 s 从 play_at 起算，用板上时钟判"})
+            log("续跑授权成立：令牌还剩 %.0f s" % float(rem))
+
         # **干跑（Round 0 / 离线排练）不要求令牌**：干跑只到 compute 就返回，
         # 从不发轨迹，令牌闸门在这里没有保护对象；反过来，要求令牌就会逼人为
         # 一次纯计算做 STOP→PLAY，而且板子关机时连代码都验不了。
