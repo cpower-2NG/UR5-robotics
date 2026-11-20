@@ -575,6 +575,48 @@ def test_colour_split_low_saturation_goes_by_position():
     assert F[pieces[0], 0].max() < 0.0 < F[pieces[1], 0].min()
 
 
+@case
+def tower_layer_count_shared():
+    """层判据（检测行与真值展开共用）：59.4 mm ⇒ 2 层；45 mm 不像 2 层。"""
+    assert gc.layer_count(0.0594, 0.0295) == (2, None)
+    assert gc.layer_count(0.030, 0.0295)[0] == 1
+    n, note = gc.layer_count(0.045, 0.0295)
+    assert n == 1 and note, (n, note)
+    assert gc.layer_count(0.0885, 0.0295)[0] == 3
+
+
+@case
+def tower_side_band_reads_lower_colour():
+    """合成 2 层塔：底层侧面像素是 cyan ⇒ 侧带读出 cyan（置信）。"""
+    size = 0.0295
+    cx, cy = 0.45, 0.30
+    ring = [(size / 2, 0.0), (-size / 2, 0.0),
+            (0.0, size / 2), (0.0, -size / 2)]
+    Qs, qpix = [], []
+    W = H = 48
+    color = np.zeros((H, W, 3), dtype=np.uint8)
+    color[:, :] = (200, 30, 30)          # 顶面红（不属于侧带）
+    i = 0
+    for z in np.linspace(0.0055, 0.0235, 25):
+        for u, v in ring:
+            Qs.append((cx + u, cy + v, z))
+            x, y = 3 + (i % 10) * 4, 3 + (i // 10) * 4
+            color[y, x] = (20, 190, 190)   # cyan
+            qpix.append((x, y))
+            i += 1
+    stats = gc.side_band_stats(np.array(Qs), np.array(qpix), color,
+                               0.0, size, 2, (cx, cy), 0.0)
+    assert len(stats) == 1, stats
+    assert stats[0]['class'] == 'cyan' and stats[0]['confident'], stats[0]
+    # 把侧带点抬进顶层区间 ⇒ 下层侧带没有点 ⇒ 不置信（变异：带选错）
+    Qs2 = np.array(Qs)
+    Qs2[:, 2] += 0.03
+    stats2 = gc.side_band_stats(Qs2, np.array(qpix), color, 0.0, size, 2,
+                                (cx, cy), 0.0)
+    assert stats2[0]['class'] == 'unknown' \
+        and not stats2[0]['confident'], stats2[0]
+
+
 # ---------------------------------------------------------------- runner
 def main():
     npass = nfail = 0

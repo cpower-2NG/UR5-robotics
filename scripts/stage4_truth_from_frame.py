@@ -92,35 +92,13 @@ import graspnet_candidates as gc                                  # noqa: E402
 import stage4_specify as sp                                       # noqa: E402
 
 BLOCK_SIZE_M = 0.0295
-MAX_LAYERS = 5
-LAYER_TOL = 0.4          # |h − n·size| / size 的容忍；超了不认成塔
-
-
-def layer_count(h_m, size, tol=LAYER_TOL, max_layers=MAX_LAYERS):
-    """一个顶面簇的实测高度 → ``(层数 n, 说明)``；单块给 ``(1, None)``。
-
-    为什么层数只能从高度反推：``find_blocks`` 的顶面掩码取「每格**最高**点」，
-    而塔的每一层侧面都落在同一批格子上 ⇒ 整根塔连成**一个**连通域，``ext`` 仍是
-    一块的边长，``h`` 才是塔高。2026-11-08 用 11-02 三阶塔的真机腕部帧核实过：
-    二层塔给出 ``h=62.9 mm / ext 29.8×31.9``，**塔底一个点都不可见**（同帧
-    ``max_h_mm=33`` 的带扫只剩台面噪声）。
-
-    所以塔的各层位置是**推出来的**（见 ``build_truth`` 的 coaxial 注释），不是量
-    出来的。残差超过 ``tol*size`` 就不认（宁可当单块留 warn，也不凭空造块）。
-    """
-    h_mm = float(h_m) * 1000.0
-    s_mm = float(size) * 1000.0
-    if h_mm < 1.5 * s_mm:
-        return 1, None
-    n = int(round(h_mm / s_mm))
-    if n < 2:
-        return 1, None
-    if n > max_layers:
-        return 1, "h=%.1f mm 超过 %d 层上限，按单块处理" % (h_mm, max_layers)
-    if abs(h_mm - n * s_mm) > tol * s_mm:
-        return 1, "h=%.1f mm 不像 %d 层（%.1f mm/层），按单块处理" % (
-            h_mm, n, s_mm)
-    return n, None
+MAX_LAYERS = gc.MAX_LAYERS
+LAYER_TOL = gc.LAYER_TOL
+#: 层判据的唯一实现搬到 ``graspnet_candidates.layer_count``（检测行与真值
+#: 展开共用一条，不再各写一套）。这里保留同名入口，测试/调用方不变。
+layer_count = gc.layer_count
+#: 下层侧色的跨帧裁决：置信帧数 ≥ min_frames，且第一二名份额差 ≥ 此值。
+SIDE_TIE_SHARE = 0.25
 
 
 def ray_plane_xy(uv, K, R_bc, t_bc, plane_z):
@@ -274,11 +252,26 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
             n_out += 1
             continue
         yaw = float(r.get("yaw", 0.0))
+        side_list = list(r.get("side_layers") or [])
         for k in range(1, n_layers + 1):          # k=1 塔底 … n 顶层
             top = float(table_top) + k * size
+            if k == n_layers:
+                layer_color = r.get("class", "unknown")
+                colour_source, colour_conf = "top_face", True
+                side = None
+            else:
+                # 2026-11-20：下层颜色**侧带实测**（顶面被压住，只有侧面可读）
+                side = (side_list[k - 1] if k - 1 < len(side_list) else None)
+                if (side and side.get("confident")
+                        and side.get("class") not in (None, "unknown")):
+                    layer_color = side["class"]
+                    colour_source, colour_conf = "side_face", True
+                else:
+                    layer_color = "unknown"
+                    colour_source, colour_conf = "side_unconfident", False
             entry = {
                 "id": int(r.get("idx", len(blocks))),
-                "color": r.get("class", "unknown"),
+                "color": layer_color,
                 "layer": k - 1,
                 "size": size,
                 "top": top,
@@ -292,6 +285,8 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
             if k == n_layers:                     # 顶层：实测的那个
                 entry["meas"] = {
                     "from": "measured_top_face",
+                    "colour_source": "top_face",
+                    "colour_confident": True,
                     "center_source": center_source,
                     "h_mm": round(h_mm, 2),
                     "uv": r.get("uv"),
@@ -323,14 +318,19 @@ def build_truth(rows, cam, table_top=0.0, block_size=BLOCK_SIZE_M,
                 if abs(h_mm - n_layers * size * 1000.0) > 6.0:
                     entry["warn_h_mm"] = round(
                         h_mm - n_layers * size * 1000.0, 2)
-            else:                                 # 下层：coaxial 推定
+            else:                                 # 下层：coaxial 推定（颜色侧带实测）
                 entry["meas"] = {
                     "from": "coaxial_with_top_face",
                     "tower_layers": n_layers,
                     "top_face_h_mm": round(h_mm, 2),
+                    # 颜色来源：侧带实测（side_face）或不可辨（side_unconfident）
+                    "colour_source": colour_source,
+                    "colour_confident": bool(colour_conf),
                     # 下层 yaw 是推定的（沿用顶层），来源跟着顶层走
                     "yaw_source": r.get("yaw_source", "depth_pca"),
                 }
+                if side:
+                    entry["meas"]["side"] = dict(side)
             if layer_note:
                 entry["meas"]["layer_note"] = layer_note
             blocks.append(entry)
@@ -489,6 +489,48 @@ def consensus(truths, radius_m=0.020, min_frames=None):
         for p in pts:
             colors[p["color"]] = colors.get(p["color"], 0) + 1
         color = max(colors, key=colors.get)
+        # 下层（塔里 layer>0 的簇）：颜色只认**侧带置信帧**，且要过跨帧裁决。
+        # 不能把 unknown 帧算进多数票 —— 3 帧读到 cyan、7 帧读不出，按多数票
+        # 会把 cyan 抹成 unknown（或反过来让噪声赢）。2026-11-20 S3。
+        lower = any(str(p["meas"].get("colour_source", "")).startswith("side")
+                    for p in pts)
+        colour_meas = {}
+        if lower:
+            side_pts = [p for p in pts if p["meas"].get("colour_confident")]
+            side_colors = {}
+            for p in side_pts:
+                side_colors[p["color"]] = side_colors.get(p["color"], 0) + 1
+            ranked = sorted(side_colors.items(), key=lambda kv: -kv[1])
+            n_side = sum(side_colors.values())
+            win = ranked[0][0] if ranked else "unknown"
+            share = (ranked[0][1] / n_side) if n_side else 0.0
+            second = (ranked[1][1] / n_side) if len(ranked) > 1 else 0.0
+            ok = (n_side >= min_frames and win != "unknown"
+                  and (share - second) >= SIDE_TIE_SHARE)
+            if ok:
+                color = win
+                colour_meas = {"colour_source": "side_face_consensus",
+                               "colour_confident": True,
+                               "side_frames": n_side,
+                               "side_share": round(share, 3)}
+            else:
+                color = "unknown"
+                colour_meas = {
+                    "colour_source": "side_unconfident_consensus",
+                    "colour_confident": False,
+                    "side_frames": n_side,
+                    "side_share": round(share, 3),
+                    "colour_warn": "侧色不置信：%d/%d 帧、份额 %.2f、"
+                                   "第一二名差 %.2f（门 %.2f）"
+                                   % (n_side, len(pts), share,
+                                      share - second, SIDE_TIE_SHARE)}
+            hues = [p["meas"].get("side", {}).get("hue_med") for p in side_pts]
+            hues = [h for h in hues if h is not None]
+            if hues:
+                colour_meas["side_hue_med"] = round(_median(hues), 1)
+        else:
+            colour_meas = {"colour_source": "top_face",
+                           "colour_confident": True}
         size = float(pts[0]["size"])
         # top 逐层不同（塔顶 = n·size），沿用各帧自己的 top 取中位；
         # 旧写法 ``top − size`` 反推台面，在塔上会算出 n−1 层的高度。
@@ -548,7 +590,7 @@ def consensus(truths, radius_m=0.020, min_frames=None):
                      "colors": colors,
                      "h_mm_median": round(_median(
                          [p["meas"].get("h_mm", 0.0) for p in pts]), 2),
-                     **img_meas},
+                     **img_meas, **colour_meas},
         })
     # 共识后的**贴合对再钳一次**：逐块的 x/y 各自取中位会把成对几何（距离/
     # 朝向）揉掉——S2:5 实测逐帧 29.50 mm → 共识 29.22。这里只对「同层、最小

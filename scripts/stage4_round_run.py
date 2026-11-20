@@ -174,8 +174,77 @@ def wrap180(deg):
     return 180.0 if d == -180.0 else d
 
 
+def resolve_tower_colours(measured_blocks, manifest_blocks,
+                          allow_fallback=False):
+    """S3：塔下层颜色的裁决（同色塔先验 / 异色塔 fail-closed）。
+
+    在**指定与配对之前**跑。下层的 ``meas.colour_source`` 以 ``side`` 开头时：
+    - 侧带**置信**且读到颜色 ⇒ 必须与布局一致，否则停（摆错 / 清单错）；
+    - 侧带**不置信**（``unknown``）：
+      · 布局是**同色塔**（本层与其支撑/被支撑层的布局色相同）⇒ 用布局色填充，
+        标 ``same_colour_prior``（同色塔的颜色本来就由塔顶直接量到）；
+      · 布局是**异色塔** ⇒ 默认停，**不许拿清单颜色冒充实测**；
+        ``allow_fallback=True`` 才按布局填充并标 ``fallback=true``。
+
+    其余块（顶面颜色）原样返回。
+    """
+    man = [dict(b) for b in (manifest_blocks or [])]
+    out = []
+    for mb in (measured_blocks or []):
+        mb = dict(mb)
+        mmeas = dict(mb.get("meas") or {})
+        src = str(mmeas.get("colour_source") or "")
+        if not src.startswith("side"):
+            out.append(mb)
+            continue
+        layer = int(mb.get("layer", 0))
+
+        def _dd(m):
+            return math.hypot(float(m["x"]) - float(mb["x"]),
+                              float(m["y"]) - float(mb["y"]))
+        cand = [m for m in man if int(m.get("layer", 0)) == layer]
+        if not cand:
+            raise ValueError("实测层 %d 在布局表里没有对应块" % layer)
+        partner = min(cand, key=_dd)
+        # 塔的另一层（同 xy 的不同层块）—— 同色塔的判据
+        mate = [p for p in man if int(p.get("layer", 0)) != layer
+                and math.hypot(float(p["x"]) - float(partner["x"]),
+                               float(p["y"]) - float(partner["y"])) <= 0.006]
+        same_colour = bool(mate) and any(
+            str(p["color"]) == str(partner["color"]) for p in mate)
+        got = str(mb.get("color"))
+        want = str(partner["color"])
+        if mmeas.get("colour_confident") and got not in ("unknown", ""):
+            if got != want:
+                raise ValueError(
+                    "塔下层侧色读到 %s，布局是 %s（层 %d）—— 摆位或清单不一致，"
+                    "停（不许用清单颜色覆盖实测）" % (got, want, layer))
+            out.append(mb)
+            continue
+        if same_colour:
+            mb["color"] = want
+            mmeas["colour_source"] = "same_colour_prior"
+            mmeas["colour_confident"] = False
+            mmeas["colour_warn"] = ("同色塔：下层侧色不置信，按布局同色填充"
+                                    "（塔顶已直接量到 %s）" % want)
+        elif allow_fallback:
+            mb["color"] = want
+            mmeas["colour_source"] = "manifest_fallback"
+            mmeas["colour_confident"] = False
+            mmeas["fallback"] = True
+        else:
+            raise ValueError(
+                "异色塔下层颜色未测出（层 %d，侧色=%s）—— 先查光照/机位；"
+                "确要用布局颜色请显式 --allow-side-colour-fallback（报告会标"
+                " fallback=true）"
+                % (layer, mmeas.get("colour_source")))
+        mb["meas"] = mmeas
+        out.append(mb)
+    return out
+
+
 def match_measured_blocks(manifest_blocks, measured_blocks,
-                          limit_mm=PICK_OFFSET_LIMIT_MM):
+                          limit_mm=PICK_OFFSET_LIMIT_MM, strict_layer=False):
     """布局表 ↔ 实测块 一一配对，返回 ``[(manifest, measured, dx_mm, dy_mm)]``。
 
     先按**颜色**配；颜色重复（S2 同色对）时取**同色且仍自由**的最近块——
@@ -185,6 +254,9 @@ def match_measured_blocks(manifest_blocks, measured_blocks,
     只有在**没有同色自由块**时才跨色兜底，每个实测块只用一次。配不出 1:1、
     或某一块离标称超过 ``limit_mm``，都抛 ``ValueError`` —— 抓点没有可信来源
     就不发计划。
+
+    ``strict_layer``（S3）：**同色且同层**优先；同色块在别的层出现 ⇒ 直接停
+    （塔顶/塔底互换会让臂先去抓被压住的那块），也不做跨色兜底。
     """
     man = [dict(b) for b in (manifest_blocks or [])]
     obs = [dict(b) for b in (measured_blocks or [])]
@@ -214,15 +286,25 @@ def match_measured_blocks(manifest_blocks, measured_blocks,
     free = list(obs)
     for m in man:
         c = str(m.get("color"))
+        layer = int(m.get("layer", 0))
 
         def _d(o):
             return math.hypot(float(o["x"]) - float(m["x"]),
                               float(o["y"]) - float(m["y"]))
         # ① 同色且仍自由：取最近（重复颜色也走这里，不再跨色抢）
         cand = [o for o in (by_col.get(c) or []) if o in free]
-        pick = min(cand, key=_d) if cand else None
+        same = [o for o in cand if int(o.get("layer", 0)) == layer]
+        pick = min(same, key=_d) if same else None
+        if pick is None and cand and strict_layer:
+            raise ValueError(
+                "块 %s（%s，层 %d）的实测同色块都在别的层（%s）—— 塔的上下层"
+                "互换会让臂先抓被压住的那块，停"
+                % (m.get("id"), c, layer,
+                   sorted({int(o.get("layer", 0)) for o in cand})))
+        if pick is None:
+            pick = min(cand, key=_d) if cand else None
         # ② 没有同色自由块 ⇒ 才按位置跨色兜底（颜色不可靠的场合）
-        if pick is None and free:
+        if pick is None and free and not strict_layer:
             pick = min(free, key=_d)
         if pick is None:
             raise ValueError("块 %s（%s）没有对应的实测块" % (m.get("id"), c))
@@ -241,22 +323,36 @@ def match_measured_blocks(manifest_blocks, measured_blocks,
 
 
 def merge_measured_truth(truth_doc, measured_doc,
-                         limit_mm=PICK_OFFSET_LIMIT_MM):
+                         limit_mm=PICK_OFFSET_LIMIT_MM, strict_layer=False):
     """抓点用**实测块位姿**（2026-11-12 用户定调，覆盖旧的「布局表即真值」）。
 
     布局表仍定义**块身份**（id / 颜色 / 尺寸 / 层）与判分口径；``x / y / yaw``
     一律换成跑前 pick burst 的实测值。为什么必须换：手摆偏差实测 15–38 mm，
     按标称坐标抓就是夹爪全闭的空夹（2026-11-12 S0:1 r1 第一块，回读 0.0 mm）。
 
+    ``strict_layer``（S3）：配对必须同层；实测颜色与布局色不一致直接停
+    （同色塔先验 / 显式 fallback 已在 ``resolve_tower_colours`` 里对齐）。
+
     返回 ``(doc, records)``：``doc`` 形状与 ``lay.scene_truth`` 相同（探针与
     ``actions_from_attempt`` 直接吃），每个块多带 ``nominal`` 与 ``meas``；
     ``records`` 是逐块偏差（只归档，不判分）。
     """
     pairs = match_measured_blocks(truth_doc.get("blocks") or [],
-                                  measured_doc.get("blocks") or [], limit_mm)
+                                  measured_doc.get("blocks") or [], limit_mm,
+                                  strict_layer=strict_layer)
     blocks, recs = [], []
     for m, o, dx, dy in pairs:
+        if strict_layer and int(o.get("layer", 0)) != int(m.get("layer", 0)):
+            raise ValueError("块 %s 实测层 %d ≠ 布局层 %d —— 塔上下层互换，停"
+                             % (m.get("id"), int(o.get("layer", 0)),
+                                int(m.get("layer", 0))))
+        if strict_layer and str(o.get("color")) != str(m.get("color")):
+            raise ValueError("块 %s 实测色 %s ≠ 布局色 %s（层 %d）—— 停止"
+                             % (m.get("id"), o.get("color"), m.get("color"),
+                                int(m.get("layer", 0))))
         nb = dict(m)
+        nb["color"] = str(o.get("color", m.get("color")))
+        nb["nominal_color"] = m.get("color")
         nb["x"] = float(o["x"])
         nb["y"] = float(o["y"])
         nb["yaw"] = float(o.get("yaw", m.get("yaw", 0.0)))
@@ -266,6 +362,8 @@ def merge_measured_truth(truth_doc, measured_doc,
         nb["meas"] = dict(o.get("meas") or {})
         blocks.append(nb)
         recs.append({"id": m.get("id"), "color": m.get("color"),
+                     "layer": int(m.get("layer", 0)),
+                     "colour_source": nb["meas"].get("colour_source"),
                      "dx_mm": round(dx, 2), "dy_mm": round(dy, 2),
                      "dist_mm": round(math.hypot(dx, dy), 2),
                      "dyaw_deg": round(wrap180(float(o.get("yaw", 0.0)) -
@@ -2648,9 +2746,23 @@ class Round:
                              "来源，停（先查分割/腕部相机，别退回标称坐标）"
                              % (rc,))
         meas = read_json(out)
+        strict_layer = (self.args.batch == "S3")
+        if strict_layer:
+            try:
+                meas["blocks"] = resolve_tower_colours(
+                    meas.get("blocks") or [], truth.get("blocks") or [],
+                    allow_fallback=bool(
+                        getattr(self.args, "allow_side_colour_fallback",
+                                False)))
+            except ValueError as e:
+                raise RoundError(EXIT_PLAN, "compute",
+                                 "塔下层颜色裁决不过：%s" % e)
+            write_json(self.p("truth", "tower-colours.json"),
+                       {"blocks": meas.get("blocks") or []})
         try:
             doc, recs = merge_measured_truth(truth, meas,
-                                             self.args.pick_offset_limit_mm)
+                                             self.args.pick_offset_limit_mm,
+                                             strict_layer=strict_layer)
         except ValueError as e:
             raise RoundError(EXIT_PLAN, "compute",
                              "实测块位姿对不上布局表：%s" % e)
@@ -2896,6 +3008,10 @@ def build_parser():
                     help="实测块心离布局表超过它就不抓（不是判分容差，是"
                          "「布局表与台面是不是同一场景」的兜底；缺省 %.0f）"
                          % PICK_OFFSET_LIMIT_MM)
+    ap.add_argument("--allow-side-colour-fallback", action="store_true",
+                    help="S3 异色塔下层侧色不置信时，允许按布局清单颜色填充"
+                         "（默认 fail-closed；打开后报告/真值会标 fallback=true，"
+                         "身份不是实测）")
     ap.add_argument("--seg", choices=("sam", "grid"), default="sam",
                     help="感知链（第 345 轮 SAM 立项、347 轮回放达标后缺省 "
                          "sam；grid=网格链回退/对照）。SAM 权重在板上 "

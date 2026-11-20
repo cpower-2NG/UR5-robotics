@@ -1847,6 +1847,82 @@ except ValueError as e:
           "orange" in str(e), str(e))
 
 # =====================================================================
+# S3 塔色裁决与层感知配对（2026-11-20）
+# ---------------------------------------------------------------------
+_tman_same = [{"id": 0, "color": "red", "layer": 0, "x": 0.40, "y": 0.30},
+              {"id": 6, "color": "red", "layer": 1, "x": 0.4005, "y": 0.3002}]
+_tobs_same = [
+    {"id": 0, "color": "unknown", "layer": 0, "x": 0.4001, "y": 0.3001,
+     "meas": {"colour_source": "side_unconfident_consensus",
+              "colour_confident": False}},
+    {"id": 1, "color": "red", "layer": 1, "x": 0.4004, "y": 0.3001,
+     "meas": {"colour_source": "top_face", "colour_confident": True}}]
+try:
+    _got = r.resolve_tower_colours(_tobs_same, _tman_same)
+    check("同色塔下层不可辨 ⇒ 按布局同色填充（same_colour_prior）",
+          _got[0]["color"] == "red"
+          and _got[0]["meas"]["colour_source"] == "same_colour_prior",
+          _got[0])
+except ValueError as e:
+    check("同色塔下层不可辨 ⇒ 按布局同色填充（same_colour_prior）", False,
+          str(e))
+
+_tman_diff = [{"id": 0, "color": "cyan", "layer": 0, "x": 0.40, "y": 0.30},
+              {"id": 6, "color": "purple", "layer": 1, "x": 0.4005, "y": 0.3002}]
+_tobs_diff = [
+    {"id": 0, "color": "unknown", "layer": 0, "x": 0.4001, "y": 0.3001,
+     "meas": {"colour_source": "side_unconfident_consensus",
+              "colour_confident": False}},
+    {"id": 1, "color": "purple", "layer": 1, "x": 0.4004, "y": 0.3001,
+     "meas": {"colour_source": "top_face", "colour_confident": True}}]
+try:
+    r.resolve_tower_colours(_tobs_diff, _tman_diff)
+    check("异色塔下层不可辨 ⇒ 默认 fail-closed", False, "没有抛错")
+except ValueError as e:
+    check("异色塔下层不可辨 ⇒ 默认 fail-closed",
+          "异色塔" in str(e) or "未测出" in str(e), str(e))
+try:
+    _got = r.resolve_tower_colours(_tobs_diff, _tman_diff, allow_fallback=True)
+    check("显式 fallback 才按清单填充并标 fallback=true",
+          _got[0]["color"] == "cyan"
+          and _got[0]["meas"].get("fallback") is True
+          and _got[0]["meas"]["colour_source"] == "manifest_fallback", _got[0])
+except ValueError as e:
+    check("显式 fallback 才按清单填充并标 fallback=true", False, str(e))
+
+_tobs_conflict = [
+    {"id": 0, "color": "yellow", "layer": 0, "x": 0.4001, "y": 0.3001,
+     "meas": {"colour_source": "side_face_consensus",
+              "colour_confident": True}},
+    {"id": 1, "color": "purple", "layer": 1, "x": 0.4004, "y": 0.3001,
+     "meas": {"colour_source": "top_face", "colour_confident": True}}]
+try:
+    r.resolve_tower_colours(_tobs_conflict, _tman_diff)
+    check("置信侧色与布局不一致 ⇒ 停（不覆盖实测）", False, "没有抛错")
+except ValueError as e:
+    check("置信侧色与布局不一致 ⇒ 停（不覆盖实测）",
+          "布局" in str(e) or "不一致" in str(e), str(e))
+
+_tobs_swap = [
+    {"id": 0, "color": "cyan", "layer": 1, "x": 0.400, "y": 0.300},
+    {"id": 1, "color": "purple", "layer": 0, "x": 0.400, "y": 0.300}]
+try:
+    r.match_measured_blocks(_tman_diff, _tobs_swap, limit_mm=1000.0,
+                            strict_layer=True)
+    check("S3 塔上下层互换 ⇒ 严格层配对 fail-closed", False, "没有抛错")
+except ValueError as e:
+    check("S3 塔上下层互换 ⇒ 严格层配对 fail-closed",
+          "层" in str(e), str(e))
+_pairs_ok = r.match_measured_blocks(
+    _tman_diff,
+    [{"id": 0, "color": "cyan", "layer": 0, "x": 0.400, "y": 0.300},
+     {"id": 1, "color": "purple", "layer": 1, "x": 0.400, "y": 0.300}],
+    limit_mm=1000.0, strict_layer=True)
+check("S3 层一致时严格配对照常过",
+      len(_pairs_ok) == 2
+      and all(int(o["layer"]) == int(m["layer"]) for m, o, _, _ in _pairs_ok))
+
+# =====================================================================
 print()
 print("通过 %d，失败 %d" % (N_PASS, N_FAIL))
 if FAILS:

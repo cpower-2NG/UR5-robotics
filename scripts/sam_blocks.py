@@ -506,6 +506,8 @@ def find_blocks_sam(frame, predictor, hue_table=None, return_masks=False,
                 "mixed_pair_unsplit": (len(picked) == 1
                                        and mixed_votes(pc["votes"],
                                                        pc["wsum"])),
+                # 塔的下层侧色（由网格链在簇上算好；SAM 只透传）
+                "side_layers": list(row.get("side_layers") or []),
             }
             if return_masks:
                 rec["mask_uv"] = pc["px"].astype(np.int32)

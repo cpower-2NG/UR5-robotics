@@ -52,12 +52,18 @@ def check(name, cond, detail=''):
 
 
 def row(idx, uv=(320.0, 240.0), cx=400.0, cy=300.0, top=32.0, h=None,
-        cls="red", low=False, yaw=0.0):
-    """``find_blocks`` 的一行（毫米 / 度，与真实输出同单位）。"""
-    return {"idx": idx, "cx": cx, "cy": cy, "top": top,
-            "h": top if h is None else h, "yaw": yaw,
-            "class": cls, "class_share": 0.9, "ext": [29.0, 28.6],
-            "ext_rect": [29.1, 28.9], "uv": list(uv), "low": low}
+        cls="red", low=False, yaw=0.0, side=None):
+    """``find_blocks`` 的一行（毫米 / 度，与真实输出同单位）。
+
+    ``side``：塔下层的侧带统计（``find_blocks`` 新字段），原样挂到行上。
+    """
+    out = {"idx": idx, "cx": cx, "cy": cy, "top": top,
+           "h": top if h is None else h, "yaw": yaw,
+           "class": cls, "class_share": 0.9, "ext": [29.0, 28.6],
+           "ext_rect": [29.1, 28.9], "uv": list(uv), "low": low}
+    if side is not None:
+        out["side_layers"] = side
+    return out
 
 
 # ---------------------------------------------------------------- 几何
@@ -266,6 +272,49 @@ def section_layers():
           [b["layer"] for b in c["blocks"]] == [0, 1]
           and abs(c["blocks"][1]["top"] - 0.059) < 1e-9,
           [(b["layer"], b["top"]) for b in c["blocks"]])
+
+    # 下层颜色：侧带实测（2026-11-20 S3）
+    side = [{"layer": 0, "class": "cyan", "share": 0.91, "n_px": 260,
+             "hue_med": 191.0, "confident": True}]
+    t = tf.build_truth([row(0, uv=(380.0, 240.0), top=59.4, h=59.4,
+                            cls="red", side=side)], CAM)
+    lo2, hi2 = t["blocks"][0], t["blocks"][1]
+    check("异色塔：下层用侧带实测色（cyan），顶层仍是 red",
+          lo2["color"] == "cyan" and hi2["color"] == "red",
+          (lo2["color"], hi2["color"]))
+    check("下层标 colour_source=side_face 且置信",
+          lo2["meas"]["colour_source"] == "side_face"
+          and lo2["meas"]["colour_confident"] is True, lo2["meas"])
+    bad = [{"layer": 0, "class": "unknown", "share": 0.2, "n_px": 40,
+            "confident": False, "why": "点数 40 < 80"}]
+    t = tf.build_truth([row(0, uv=(380.0, 240.0), top=59.4, h=59.4,
+                            cls="red", side=bad)], CAM)
+    check("侧色不置信 ⇒ 下层 unknown（不拿顶面色冒充）",
+          t["blocks"][0]["color"] == "unknown"
+          and t["blocks"][0]["meas"]["colour_confident"] is False,
+          t["blocks"][0]["meas"])
+
+    # 跨帧共识：置信帧够 → 侧色；不够 → unknown
+    def _frame(colour, confident=True, du=0.0):
+        s = [{"layer": 0, "class": colour, "share": 0.9, "n_px": 200,
+              "hue_med": 191.0, "confident": confident}]
+        return tf.build_truth([row(0, uv=(380.0 + du, 240.0), h=59.4,
+                                   top=59.4, cls="red", side=s)], CAM)
+    c3 = tf.consensus([_frame("cyan"), _frame("cyan", du=1.0),
+                       _frame("cyan", du=-1.0)], min_frames=3)
+    lo_c = [b for b in c3["blocks"] if b["layer"] == 0][0]
+    check("10 帧里 3 帧置信 ⇒ 下层颜色 cyan（跨帧共识）",
+          lo_c["color"] == "cyan"
+          and lo_c["meas"]["colour_source"] == "side_face_consensus",
+          lo_c["meas"])
+    c4 = tf.consensus([_frame("cyan"), _frame("cyan", du=1.0),
+                       _frame("unknown", confident=False, du=-1.0)],
+                      min_frames=3)
+    lo_c = [b for b in c4["blocks"] if b["layer"] == 0][0]
+    check("置信帧不足 ⇒ 下层 unknown + colour_warn",
+          lo_c["color"] == "unknown"
+          and lo_c["meas"]["colour_confident"] is False
+          and "colour_warn" in lo_c["meas"], lo_c["meas"])
 
 
 # ---------------------------------------------------------------- 空真值

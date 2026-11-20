@@ -115,6 +115,24 @@ COLOUR_SPLIT_GATE = 1.1
 #: 是贴合边颜色分裂的系统性伪影。**只在测得「穿插」时动手**——两心距已
 #: ≥ 块边的对（真留了缝）不动，不会把留缝摆放的对硬捏到贴面。
 PAIR_CLAMP_TO_BLOCK = True
+
+# ── 塔的下层颜色（2026-11-20 S3） ──────────────────────────────────────
+#: 层数反推的容忍（与 stage4_truth_from_frame 原先那份同值；实现搬到本模块，
+#: 让「检测行」与「真值展开」共用一条判据，不再各写一套）。
+MAX_LAYERS = 5
+LAYER_TOL = 0.4          # |h − n·size| / size 的容忍；超了不认成塔
+#: 侧面色带的上下内缩：避开顶面边缘与层间接缝。
+SIDE_BAND_INSET_M = 0.004
+#: 只取塔外圈这一环（块局部坐标 max(|u|,|v|) ∈ [size/2−ring, size/2+ring]）。
+#: 上层同心偏差 ≤3 mm 时下层侧面仍完整落在环内。
+SIDE_RING_M = 0.004
+#: 侧色置信门：点数、票面份额、中位色相到最近类中心的距离。
+#: （侧面比顶面暗，饱和度门与顶面同值；亮度下限降到 35，常量集中在这里。）
+SIDE_MIN_PX = 80
+SIDE_SHARE_MIN = 0.65
+SIDE_HUE_MAX_DEG = 15.0
+SIDE_S_MIN = 60.0
+SIDE_V_MIN = 35.0
 GRASPNET_ROOT = os.path.expanduser("~/robotics/third_party/graspness_unofficial")
 CKPT = os.path.expanduser("~/robotics/third_party/graspnet-baseline/logs/checkpoint-rs.tar")
 
@@ -558,6 +576,127 @@ def circular_median_deg(angles):
     return float((ref + np.median(rel)) % 360.0)
 
 
+def layer_count(h_m, size, tol=LAYER_TOL, max_layers=MAX_LAYERS):
+    """一个顶面簇的实测高度 → ``(层数 n, 说明)``；单块给 ``(1, None)``。
+
+    为什么层数只能从高度反推：``find_blocks`` 的顶面掩码取「每格**最高**点」，
+    而塔的每一层侧面都落在同一批格子上 ⇒ 整根塔连成**一个**连通域，``ext`` 仍是
+    一块的边长，``h`` 才是塔高。2026-11-08 用 11-02 三阶塔的真机腕部帧核实过：
+    二层塔给出 ``h=62.9 mm / ext 29.8×31.9``，**塔底一个点都不可见**（同帧
+    ``max_h_mm=33`` 的带扫只剩台面噪声）。
+
+    所以塔的各层位置是**推出来的**（见 ``build_truth`` 的 coaxial 注释），不是量
+    出来的。残差超过 ``tol*size`` 就不认（宁可当单块留 warn，也不凭空造块）。
+    """
+    h_mm = float(h_m) * 1000.0
+    s_mm = float(size) * 1000.0
+    if h_mm < 1.5 * s_mm:
+        return 1, None
+    n = int(round(h_mm / s_mm))
+    if n < 2:
+        return 1, None
+    if n > max_layers:
+        return 1, "h=%.1f mm 超过 %d 层上限，按单块处理" % (h_mm, max_layers)
+    if abs(h_mm - n * s_mm) > tol * s_mm:
+        return 1, "h=%.1f mm 不像 %d 层（%.1f mm/层），按单块处理" % (
+            h_mm, n, s_mm)
+    return n, None
+
+
+def side_band_stats(Qs, qpix, color, table_z, size, n_layers, center_xy,
+                    yaw_deg, hue_table=None):
+    """塔的下层（0 … n_layers−2）**侧面颜色**统计（base 系输入）。
+
+    为什么需要它：塔底的顶面被上层整块压住，顶面颜色只能读到塔顶；异色塔的
+    下层颜色在现有链里**完全不可观测**（层高展开把两层都写成顶面色）。塔的
+    下层**侧面**在俯斜视角下是可见的（上层在它正上方，不遮它的侧面），所以
+    按层高切出一条侧带、取环外一圈像素投票，就能把下层颜色量出来。
+
+    输入：
+    - ``Qs`` (N,3) 该簇**全部**点（base 系，米）；``qpix`` (N,2) 对应像素 (u,v)；
+    - ``color`` H×W×3（RGB）；``table_z`` 台面 base z；``size`` 块边（米）；
+    - ``center_xy`` 块心 (x,y) 米；``yaw_deg`` 顶面 yaw。
+
+    返回每层一个 dict（``layer/class/share/n_px/hue_med/sat_med/votes/
+    confident/why``）；不置信时 ``class="unknown"``。判据与顶面投票同口径
+    （饱和度加权、s/v 门、orange/tan 二义用 2D 消除）。
+    """
+    out = []
+    if int(n_layers) < 2 or Qs is None or len(Qs) == 0:
+        return out
+    Qs = np.asarray(Qs, dtype=float)
+    qpix = np.asarray(qpix)
+    ca, sa = math.cos(math.radians(float(yaw_deg))), \
+        math.sin(math.radians(float(yaw_deg)))
+    dx = Qs[:, 0] - float(center_xy[0])
+    dy = Qs[:, 1] - float(center_xy[1])
+    u = ca * dx + sa * dy
+    v = -sa * dx + ca * dy
+    r = np.maximum(np.abs(u), np.abs(v))
+    ring = ((r >= float(size) / 2.0 - SIDE_RING_M) &
+            (r <= float(size) / 2.0 + SIDE_RING_M))
+    for k in range(int(n_layers) - 1):
+        z0 = float(table_z) + k * float(size) + SIDE_BAND_INSET_M
+        z1 = float(table_z) + (k + 1) * float(size) - SIDE_BAND_INSET_M
+        sel = ring & (Qs[:, 2] >= z0) & (Qs[:, 2] <= z1)
+        pp = qpix[sel]
+        entry = {"layer": int(k), "class": "unknown", "share": 0.0,
+                 "n_px": int(len(pp)), "hue_med": None, "sat_med": None,
+                 "votes": {}, "confident": False}
+        if len(pp) == 0:
+            entry["why"] = "侧带没有点"
+            out.append(entry)
+            continue
+        rgb = color[pp[:, 1], pp[:, 0]].astype(float)
+        step = max(1, len(rgb) // 400)
+        votes, wsum = {}, 0.0
+        hues, sats = [], []
+        for p in rgb[::step]:
+            h_, s_, v_ = rgb_to_hsv255(p)
+            hues.append(h_)
+            sats.append(s_)
+            if s_ < SIDE_S_MIN or v_ < SIDE_V_MIN:
+                continue
+            name, _ = block_classes.nearest_class_by_hue(h_, table=hue_table)
+            votes[name] = votes.get(name, 0.0) + s_
+            wsum += s_
+        hue_med = float(np.median(hues)) if hues else None
+        sat_med = float(np.median(sats)) if sats else None
+        cls = max(votes, key=votes.get) if wsum > 0 else "unknown"
+        if wsum > 0 and cls in ("orange", "tan"):
+            fixed = block_classes.disambiguate_orange_tan(hue_med, sat_med)
+            if fixed is not None and fixed != cls:
+                votes[fixed] = votes.get(fixed, 0.0) + votes.pop(cls)
+                cls = fixed
+        share = (votes.get(cls, 0.0) / wsum) if wsum > 0 else 0.0
+        hue_dist = None
+        if hue_med is not None:
+            _, hue_dist = block_classes.nearest_class_by_hue(
+                hue_med, table=hue_table)
+        why = []
+        if len(pp) < SIDE_MIN_PX:
+            why.append("点数 %d < %d" % (len(pp), SIDE_MIN_PX))
+        if share < SIDE_SHARE_MIN:
+            why.append("份额 %.2f < %.2f" % (share, SIDE_SHARE_MIN))
+        if hue_dist is None or hue_dist > SIDE_HUE_MAX_DEG:
+            why.append("色相偏 %.1f° > %.1f°"
+                       % (-1.0 if hue_dist is None else hue_dist,
+                          SIDE_HUE_MAX_DEG))
+        confident = (not why) and cls != "unknown"
+        entry.update({
+            "class": cls, "share": round(float(share), 3),
+            "hue_med": (None if hue_med is None else round(hue_med, 1)),
+            "sat_med": (None if sat_med is None else round(sat_med, 1)),
+            "votes": {kk: int(vv) for kk, vv in
+                      sorted(votes.items(), key=lambda kv: -kv[1])},
+            "confident": bool(confident),
+        })
+        if why:
+            entry["why"] = "；".join(why)
+        out.append(entry)
+    return out
+
+
 def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                 max_h_mm=70.0, legacy=False, split=False, hue_table=None,
                 return_masks=False):
@@ -619,6 +758,7 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
             if sel.sum() < 200:
                 continue
             Qs = Q[sel]
+            qs_pix = qpix[sel]
             lo, hi = Qs.min(0), Qs.max(0)
             if (hi[0] - lo[0]) < 0.010 or (hi[1] - lo[1]) < 0.010:
                 continue
@@ -760,6 +900,15 @@ def find_blocks(frame, table_z=None, min_h_mm=15.0, min_cells=12,
                     # 方案④标记：未拆开且票面双类 ≥25%（build_truth 会丢掉）
                     "mixed_pair_unsplit": bool(mixed_pair_unsplit),
                 }
+                # 塔的下层颜色（2026-11-20）：侧带实测；单块簇不产生该字段。
+                if not low:
+                    n_layers, _ln = layer_count(
+                        float(rec["h"]) / 1000.0, 0.0295)
+                    if n_layers >= 2:
+                        rec["side_layers"] = side_band_stats(
+                            Qs, qs_pix, color, table_z, 0.0295, n_layers,
+                            (float(c[0]), float(c[1])), yaw,
+                            hue_table=hue_table)
                 # O1 离线评估用：顶面像素集（图像坐标，u,v）。默认不生成，生产
                 # 路径的返回结构不变；评估器用同一份分割结果算实例 IoU。
                 if return_masks:
