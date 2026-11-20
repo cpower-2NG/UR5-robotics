@@ -833,6 +833,26 @@ except r.RoundError as e:
     check("等待授权：只有旧令牌 ⇒ 超时停（RoundError 3）",
           e.code == r.EXIT_GATE)
 
+# 上限：剩余不可能超过 TTL。2026-11-20 真机实测：板钟校时后旧令牌显示还剩
+# 23618 秒，旧实现只看下限，直接放行了一次未授权的观察段。
+_rb3 = object.__new__(r.RoundBoard)
+_rb3.token_state = lambda: ("a" * 32, 23618.0, "")
+_c3 = [0.0]
+
+
+def _now3():
+    _c3[0] += 1.0
+    return _c3[0]
+
+
+try:
+    quiet(_rb3.wait_token, 3, 1, now=_now3, sleep=lambda s: None,
+          fresh_min=540.0)
+    check("等待授权：剩余 > TTL（板钟跳变）⇒ 不当授权", False)
+except r.RoundError as e:
+    check("等待授权：剩余 > TTL（板钟跳变）⇒ 不当授权",
+          e.code == r.EXIT_GATE)
+
 
 # 板上探针命令：``~/precision/run.sh`` 自己就是 ``exec python3 "$@"``，
 # 后面再写一个 python3 会被当成「要打开的脚本名」（2026-11-11 Round 0 实测

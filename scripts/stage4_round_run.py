@@ -1166,13 +1166,25 @@ class BoardPort(object):
         签发的（600 s TTL 留 60 s 余量）。
         """
         deadline = float(now()) + float(timeout_s)
+        ttl = float(getattr(pr, "TOKEN_TTL_S", 900.0))
         last = None
         while float(now()) < deadline:
             tok, rem, why = self.token_state()
-            if tok and (fresh_min is None or float(rem) >= float(fresh_min)):
+            fresh = (tok and (fresh_min is None
+                              or float(rem) >= float(fresh_min))
+                     # **上限**：剩余时间不可能超过 TTL。超过 = play_at 在未来
+                     # （板钟被校/跳变后的旧令牌）⇒ 绝不能当这一次的授权。
+                     # 2026-11-20 真机实测：校时后旧令牌显示还剩 23618 秒，
+                     # 旧实现只看下限，直接放行了一次未授权的观察段。
+                     and float(rem) <= ttl + 5.0)
+            if fresh:
                 log("授权成立：按板上时钟令牌还剩 %.0f 秒" % rem)
                 return tok, rem
-            if tok:
+            if tok and float(rem) > ttl + 5.0:
+                why = ("令牌剩余 %.0f 秒 > TTL %.0f —— 板钟跳变/未来令牌，"
+                       "不是这一次签发的，继续等新的 STOP→PLAY"
+                       % (float(rem), ttl))
+            elif tok:
                 why = ("令牌只剩 %.0f 秒（< %.0f）—— 不是这一次签发的，继续等"
                        "新的 STOP→PLAY" % (float(rem), float(fresh_min)))
             if why != last:
