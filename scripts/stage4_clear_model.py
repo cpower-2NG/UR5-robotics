@@ -273,10 +273,95 @@ DEFAULT_CELLS = (8, 6, 4, 2, 0)
 
 #: 按批缺省格（2026-11-15 S1/S2 接入编排器）：S0 五格不变；S1/S2 六块六格 ——
 #: 第 6 格取边中格 **1**（与 0/2 相邻各 60 mm，29.5 mm 块物理不挤；执行次序
-#: 仍是远格先填 8,6,4,2 → 1 → 0）。S3（7 块）/S4（9 块）进阶批等接入时再定。
+#: 仍是远格先填 8,6,4,2 → 1 → 0）。**S3 不走这张表**：7 块的格位由颜色决定
+#: （``assign_cells_by_colour``，2026-11-20 用户拍板），重复色溢出到备用格。
 DEFAULT_CELLS_BY_BATCH = {"S0": DEFAULT_CELLS,
                           "S1": (8, 6, 4, 2, 1, 0),
                           "S2": (8, 6, 4, 2, 1, 0)}
+
+#: 垫纸色序唯一来源 = ``stage2-mat.json`` 的 ``grid_order``（7 色各一次 + 2 备用）。
+#: 这里保留一份同值默认，只作**对拍**用；运行时一律读 ``grid-pre.json`` 的
+#: ``grid_order``（解垫时从 mat 嵌入），缺字段就停，不允许猜。
+DEFAULT_GRID_ORDER = ("red", "orange", "tan", "yellow", "yellowgreen",
+                      "cyan", "purple", "spare", "spare")
+
+
+def _load_slot_routing():
+    """按源码路径 import ``grasp_planner/slot_routing.py``（颜色→槽位的唯一实现）。
+
+    与 ``_load_gen_scene`` 同一取向：不走 install 树，改了源码不用 colcon build。
+    """
+    root = os.path.dirname(HERE)
+    path = os.path.join(root, "ros2_ws", "src", "grasp_planner")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import grasp_planner.slot_routing as sr                        # noqa: E402
+    return sr
+
+
+_SR = _load_slot_routing()
+
+
+def validate_grid_order(order):
+    """校验 9 格色序：7 色各一次 + ``spare`` 恰好 2 个。"""
+    import block_classes as bc
+    order = list(order or ())
+    if len(order) != 9:
+        raise ValueError("宫格色序必须 9 项（7 色 + 2 备用），收到 %d 项：%r"
+                         % (len(order), order))
+    allowed = set(bc.DEFAULT_CLASSES) | {"spare"}
+    bad = [c for c in order if c not in allowed]
+    if bad:
+        raise ValueError("宫格色序含未知颜色：%r（允许 %s 或 spare）"
+                         % (bad, ", ".join(bc.DEFAULT_CLASSES)))
+    for name in bc.DEFAULT_CLASSES:
+        if order.count(name) != 1:
+            raise ValueError("七色必须各出现一次；%s 出现 %d 次：%r"
+                             % (name, order.count(name), order))
+    if order.count("spare") != 2:
+        raise ValueError("备用格必须 2 个；收到 %d 个：%r"
+                         % (order.count("spare"), order))
+
+
+def grid_order_of(doc):
+    """``grid-pre.json`` → 色序（缺字段即停：S3 的格位没有别的来源）。"""
+    order = (doc or {}).get("grid_order")
+    if not order:
+        raise ValueError("网格文档缺 grid_order —— S3 的格位由颜色决定，"
+                         "不许猜默认顺序（重新解垫并嵌入 mat 的 grid_order）")
+    validate_grid_order(order)
+    return list(order)
+
+
+def assign_cells_by_colour(blocks, grid_order=None):
+    """块表 → ``{str(id): 格号}``：**按颜色归格，重复色溢出到备用格**。
+
+    规则（2026-11-20 用户拍板，继承阶段 2「七色对七格」）：
+    1. 块按 id 升序处理（与 ``assign_cells`` 同序）；
+    2. 每块在色序里按 0→8 找第一个「未占用且颜色相等，或为 ``spare``」的格；
+    3. 同色第二块因此进第一个空备用格（7，再 8）；两个重复色按 id 序先后吃 7、8；
+    4. 找不到格 ⇒ ``ValueError``（执行前停，不许改色或硬塞）。
+
+    槽位选择本身复用 ``grasp_planner.slot_routing.pick_slot``（同色优先、
+    ``spare`` 作通配），不在这里另写一套。
+    """
+    order = list(DEFAULT_GRID_ORDER if grid_order is None else grid_order)
+    validate_grid_order(order)
+    slot_classes = [None if c == "spare" else c for c in order]
+    used = [False] * len(order)
+    out = {}
+    for b in sorted(blocks, key=lambda x: int(x["id"])):
+        colour = str(b.get("color"))
+        if colour not in slot_classes:
+            raise ValueError("块 %s 的颜色 %r 不在垫纸色序里（%s）"
+                             % (b.get("id"), colour, order))
+        idx = _SR.pick_slot(used, slot_classes, colour)
+        if idx is None:
+            raise ValueError("块 %s（%s）没有可用格位：7 个色格 + 2 个备用格"
+                             "已满（重复色至多 2 对）" % (b.get("id"), colour))
+        out[str(b["id"])] = int(idx)
+        used[idx] = True
+    return out
 
 
 def parse_cells(spec, n=None, batch=None):
@@ -288,6 +373,9 @@ def parse_cells(spec, n=None, batch=None):
     优先于按批缺省（行为不变）。
     """
     if spec is None or (isinstance(spec, str) and not spec.strip()):
+        if batch == "S3":
+            raise ValueError("S3 的格位由颜色决定（assign_cells_by_colour），"
+                             "不能按 id 顺序分配 —— 请用垫纸 grid_order")
         base = DEFAULT_CELLS_BY_BATCH.get(batch, DEFAULT_CELLS)
         cells = list(base[:n] if n is not None else base)
     else:

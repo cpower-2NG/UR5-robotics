@@ -33,6 +33,7 @@ sys.path.insert(0, HERE)
 
 import graspnet_candidates as gc                                 # noqa: E402
 import stage2_pad as sp                                          # noqa: E402
+import stage4_clear_model as cm                                  # noqa: E402
 
 DEFAULT_MAT = os.path.expanduser(
     '~/robotics/notes/ur5-vision-grasp/stage2-mat/stage2-mat.json')
@@ -114,10 +115,17 @@ def solve_burst(burst, camera='wrist', mat=DEFAULT_MAT, max_rms_px=None,
     return rows, failures, len(names)
 
 
-def build_doc(rows, t_med, yaw_med, spread, k, camera, burst, mat, n_total):
-    """共识 → ``stage2-grid`` 文档（计划端与判分端共用）。"""
+def build_doc(rows, t_med, yaw_med, spread, k, camera, burst, mat, n_total,
+              mat_doc=None):
+    """共识 → ``stage2-grid`` 文档（计划端与判分端共用）。
+
+    ``mat_doc``（``stage2-mat.json`` 的内容）给了就把 **色序与格心**一起嵌进来：
+    S3 的「按颜色归格」只认这一份（``grid_order`` + ``cells``），探针/判分在
+    独立进程里不需要再找 mat。缺 ``grid_order`` 的旧 mat 不写这两个键 ——
+    S3 在下游按缺数据 fail-closed（见 ``cm.grid_order_of``）。
+    """
     rms = [r['rms_px'] for r in rows if r.get('rms_px') is not None]
-    return {
+    doc = {
         'version': 1,
         'kind': 'stage2-grid',
         'camera': camera,
@@ -137,6 +145,20 @@ def build_doc(rows, t_med, yaw_med, spread, k, camera, burst, mat, n_total):
             'rms_adopted_px': (float(np.median(rms)) if rms else None),
         },
     }
+    if mat_doc:
+        order = list(mat_doc.get('grid_order') or [])
+        if order:
+            cm.validate_grid_order(order)
+            doc['grid_order'] = order
+        cells = []
+        for c in ((mat_doc.get('grid') or {}).get('cells') or []):
+            cells.append({'idx': int(c['idx']), 'row': int(c['row']),
+                          'col': int(c['col']), 'color': str(c['color']),
+                          'center_pad_mm': [float(v) for v in
+                                            c['center_pad_mm']]})
+        if cells:
+            doc['cells'] = cells
+    return doc
 
 
 def embed_pad_spec(doc, spec_doc):
@@ -221,8 +243,15 @@ def main(argv=None):
         print('!! 离散超限：%s ⇒ 不写文件（垫位姿没有共识）' % '；'.join(bad))
         return 1
 
+    mat_doc = None
+    try:
+        with open(args.mat, encoding='utf-8') as f:
+            mat_doc = json.load(f)
+    except (OSError, ValueError) as exc:                # noqa: BLE001
+        print('  ⚠ 读不到/解析不了 --mat %s：%s —— grid 文档将缺 grid_order/'
+              'cells（S3 会在下游 fail-closed）' % (args.mat, exc))
     doc = build_doc(rows, t_med, yaw_med, spread, k, args.camera, args.burst,
-                    args.mat, n_total)
+                    args.mat, n_total, mat_doc=mat_doc)
     spec_doc = None
     if args.pad_spec:
         if not os.path.exists(args.pad_spec):

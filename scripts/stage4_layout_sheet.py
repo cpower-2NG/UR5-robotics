@@ -179,6 +179,7 @@ def sheet_doc(batch, layout):
         "blocks": [{
             "id": b["id"],
             "color": b["color"],
+            "layer": int(b.get("layer", 0)),
             "x_mm": b["x"] * 1000.0,
             "y_mm": b["y"] * 1000.0,
             "yaw_deg": b["yaw"],
@@ -198,11 +199,12 @@ def info_lines(doc, zh=True):
                     % (z[0], z[1], z[2], z[3]))
         rows.append("块边长 %.1f mm（图上是真实大小）" % doc["block_size_mm"])
         rows.append("")
-        rows.append("id  颜色        x      y    yaw")
+        rows.append("id  颜色       层    x      y    yaw")
         for b in sorted(doc["blocks"], key=lambda d: d["id"]):
             zh_name = COLOR_ZH.get(b["color"], b["color"])
-            rows.append("%d   %s %-9s %6.1f %6.1f %5.1f°"
+            rows.append("%d   %s %-9s L%d %6.1f %6.1f %5.1f°"
                         % (b["id"], zh_name, b["color"],
+                           int(b.get("layer", 0)),
                            b["x_mm"], b["y_mm"], b["yaw_deg"]))
         rows.append("")
         rows += [
@@ -324,7 +326,10 @@ def draw_page(fig, geom, doc, font):
                 zorder=4)
         ax.plot([cx, cx], [cy - 2.5, cy + 2.5], color="#000000", lw=0.8,
                 zorder=4)
-        ax.text(cx, cy + 5.0, str(b["id"]), fontsize=6, ha="center",
+        tag = str(b["id"])
+        if int(b.get("layer", 0)) > 0:
+            tag += "L%d" % int(b.get("layer", 0))      # 塔上层：俯视图上标 L1
+        ax.text(cx, cy + 5.0, tag, fontsize=6, ha="center",
                 va="bottom", zorder=4)
 
     # 100 mm 比例尺（打印后第一个要核对的东西）

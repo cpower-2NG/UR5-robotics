@@ -32,6 +32,7 @@ C 阶段编排：
 import contextlib
 import io
 import json
+import math
 import os
 import subprocess
 import sys
@@ -50,6 +51,7 @@ import stage4_clear_model as cm                                 # noqa: E402
 import stage4_clear_run as cr                                   # noqa: E402
 import stage4_layouts as lay                                    # noqa: E402
 import stage4_round_run as r                                    # noqa: E402
+import stage4_specify as spec                                   # noqa: E402
 
 N_PASS = N_FAIL = 0
 FAILS = []
@@ -354,6 +356,80 @@ check("contact_pairs 吃实测块表同口径（对标称/实测一致）",
       lay.contact_pairs(_with_moved(_s1, 1, 60.0, 0.0)) == [] and
       lay.contact_pairs(_s1_two) == [(0, 1), (0, 5)],
       repr(lay.contact_pairs(_s1_two)))
+
+# S3（2026-11-20 接入）：两层塔 + 颜色归格 + 结构化命令
+check("S3 布局表与 gen_scene 逐块一致（含层/高度）",
+      lay.compare_with_gen_scene("S3") == [],
+      repr(lay.compare_with_gen_scene("S3")))
+errs = []
+for k in sorted(lay.BATCHES["S3"]):
+    errs += lay.validate_layout("S3", k)
+check("S3 五个布局自检（塔 + 恰好 1 贴合对 + 颜色规则）", errs == [],
+      repr(errs))
+
+
+def _tower_of(blocks):
+    top = [b for b in blocks if int(b.get("layer", 0)) == 1]
+    assert len(top) == 1
+    hi = top[0]
+    lo = [b for b in blocks if int(b.get("layer", 0)) == 0
+          and math.hypot(b["x"] - hi["x"], b["y"] - hi["y"]) <= 0.006][0]
+    return lo, hi
+
+
+_b1 = lay.layout_blocks("S3", 1)
+_b2 = lay.layout_blocks("S3", 2)
+_lo1, _hi1 = _tower_of(_b1)
+_lo2, _hi2 = _tower_of(_b2)
+check("S3:1 塔上下同色 / S3:2 塔上下异色（用户「都要有」）",
+      _lo1["color"] == _hi1["color"] and _lo2["color"] != _hi2["color"],
+      "%s/%s vs %s/%s" % (_lo1["color"], _hi1["color"],
+                          _lo2["color"], _hi2["color"]))
+_cell1 = cm.assign_cells_by_colour(_b1, cm.DEFAULT_GRID_ORDER)
+_cell2 = cm.assign_cells_by_colour(_b2, cm.DEFAULT_GRID_ORDER)
+check("S3:1 两个备用格都用上 / S3:2 七个色格全用",
+      {7, 8} <= set(_cell1.values()) and len(set(_cell1.values())) == 7 and
+      set(_cell2.values()) == set(range(7)), "%s vs %s" % (_cell1, _cell2))
+check("S3 格位与颜色一致（色格或备用格）",
+      all(cm.DEFAULT_GRID_ORDER[v] in
+          ({b["color"] for b in _b1 if str(b["id"]) == k} | {"spare"})
+          for k, v in _cell1.items()))
+
+
+def _rows_from_layout(blocks):
+    return [{"idx": b["id"], "class": b["color"], "cx": b["x"] * 1000,
+             "cy": b["y"] * 1000, "top": b["top"] * 1000, "low": False,
+             "n": 800, "px_area_mm2": 29.5 * 29.5} for b in blocks]
+
+
+_cmd_bad = []
+for k in sorted(lay.BATCHES["S3"]):
+    blocks = lay.layout_blocks("S3", k)
+    rows = _rows_from_layout(blocks)
+    seen = []
+    for bid, cmd in lay.commands_for_layout("S3", k):
+        res = spec.select(rows, cmd)
+        if res["status"] != "ok" or res["instance"] != bid:
+            _cmd_bad.append((k, bid, cmd, res["status"], res.get("instance")))
+        else:
+            seen.append(res["instance"])
+    if sorted(seen) != sorted(b["id"] for b in blocks):
+        _cmd_bad.append((k, "覆盖不全", sorted(seen)))
+check("S3 命令表 7/7 唯一解析且与目标 id 1:1", _cmd_bad == [],
+      repr(_cmd_bad[:3]))
+check("S3 摆块提示含塔/贴合对/备用格",
+      all(("两层塔" in r.placement_hint("S3", lay.layout_blocks("S3", k)) and
+           "备用格" in r.placement_hint("S3", lay.layout_blocks("S3", k)))
+          for k in sorted(lay.BATCHES["S3"])))
+check("S3 gap_policy = 累积探针口径",
+      r.gap_policy("S3") == (0.0, "cumulative_probe_verified"),
+      repr(r.gap_policy("S3")))
+try:
+    cm.parse_cells(None, 7, batch="S3")
+    _ok = False
+except ValueError:
+    _ok = True
+check("S3 不接受按 id 分配格位（parse_cells 拒绝）", _ok)
 
 # =====================================================================
 print("--- C. 阶段编排（FakeBoard + 打桩规划） ---")

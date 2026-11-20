@@ -407,12 +407,54 @@ def r2_gate(remaining, exec_est_s, margin=None):
 #: S1/S2 的贴合对（中心距 ≈29.5 mm）过不了 60 mm ⇒ 放宽到 0，判决来源 =
 #: **探针 OBB 已逐邻块核隙**（probe_verified）。判得必须有来源落盘
 #: （``cr.plan_sequence`` 文档同句；manifest 的 ``gap_check`` 字段照记）。
-GAP_POLICY_BY_BATCH = {"S0": (0.06, "layout_gap")}
+GAP_POLICY_BY_BATCH = {"S0": (0.06, "layout_gap"),
+                       # S3：两层塔 + 贴合对 ⇒ 表级 60 mm 不成立；邻块间隙由
+                       # **累积探针**逐邻块 OBB 核（含「塔顶被搬走后」的世界）。
+                       "S3": (0.0, "cumulative_probe_verified")}
 
 
 def gap_policy(batch):
     """批次 → ``(min_block_gap_m, gap_check)``。未知批次（S1/S2/…）= 贴面口径。"""
     return GAP_POLICY_BY_BATCH.get(batch, (0.0, "probe_verified"))
+
+
+def _placement_hint_s3(layout_blocks):
+    """S3 摆块提示：塔（上下颜色/顺序）+ 贴合对 + 其余摆散 + 备用格说明。"""
+    n = len(layout_blocks)
+    by_id = {str(b["id"]): b for b in layout_blocks}
+    tower = None
+    for b in layout_blocks:
+        if int(b.get("layer", 0)) == 0:
+            continue
+        sup = [a for a in layout_blocks if int(a.get("layer", 0)) == 0
+               and math.hypot(a["x"] - b["x"], a["y"] - b["y"]) <= 0.006]
+        if sup:
+            tower = (sup[0], b)
+            break
+    parts = []
+    if tower:
+        lo, hi = tower
+        same = lo["color"] == hi["color"]
+        parts.append("两块叠成两层塔（%s：下层 %s / 上层 %s，同心 ≤3 mm、"
+                     "上层压在正上方）"
+                     % ("同色" if same else "异色", lo["color"], hi["color"]))
+    pair_ids = lay.contact_pairs(layout_blocks)
+    if len(pair_ids) == 1:
+        ca, cb = (by_id[str(pid)]["color"] for pid in pair_ids[0])
+        parts.append(("同色 %s 两块贴住成一对" % ca if ca == cb
+                      else "%s 与 %s 两块贴住成一对（异色）" % (ca, cb)))
+    group = set()
+    if tower:
+        group |= {str(tower[0]["id"]), str(tower[1]["id"])}
+    for pid in pair_ids:
+        group |= {str(p) for p in pid}
+    rest = [str(b["color"]) for b in layout_blocks if str(b["id"]) not in group]
+    if rest:
+        parts.append("%s 三块互相摆散（离塔和贴合对都留空隙）"
+                     % "/".join(rest))
+    return ("%d 块自由摆：%s。全部落在拾取区内；**不要把块预放到垫上**。"
+            "垫面 7 个色格 + 2 个备用格：每块按自己的颜色进对应色格，"
+            "重复色的第二块进备用格（7 → 8）。" % (n, "；".join(parts)))
 
 
 def placement_hint(batch, layout_blocks):
@@ -424,6 +466,8 @@ def placement_hint(batch, layout_blocks):
     n = len(layout_blocks)
     if batch == "S0":
         return ("%d 块自由摆：拾取区内、互相摆散（无接触）" % n)
+    if batch == "S3":
+        return _placement_hint_s3(layout_blocks)
     pair_ids = lay.contact_pairs(layout_blocks)
     if len(pair_ids) == 1:
         colors = []
@@ -473,7 +517,24 @@ def bias_setup(mode, seed_spec, estimate_path):
             "source": source, "note": gb.bias_note(mode)}
 
 
-def validate_pad_doc(doc, min_frames=10, max_spread_mm=2.0, max_spread_deg=0.5):
+def grid_order_from_mat(path):
+    """读 ``stage2-mat.json`` 的 ``grid_order``（S3 启动期摘要用，不需要动臂）。
+
+    运行时真正的色序来自本场解垫后写进 ``grid-pre.json`` 的那一份；这里只用于
+    **授权前**打印「块 → 色格 / 备用格」。两处不一致时，解垫后的那道校验会红。
+    """
+    with open(os.path.expanduser(path), encoding="utf-8") as f:
+        doc = json.load(f)
+    order = doc.get("grid_order")
+    if not order:
+        raise ValueError("垫纸材质 %s 缺 grid_order —— S3 的格位没有来源"
+                         % path)
+    cm.validate_grid_order(order)
+    return list(order)
+
+
+def validate_pad_doc(doc, min_frames=10, max_spread_mm=2.0, max_spread_deg=0.5,
+                     require_grid_order=False):
     """解垫文档是否够格当本轮计划与判分的**同一份**垫位姿。返回问题列表。
 
     ``min_frames`` 缺省 10（2026-11-15 v0.8：burst 20→10，用户拍板；共识下限
@@ -507,6 +568,49 @@ def validate_pad_doc(doc, min_frames=10, max_spread_mm=2.0, max_spread_deg=0.5):
     for k in ("grid_center_base_mm", "grid_yaw_base_deg"):
         if k not in doc:
             probs.append("缺字段 %s" % k)
+    if require_grid_order:
+        try:
+            order = cm.grid_order_of(doc)
+        except ValueError as e:
+            probs.append(str(e))
+        else:
+            cells = doc.get("cells") or []
+            if cells:
+                probs.extend(_check_cell_geometry(cells, order))
+    return probs
+
+
+def _check_cell_geometry(cells, order):
+    """``grid-pre.json`` 的 cells 与实测垫位姿 + ``cell_center`` 同一几何。
+
+    垫心/偏航已经 ``cm.configure_pad`` 过；这里按垫系坐标反算 base 系，与
+    ``cm.cell_center(idx)`` 比（容差 0.1 mm）—— 防止 mat 的格心约定与代码分家。
+    """
+    probs = []
+    try:
+        # 垫心/偏航已经 cm.configure_pad 过：按垫系坐标反算 base 系
+        ca = math.cos(cm.PAD_YAW_RAD)
+        sa = math.sin(cm.PAD_YAW_RAD)
+        by_idx = {int(c["idx"]): c for c in cells}
+        if sorted(by_idx) != list(range(9)):
+            probs.append("cells 必须恰好是 0–8（收到 %s）" % sorted(by_idx))
+            return probs
+        for idx, c in by_idx.items():
+            want_colour = order[idx] if idx < len(order) else None
+            if want_colour is not None and str(c.get("color")) != want_colour:
+                probs.append("格 %d 颜色 %r ≠ grid_order[%d]=%r"
+                             % (idx, c.get("color"), idx, want_colour))
+            u = float(c["center_pad_mm"][0]) / 1000.0
+            v = float(c["center_pad_mm"][1]) / 1000.0
+            x = cm.PAD_CENTER[0] + ca * u - sa * v
+            y = cm.PAD_CENTER[1] + sa * u + ca * v
+            cx, cy = cm.cell_center(idx)
+            d = math.hypot(x - cx, y - cy) * 1000.0
+            if d > 0.1:
+                probs.append("格 %d 的 mat 格心与 cell_center 差 %.2f mm"
+                             % (idx, d))
+    except (KeyError, TypeError, ValueError, IndexError) as e:
+        probs.append("cells 几何校验失败：%s" % e)
     return probs
 
 
@@ -1686,16 +1790,25 @@ class Round:
         print("  布局 %s:%d  第 %d 次  轮次 %s"
               % (self.args.batch, int(self.args.layout), int(self.args.run),
                  self.round_id))
-        cells = cm.parse_cells(self.args.cells, len(layout_blocks),
-                               batch=self.args.batch)
-        cell_map = cm.assign_cells([b["id"] for b in layout_blocks], cells)
+        if self.args.batch == "S3":
+            order = grid_order_from_mat(self.args.pad_mat)
+            cell_map = cm.assign_cells_by_colour(layout_blocks, order)
+            print("  格位（按垫纸颜色；重复色进备用格）：%s"
+                  % "  ".join("%s→%d" % kv
+                              for kv in sorted(cell_map.items(),
+                                               key=lambda kv: int(kv[0]))))
+        else:
+            cells = cm.parse_cells(self.args.cells, len(layout_blocks),
+                                   batch=self.args.batch)
+            cell_map = cm.assign_cells([b["id"] for b in layout_blocks], cells)
         print("  摆块（契约 v0.8 自由摆位，不要求照标称坐标）：%s"
               % placement_hint(self.args.batch, layout_blocks))
         for bid in _sorted_ids([b["id"] for b in layout_blocks]):
             blk = [b for b in layout_blocks if str(b["id"]) == bid][0]
-            print("  块 %-2s %-11s → 格 %d   (标称 %6.1f, %6.1f mm / %5.1f°，"
+            print("  块 %-2s %-11s L%d → 格 %d   (标称 %6.1f, %6.1f mm / %5.1f°，"
                   "仅参考)"
-                  % (bid, blk["color"], cell_map[bid], blk["x"] * 1000,
+                  % (bid, blk["color"], int(blk.get("layer", 0)),
+                     cell_map[bid], blk["x"] * 1000,
                      blk["y"] * 1000, blk["yaw"]))
         print("  跑前机位：pick / pad    跑后机位：pick / free / pad"
               "    跑后回 HOME（%s）" % (hp.HOME_JOINTS_DEG,))
@@ -2825,9 +2938,12 @@ def prepare(ap, args):
         args.bias_estimate = os.path.join(
             os.path.dirname(os.path.abspath(args.out_dir)),
             gb.BIAS_ESTIMATE_FILE)
-    if args.cells is None:
+    if args.cells is None and args.batch != "S3":
         args.cells = ",".join(str(c) for c in
                               cm.parse_cells(None, None, batch=args.batch))
+    if args.batch == "S3" and args.cells:
+        ap.error("S3 的格位由颜色决定（垫纸 grid_order + 重复色进备用格），"
+                 "不接受 --cells；去掉它即可")
     if args.batch not in lay.BATCHES:
         ap.error("未知批次 %r（可选 %s）" % (args.batch, sorted(lay.BATCHES)))
     if int(args.layout) not in lay.BATCHES[args.batch]:

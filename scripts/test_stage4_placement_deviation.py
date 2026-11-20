@@ -284,9 +284,16 @@ def main():
 
     tower = [ob('red', 330.0, 250.0, 0.0, layer=0),
              ob('red', 330.0, 250.0, 0.0, layer=1)]
-    rep_t = pd.build_report(make_doc(tower), 'tower.json', exp, 'layout:S0:1')
-    check('G11 塔的下层不参与配对（只取 layer 0）',
-          rep_t['n_observed'] == 1, repr(rep_t['n_observed']))
+    tower_exp = [{"id": 0, "color": "red", "x_mm": 330.0, "y_mm": 250.0,
+                  "yaw_deg": 0.0, "layer": 0},
+                 {"id": 1, "color": "red", "x_mm": 330.0, "y_mm": 250.0,
+                  "yaw_deg": 0.0, "layer": 1}]
+    rep_t = pd.build_report(make_doc(tower), 'tower.json', tower_exp, 'tower-exp')
+    check('G11 塔的上下层各配各的（层感知：不互换、不重复）',
+          rep_t['n_observed'] == 2 and rep_t['n_matched'] == 2 and
+          [b['layer'] for b in rep_t['blocks']] == [0, 1] and
+          all(b['layer'] == b['observed_layer'] for b in rep_t['blocks']) and
+          not rep_t['unmatched_expected'], repr(rep_t['blocks']))
 
     print()
     if N_FAIL:

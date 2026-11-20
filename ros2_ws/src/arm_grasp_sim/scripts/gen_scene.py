@@ -113,6 +113,19 @@ CLASSES = ["red", "orange", "tan", "yellow", "yellowgreen", "cyan", "purple"]
 BATCH_COUNTS = {"S0": 5, "S1": 6, "S2": 6, "S3": 7, "S4": 9}
 LAYOUTS_PER_BATCH = 5
 
+#: S3 固定颜色计划（2026-11-20 用户拍板：塔与贴合对可同可异，其余块互异；
+#: 7 色可用 ⇒ 最多 2 个重复色，正好由垫纸的 2 个备用格吸收）。
+#: 元组 = (塔下, 塔上, 对a, 对b, 孤立1, 孤立2, 孤立3)。
+#: S3:1 = 真机轮 A（同色塔 + 同色对，两个备用格都用上）；
+#: S3:2 = 真机轮 B（异色塔 + 异色对，7 色格全用）。
+S3_COLOUR_PLANS = {
+    1: ("red", "red", "cyan", "cyan", "orange", "yellow", "yellowgreen"),
+    2: ("cyan", "purple", "yellow", "yellowgreen", "red", "orange", "tan"),
+    3: ("tan", "tan", "cyan", "purple", "red", "orange", "yellow"),
+    4: ("orange", "purple", "red", "red", "yellow", "yellowgreen", "cyan"),
+    5: ("purple", "purple", "yellow", "yellow", "red", "orange", "cyan"),
+}
+
 # 顶面相机（真机旧支架实测，base_link 系；见 docs/calib/extrinsics-2026-10-03-base_link.json）
 TOPCAM_XYZ = (0.34694477757210807, 0.8693043936314018, 0.6454397556505314)
 TOPCAM_Q = (0.32913450910630487, 0.31637465543060517,
@@ -181,8 +194,13 @@ def _add_contact_pair(rng, placed, same_color, color_pair):
     raise RuntimeError("接触对采样失败")
 
 
-def _add_stack(rng, placed):
-    """放一个两层塔：上下块同心度偏差 ≤ 3 mm，yaw 差 0–10°。"""
+def _add_stack(rng, placed, colors=None):
+    """放一个两层塔：上下块同心度偏差 ≤ 3 mm，yaw 差 0–10°。
+
+    ``colors``（``(塔下, 塔上)``）给了就按显式颜色放 —— **不再消耗颜色随机数**，
+    这是 S3 的固定颜色计划（2026-11-20）。不给时保持原抽样顺序，S4 的随机
+    序列逐位不变（回归测试把守）。
+    """
     margin = BLOCK_M / 2 + 0.006
     for _try in range(4000):
         x = rng.uniform(ZONE[0] + margin, ZONE[1] - margin)
@@ -193,9 +211,12 @@ def _add_stack(rng, placed):
         off = rng.uniform(0.0, 0.003)
         off_dir = rng.uniform(0.0, 360.0)
         dx, dy = _rot2((off, 0.0), off_dir)
-        bottom = dict(x=x, y=y, yaw=base_yaw, color=rng.choice(CLASSES), layer=0)
-        top = dict(x=x + dx, y=y + dy, yaw=(base_yaw + rng.uniform(0.0, 10.0)) % 180.0,
-                   color=rng.choice(CLASSES), layer=1)
+        bottom_color = colors[0] if colors else rng.choice(CLASSES)
+        bottom = dict(x=x, y=y, yaw=base_yaw, color=bottom_color, layer=0)
+        # 顺序与旧实现逐位一致：先抽顶层 yaw 增量，再抽顶层颜色。
+        top_yaw = (base_yaw + rng.uniform(0.0, 10.0)) % 180.0
+        top_color = colors[1] if colors else rng.choice(CLASSES)
+        top = dict(x=x + dx, y=y + dy, yaw=top_yaw, color=top_color, layer=1)
         return bottom, top
     raise RuntimeError("塔采样失败")
 
@@ -228,17 +249,19 @@ def make_layout(batch, index):
         blocks = placed
 
     elif batch == "S3":
-        bottom, top = _add_stack(rng, [])
+        # 2026-11-20：颜色按 S3_COLOUR_PLANS 固定（塔与贴合对可同可异、
+        # 其余互异）；坐标仍按种子抽样。真机轮 A = S3:1、轮 B = S3:2。
+        plan = S3_COLOUR_PLANS[index]
+        bottom, top = _add_stack(rng, [], colors=(plan[0], plan[1]))
         placed = [bottom]
         # 塔外再放一对接触（两层重叠场景同时有「上下」与「贴边」）
-        extra_pair = _add_contact_pair(rng, placed, same_color=False, color_pair=None)
+        extra_pair = _add_contact_pair(rng, placed, same_color=False,
+                                       color_pair=(plan[2], plan[3]))
         placed += list(extra_pair)
         rest = _sample_isolated(rng, placed, n - 4, BLOCK_M + 0.030)
-        colors = [c for c in CLASSES if c not in {b["color"] for b in placed}]
-        rng.shuffle(colors)
         for i, p in enumerate(rest):
-            placed.append(dict(p, yaw=rng.uniform(0, 180), color=colors[i % len(colors)],
-                               layer=0))
+            placed.append(dict(p, yaw=rng.uniform(0, 180),
+                               color=plan[4 + i], layer=0))
         blocks = placed + [top]
 
     else:  # S4：自由布局 —— 一塔 + 两对接触 + 3 个孤立块

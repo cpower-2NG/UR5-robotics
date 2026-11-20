@@ -88,9 +88,12 @@ def expected_blocks(batch=None, layout=None, scene=None):
 
 
 def observed_blocks(doc, source):
-    """观测真值 → 同样字段。只取顶层（layer 0）：跑前 S0 的块不该叠塔，
-    塔的上下层 xy 完全相同，全收进来会让一块期望块被配两次。"""
-    flat = [b for b in (doc.get("blocks") or []) if int(b.get("layer", 0)) == 0]
+    """观测真值 → 同样字段。**保留全部层**（S3 的两层塔都要记）。
+
+    层信息参与配对（``match_blocks`` 里同层优先）：塔顶/塔底的 xy 相同，
+    只按距离会把上下层配反。S0–S2 只有 layer 0，行为不变。
+    """
+    flat = list(doc.get("blocks") or [])
     out = []
     for b in flat:
         out.append({
@@ -99,18 +102,19 @@ def observed_blocks(doc, source):
             "x_mm": float(b["x"]) * 1000.0,
             "y_mm": float(b["y"]) * 1000.0,
             "yaw_deg": float(b.get("yaw", 0.0)),
+            "layer": int(b.get("layer", 0)),
             "n_frames": (b.get("meas") or {}).get("n_frames"),
         })
     if not out:
-        raise ValueError("%s 里没有 layer 0 的块（真值为空 ⇒ 不出数）" % source)
+        raise ValueError("%s 里没有块（真值为空 ⇒ 不出数）" % source)
     return out, source
 
 
 def match_blocks(expected, observed, radius_mm=MATCH_RADIUS_MM):
-    """期望 ↔ 观测的配对：颜色优先、再按距离贪心。
+    """期望 ↔ 观测的配对：**同色同层**优先、再按距离贪心。
 
-    颜色可能被分错（实测有），所以**同色不是硬条件** —— 只是更大距离的
-    候选排在同色后面。返回 ``(pairs, unmatched_expected, unmatched_observed)``。
+    颜色可能被分错（实测有），所以同色不是硬条件 —— 只是候选排序；层差
+    同样是排序项（塔上下层必须各配各的）。
     """
     cand = []
     for ei, e in enumerate(expected):
@@ -118,11 +122,12 @@ def match_blocks(expected, observed, radius_mm=MATCH_RADIUS_MM):
             d = math.hypot(e["x_mm"] - o["x_mm"], e["y_mm"] - o["y_mm"])
             if d > radius_mm:
                 continue
-            same = (e["color"] == o["color"])
-            cand.append((0 if same else 1, d, ei, oi))
+            same_color = 0 if e["color"] == o["color"] else 1
+            same_layer = 0 if int(e.get("layer", 0)) == int(o.get("layer", 0)) else 1
+            cand.append((same_layer, same_color, d, ei, oi))
     cand.sort()
     used_e, used_o, pairs = set(), set(), []
-    for _bad, _d, ei, oi in cand:
+    for _layer, _color, _d, ei, oi in cand:
         if ei in used_e or oi in used_o:
             continue
         used_e.add(ei)
@@ -142,6 +147,8 @@ def deviation_record(e, o):
     return {
         "id": e["id"],
         "color": e["color"],
+        "layer": int(e.get("layer", 0)),
+        "observed_layer": int(o.get("layer", 0)),
         "observed_color": o["color"],
         "color_match": e["color"] == o["color"],
         "expected_mm": [round(e["x_mm"], 3), round(e["y_mm"], 3)],

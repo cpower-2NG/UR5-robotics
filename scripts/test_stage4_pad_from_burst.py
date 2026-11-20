@@ -193,9 +193,43 @@ def sec_embed_spec():
     check('纯函数：不改入参', base.get('pad_thickness_m') is None)
 
 
+def sec_grid_order():
+    print('\n[6] grid 文档嵌色序与格心（S3 颜色归格）')
+    rows = [row(461.3, -158.2, -89.4, i) for i in range(6)]
+    t, yaw, sp, k = pb.consensus(rows)
+    order = list(cm.DEFAULT_GRID_ORDER)
+    cells = []
+    for i in range(9):
+        r, c = divmod(i, 3)
+        cells.append({'idx': i, 'row': r, 'col': c, 'color': order[i],
+                      'center_pad_mm': [(c - 1) * 60.0, (1 - r) * 60.0]})
+    mat = {'grid_order': order, 'grid': {'cells': cells}}
+    doc = pb.build_doc(rows, t, yaw, sp, k, 'wrist', 'burst-x', 'mat.json', 8,
+                       mat_doc=mat)
+    check('嵌入 grid_order 与 9 个格心',
+          doc.get('grid_order') == order and len(doc.get('cells') or []) == 9,
+          repr(doc.get('grid_order')))
+    check('load_grid 后 grid_order_of 能读（S3 的格位来源）',
+          cm.grid_order_of(doc) == order)
+    doc2 = pb.build_doc(rows, t, yaw, sp, k, 'wrist', 'burst-x', 'mat.json', 8,
+                        mat_doc={'grid': {}})
+    check('mat 缺 grid_order ⇒ 不写该键（下游 fail-closed，不猜）',
+          'grid_order' not in doc2)
+    bad = dict(mat)
+    bad['grid_order'] = order[:-1]
+    try:
+        pb.build_doc(rows, t, yaw, sp, k, 'wrist', 'burst-x', 'mat.json', 8,
+                     mat_doc=bad)
+        ok = False
+    except ValueError:
+        ok = True
+    check('非法色序 ⇒ 解垫阶段就报错', ok)
+
+
 def main():
     print('=' * 68)
-    for fn in (sec_wrap, sec_consensus, sec_doc, sec_gates, sec_embed_spec):
+    for fn in (sec_wrap, sec_consensus, sec_doc, sec_gates, sec_embed_spec,
+               sec_grid_order):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001

@@ -567,6 +567,80 @@ def section_pad_pose():
           tuple(v * 1000.0 for v in cm.PAD_CENTER) == gs.PAD_CENTER_MM)
 
 
+def section_colour_cells():
+    print('\n--- 颜色→格位（S3，2026-11-20） ---')
+    order = list(cm.DEFAULT_GRID_ORDER)
+    check('DEFAULT_GRID_ORDER：7 色各一次 + 2 备用',
+          len(order) == 9 and order.count('spare') == 2 and
+          sorted(c for c in order if c != 'spare') ==
+          sorted(['red', 'orange', 'tan', 'yellow', 'yellowgreen',
+                  'cyan', 'purple']))
+    import stage2_mat as sm2
+    check('与 stage2_mat.DEFAULT_ORDER 同源同值',
+          order == list(sm2.DEFAULT_ORDER), repr(sm2.DEFAULT_ORDER))
+    for bad, why in (([], '空'), (order[:-1], '少一项'),
+                     ([order[0]] + order[1:-1] + ['red'], '备用不足/重复色'),
+                     (['blue'] + order[1:], '未知颜色')):
+        try:
+            cm.validate_grid_order(bad)
+            ok = False
+        except ValueError:
+            ok = True
+        check('validate_grid_order 拒 %s' % why, ok)
+    # 7 色各一块 ⇒ 各自色格
+    seven = [{'id': i, 'color': c} for i, c in enumerate(order[:7])]
+    got = cm.assign_cells_by_colour(seven, order)
+    check('七色各一块 ⇒ 各进自己的色格',
+          all(got[str(i)] == i for i in range(7)) and
+          len(set(got.values())) == 7, repr(got))
+    # 同色重复 ⇒ 色格 + 备用 7；两对 ⇒ 7、8
+    one = seven + [{'id': 7, 'color': 'cyan'}]
+    got = cm.assign_cells_by_colour(one, order)
+    check('同色第二块 ⇒ 第一个备用格 7',
+          got['5'] == 5 and got['7'] == 7, repr(got))
+    two = seven + [{'id': 7, 'color': 'cyan'}, {'id': 8, 'color': 'red'}]
+    got = cm.assign_cells_by_colour(two, order)
+    check('两个重复色按 id 序 ⇒ 7、8 都用上',
+          set(got.values()) == set(range(9)) and got['7'] == 7 and
+          got['8'] == 8, repr(got))
+    try:
+        cm.assign_cells_by_colour(
+            [{'id': i, 'color': 'cyan'} for i in range(4)], order)
+        ok = False
+    except ValueError:
+        ok = True
+    check('第三个同色还能放（色格+2 备用），第四个 ⇒ fail-closed', ok)
+    blk = [{'id': 0, 'color': 'red'}, {'id': 1, 'color': 'cyan'},
+           {'id': 2, 'color': 'cyan'}, {'id': 3, 'color': 'orange'},
+           {'id': 4, 'color': 'yellow'}, {'id': 5, 'color': 'yellowgreen'},
+           {'id': 6, 'color': 'red'}]
+    shuffled = [blk[i] for i in (3, 0, 6, 2, 5, 1, 4)]
+    check('分配与输入顺序无关（按 id 升序）',
+          cm.assign_cells_by_colour(shuffled, order) ==
+          cm.assign_cells_by_colour(blk, order), repr(blk))
+    try:
+        cm.assign_cells_by_colour([{'id': 0, 'color': 'blue'}], order)
+        ok = False
+    except ValueError:
+        ok = True
+    check('颜色不在垫纸色序里 ⇒ fail-closed', ok)
+    import grasp_planner.slot_routing as sr
+    check('槽位选择与 grasp_planner.slot_routing.pick_slot 同一实现',
+          cm._SR.pick_slot is sr.pick_slot)
+    try:
+        cm.parse_cells(None, 7, batch='S3')
+        ok = False
+    except ValueError:
+        ok = True
+    check('parse_cells(S3, 无 spec) ⇒ 拒绝（不许回退 5 格）', ok)
+    try:
+        cm.grid_order_of({'kind': 'stage2-grid'})
+        ok = False
+    except ValueError:
+        ok = True
+    check('grid_order_of 缺字段 ⇒ 停（不猜默认顺序）', ok)
+
+
 def main():
     print('=' * 68)
     # C1：模块缺省 = 未实测哨兵；本套件全是**模型世界**的几何测试，
@@ -574,6 +648,7 @@ def main():
     cm.install_model_pad_defaults()
     section_gen_scene_sync()
     section_cells()
+    section_colour_cells()
     section_cell_plan()
     section_free()
     section_blocks()

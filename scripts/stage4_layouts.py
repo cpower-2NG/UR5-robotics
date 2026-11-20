@@ -135,7 +135,68 @@ S2_SELECTED = {
     ),
 }
 
-BATCHES = {"S0": S0_SELECTED, "S1": S1_SELECTED, "S2": S2_SELECTED}
+#: S3（两层重叠，2026-11-20 用户拍板）：7 块 = 一个两层塔 + 一对贴合 + 3 孤立。
+#: 颜色计划固定（塔与贴合对可同可异、其余互异），见 ``gen_scene.S3_COLOUR_PLANS``。
+#: 元组为 **6 元**：``(id, color, x_mm, y_mm, yaw_deg, layer)``；其余批次仍是 5 元。
+#: S3:1 = 真机轮 A（同色塔 + 同色对，两个备用格都用上）；
+#: S3:2 = 真机轮 B（异色塔 + 异色对，7 色格全用）。
+S3_SELECTED = {
+    1: (
+        (0, "red", 383.042, 377.179, 159.434, 0),
+        (1, "cyan", 491.441, 351.138, 29.193, 0),
+        (2, "cyan", 517.193, 365.527, 29.193, 0),
+        (3, "orange", 336.054, 336.605, 40.521, 0),
+        (4, "yellow", 271.823, 276.377, 121.352, 0),
+        (5, "yellowgreen", 289.076, 219.171, 131.568, 0),
+        (6, "red", 383.330, 376.041, 168.400, 1),
+    ),
+    2: (
+        (0, "cyan", 488.962, 256.699, 134.711, 0),
+        (1, "yellow", 307.595, 302.516, 106.824, 0),
+        (2, "yellowgreen", 299.057, 330.754, 106.824, 0),
+        (3, "red", 538.499, 383.451, 34.508, 0),
+        (4, "orange", 339.460, 197.676, 157.071, 0),
+        (5, "tan", 408.695, 227.491, 13.507, 0),
+        (6, "purple", 490.221, 255.159, 138.727, 1),
+    ),
+    3: (
+        (0, "tan", 313.498, 354.096, 17.898, 0),
+        (1, "cyan", 436.151, 291.749, 42.054, 0),
+        (2, "purple", 458.055, 311.509, 42.054, 0),
+        (3, "red", 540.112, 362.635, 42.581, 0),
+        (4, "orange", 555.939, 234.679, 12.622, 0),
+        (5, "yellow", 446.939, 231.508, 14.435, 0),
+        (6, "tan", 312.405, 352.666, 19.081, 1),
+    ),
+    4: (
+        (0, "orange", 536.594, 255.324, 88.338, 0),
+        (1, "red", 369.635, 346.695, 46.903, 0),
+        (2, "red", 389.791, 368.236, 46.903, 0),
+        (3, "yellow", 295.835, 264.988, 102.595, 0),
+        (4, "yellowgreen", 445.820, 286.058, 76.848, 0),
+        (5, "cyan", 354.372, 284.835, 49.684, 0),
+        (6, "purple", 536.026, 255.594, 93.270, 1),
+    ),
+    5: (
+        (0, "purple", 450.498, 296.082, 176.119, 0),
+        (1, "yellow", 357.261, 365.779, 18.585, 0),
+        (2, "yellow", 385.222, 375.181, 18.585, 0),
+        (3, "red", 458.297, 372.766, 70.571, 0),
+        (4, "orange", 379.102, 213.967, 145.271, 0),
+        (5, "cyan", 548.731, 237.909, 146.952, 0),
+        (6, "purple", 451.983, 297.915, 0.228, 1),
+    ),
+}
+
+BATCHES = {"S0": S0_SELECTED, "S1": S1_SELECTED, "S2": S2_SELECTED,
+           "S3": S3_SELECTED}
+
+#: S3 的默认指定/执行顺序（2026-11-20）：轮 A 塔底先行（触发「清障吸收」），
+#: 轮 B 塔顶先行（塔底直接暴露）。其余布局按 id 升序。
+S3_COMMAND_ORDER = {
+    1: (0, 6, 1, 2, 3, 4, 5),
+    2: (6, 0, 1, 2, 3, 4, 5),
+}
 
 
 def layout_blocks(batch, layout):
@@ -151,16 +212,22 @@ def layout_blocks(batch, layout):
                          % (batch, layout, sorted(table)))
     size = BLOCK_SIZE_M
     blocks = []
-    for bid, color, x_mm, y_mm, yaw in table[layout]:
+    for row in table[layout]:
+        if len(row) == 6:
+            bid, color, x_mm, y_mm, yaw, layer = row
+        else:
+            bid, color, x_mm, y_mm, yaw = row
+            layer = 0
+        layer = int(layer)
         blocks.append({
             "id": int(bid),
             "color": str(color),
-            "layer": 0,
+            "layer": layer,
             "size": size,
             "x": float(x_mm) / 1000.0,
             "y": float(y_mm) / 1000.0,
-            "z": size / 2.0,
-            "top": size,
+            "z": size / 2.0 + size * layer,
+            "top": size * (layer + 1),
             "yaw": float(yaw),
         })
     return blocks
@@ -223,9 +290,68 @@ def validate_blocks(batch, blocks, min_gap_m=0.060):
             elif batch == "S0" and d < min_gap_m:
                 errs.append("块 %d/%d 中心距 %.1f mm < %.0f mm"
                             % (a["id"], c["id"], d * 1000, min_gap_m * 1000))
-    if batch in ("S1", "S2") and contacts != 1:
+    if batch in ("S1", "S2", "S3") and contacts != 1:
         errs.append("%s 应有恰好 1 个贴合对，实得 %d 个（场景定义：一个贴合对"
                     " + 其余摆散）" % (batch, contacts))
+    if batch == "S3":
+        errs.extend(_validate_s3_stack_and_colours(blocks, contacts))
+    return errs
+
+
+def _validate_s3_stack_and_colours(blocks, contacts):
+    """S3 专有校验：塔必须有支撑、颜色重复只准出现在塔/贴合对内。
+
+    「其余块各不同色」是 2026-11-20 用户定的场景定义；7 色最多 2 个重复色，
+    正好由垫纸的 2 个备用格吸收（见 ``stage4_clear_model.assign_cells_by_colour``）。
+    """
+    errs = []
+    layers = [int(b.get("layer", 0)) for b in blocks]
+    if max(layers) > 1:
+        errs.append("S3 只允许两层塔（实得 layer 最大 %d）" % max(layers))
+    tower = []
+    for b in blocks:
+        lv = int(b.get("layer", 0))
+        if lv == 0:
+            continue
+        sup = [a for a in blocks if int(a.get("layer", 0)) == lv - 1
+               and math.hypot(a["x"] - b["x"], a["y"] - b["y"])
+               <= 0.006]
+        if not sup:
+            errs.append("块 %d 在 layer %d 但下方 6 mm 内没有支撑块"
+                        % (b["id"], lv))
+        else:
+            tower.append((sup[0]["id"], b["id"]))
+    if len(tower) != 1:
+        errs.append("S3 应有恰好 1 个两层塔，实得 %d 个" % len(tower))
+    pairs = contact_pairs(blocks)
+    group = set()
+    for t in tower:
+        group |= set(t)
+    if len(pairs) == 1:
+        group |= set(pairs[0])
+    counts = {}
+    for b in blocks:
+        counts[b["color"]] = counts.get(b["color"], 0) + 1
+    for color, n in counts.items():
+        if n > 2:
+            errs.append("颜色 %s 出现 %d 次（S3 每色至多 2 块）" % (color, n))
+            continue
+        if n < 2:
+            continue
+        ids = {b["id"] for b in blocks if b["color"] == color}
+        ok = any(set(t) == ids for t in tower) or \
+            any(set(p) == ids for p in pairs)
+        if not ok:
+            errs.append("重复色 %s 只允许出现在塔内或贴合对内（实际块 %s）"
+                        % (color, sorted(ids)))
+    isolated = [b for b in blocks if b["id"] not in group]
+    iso_colours = [b["color"] for b in isolated]
+    if len(set(iso_colours)) != len(iso_colours):
+        errs.append("S3 的孤立块颜色必须两两不同（实得 %s）" % iso_colours)
+    used = {b["color"] for b in blocks if b["id"] in group}
+    dup = sorted(set(c for c in iso_colours if c in used))
+    if dup:
+        errs.append("孤立块复用了塔/贴合对的颜色：%s" % ", ".join(dup))
     return errs
 
 
@@ -259,6 +385,55 @@ def contact_pairs(blocks):
     return out
 
 
+def commands_for_layout(batch, layout):
+    """标称布局 → 一组**无歧义**的结构化命令，按默认执行顺序返回。
+
+    每条是 ``(id, command)``。规则（与 ``stage4_specify.select`` 的语义对齐）：
+    - 颜色只出现一次 ⇒ 裸颜色；
+    - 同色两层塔 ⇒ ``<color> top|bottom``（按 layer）；
+    - 同色贴合对 ⇒ 按较大分离轴给 ``left|right``（y 轴）或 ``front|back``（x 轴）。
+    真机自由摆位时由操作者按实际摆位照抄/微调；本函数只保证**标称表**上
+    7 条命令两两解析到不同实例（测试对拍）。
+    """
+    blocks = layout_blocks(batch, layout)
+    by_colour = {}
+    for b in blocks:
+        by_colour.setdefault(b["color"], []).append(b)
+    cmds = {}
+    for color, group in by_colour.items():
+        if len(group) == 1:
+            cmds[group[0]["id"]] = str(color)
+            continue
+        if len(group) != 2:
+            raise ValueError("%s:%d 颜色 %s 出现 %d 次，无法生成唯一命令"
+                             % (batch, layout, color, len(group)))
+        a, b = group
+        if int(a.get("layer", 0)) != int(b.get("layer", 0)):
+            lo, hi = (a, b) if a["layer"] < b["layer"] else (b, a)
+            cmds[lo["id"]] = "%s bottom" % color
+            cmds[hi["id"]] = "%s top" % color
+            continue
+        dx = abs(a["x"] - b["x"])
+        dy = abs(a["y"] - b["y"])
+        if dy >= dx:                                  # left = y 最大
+            hi = a if a["y"] > b["y"] else b
+            lo = b if hi is a else a
+            cmds[hi["id"]] = "%s left" % color
+            cmds[lo["id"]] = "%s right" % color
+        else:                                         # front = x 最大
+            hi = a if a["x"] > b["x"] else b
+            lo = b if hi is a else a
+            cmds[hi["id"]] = "%s front" % color
+            cmds[lo["id"]] = "%s back" % color
+    order = S3_COMMAND_ORDER.get(int(layout)) if batch == "S3" else None
+    if order is None:
+        order = tuple(sorted(cmds))
+    if set(order) != set(cmds):
+        raise ValueError("S3:%d 的命令顺序与命令集合不一致：%s vs %s"
+                         % (int(layout), sorted(order), sorted(cmds)))
+    return [(int(bid), cmds[bid]) for bid in order]
+
+
 def compare_with_gen_scene(batch="S0"):
     """与 ``gen_scene.make_layout`` 逐块对拍；返回差异列表（空 = 一致）。"""
     import gen_scene as gs                                      # cm 已把它放上 sys.path
@@ -276,6 +451,15 @@ def compare_with_gen_scene(batch="S0"):
             if a["color"] != b["color"]:
                 diffs.append("%s:%d 块 %d 颜色 %s vs %s"
                              % (batch, layout, bid, a["color"], b["color"]))
+            if int(a.get("layer", 0)) != int(b.get("layer", 0)):
+                diffs.append("%s:%d 块 %d 层 %d vs %d"
+                             % (batch, layout, bid, int(a.get("layer", 0)),
+                                int(b.get("layer", 0))))
+            dz = abs(float(a["z"]) - float(b["z"])) * 1000.0
+            dtop = abs(float(a["top"]) - float(b["top"])) * 1000.0
+            if dz > 0.05 or dtop > 0.05:
+                diffs.append("%s:%d 块 %d 高度差 z %.3f mm / top %.3f mm"
+                             % (batch, layout, bid, dz, dtop))
             dx = abs(a["x"] - float(b["x"])) * 1000.0
             dy = abs(a["y"] - float(b["y"])) * 1000.0
             dyaw = abs(a["yaw"] - float(b["yaw"]))
@@ -310,7 +494,9 @@ def main(argv=None):
         print("布局自检通过：%d 个布局，与 gen_scene 逐块一致%s"
               % (len(BATCHES[args.batch]),
                  "、间距 ≥60 mm" if args.batch == "S0"
-                 else "、贴合对 = 恰好 1 对（接触批口径）"))
+                 else ("、贴合对 = 恰好 1 对（接触批口径）"
+                       if args.batch in ("S1", "S2")
+                       else "、塔 + 贴合对各 1 对、层高/颜色规则通过")))
         return 0
 
     if args.layout is not None:
