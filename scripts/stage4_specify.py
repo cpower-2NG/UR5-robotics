@@ -112,6 +112,32 @@ def _norm(text):
     return s
 
 
+def rows_from_truth(blocks):
+    """真值块（``id/color/x/y/top/layer``，米）→ ``select`` 吃的检测行形状。
+
+    轮内指定在**跑前实测真值**上解析（不是原始检测行）—— 这样塔的上下两层
+    作为两个实例都在（``<color> top|bottom`` 才有意义）。``x/y/top`` 米→毫米；
+    ``n`` 缺省给一个足够大的数（``visible_ratio`` 只用于排序，不参与判据）。
+    """
+    rows = []
+    for b in blocks or []:
+        m = b.get("meas") or {}
+        rows.append({
+            "idx": int(b.get("id", b.get("idx", len(rows)))),
+            "class": str(b.get("color", b.get("class", "unknown"))),
+            "cx": float(b["x"]) * 1000.0,
+            "cy": float(b["y"]) * 1000.0,
+            "top": float(b["top"]) * 1000.0,
+            "yaw_rect": float(b.get("yaw", 0.0)),
+            "yaw": float(b.get("yaw", 0.0)),
+            "layer": int(b.get("layer", 0)),
+            "low": False,
+            "n": int(m.get("n_pts") or 800),
+            "class_share": m.get("class_share"),
+        })
+    return rows
+
+
 def parse_command(text, classes=None):
     """文本 → 意图字典；语法外一律 ``CommandError``（带原话，方便人改）。
 

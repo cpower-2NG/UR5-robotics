@@ -88,6 +88,7 @@ import real_motion_authorize as rma                             # noqa: E402
 import home_pose as hp                                          # noqa: E402
 import stage4_clear_model as cm                                 # noqa: E402
 import stage4_clear_run as cr                                   # noqa: E402
+import stage4_specify as spec                                   # noqa: E402
 import stage4_layouts as lay                                    # noqa: E402
 import stage4_pad_from_burst as pfb                             # noqa: E402
 import stage4_placement_deviation as pdv                        # noqa: E402
@@ -320,6 +321,66 @@ def match_measured_blocks(manifest_blocks, measured_blocks,
                    _mm(m["x"]), _mm(m["y"]), d, limit_mm))
         pairs.append((m, pick, dx, dy))
     return pairs
+
+
+def resolve_designation(commands, measured_blocks, manifest_blocks,
+                        limit_mm=PICK_OFFSET_LIMIT_MM):
+    """S3：结构化命令 → 每条解析成**唯一实测实例** → 映射到布局 id。
+
+    判据（任一不满足即 ``ValueError``，执行前停）：
+    - 每条命令在**实测真值**上 ``status == "ok"``（0 匹配 / 歧义都停）；
+    - 各条落到不同的实例；
+    - 覆盖全部实测块（条数 = 块数、无遗漏）；
+    - 实测解析到的布局块，必须与**在布局表上**解析到的那一块是同一个
+      （测量与清单不一致就停，不许拿清单坐标顶替实测）。
+
+    返回 ``{"commands", "order", "resolved", "accuracy", "n_ok"}``；``order``
+    是**布局块 id** 按命令顺序排列的执行序。
+    """
+    rows_m = spec.rows_from_truth(measured_blocks)
+    rows_c = spec.rows_from_truth(manifest_blocks)
+    pairs = match_measured_blocks(manifest_blocks, measured_blocks, limit_mm,
+                                  strict_layer=True)
+    m2m = {str(o["id"]): m for m, o, _dx, _dy in pairs}
+    seen = set()
+    resolved = []
+    for raw in commands:
+        r = spec.select(rows_m, raw)
+        if r["status"] != "ok":
+            raise ValueError("指定 %r 解析不了：%s（%s）"
+                             % (raw, r["status"], r.get("reason") or ""))
+        sid = str(r["instance"])
+        if sid in seen:
+            raise ValueError("指定 %r 与前面的命令落到同一实测实例 %s"
+                             % (raw, sid))
+        seen.add(sid)
+        m = m2m.get(sid)
+        if m is None:
+            raise ValueError("指定 %r 的实测实例 %s 没有配到布局块" % (raw, sid))
+        e = spec.select(rows_c, raw)
+        if e["status"] != "ok":
+            raise ValueError("指定 %r 在布局表上解析不了：%s（%s）"
+                             % (raw, e["status"], e.get("reason") or ""))
+        if str(e["instance"]) != str(m["id"]):
+            raise ValueError(
+                "指定 %r：实测指向布局块 %s，布局表指向 %s —— 测量与清单不一致"
+                % (raw, m["id"], e["instance"]))
+        resolved.append({"raw": raw, "measured_id": sid,
+                         "manifest_id": str(m["id"]),
+                         "confidence": r.get("confidence"),
+                         "echo": r.get("block")})
+    all_ids = {str(b["id"]) for b in measured_blocks}
+    if seen != all_ids:
+        raise ValueError("指定命令覆盖不全：解析到 %s，实测块 %s"
+                         % (sorted(seen), sorted(all_ids)))
+    if len(commands) != len(manifest_blocks):
+        raise ValueError("命令条数 %d ≠ 布局块数 %d"
+                         % (len(commands), len(manifest_blocks)))
+    return {"version": 1, "kind": "stage4-designation",
+            "commands": resolved,
+            "order": [x["manifest_id"] for x in resolved],
+            "n_commands": len(resolved), "n_ok": len(resolved),
+            "accuracy": 1.0}
 
 
 def merge_measured_truth(truth_doc, measured_doc,
@@ -1921,6 +1982,26 @@ class Round:
                   % (bid, blk["color"], int(blk.get("layer", 0)),
                      cell_map[bid], blk["x"] * 1000,
                      blk["y"] * 1000, blk["yaw"]))
+        if self.args.batch == "S3":
+            cmds = self._designate_commands()
+            if not cmds:
+                raise RoundError(EXIT_PLAN, "authorize",
+                                 "S3 需要 --designate-file / --designate：每块"
+                                 "一条结构化命令（%d 条）—— 不退回 id 顺序"
+                                 % len(layout_blocks))
+            if len(cmds) != len(layout_blocks):
+                raise RoundError(EXIT_PLAN, "authorize",
+                                 "指定命令 %d 条 ≠ 布局块 %d 块"
+                                 % (len(cmds), len(layout_blocks)))
+            for raw in cmds:
+                try:
+                    spec.parse_command(raw)
+                except spec.CommandError as e:
+                    raise RoundError(EXIT_PLAN, "authorize",
+                                     "指定语法错：%s" % e)
+            print("  指定（语法已核；实例解析在观察后的实测真值上做）：")
+            for i, raw in enumerate(cmds):
+                print("    %d. %s" % (i + 1, raw))
         print("  跑前机位：pick / pad    跑后机位：pick / free / pad"
               "    跑后回 HOME（%s）" % (hp.HOME_JOINTS_DEG,))
         print("  失败即停：预检红 / 解垫不过 / 探针无解 / 任一计划预检不过 / "
@@ -2105,8 +2186,9 @@ class Round:
         if mism:
             raise RoundError(EXIT_PLAN, "compute",
                              "布局表与 gen_scene 不一致：%s" % "；".join(mism))
+        desig = None
         if self.args.truth_source == "measured":
-            truth = self._measured_truth(truth)
+            truth, desig = self._measured_truth(truth)
         else:
             log("抓点：用布局表标称坐标（--truth-source manifest）—— 手摆偏差"
                 "不进计划，偏差只进摆位表")
@@ -2120,8 +2202,9 @@ class Round:
                                  "measured）；布局标称坐标只做身份先验")
             grid_order = cm.grid_order_of(pad_doc)
             cell_map = cm.assign_cells_by_colour(truth["blocks"], grid_order)
-            # 执行顺序（P3 起由结构化指定给出；此处先按 id 升序，指定失败也停）
-            order = [str(t) for t in ids]
+            # 执行顺序 = 结构化指定给出的顺序（命令即意图；不退回 id 升序）
+            order = ([str(x) for x in desig["order"]] if desig
+                     else [str(t) for t in ids])
             write_json(self.p("truth", "cell-map.json"),
                        {"grid_order": grid_order, "cell_map": cell_map,
                         "order": order,
@@ -2927,6 +3010,19 @@ class Round:
                              % (rc_round, rc_score))
         return EXIT_OK
 
+    def _designate_commands(self):
+        """``--designate``（可重复）与 ``--designate-file``（一行一条）合并。"""
+        cmds = [str(x) for x in (getattr(self.args, "designate", None) or [])]
+        path = getattr(self.args, "designate_file", None)
+        if path:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    cmds.append(s)
+        return cmds
+
     def _measured_truth(self, truth):
         """抓点用跑前 pick burst 的**实测块位姿**（用户 2026-11-12 定调）。
 
@@ -2950,6 +3046,7 @@ class Round:
                              % (rc,))
         meas = read_json(out)
         strict_layer = (self.args.batch == "S3")
+        desig = None
         if strict_layer:
             try:
                 meas["blocks"] = resolve_tower_colours(
@@ -2960,8 +3057,21 @@ class Round:
             except ValueError as e:
                 raise RoundError(EXIT_PLAN, "compute",
                                  "塔下层颜色裁决不过：%s" % e)
+            try:
+                desig = resolve_designation(
+                    self._designate_commands(), meas.get("blocks") or [],
+                    truth.get("blocks") or [],
+                    self.args.pick_offset_limit_mm)
+            except ValueError as e:
+                raise RoundError(EXIT_PLAN, "compute",
+                                 "结构化指定不过：%s" % e)
             write_json(self.p("truth", "tower-colours.json"),
                        {"blocks": meas.get("blocks") or []})
+            write_json(self.p("truth", "designation.json"), desig)
+            for x in desig["commands"]:
+                log("  指定 %-18r → 块 %s（实测 %s，conf %s）"
+                    % (x["raw"], x["manifest_id"], x["measured_id"],
+                       x.get("confidence")))
         try:
             doc, recs = merge_measured_truth(truth, meas,
                                              self.args.pick_offset_limit_mm,
@@ -2977,7 +3087,7 @@ class Round:
                    r["dyaw_deg"]))
         log("抓点：跑前 pick burst 实测（%d 块，最远离标称 %.1f mm）"
             % (len(recs), max(r["dist_mm"] for r in recs) if recs else 0.0))
-        return doc
+        return doc, desig
 
     def _ensure_pre_pick_burst(self):
         """把跑前 pick burst 拉到本地（**只有 ``--analysis local`` 用**）。
@@ -3219,6 +3329,13 @@ def build_parser():
                     help="S3 清障落点：cell（默认）= 被清块进自己的色格，若它"
                          "本身是后面的目标则同时算它的目标抓取（每块只抓一次）；"
                          "free = 落自由区，之后还要再抓一次")
+    ap.add_argument("--designate", action="append", default=[],
+                    metavar="CMD",
+                    help="S3 结构化指定命令（可重复；与 --designate-file 合并）。"
+                         "例：\"red bottom\"。顺序即执行顺序")
+    ap.add_argument("--designate-file", default=None, metavar="FILE",
+                    help="S3 结构化指定：一行一条命令（空行 / # 注释忽略）；"
+                         "板端路径由 launch_round 推送")
     ap.add_argument("--seg", choices=("sam", "grid"), default="sam",
                     help="感知链（第 345 轮 SAM 立项、347 轮回放达标后缺省 "
                          "sam；grid=网格链回退/对照）。SAM 权重在板上 "

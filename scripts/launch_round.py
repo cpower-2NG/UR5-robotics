@@ -103,6 +103,10 @@ def board_inputs(args, round_dir):
         paths["bias"] = "%s/bias_estimate.json" % (
             os.path.dirname(paths["round_dir"].rstrip("/")))
         pushes.append((args.bias, paths["bias"]))
+    dfile = getattr(args, "designate_file", None)
+    if dfile:
+        paths["designate_file"] = "%s/designate.txt" % paths["round_dir"]
+        pushes.append((dfile, paths["designate_file"]))
     return pushes, paths
 
 
@@ -120,7 +124,8 @@ def orchestrator_args(args, paths):
             "--out-dir", paths["round_dir"],
             "--urdf", urdf,
             "--board-repo", paths["repo"]]
-    for k in ("expect", "pad_spec", "pad_mat", "facts", "bias"):
+    for k in ("expect", "pad_spec", "pad_mat", "facts", "bias",
+              "designate_file"):
         if paths.get(k):
             # bias 的编排器旗标是 --bias-estimate（裸 --bias 会歧义命中
             # --bias-comp/--bias-seed，argparse 直接拒——b3demo 实测）
@@ -171,6 +176,9 @@ def main(argv=None):
     ap.add_argument("--urdf-board", default=None,
                     help="板上 urdf 路径（缺省 ~/precision/robot.urdf）")
     ap.add_argument("--bias", default=None, help="本地 bias_estimate.json")
+    ap.add_argument("--designate-file", default=None,
+                    help="S3 结构化指定：本地一行一条命令的文本（推上板，"
+                         "编排器 --designate-file 读它）")
     ap.add_argument("--round-arg", action="append", default=[],
                     help="透传给编排器的单个旗标/值，可重复（如 --dry-run）")
     ap.add_argument("--dry-run", action="store_true",
