@@ -20,6 +20,7 @@
 在 ``stage4_clear_probe.py``。
 """
 import json
+import hashlib
 import math
 import os
 import sys
@@ -362,6 +363,110 @@ def assign_cells_by_colour(blocks, grid_order=None):
         out[str(b["id"])] = int(idx)
         used[idx] = True
     return out
+
+
+def clear_destination(block, cell_map, dest_mode="cell", pending_ids=()):
+    """清障落点决策（纯函数；真正可行的 IK 核验在探针里）。
+
+    ``cell`` 模式（S3 默认）：被清块放进**它自己的目标格**；若它本身是尚未
+    处理的目标（在 ``pending_ids`` 里），这一步同时算作它的目标抓取
+    （``absorbed=True``）⇒ 每块只抓一次。
+    ``free`` 模式：落自由区（坐标由探针选），被搬的目标之后还要再抓一次
+    （``relocated=True``）。
+    """
+    bid = str(block.get("id"))
+    pending = {str(p) for p in (pending_ids or ())}
+    if dest_mode == "cell":
+        cell = (cell_map or {}).get(bid)
+        if cell is None:
+            raise ValueError("清障块 %s 在 cell 模式下没有目标格" % bid)
+        cx, cy = cell_center(int(cell))
+        return {"mode": "cell", "cell": int(cell), "x": cx, "y": cy,
+                "absorbed": bid in pending, "relocated": False}
+    if dest_mode == "free":
+        return {"mode": "free", "cell": None, "x": None, "y": None,
+                "absorbed": False, "relocated": bid in pending}
+    raise ValueError("dest_mode 只收 cell / free，收到 %r" % (dest_mode,))
+
+
+def validate_pick_counts(picked, dest_mode, ids=None):
+    """抓放次数校验（累积模式）：cell ⇒ 每块恰好 1；free ⇒ 允许 2 且记 repick。
+
+    返回问题列表（空 = 通过）。``picked`` 是 ``{str(id): 次数}``。
+    """
+    probs = []
+    keys = [str(i) for i in ids] if ids is not None else list(picked)
+    for k in keys:
+        n = int(picked.get(k, 0) or 0)
+        if dest_mode == "cell":
+            if n != 1:
+                probs.append("块 %s 抓放 %d 次（cell 模式要求恰好 1 次）"
+                             % (k, n))
+        else:
+            if n < 1:
+                probs.append("块 %s 一次都没抓" % k)
+            elif n > 2:
+                probs.append("块 %s 抓放 %d 次（free 模式最多 2 次）" % (k, n))
+    return probs
+
+
+def check_attempt_coverage(attempts, ids, cell_map, dest_mode):
+    """每个目标要么有自己的 planned attempt，要么被更早的清障吸收。
+
+    返回问题列表（空 = 通过）。规则：
+    - cell 模式：被吸收的块必须在**它之前的**某个 attempt 的 ``clearing_steps``
+      里出现（``absorbed=True``），且那次清障的格 = 它自己的格；
+    - 没有被吸收的目标必须有一条 ``status != absorbed`` 的 attempt，cell 对。
+    """
+    probs = []
+    order = [str(a.get("id")) for a in attempts]
+    planned = {str(a.get("id")): a for a in attempts
+               if str(a.get("status") or "planned") != "absorbed"}
+    absorbed_at = {}
+    for k, a in enumerate(attempts):
+        for st in a.get("clearing_steps") or []:
+            if st.get("absorbed"):
+                absorbed_at.setdefault(str(st.get("move")), k)
+    for tid in [str(i) for i in ids]:
+        if tid in planned:
+            if dest_mode == "cell":
+                cell = planned[tid].get("cell")
+                if cell is None or int(cell) != int(cell_map.get(tid, -1)):
+                    probs.append("目标 %s 的探针格 %r ≠ 本轮格 %r"
+                                 % (tid, cell, cell_map.get(tid)))
+            continue
+        if dest_mode == "cell" and tid in absorbed_at:
+            k = absorbed_at[tid]
+            steps = [st for st in attempts[k].get("clearing_steps") or []
+                     if str(st.get("move")) == tid and st.get("absorbed")]
+            cells = {int(st.get("cell")) for st in steps
+                     if st.get("cell") is not None}
+            if cells and cells != {int(cell_map.get(tid, -1))}:
+                probs.append("被吸收的块 %s 落在格 %s ≠ 自己的格 %r"
+                             % (tid, sorted(cells), cell_map.get(tid)))
+            continue
+        probs.append("目标 %s 既没有 planned attempt，也没有被清障吸收" % tid)
+    del order
+    return probs
+
+
+def scene_fingerprint(truth, order, cell_map, dest_mode, grid_order):
+    """场景指纹：真值块位 + 色序 + 格位 + 顺序 + 落点模式（探针/编排共用）。
+
+    ``--probe-report`` 复用时编排器重算并比对 —— 防止拿旧摆位/旧格位的探针
+    报告去跑新场景（探针世界与规划世界不是同一个，是最隐蔽的错位）。
+    """
+    doc = {
+        "blocks": [{k: b.get(k) for k in
+                    ("id", "color", "layer", "x", "y", "z", "yaw", "size")}
+                   for b in ((truth or {}).get("blocks") or [])],
+        "order": [str(t) for t in (order or ())],
+        "cell_map": {str(k): int(v) for k, v in (cell_map or {}).items()},
+        "dest_mode": str(dest_mode),
+        "grid_order": list(grid_order or []),
+    }
+    raw = json.dumps(doc, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def parse_cells(spec, n=None, batch=None):

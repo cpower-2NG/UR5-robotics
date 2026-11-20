@@ -1124,15 +1124,28 @@ def _analysis_cmd(repo, kind, opts, out_remote):
             % (repo, pr.BOARD_DIR, " ".join(argv)))
 
 
-def _probe_cmd(repo, cells, group, truth_remote, grid_remote, report_remote):
-    """板上探针命令串（ssh 与 LocalBoard 共用一条构造）。"""
-    parts = [repo, truth_remote, str(cells), group, grid_remote,
-             report_remote]
+def _probe_cmd(repo, cells, group, truth_remote, grid_remote, report_remote,
+               extra=()):
+    """板上探针命令串（ssh 与 LocalBoard 共用一条构造）。
+
+    ``extra`` 是累积模式（S3）的附加旗标，**必须写成 ``--flag=value``**（值里
+    不许有空白）—— 这里的参数全部直接拼进 shell，不走 shlex（板端 ``~`` 不展开
+    的教训，见调用方 docstring），所以用 ``_require_clean_args`` 先把关。
+    """
+    extra = [str(x) for x in (extra or ())]
+    parts = [repo, truth_remote, group, grid_remote, report_remote] + extra
+    if cells:
+        parts.append(str(cells))
     _require_clean_args(parts, "探针")
-    return ("cd %s && %s/run.sh scripts/stage4_clear_probe.py "
-            "--truth %s --grid %s --cells %s --group %s --report %s"
-            % (repo, pr.BOARD_DIR, truth_remote, grid_remote, cells,
-               group, report_remote))
+    cmd = ("cd %s && %s/run.sh scripts/stage4_clear_probe.py "
+           "--truth %s --grid %s --group %s --report %s"
+           % (repo, pr.BOARD_DIR, truth_remote, grid_remote, group,
+              report_remote))
+    if cells:
+        cmd += " --cells %s" % cells
+    for x in extra:
+        cmd += " " + x
+    return cmd
 
 
 def resolve_validator(where, dry_run, allow_no_validator, joint_names,
@@ -1368,7 +1381,7 @@ class RoundBoard(BoardPort):
         return r
 
     def probe(self, repo, cells, group, truth_remote, grid_remote,
-              report_remote):
+              report_remote, extra=()):
         """板上跑一轮只读探针（MoveIt 服务，不发轨迹）。
 
         ``~/precision/run.sh`` **本身就是解释器包装器**（``exec python3 "$@"``），
@@ -1381,7 +1394,7 @@ class RoundBoard(BoardPort):
         波浪号焊死、不展开。改为直接要求不含空白/引号（本仓生成的都是这种）。
         """
         cmd = _probe_cmd(repo, cells, group, truth_remote, grid_remote,
-                         report_remote)
+                         report_remote, extra=extra)
         return self.ssh(cmd)
 
 
@@ -1518,9 +1531,9 @@ class LocalBoard(BoardPort):
         return r
 
     def probe(self, repo, cells, group, truth_remote, grid_remote,
-              report_remote):
+              report_remote, extra=()):
         cmd = _probe_cmd(repo, cells, group, truth_remote, grid_remote,
-                         report_remote)
+                         report_remote, extra=extra)
         return self.ssh(cmd)
 
 
@@ -2066,7 +2079,9 @@ class Round:
         pad_doc = read_json(grid_path)
         probs = validate_pad_doc(pad_doc, self.args.pad_min_frames,
                                  self.args.pad_max_spread_mm,
-                                 self.args.pad_max_spread_deg)
+                                 self.args.pad_max_spread_deg,
+                                 require_grid_order=(
+                                     self.args.batch == "S3"))
         if probs:
             raise RoundError(EXIT_PLAN, "compute",
                              "解垫不过：%s" % "；".join(probs))
@@ -2098,8 +2113,29 @@ class Round:
         write_json(truth_path, truth)
 
         ids = _sorted_ids([b["id"] for b in layout_blocks])
-        cells = cm.parse_cells(self.args.cells, len(ids), batch=self.args.batch)
-        cell_map = cm.assign_cells(ids, cells)
+        if self.args.batch == "S3":
+            if self.args.truth_source != "measured":
+                raise RoundError(EXIT_PLAN, "compute",
+                                 "S3 必须用跑前实测真值（--truth-source "
+                                 "measured）；布局标称坐标只做身份先验")
+            grid_order = cm.grid_order_of(pad_doc)
+            cell_map = cm.assign_cells_by_colour(truth["blocks"], grid_order)
+            # 执行顺序（P3 起由结构化指定给出；此处先按 id 升序，指定失败也停）
+            order = [str(t) for t in ids]
+            write_json(self.p("truth", "cell-map.json"),
+                       {"grid_order": grid_order, "cell_map": cell_map,
+                        "order": order,
+                        "dest_mode": self.args.clear_dest})
+            log("  格位（按颜色）：%s"
+                % "  ".join("%s→%d" % kv
+                            for kv in sorted(cell_map.items(),
+                                             key=lambda kv: int(kv[0]))))
+        else:
+            cells = cm.parse_cells(self.args.cells, len(ids),
+                                   batch=self.args.batch)
+            cell_map = cm.assign_cells(ids, cells)
+            grid_order = None
+            order = [str(t) for t in ids]
 
         # ---- 探针（板上一趟，只读）。``--probe-report``：复用一份**已经跑过**
         # 的探针报告（只读规划服务，不动臂、不占令牌；§5 超预算时的杠杆 1）。
@@ -2114,11 +2150,17 @@ class Round:
             t_probe = float(self.deps["now"]())
             self.board.push(truth_path, self.b("truth", "layout.json"), "truth")
             self.board.push(grid_path, self.b("grid-pre.json"), "grid-pre.json")
+            extra = []
+            if self.args.batch == "S3":
+                extra = ["--cumulative", "--assign-by=colour",
+                         "--dest-mode=%s" % self.args.clear_dest,
+                         "--target-order=%s" % ",".join(order)]
             r = self.board.probe(self.args.board_repo, self.args.cells,
                                  self.args.probe_group,
                                  self.b("truth", "layout.json"),
                                  self.b("grid-pre.json"),
-                                 self.b("probe.json"))
+                                 self.b("probe.json"),
+                                 extra=extra)
             self.timing["probe_s"] = round(float(self.deps["now"]()) - t_probe, 1)
             if r.returncode not in (0, 1):
                 raise RoundError(EXIT_PLAN, "compute",
@@ -2130,7 +2172,12 @@ class Round:
             except RoundError as e:
                 raise RoundError(EXIT_PLAN, "compute", "探针报告没拉回来：%s" % e)
         report = read_json(probe_path)
-        self._check_probe(report, ids, cell_map)
+        fp = (cm.scene_fingerprint(truth, order, cell_map,
+                                   self.args.clear_dest, grid_order)
+              if self.args.batch == "S3" else None)
+        self._check_probe(report, ids, cell_map, order=order,
+                          dest_mode=self.args.clear_dest,
+                          batch=self.args.batch, fingerprint=fp)
 
         # ---- 逐目标规划（共用 plan/，q 与布局逐段衔接；三机位只追加一次）
         t_plan = float(self.deps["now"]())
@@ -2158,7 +2205,11 @@ class Round:
         scenes = report.get("scenes") or []
         attempts = {str(a["id"]): a for a in
                     (scenes[0].get("attempts") if scenes else []) or []}
-        for tid in ids:
+        if self.args.batch == "S3":
+            all_plans, q, idx = self._plan_s3(
+                chain, q, plan_dir, truth, report, bias, truth_path,
+                probe_path, grid_path, cell_map, order)
+        for tid in ([] if self.args.batch == "S3" else ids):
             attempt = attempts[tid]
             actions, _blocks = cr.actions_from_attempt(
                 truth, attempt, cm.PAD_THICK, bias_mm=bias["applied_mm"])
@@ -2328,7 +2379,8 @@ class Round:
                 "yaw_deg": float(doc["grid_yaw_base_deg"]),
                 "source": os.path.basename(grid_path), "measured": True}
 
-    def _check_probe(self, report, ids, cell_map):
+    def _check_probe(self, report, ids, cell_map, order=None,
+                     dest_mode=None, batch=None, fingerprint=None):
         # 规划组名先查：用错组**不会报错**，只会让每个目标 0.4 s 内
         # `no_clearing_plan`（2026-11-11 Round 0：缺省写成了仿真组
         # `ur5_manipulator`）。别把它当成「场景无解」。
@@ -2351,6 +2403,10 @@ class Round:
                              "探针在 MoveIt 里留下幽灵块（cleanup=%r）—— "
                              "先清场景或重起 MoveIt，不执行" % (cleanup,))
         attempts = {str(a["id"]): a for a in scenes[0].get("attempts") or []}
+        if (batch or self.args.batch) == "S3":
+            self._check_probe_s3(report, scenes[0], attempts, ids, cell_map,
+                                 order or [], dest_mode, fingerprint)
+            return
         for tid in ids:
             a = attempts.get(tid)
             if a is None:
@@ -2376,6 +2432,153 @@ class Round:
                     "目标 %s 探针要求 %d 步清障，但本轮按「布局间距 ≥60 mm、"
                     "无接触」逐目标独立规划 —— 累积清障尚未实现，停"
                     % (tid, len(steps)))
+
+    def _check_probe_s3(self, report, scene, attempts, ids, cell_map,
+                        order, dest_mode, fingerprint):
+        """S3 累积探针的准入：模式/顺序/格位/指纹/次数/覆盖/终态，任一不符即停。"""
+        probs = []
+        if str(scene.get("mode") or report.get("mode")) != "cumulative":
+            probs.append("探针不是累积模式（mode=%r）"
+                         % (scene.get("mode") or report.get("mode")))
+        want_mode = dest_mode or "cell"
+        if str(scene.get("dest_mode") or want_mode) != str(want_mode):
+            probs.append("探针落点模式 %r ≠ 本轮 %r"
+                         % (scene.get("dest_mode"), want_mode))
+        got_order = [str(x) for x in (scene.get("order") or [])]
+        want_order = [str(x) for x in (order or [])]
+        if got_order != want_order:
+            probs.append("探针目标顺序 %s ≠ 本轮 %s" % (got_order, want_order))
+        got_cells = {str(k): int(v) for k, v in
+                     (scene.get("cell_map") or {}).items()}
+        want_cells = {str(k): int(v) for k, v in (cell_map or {}).items()}
+        if got_cells != want_cells:
+            probs.append("探针格位 %s ≠ 本轮 %s" % (got_cells, want_cells))
+        if fingerprint and scene.get("scene_fingerprint") != fingerprint:
+            probs.append("场景指纹不符（报告 %r ≠ 本轮 %r）—— 旧探针报告配新摆位"
+                         % (scene.get("scene_fingerprint"), fingerprint))
+        probs.extend(scene.get("pick_problems") or [])
+        probs.extend(scene.get("coverage_problems") or [])
+        term = scene.get("batch_final") or scene.get("terminal") or {}
+        if not term.get("ok"):
+            probs.append("批末终态不合法（%s）"
+                         % "；".join(term.get("reasons") or []))
+        for tid in [str(t) for t in ids]:
+            a = attempts.get(tid)
+            if a is None:
+                probs.append("探针没测目标 %s" % tid)
+                continue
+            if not a.get("ok"):
+                probs.append("目标 %s 探针失败：%s" % (tid, a.get("reason")))
+                continue
+            if a.get("cell") is not None and tid in cell_map:
+                if int(a["cell"]) != int(cell_map[tid]):
+                    probs.append("目标 %s 的探针格 %r ≠ 本轮 %r"
+                                 % (tid, a.get("cell"), cell_map[tid]))
+            for st in a.get("clearing_steps") or []:
+                bid = str(st.get("move"))
+                if not st.get("absorbed"):
+                    continue
+                if bid not in cell_map:
+                    probs.append("被吸收的块 %s 没有格位" % bid)
+                elif st.get("cell") is None or \
+                        int(st["cell"]) != int(cell_map[bid]):
+                    probs.append("被吸收的块 %s 落在格 %r ≠ 自己的格 %r"
+                                 % (bid, st.get("cell"), cell_map[bid]))
+        if probs:
+            raise RoundError(EXIT_PLAN, "compute",
+                             "S3 累积探针不过：%s —— 停，不执行"
+                             % "；".join(probs))
+
+    def _plan_s3(self, chain, q_in, plan_dir, truth, report, bias,
+                 truth_path, probe_path, grid_path, cell_map, order):
+        """S3：累积报告 → 一份平铺动作表 → **一次** ``plan_sequence`` → 逐目标 manifest。
+
+        动作表里每个块恰好一次（被吸收的塔顶 = 它自己的目标动作）。释放扫掠
+        按全局顺序累计已就位块（清障落格也算），任一冲突 fail-closed。
+        """
+        pack = cr.actions_from_cumulative(
+            truth, report, cm.PAD_THICK, bias_mm=bias["applied_mm"])
+        actions = pack["actions"]
+        gap_m, gap_check = gap_policy(self.args.batch)
+        q_start = list(q_in)
+        try:
+            plans, layout, q = cr.plan_sequence(
+                chain, q_start, actions, [dict(b) for b in truth["blocks"]],
+                plan_dir, place_clearance=self.args.place_clearance,
+                wrist_survey=False,
+                place_yaw_equiv=bool(self.args.place_yaw_equiv180),
+                start=0, min_block_gap=gap_m, gap_check=gap_check,
+                tail_targets=cr.view_targets(),
+                validator=getattr(self, "_validator", None),
+                from_check_mm=2.0)
+        except pp.PlanError as e:
+            raise RoundError(EXIT_PLAN, "compute",
+                             "S3 计划预检不过：%s —— run.sh 不写、整轮不执行"
+                             % e)
+        if len(plans) != len(actions):
+            raise RoundError(EXIT_PLAN, "compute",
+                             "计划数 %d ≠ 动作数 %d" % (len(plans), len(actions)))
+        placed = []
+        sweeps = []
+        for a, p in zip(actions, plans):
+            c = p.get("commanded_center_mm")
+            if not c:
+                sweeps.append(None)
+                continue
+            sweep = cm.release_sweep_conflicts(
+                (float(c[0]) / 1000.0, float(c[1]) / 1000.0),
+                cr.PLACE_OPEN_MM, placed)
+            sweeps.append({"opening_mm": cr.PLACE_OPEN_MM,
+                           "n_placed_before": len(placed),
+                           "conflicts": sweep})
+            if sweep:
+                raise RoundError(EXIT_PLAN, "compute",
+                                 "块 %s 的释放扫掠会碰到已就位块 %s（开爪 "
+                                 "%.0f mm）—— 计划期拒发"
+                                 % (a.get("block"), sweep, cr.PLACE_OPEN_MM))
+            placed.append({"x": float(c[0]) / 1000.0,
+                           "y": float(c[1]) / 1000.0,
+                           "size": float(cm.BLOCK_M),
+                           "id": a.get("block")})
+        scene = (report.get("scenes") or [{}])[0]
+        attempts = {str(x["id"]): x for x in
+                    (scene.get("attempts") or [])}
+        picked = dict(scene.get("picked") or {})
+        q_end = list(q)
+        for tid in [str(t) for t in order]:
+            own = (pack["owner"] or {}).get(tid) or {}
+            idxs = list(own.get("actions") or [])
+            acts = [actions[i] for i in idxs]
+            tplans = [plans[i] for i in idxs]
+            att = attempts.get(tid) or {"id": tid, "status": "absorbed",
+                                        "cell": cell_map.get(tid)}
+            manifest = self._manifest(tid, att, acts, tplans, q_start, q_end,
+                                      layout, truth_path, probe_path,
+                                      grid_path, bias)
+            manifest["dest_mode"] = self.args.clear_dest
+            manifest["cell_color"] = (cm.DEFAULT_GRID_ORDER[int(cell_map[tid])]
+                                      if tid in cell_map else None)
+            manifest["action_index"] = min(idxs) if idxs else None
+            manifest["pick_count"] = int(picked.get(tid, 0) or 0)
+            manifest["absorbed_by"] = own.get("absorbed_by")
+            own_target = own.get("target_action")
+            manifest["clearing"] = [
+                {"index": i, "kind": actions[i].get("kind"),
+                 "block": actions[i].get("block"),
+                 "cell": actions[i].get("cell"),
+                 "absorbed": actions[i].get("absorbed"),
+                 "absorbed_by": actions[i].get("absorbed_by"),
+                 "from_xy": actions[i].get("from_xy"),
+                 "desired_center_mm": actions[i].get("desired_center_mm"),
+                 "commanded_center_mm": actions[i].get("commanded_center_mm")}
+                for i in idxs if i != own_target]
+            manifest["sweep_check"] = (sweeps[idxs[-1]] if idxs else None)
+            write_json(self.p("plan", "manifest-%s.json" % tid), manifest)
+            log("  目标 %s：%d 个动作（清障 %d）"
+                % (tid, len(acts), len(manifest["clearing"])))
+        log("  S3 动作表 %d 个（每块恰好 1）→ %d 份计划"
+            % (len(actions), len(plans)))
+        return plans, q, len(plans)
 
     def _manifest(self, tid, attempt, actions, plans, q_before, q_after,
                   layout, truth_path, probe_path, grid_path, bias):
@@ -3012,6 +3215,10 @@ def build_parser():
                     help="S3 异色塔下层侧色不置信时，允许按布局清单颜色填充"
                          "（默认 fail-closed；打开后报告/真值会标 fallback=true，"
                          "身份不是实测）")
+    ap.add_argument("--clear-dest", choices=("cell", "free"), default="cell",
+                    help="S3 清障落点：cell（默认）= 被清块进自己的色格，若它"
+                         "本身是后面的目标则同时算它的目标抓取（每块只抓一次）；"
+                         "free = 落自由区，之后还要再抓一次")
     ap.add_argument("--seg", choices=("sam", "grid"), default="sam",
                     help="感知链（第 345 轮 SAM 立项、347 轮回放达标后缺省 "
                          "sam；grid=网格链回退/对照）。SAM 权重在板上 "

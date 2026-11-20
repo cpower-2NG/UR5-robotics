@@ -168,7 +168,14 @@ pad_ok = {"kind": "stage2-grid", "n_frames_ok": 20, "n_frames_total": 20,
           "grid_yaw_base_deg": -179.778,
           # C1 后置：厚度来源链吃解垫的垫面 z（T_base_pad[2,3]，台面=0）
           "T_base_pad": [[1, 0, 0, 0.4242], [0, 1, 0, -0.11224],
-                         [0, 0, 1, 0.00017], [0, 0, 0, 1]]}
+                         [0, 0, 1, 0.00017], [0, 0, 0, 1]],
+          # S3：色序 + 格心（与解垫工具从 mat 嵌入的字段一致）
+          "grid_order": list(cm.DEFAULT_GRID_ORDER),
+          "cells": [{"idx": i, "row": i // 3, "col": i % 3,
+                     "color": cm.DEFAULT_GRID_ORDER[i],
+                     "center_pad_mm": [((i % 3) - 1) * 60.0,
+                                       (1 - (i // 3)) * 60.0]}
+                    for i in range(9)]}
 check("解垫文档合格 ⇒ 无问题", r.validate_pad_doc(pad_ok) == [])
 check("解垫：帧数不足 ⇒ 红",
       any("帧" in x for x in
@@ -477,7 +484,8 @@ def fake_plan_sequence(chain_, q, actions, blocks, out_dir,
                        survey_tool0=None, place_clearance=None,
                        wrist_survey=True, views=None, place_yaw_equiv=False,
                        start=0, min_block_gap=0.0, gap_check="probe_verified",
-                       tail_targets=None, validator=None):
+                       tail_targets=None, validator=None, from_check_mm=None,
+                       **kw):
     PLAN_CALLS.append({"start": start, "wrist_survey": wrist_survey,
                        "gap_check": gap_check, "min_block_gap": min_block_gap,
                        "n_actions": len(actions),
@@ -490,7 +498,8 @@ def fake_plan_sequence(chain_, q, actions, blocks, out_dir,
     plans = []
     os.makedirs(out_dir, exist_ok=True)
     for i, a in enumerate(actions):
-        name = "%02d-%s-block-%s.json" % (int(start) + i, a["kind"], a["id"])
+        bid = a.get("block", a.get("id"))
+        name = "%02d-%s-block-%s.json" % (int(start) + i, a["kind"], bid)
         path = os.path.join(out_dir, name)
         _write_plan(path)
         plans.append({"name": name, "path": path, "kind": a["kind"],
@@ -502,7 +511,7 @@ def fake_plan_sequence(chain_, q, actions, blocks, out_dir,
     for a in actions:
         if a["kind"] == "target":
             for b in new_blocks:
-                if str(b["id"]) == str(a["id"]):
+                if str(b["id"]) == str(a.get("block", a.get("id"))):
                     b["x"], b["y"] = a.get("commanded_center_mm", [0, 0])
                     b["x"] /= 1000.0
                     b["y"] /= 1000.0
@@ -557,6 +566,57 @@ try:
                   e.code == r.EXIT_MISSING)
 finally:
     r.subprocess.run = _saved_run
+
+
+def _s3_probe_report(blocks, ids):
+    """S3 假累积报告：塔底目标带一步清障，塔顶被**吸收**到它自己的格。"""
+    order = [str(i) for i in ids]
+    grid_order = list(cm.DEFAULT_GRID_ORDER)
+    cmap = cm.assign_cells_by_colour(blocks, grid_order)
+    hit = {"axis": 2, "sign": -1, "closing": 0, "variant": 0,
+           "vertical": True, "verdict": "ok"}
+    by_id = {str(b["id"]): b for b in blocks}
+    absorbed = {}
+    attempts = []
+    for tid in order:
+        b = by_id[tid]
+        if tid in absorbed:
+            attempts.append({"id": int(tid), "ok": True, "status": "absorbed",
+                             "cell": cmap[tid], "absorbed_by": absorbed[tid],
+                             "clearing_steps": [], "reason": None})
+            continue
+        steps = []
+        if int(b.get("layer", 0)) == 0:
+            deps = [x for x in blocks if int(x.get("layer", 0)) == 1
+                    and math.hypot(x["x"] - b["x"], x["y"] - b["y"]) <= 0.006]
+            if deps:
+                d = deps[0]
+                did = str(d["id"])
+                steps.append({"move": int(did),
+                              "from": [d["x"], d["y"], d["z"]],
+                              "to": [0.0, 0.0, 0.01475],
+                              "grasp": hit, "cell": cmap[did],
+                              "absorbed": True})
+                absorbed[did] = tid
+        a = {"id": int(tid), "ok": True, "status": "planned",
+             "cell": cmap[tid], "target_from": [b["x"], b["y"], b["z"]],
+             "target_top": b["top"], "clearing_steps": steps,
+             "grasp_hit": hit, "reason": None,
+             "terminal": {"ok": True}}
+        if steps:
+            a["initial_b_ok"] = False
+        attempts.append(a)
+    picked = {str(i): 1 for i in ids}
+    fp = cm.scene_fingerprint({"blocks": blocks}, order, cmap, "cell",
+                              grid_order)
+    return {"scenes": [{"attempts": attempts, "mode": "cumulative",
+                        "dest_mode": "cell", "order": order,
+                        "cell_map": cmap, "grid_order": grid_order,
+                        "picked": picked, "batch_final": {"ok": True},
+                        "pick_problems": [], "coverage_problems": [],
+                        "scene_fingerprint": fp}],
+            "group": "ur_manipulator",
+            "scene_cleanup": {"ok": True, "world": [], "attached": []}}
 
 
 class FakeBoard:
@@ -645,14 +705,16 @@ class FakeBoard:
             f.write(b"\x89PNG")
 
     def probe(self, repo, cells, group, truth_remote, grid_remote,
-              report_remote):
-        self.calls.append(("probe", cells))
-        self.files[report_remote] = self.probe_report()
+              report_remote, extra=()):
+        self.calls.append(("probe", cells, tuple(extra)))
+        self.files[report_remote] = self.probe_report(extra=extra)
         return Rc(0)
 
-    def probe_report(self):
+    def probe_report(self, extra=()):
         blocks = lay.layout_blocks(FAKE_BATCH[0], 1)
         ids = r._sorted_ids([b["id"] for b in blocks])
+        if FAKE_BATCH[0] == "S3":
+            return _s3_probe_report(blocks, ids)
         cmap = cm.assign_cells(ids, cm.parse_cells(None, len(ids),
                                                    batch=FAKE_BATCH[0]))
         attempts = [{"id": int(i), "ok": True, "cell": cmap[i],
@@ -908,7 +970,8 @@ def fake_truth(burst, out, allow_empty=False, seg='sam'):
     if not allow_empty:
         blocks = [{"id": b["id"], "color": b["color"], "x": b["x"],
                    "y": b["y"], "yaw": b["yaw"], "size": b["size"],
-                   "top": b["top"]} for b in lay.layout_blocks(FAKE_BATCH[0], 1)]
+                   "top": b["top"], "layer": int(b.get("layer", 0))}
+                  for b in lay.layout_blocks(FAKE_BATCH[0], 1)]
     with open(out, "w") as f:
         json.dump({"blocks": blocks}, f)
     return 0
@@ -1093,6 +1156,45 @@ with tempfile.TemporaryDirectory() as td:
               s is not None and s["opening_mm"] == 50.0 and s["conflicts"] == []
               and s["n_placed_before"] == i
               for i, s in enumerate(sweeps)), repr(sweeps))
+
+# ---- C1b2 S3 干跑：两层塔 + 颜色归格 + 累积清障（2026-11-20）
+with tempfile.TemporaryDirectory() as td:
+    b = FakeBoard()
+    rc, out, rd = run(td, b, batch="S3", layout=1, dry_run=True)
+    check("S3 干跑：rc 0 且停在 compute",
+          rc == 0 and phases_of(rd)[-1] == "compute",
+          repr((rc, out[-400:])))
+    pcalls = [c for c in b.calls if c[0] == "probe"]
+    extra = list(pcalls[0][2]) if pcalls else []
+    check("S3：探针按累积模式跑（cumulative / assign-by / dest-mode / order）",
+          any(x == "--cumulative" for x in extra)
+          and any(x == "--assign-by=colour" for x in extra)
+          and any(x == "--dest-mode=cell" for x in extra)
+          and any(x.startswith("--target-order=") for x in extra), extra)
+    mans = sorted(f for f in os.listdir(rd.p("plan"))
+                  if f.startswith("manifest"))
+    check("S3：七个目标各一个 manifest", len(mans) == 7, mans)
+    docs = {m: json.load(open(rd.p("plan", m))) for m in mans}
+    by_tid = {m.split("-")[1].split(".")[0]: d for m, d in docs.items()}
+    check("S3：manifest 记 dest_mode / cell_color / pick_count",
+          all(d.get("dest_mode") == "cell" and d.get("cell_color")
+              and d.get("pick_count") == 1 for d in docs.values()),
+          repr({k: (v.get("dest_mode"), v.get("cell_color"),
+                    v.get("pick_count")) for k, v in by_tid.items()}))
+    check("S3：塔顶被吸收（absorbed_by=0、无自己的清障列表）",
+          by_tid["6"].get("absorbed_by") == "0"
+          and (by_tid["6"].get("clearing") or []) == [], by_tid["6"])
+    check("S3：塔底名下有恰好 1 步清障",
+          len(by_tid["0"].get("clearing") or []) == 1,
+          by_tid["0"].get("clearing"))
+    ids_in_plans = {n.split("block-")[1].split(".")[0]
+                    for n in os.listdir(rd.p("plan")) if "block-" in n}
+    check("S3：七个块各一个计划（塔顶没有第二次抓）",
+          ids_in_plans == {str(i) for i in range(7)}, ids_in_plans)
+    sweeps = [d.get("sweep_check") for d in docs.values()]
+    check("S3：释放扫掠含清障落格且无冲突",
+          all(s is not None and s["conflicts"] == [] for s in sweeps),
+          repr(sweeps))
 
 # ---- C1c 抓点：实测块位姿必须进 plan_sequence（不是标称坐标）
 # 回归 2026-11-12 S0:1 r1 attempt5：跑前 burst 量出实测（写进 e9.from_xy），
@@ -1416,8 +1518,8 @@ def patch_probe(board, mutate):
     """
     orig = board.probe_report
 
-    def patched():
-        doc = orig()
+    def patched(*a, **kw):
+        doc = orig(*a, **kw)
         mutate(doc)
         return doc
     board.probe_report = patched

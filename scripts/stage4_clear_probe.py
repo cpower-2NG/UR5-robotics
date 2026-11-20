@@ -39,6 +39,7 @@
 要实际执行，不在本探针里。
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -208,9 +209,43 @@ def find_destination(node, clients, blocks, bid, pool):
     return None, "no_geometric_destination"
 
 
+def find_cell_destination(node, clients, blocks, bid, pool, cell_map=None,
+                          placed_ids=()):
+    """把被清块放进**它自己的宫格**（S3 cell 模式；含 IK 与释放扫掠核验）。
+
+    与 ``find_destination`` 的区别：落点不是自由区，而是本块的色格（1:1 分配
+    保证空闲）。**不允许回退自由区** —— 颜色归格是场景要求。释放扫掠对
+    「已经在格上的块」做静态判（探针里的世界是累积推进的，必须看得见它们）。
+    """
+    blk = _find_block(blocks, bid)
+    if blk is None:
+        return None, "block_missing"
+    cell = (cell_map or {}).get(str(bid))
+    if cell is None:
+        return None, "no_cell"
+    g = cm.place_in_cell(blk, int(cell))
+    if not inside_table(g):
+        return None, "outside_table"
+    rest = [b for b in blocks if str(b["id"]) != str(bid)]
+    placed = [b for b in rest
+              if str(b["id"]) in {str(p) for p in (placed_ids or ())}]
+    conf = cm.release_sweep_conflicts((g["x"], g["y"]),
+                                      cr.PLACE_OPEN_MM, placed)
+    if conf:
+        return None, "release_sweep_conflict"
+    layout = rest + [g]
+    if not apply_layout(node, clients, layout):
+        return None, "scene_apply_failed"
+    res = eval_block(node, clients, g, layout, pool)
+    if not res["b_ok"]:
+        return None, "no_ik_cell"
+    return {"x": float(g["x"]), "y": float(g["y"]), "block": g,
+            "row": res["hit"], "cell": int(cell)}, None
+
+
 # ---------------------------------------------------------------- 递归清障
 def ensure_graspable(node, clients, blocks, bid, depth, pool, active,
-                     prefer_closing=None):
+                     prefer_closing=None, dest_fn=None):
     """保证 ``bid`` 在当前（规划后的）布局里**可以动**：可抓 ∧ 顶面无块。
 
     「可抓」不够 —— 若还有块压在 ``bid`` 上，抓走它上面那块就会掉，终态必然
@@ -256,11 +291,11 @@ def ensure_graspable(node, clients, blocks, bid, depth, pool, active,
             if str(other) == PAD_ID or str(other) in active:
                 continue
             sub = ensure_graspable(node, clients, cur, other, depth + 1, pool,
-                                   active)
+                                   active, dest_fn=dest_fn)
             if sub is None:
                 continue
-            dest, _why = find_destination(node, clients, sub["blocks"], other,
-                                          pool)
+            dest, _why = (dest_fn or find_destination)(
+                node, clients, sub["blocks"], other, pool)
             if dest is None:
                 continue
             src = _find_block(sub["blocks"], other)
@@ -347,6 +382,159 @@ def run_attempt(node, clients, truth, target_id, cell, pool,
     return out
 
 
+# ---------------------------------------------------------------- 累积尝试
+def scene_fingerprint(truth, order, cell_map, dest_mode, grid_order):
+    """场景指纹（唯一实现在 ``stage4_clear_model``，编排器复用同一份）。"""
+    return cm.scene_fingerprint(truth, order, cell_map, dest_mode, grid_order)
+
+
+def run_scene_cumulative(node, clients, truth, order, cell_map, dest_mode,
+                         pool, prefer_closing=None, grid_order=None):
+    """S3 累积清障：**同一个不断推进的世界**里按 ``order`` 逐目标跑。
+
+    与 ``run_attempt``（每个目标从原始布局重来）的区别：
+    - 前一个目标/清障动作真的施加到世界里，后一个目标按新世界规划；
+    - ``dest_mode="cell"``：被清块进**它自己的格**；若它本身是后面的目标，
+      这一抓同时算它的目标抓取（``absorbed``）⇒ 每块只抓一次；
+    - ``dest_mode="free"``：被清块进自由区，轮到自己时再抓一次（``repick``）；
+    - 批末校验 ``picked`` 次数与目标覆盖，并出终态报告。
+    """
+    blocks0 = [dict(b) for b in (truth.get("blocks") or [])]
+    ids = [b["id"] for b in blocks0]
+    order = [str(t) for t in order]
+    world = [dict(b) for b in blocks0]
+    picked = {str(b["id"]): 0 for b in blocks0}
+    absorbed_by = {}
+    placed_ids = set()
+    attempts = []
+    fp = scene_fingerprint(truth, order, cell_map, dest_mode, grid_order)
+    t_all = time.time()
+    if not apply_layout(node, clients, world):
+        return {"mode": "cumulative", "dest_mode": dest_mode, "order": order,
+                "cell_map": dict(cell_map or {}), "grid_order": list(grid_order or []),
+                "picked": picked, "attempts": [], "ok": False,
+                "reason": "scene_apply_failed", "scene_fingerprint": fp,
+                "seconds": 0.0}
+    for k, tid in enumerate(order):
+        t0 = time.time()
+        if picked.get(tid, 0) >= 1 and dest_mode == "cell":
+            attempts.append({"id": tid, "ok": True, "status": "absorbed",
+                             "absorbed_by": absorbed_by.get(tid),
+                             "cell": (cell_map or {}).get(tid),
+                             "clearing_steps": [], "seconds": 0.0})
+            log("  target-%-2s ABSORBED（更早的清障已把它放进自己的格）" % tid)
+            continue
+        blk = _find_block(world, tid)
+        if blk is None:
+            attempts.append({"id": tid, "ok": False, "status": "failed",
+                             "reason": "target_missing", "seconds": 0.0})
+            break
+        target_from = [float(blk["x"]), float(blk["y"]), float(blk["z"])]
+        target_top = float(blk["z"]) + float(blk["size"]) / 2.0
+        future = set(order[k + 1:])
+
+        def _dest(node, clients, blocks, bid, pool, _future=future,
+                  _placed=frozenset(placed_ids)):
+            if dest_mode == "cell":
+                return find_cell_destination(node, clients, blocks, bid, pool,
+                                             cell_map=cell_map,
+                                             placed_ids=_placed)
+            return find_destination(node, clients, blocks, bid, pool)
+
+        res = ensure_graspable(node, clients, world, tid, 0, pool,
+                               frozenset(), prefer_closing=prefer_closing,
+                               dest_fn=_dest)
+        if res is None:
+            attempts.append({"id": tid, "ok": False, "status": "failed",
+                             "reason": "no_clearing_plan",
+                             "target_from": target_from,
+                             "target_top": target_top,
+                             "seconds": round(time.time() - t0, 2)})
+            break
+        steps = []
+        for st in res["steps"]:
+            st = dict(st)
+            bid = str(st["move"])
+            picked[bid] = picked.get(bid, 0) + 1
+            st["cell"] = (int(cell_map[str(bid)])
+                          if dest_mode == "cell" and cell_map else None)
+            st["absorbed"] = bool(dest_mode == "cell" and bid in future)
+            st["repick"] = bool(dest_mode == "free" and bid in future)
+            if st["absorbed"]:
+                absorbed_by[bid] = tid
+            if dest_mode == "cell":
+                placed_ids.add(bid)
+            sb = _find_block(blocks0, bid)
+            if sb:
+                st["block_color"] = sb.get("color")
+                st["block_layer"] = int(sb.get("layer", 0))
+            steps.append(st)
+        cell = (cell_map or {}).get(tid, 4)
+        plac = check_placement(node, clients, res["blocks"], tid, int(cell),
+                               pool, prefer_closing=prefer_closing)
+        if plac is None or not plac["ok"]:
+            attempts.append({"id": tid, "ok": False, "status": "failed",
+                             "reason": "place_pose_illegal",
+                             "clearing_steps": steps,
+                             "target_from": target_from,
+                             "target_top": target_top, "cell": int(cell),
+                             "place_reasons": (plac or {}).get("reasons"),
+                             "seconds": round(time.time() - t0, 2)})
+            break
+        # 目标释放扫掠 vs 已就位块（含清障落格）
+        cc = cm.cell_center(int(cell))
+        placed = [b for b in res["blocks"]
+                  if str(b["id"]) in {str(p) for p in placed_ids}]
+        sweep = cm.release_sweep_conflicts((cc[0], cc[1]),
+                                           cr.PLACE_OPEN_MM, placed)
+        if sweep:
+            attempts.append({"id": tid, "ok": False, "status": "failed",
+                             "reason": "release_sweep_conflict",
+                             "clearing_steps": steps,
+                             "target_from": target_from,
+                             "target_top": target_top, "cell": int(cell),
+                             "sweep": sweep,
+                             "seconds": round(time.time() - t0, 2)})
+            break
+        first = res.get("initial") or {}
+        a = {"id": tid, "ok": True, "status": "planned", "reason": None,
+             "cell": int(cell),
+             "target_from": target_from, "target_top": target_top,
+             "clearing_steps": steps,
+             "grasp_hit": res["final"]["hit"],
+             "grasp_reasons": res["final"]["reasons"],
+             "initial_b_ok": bool(first.get("b_ok")),
+             "initial_reasons": first.get("reasons"),
+             "place_hit": plac["row"],
+             "final_blocks": [{kk: b.get(kk) for kk in
+                               ("id", "x", "y", "z", "yaw", "size")}
+                              for b in plac["final"]],
+             "seconds": round(time.time() - t0, 2)}
+        attempts.append(a)
+        log("  target-%-2s OK   格 %d  清障 %d 步  %.1f s"
+            % (tid, int(cell), len(steps), a["seconds"]))
+        if dest_mode == "cell":
+            placed_ids.add(tid)
+        picked[tid] = picked.get(tid, 0) + 1
+        world = plac["final"]
+    rep = cm.terminal_report(world, pair_pen_tol=cm.PAIR_PEN_TOL)
+    pick_probs = cm.validate_pick_counts(picked, dest_mode, ids)
+    cov_probs = cm.check_attempt_coverage(attempts, ids, cell_map or {},
+                                          dest_mode)
+    ok = bool(rep["ok"] and not pick_probs and not cov_probs
+              and len(attempts) == len(ids)
+              and all(a.get("ok") for a in attempts))
+    return {"mode": "cumulative", "dest_mode": dest_mode, "order": order,
+            "cell_map": {str(k): int(v) for k, v in (cell_map or {}).items()},
+            "grid_order": list(grid_order or []),
+            "picked": picked, "attempts": attempts,
+            "terminal": rep, "batch_final": rep,
+            "ok": ok, "pick_problems": pick_probs,
+            "coverage_problems": cov_probs,
+            "scene_fingerprint": fp,
+            "seconds": round(time.time() - t_all, 2)}
+
+
 # ---------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(
@@ -381,12 +569,24 @@ def main(argv=None):
                          "放进宫格时要用它定位；缺省 = 与 --truth 同目录的 "
                          "grid-pre.json / grid.json，再没有就停（fail-closed）。"
                          "模型常量与印刷垫差 87.5 mm/88.7°，真机不许用")
+    ap.add_argument("--cumulative", action="store_true",
+                    help="S3 累积清障：同一个不断推进的世界里按 --target-order "
+                         "逐目标跑（默认 false = 每个目标从原始布局重来）")
+    ap.add_argument("--dest-mode", choices=("cell", "free"), default="cell",
+                    help="清障落点（累积模式）：cell = 该块自己的色格（默认，"
+                         "每块只抓一次）；free = 自由区（之后还要再抓一次）")
+    ap.add_argument("--assign-by", choices=("id", "colour"), default="colour",
+                    help="累积模式的格位来源：colour = 按垫纸 grid_order 颜色归格"
+                         "（S3 默认）；id = 旧口径 assign_cells(--cells)")
+    ap.add_argument("--target-order", default=None, metavar="0,6,1,...",
+                    help="累积模式的执行顺序（缺省 = truth 块 id 顺序）")
     args = ap.parse_args(argv)
 
     # 垫位姿必须在建场景**之前**定下来：初态布局里有垫，终态布局里目标块要
     # 落到宫格中心，两处都读 ``cm.PAD_CENTER``。
     if args.grid:
         cm.load_grid(args.grid)
+        grid_path = args.grid
         log("垫位姿（实测）：%s" % args.grid)
     else:
         hint = os.path.dirname(os.path.abspath(args.truth[0]))
@@ -398,6 +598,7 @@ def main(argv=None):
                   file=sys.stderr)
             return 2
         cm.load_grid(found)
+        grid_path = found
         log("垫位姿（实测）：%s" % found)
     log("       垫心 (%.1f, %.1f) mm  yaw %.3f°"
         % (cm.PAD_CENTER[0] * 1000.0, cm.PAD_CENTER[1] * 1000.0,
@@ -450,6 +651,43 @@ def main(argv=None):
     for path in args.truth:
         with open(path, encoding="utf-8") as f:
             truth = json.load(f)
+        if args.cumulative:
+            with open(grid_path, encoding="utf-8") as f:
+                gdoc = json.load(f)
+            grid_order = cm.grid_order_of(gdoc)
+            ids = [b["id"] for b in truth["blocks"]]
+            order = ([int(x) for x in args.target_order.split(",")]
+                     if args.target_order else list(ids))
+            if args.assign_by == "colour":
+                cell_map = cm.assign_cells_by_colour(truth["blocks"],
+                                                     grid_order)
+            else:
+                cell_map = cm.assign_cells(
+                    ids, cm.parse_cells(args.cells, len(ids)))
+            log("\n== %s（%s:%s，累积 %d 块 / 顺序 %s / 落点 %s）=="
+                % (path, truth.get("batch"), truth.get("index"), len(ids),
+                   order, args.dest_mode))
+            log("   格位：%s" % "  ".join("%s→%d" % kv for kv in
+                                          sorted(cell_map.items())))
+            res = run_scene_cumulative(
+                node, clients, truth, order, cell_map, args.dest_mode, pool,
+                prefer_closing=args.prefer_closing, grid_order=grid_order)
+            scenes.append({"truth": path, "batch": truth.get("batch"),
+                           "index": truth.get("index"), "cells": cell_map,
+                           "attempts": res["attempts"], **{
+                               k: res[k] for k in
+                               ("mode", "dest_mode", "order", "cell_map",
+                                "grid_order", "picked", "terminal",
+                                "batch_final", "ok", "pick_problems",
+                                "coverage_problems", "scene_fingerprint")},
+                           "seconds": res.get("seconds")})
+            if cell_map:
+                cells_report.update(cell_map)
+            if not res["ok"]:
+                log("!! 累积批不通过：pick=%s coverage=%s terminal_ok=%s"
+                    % (res["pick_problems"], res["coverage_problems"],
+                       (res.get("terminal") or {}).get("ok")))
+            continue
         ids = [b["id"] for b in truth["blocks"]]
         if args.max_targets:
             ids = ids[:args.max_targets]
@@ -515,7 +753,10 @@ def main(argv=None):
             if not a["ok"]:
                 reason_hist[a["reason"]] = reason_hist.get(a["reason"], 0) + 1
 
-    passed = bool(n and ratio >= args.gate)
+    if args.cumulative:
+        passed = bool(scenes) and all(bool(s.get("ok")) for s in scenes)
+    else:
+        passed = bool(n and ratio >= args.gate)
     report = {"truths": args.truth, "cell": args.cell,
               "cells": cells_report or None,
               "prefer_closing": args.prefer_closing,
@@ -526,6 +767,15 @@ def main(argv=None):
               "fail_reasons": reason_hist,
               "gate": args.gate, "pass": passed,
               "scene_cleanup": cleanup}
+    if args.cumulative:
+        report["mode"] = "cumulative"
+        report["dest_mode"] = args.dest_mode
+        report["assign_by"] = args.assign_by
+        report["cumulative"] = [{
+            k: s.get(k) for k in
+            ("order", "cell_map", "grid_order", "picked", "ok",
+             "pick_problems", "coverage_problems", "scene_fingerprint")}
+            for s in scenes]
 
     log("\n== 汇总 ==")
     for batch, b in sorted(per_batch.items()):

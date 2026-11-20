@@ -102,10 +102,38 @@ def section_semantics():
           'if args.cells else None' in src)
 
 
+def section_cumulative_wiring():
+    print('\n[3] 累积清障接线（S3，2026-11-20）')
+    tree, src = _parse()
+    main = _main_fn(tree)
+    opts = [_opt_strings(n) for n in ast.walk(main)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == 'add_argument']
+    flats = [o for o in opts if o]
+    for flag in ('--cumulative', '--dest-mode', '--assign-by',
+                 '--target-order'):
+        check('argparse 有 %s' % flag,
+              any(flag in o for o in flats), str([o[:1] for o in flats]))
+    for name in ('def run_scene_cumulative', 'def find_cell_destination',
+                 'def scene_fingerprint'):
+        check('源码有 %s' % name, name in src)
+    for call in ('cm.assign_cells_by_colour', 'cm.grid_order_of',
+                 'cm.validate_pick_counts', 'cm.check_attempt_coverage',
+                 'cm.release_sweep_conflicts', 'cm.scene_fingerprint'):
+        check('源码调用 %s（单一出处）' % call, call in src)
+    check('主循环按 --cumulative 分支', 'if args.cumulative:' in src)
+    for key in ('"mode": "cumulative"', '"dest_mode": dest_mode',
+                '"picked": picked', '"batch_final": rep',
+                '"scene_fingerprint": fp'):
+        check('报告带 %s' % key, key in src)
+
+
 def main():
     print('=' * 68)
     section_wiring()
     section_semantics()
+    section_cumulative_wiring()
     print('\n%d PASS  %d FAIL' % (N_PASS, N_FAIL))
     if FAILS:
         print('未通过：' + '; '.join(FAILS))

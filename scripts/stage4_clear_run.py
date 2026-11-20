@@ -374,6 +374,131 @@ def actions_from_attempt(truth, attempt, pad_thick, bias_mm=None):
     return actions, blocks
 
 
+def actions_from_cumulative(truth, report, pad_thick, bias_mm=None):
+    """累积探针报告 → **一份按全局顺序平铺的动作表**（S3）。
+
+    与 ``actions_from_attempt`` 的区别：
+    - 清障步的 ``from`` 来自探针记录的**当时世界**（不是原始 truth）；
+    - ``cell`` 模式里被清块若本身是后面的目标，它的这次清障就是**它自己的
+      目标抓取**（``kind="target"``、落点 = 自己的格、吃 b̂）⇒ 每块恰好一个
+      动作；``free`` 模式的清障是 ``kind="clear"``（落自由区、不吃 b̂）。
+    返回 ``{"actions", "owner", "block_action", "blocks", "dest_mode"}``：
+    ``owner[tid]["actions"]`` 是该目标名下（含它触发的清障）的动作下标，
+    ``block_action[bid]`` 是该块唯一的动作下标。每个块的动作数必须恰好 1。
+    """
+    scene = (report.get("scenes") or [report])[0]
+    attempts = scene.get("attempts") or []
+    dest_mode = str(scene.get("dest_mode") or report.get("dest_mode") or "cell")
+    blocks = [dict(b) for b in (truth.get("blocks") or [])]
+    actions = []
+    owner = {}
+    block_action = {}
+
+    def _own(tid):
+        return owner.setdefault(str(tid), {"actions": [],
+                                           "target_action": None,
+                                           "absorbed_by": None})
+
+    def _hit(st):
+        return {k: (st.get("grasp") or {}).get(k) for k in
+                ("axis", "sign", "closing", "variant", "verdict")}
+
+    for a in attempts:
+        tid = str(a.get("id"))
+        own = _own(tid)
+        if str(a.get("status") or "planned") == "absorbed":
+            own["absorbed_by"] = (None if a.get("absorbed_by") is None
+                                  else str(a.get("absorbed_by")))
+            continue
+        for st in a.get("clearing_steps") or []:
+            bid = str(st["move"])
+            blk = find_block(blocks, bid)
+            if blk is None:
+                raise ValueError("清障步骤引用了不存在的块 %r" % (bid,))
+            if not st.get("grasp"):
+                raise ValueError("清障步骤 %r 没有抓取命中记录" % (bid,))
+            src, to = st["from"], st["to"]
+            from_xy = [float(src[0]), float(src[1])]
+            from_top = float(src[2]) + float(blk["size"]) / 2.0
+            absorbed = bool(st.get("absorbed"))
+            if absorbed:
+                cell = int(st["cell"])
+                cx, cy = cm.cell_center(cell)
+                act = _target_xy_action(
+                    "target", bid, from_xy, from_top, [cx, cy],
+                    float(pad_thick),
+                    grasp_yaw_deg(st.get("grasp"), blk.get("yaw", 0.0)),
+                    _hit(st), bias_mm)
+                act["absorbed"] = True
+                act["absorbed_by"] = tid
+            else:
+                surf = surface_of(float(to[2]), float(blk["size"]),
+                                  "清障块 %r" % (bid,), pad_thick=pad_thick)
+                act = _target_xy_action(
+                    "clear", bid, from_xy, from_top,
+                    [float(to[0]), float(to[1])], surf,
+                    grasp_yaw_deg(st.get("grasp"), blk.get("yaw", 0.0)),
+                    _hit(st), None)
+                act["absorbed"] = False
+                act["absorbed_by"] = None
+            act["cell"] = (int(st["cell"]) if st.get("cell") is not None
+                           else None)
+            act["owner"] = tid
+            idx = len(actions)
+            actions.append(act)
+            own["actions"].append(idx)
+            if act.get("kind") == "target":
+                block_action[bid] = idx
+            if absorbed:
+                bown = _own(bid)
+                bown["actions"].append(idx)
+                bown["target_action"] = idx
+                bown["absorbed_by"] = tid
+        if str(a.get("status") or "planned") != "absorbed":
+            tgt = find_block(blocks, tid)
+            if tgt is None:
+                raise ValueError("真值里没有目标块 %r" % (tid,))
+            cell = a.get("cell")
+            if cell is None:
+                raise ValueError("目标块 %r 没有格位" % (tid,))
+            cx, cy = cm.cell_center(int(cell))
+            tf_ = a.get("target_from") or [tgt["x"], tgt["y"], tgt["z"]]
+            from_xy = [float(tf_[0]), float(tf_[1])]
+            from_top = float(a.get("target_top") or
+                             (float(tgt["z"]) + float(tgt["size"]) / 2.0))
+            act = _target_xy_action(
+                "target", tid, from_xy, from_top, [cx, cy], float(pad_thick),
+                grasp_yaw_deg(a.get("grasp_hit"), tgt.get("yaw", 0.0)),
+                _hit({"grasp": a.get("grasp_hit")}), bias_mm)
+            act["cell"] = int(cell)
+            act["absorbed"] = False
+            act["absorbed_by"] = None
+            act["owner"] = tid
+            idx = len(actions)
+            actions.append(act)
+            own["actions"].append(idx)
+            own["target_action"] = idx
+            block_action[tid] = idx
+    probs = []
+    for b in blocks:
+        bid = str(b["id"])
+        acts = [a for a in actions if str(a["block"]) == bid]
+        if dest_mode == "cell":
+            if len(acts) != 1 or acts[0].get("kind") != "target":
+                probs.append("块 %s 有 %d 个动作（cell 模式要求恰好 1 个 target）"
+                             % (bid, len(acts)))
+        else:
+            kinds = [a.get("kind") for a in acts]
+            if not (len(acts) == 1 and kinds == ["target"]) and \
+                    not (len(acts) == 2 and sorted(kinds) == ["clear", "target"]):
+                probs.append("块 %s 的动作 %s 不合法（free 模式：target 或 "
+                             "clear+target）" % (bid, kinds))
+    if probs:
+        raise ValueError("累积动作表不合法：%s" % "；".join(probs))
+    return {"actions": actions, "owner": owner, "block_action": block_action,
+            "blocks": blocks, "dest_mode": dest_mode}
+
+
 # ---------------------------------------------------------------- E4b 对中
 def apply_align(truth, actions, align, target, max_corr_mm=ALIGN_MAX_CORR_MM):
     """把 E4b 的 ``(dx, dy, dyaw)`` 折进目标块。返回写进 manifest 的记录。
@@ -646,7 +771,7 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
                   start=0, min_block_gap=0.0, gap_check="probe_verified",
                   tail_targets=None, validator=None,
                   pick_open_mm=None, place_open_mm=None,
-                  release_dwell_s=None):
+                  release_dwell_s=None, from_check_mm=None):
     """逐步生成计划；任何一步预检失败就抛 ``pp.PlanError``，不写半份序列。
 
     ``wrist_survey=True``（缺省）在序列末尾依次平动到 ``views`` 里的每个
@@ -692,6 +817,14 @@ def plan_sequence(chain, q_start, actions, blocks, out_dir,
         # 却是标称坐标，差 25 mm，空夹回读 0.0 mm。
         from_xy = act.get("from_xy")
         if from_xy is not None:
+            if from_check_mm is not None:
+                d_mm = math.hypot(float(from_xy[0]) - float(blk["x"]),
+                                  float(from_xy[1]) - float(blk["y"])) * 1000.0
+                if d_mm > float(from_check_mm):
+                    raise pp.PlanError(
+                        "块 %s 的动作起点与运行布局差 %.1f mm（上限 %.1f）"
+                        "—— 探针世界与规划世界不是同一个（累积清障的起点"
+                        "过期）" % (act["block"], d_mm, float(from_check_mm)))
             blk["x"] = float(from_xy[0])
             blk["y"] = float(from_xy[1])
         pp_blocks = [to_pp_block(b) for b in layout]

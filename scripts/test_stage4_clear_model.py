@@ -641,6 +641,67 @@ def section_colour_cells():
     check('grid_order_of 缺字段 ⇒ 停（不猜默认顺序）', ok)
 
 
+def section_cumulative():
+    print('\n--- 累积清障纯函数（S3，2026-11-20） ---')
+    cm.install_model_pad_defaults()
+    blk = {'id': 6, 'size': 0.0295}
+    d = cm.clear_destination(blk, {'6': 7}, 'cell', pending_ids=['6'])
+    cx, cy = cm.cell_center(7)
+    check('cell 模式：落点是自己的格心、absorbed 标对',
+          d['mode'] == 'cell' and d['cell'] == 7 and d['absorbed'] is True
+          and abs(d['x'] - cx) < 1e-12 and abs(d['y'] - cy) < 1e-12, d)
+    d = cm.clear_destination(blk, {'6': 7}, 'cell')
+    check('cell 模式：不是未来目标 ⇒ absorbed=False', d['absorbed'] is False)
+    d = cm.clear_destination(blk, None, 'free', pending_ids=['6'])
+    check('free 模式：落自由区、被搬目标 reloc', d['mode'] == 'free'
+          and d['x'] is None and d['relocated'] is True, d)
+    try:
+        cm.clear_destination(blk, {}, 'cell')
+        ok = False
+    except ValueError:
+        ok = True
+    check('cell 模式缺格 ⇒ 停（不回退自由区）', ok)
+
+    check('次数校验：cell 全 1 过 / 0 或 2 红',
+          cm.validate_pick_counts({'0': 1, '1': 1}, 'cell', ['0', '1']) == []
+          and cm.validate_pick_counts({'0': 0, '1': 1}, 'cell') and
+          cm.validate_pick_counts({'0': 2, '1': 1}, 'cell'))
+    check('次数校验：free 允许 2（repick），3 红',
+          cm.validate_pick_counts({'0': 2, '1': 1}, 'free') == []
+          and cm.validate_pick_counts({'0': 3, '1': 1}, 'free'))
+
+    att = [{"id": 0, "status": "planned", "cell": 0, "clearing_steps": []},
+           {"id": 6, "status": "absorbed", "cell": 7, "clearing_steps": []}]
+    # 0 的这次尝试把 6 放进它自己的格（吸收）
+    att[0]["clearing_steps"] = [{"move": 6, "cell": 7, "absorbed": True}]
+    cell_map = {'0': 0, '6': 7}
+    check('覆盖校验：planned + absorbed 都认',
+          cm.check_attempt_coverage(att, [0, 6], cell_map, 'cell') == [])
+    bad = [{"id": 0, "status": "planned", "cell": 0, "clearing_steps": []}]
+    check('覆盖校验：少了被吸收的目标 ⇒ 红',
+          cm.check_attempt_coverage(bad, [0, 6], cell_map, 'cell'))
+    bad2 = [{"id": 0, "status": "planned", "cell": 7,
+             "clearing_steps": []},
+            {"id": 6, "status": "planned", "cell": 7,
+             "clearing_steps": []}]
+    check('覆盖校验：planned 的格与本轮不符 ⇒ 红',
+          cm.check_attempt_coverage(bad2, [0, 6], cell_map, 'cell'))
+
+    truth = {"blocks": [{"id": 0, "color": "red", "layer": 0, "x": 0.4,
+                         "y": 0.3, "z": 0.01475, "yaw": 10.0,
+                         "size": 0.0295}]}
+    f1 = cm.scene_fingerprint(truth, ['0', '6'], {'0': 0, '6': 7}, 'cell',
+                              list(cm.DEFAULT_GRID_ORDER))
+    f2 = cm.scene_fingerprint(truth, ['0', '6'], {'0': 0, '6': 7}, 'cell',
+                              list(cm.DEFAULT_GRID_ORDER))
+    check('场景指纹：同输入同值', f1 == f2 and len(f1) == 16)
+    check('场景指纹：顺序/落点变化 ⇒ 变',
+          cm.scene_fingerprint(truth, ['6', '0'], {'0': 0, '6': 7}, 'cell',
+                               list(cm.DEFAULT_GRID_ORDER)) != f1 and
+          cm.scene_fingerprint(truth, ['0', '6'], {'0': 0, '6': 7}, 'free',
+                               list(cm.DEFAULT_GRID_ORDER)) != f1)
+
+
 def main():
     print('=' * 68)
     # C1：模块缺省 = 未实测哨兵；本套件全是**模型世界**的几何测试，
@@ -649,6 +710,7 @@ def main():
     section_gen_scene_sync()
     section_cells()
     section_colour_cells()
+    section_cumulative()
     section_cell_plan()
     section_free()
     section_blocks()

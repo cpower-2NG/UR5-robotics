@@ -1838,6 +1838,69 @@ def section_validator_passthrough():
           seen and all(s is None for s in seen), seen)
 
 
+def _cum_report(dest_mode, absorbed):
+    hit = {'axis': 2, 'sign': -1, 'closing': 0, 'variant': 0,
+           'vertical': True, 'verdict': 'ok'}
+    step = {'move': 8, 'from': [0.40, 0.30, 0.04425],
+            'to': [0.52, 0.54, 0.01475], 'grasp': hit}
+    if absorbed:
+        step.update({'cell': 7, 'absorbed': True})
+    else:
+        step.update({'cell': None, 'absorbed': False, 'repick': True})
+    att = [{'id': 0, 'ok': True, 'status': 'planned', 'cell': 0,
+            'target_from': [0.40, 0.30, 0.01475], 'target_top': 0.0295,
+            'clearing_steps': [step], 'grasp_hit': hit}]
+    if absorbed:
+        att.append({'id': 8, 'ok': True, 'status': 'absorbed', 'cell': 7,
+                    'absorbed_by': 0, 'clearing_steps': []})
+    else:
+        att.append({'id': 8, 'ok': True, 'status': 'planned', 'cell': 7,
+                    'target_from': [0.52, 0.54, 0.01475],
+                    'target_top': 0.0295, 'clearing_steps': [],
+                    'grasp_hit': hit})
+    att.append({'id': 3, 'ok': True, 'status': 'planned', 'cell': 2,
+                'target_from': [0.60, 0.30, 0.01475], 'target_top': 0.0295,
+                'clearing_steps': [], 'grasp_hit': hit})
+    return {'scenes': [{'dest_mode': dest_mode, 'attempts': att}]}
+
+
+def section_cumulative_actions():
+    print('\n--- 累积动作表（S3，2026-11-20） ---')
+    cm.install_model_pad_defaults()
+    bias = [2.0, 1.0]
+    pack = cr.actions_from_cumulative(tower_truth(), _cum_report('cell', True),
+                                      cm.PAD_THICK, bias_mm=bias)
+    acts = pack['actions']
+    check('cell 模式：3 块 → 3 个动作（被吸收的塔顶就是它自己的目标）',
+          len(acts) == 3
+          and [a['block'] for a in acts] == ['8', '0', '3'], acts)
+    a8 = acts[0]
+    cx, cy = cm.cell_center(7)
+    check('被吸收的清障是 kind=target、落点是自己的格、吃 b̂',
+          a8['kind'] == 'target' and a8['absorbed'] is True
+          and abs(a8['desired_center_mm'][0] - cx * 1000) < 0.01
+          and abs(a8['commanded_center_mm'][0] -
+                  (cx * 1000 - bias[0])) < 0.01, a8)
+    check('owner：目标 0 名下含清障 + 自己；目标 8 指向那一抓',
+          pack['owner']['0']['actions'] == [0, 1]
+          and pack['owner']['8']['target_action'] == 0
+          and pack['owner']['8']['absorbed_by'] == '0', pack['owner'])
+    check('块 → 唯一 target 动作', pack['block_action'] ==
+          {'8': 0, '0': 1, '3': 2}, pack['block_action'])
+
+    pack = cr.actions_from_cumulative(tower_truth(),
+                                      _cum_report('free', False),
+                                      cm.PAD_THICK, bias_mm=bias)
+    acts = pack['actions']
+    k8 = [a['kind'] for a in acts if a['block'] == '8']
+    check('free 模式：被搬目标有 clear + target 两个动作',
+          len(acts) == 4 and k8 == ['clear', 'target'], acts)
+    clr = [a for a in acts if a['block'] == '8' and a['kind'] == 'clear'][0]
+    check('free 清障落台面、不吃 b̂',
+          abs(clr['surface_z']) < 1e-12
+          and clr.get('applied_bias_mm') is None, clr)
+
+
 def main():
     print('=' * 68)
     # C1：模块缺省 = 未实测哨兵；本套件是模型世界（仿真几何），显式装模型常量。
@@ -1851,7 +1914,8 @@ def main():
                section_from_xy,
                section_gap, section_mutation, section_verify, section_fuse,
                section_merge_truth, section_colour, section_pad_pose,
-               section_align, section_view_gate, section_finish):
+               section_align, section_view_gate, section_finish,
+               section_cumulative_actions):
         try:
             fn()
         except Exception as e:                            # noqa: BLE001
