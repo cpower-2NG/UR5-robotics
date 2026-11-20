@@ -646,6 +646,9 @@ class FakeBoard:
         self.calls.append(("ssh", cmd))
         return Rc(0)
 
+    def warm(self, seg="sam"):
+        self.calls.append(("warm", seg))
+
     def preflight(self, repo):
         self.calls.append(("preflight", repo))
         return self.preflight_doc

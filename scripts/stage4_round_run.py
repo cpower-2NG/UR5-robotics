@@ -75,6 +75,7 @@ import shutil
 import subprocess
 import sys
 import time
+import types
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1146,8 +1147,13 @@ class BoardPort(object):
     不是状态机。
 
     端口方法：ssh / push / push_many / mkdir / clear / pull_file / pull_dir /
-    joints / preflight / token_state / wait_token / run_script / analyze / probe。
+    joints / preflight / token_state / wait_token / run_script / analyze / probe /
+    warm。
     """
+
+    def warm(self, seg="sam"):
+        """预热板端分析（模型加载）。缺省 no-op；LocalBoard 同进程预热。"""
+        return None
 
     def wait_token(self, timeout_s, poll_s, now=time.time, sleep=time.sleep,
                    out=log, fresh_min=None):
@@ -1588,10 +1594,37 @@ class LocalBoard(BoardPort):
         r = self.ssh("bash %s %s" % (remote_script, shlex.quote(token)))
         return r.returncode, ((r.stdout or "") + (r.stderr or ""))
 
+    def warm(self, seg="sam"):
+        """把 MobileSAM 加载进本进程（授权等待期间做，不进令牌窗口）。"""
+        try:
+            import stage4_board_analysis as ba
+            ba.warm(seg)
+        except Exception as e:                              # noqa: BLE001
+            log("!! 模型预热失败（不致命，真值时会再加载）：%s" % e)
+
     def analyze(self, repo, kind, opts, out_remote, out_local):
-        cmd = _analysis_cmd(repo, kind, opts, out_remote)
-        self.mkdir(os.path.dirname(out_remote))
-        r = self.ssh(cmd)
+        """板上分析：**同进程**调用 ``stage4_board_analysis``（模型只加载一次）。
+
+        2026-11-20 实测：每起一个分析子进程都要重载 MobileSAM（≈25 s），跑前
+        真值 + 跑后三机位 = 4 次。``--where board`` 的编排器与分析同在本机 ⇒
+        直接 import 调用，预测器缓存跨阶段复用（授权前预热即可零加载）。
+        """
+        out_exp = os.path.expanduser(str(out_remote))
+        argv = [str(kind)] + [
+            os.path.expanduser(str(v)) if str(v).startswith("~")
+            else str(v) for v in (opts or [])]
+        argv += ["--out", out_exp]
+        self.mkdir(os.path.dirname(out_exp))
+        err = ""
+        try:
+            import stage4_board_analysis as ba
+            rc = int(ba.main(argv) or 0)
+        except SystemExit as e:
+            rc = int(e.code or 0)
+        except Exception as e:                              # noqa: BLE001
+            rc = 1
+            err = "%s: %s" % (type(e).__name__, e)
+        r = types.SimpleNamespace(returncode=rc, stdout="", stderr=err)
         if r.returncode != 0:
             log("  !! 板上分析 %s rc=%d：%s"
                 % (kind, r.returncode,
@@ -1776,11 +1809,13 @@ class Round:
             return int(self.deps["truth_from_view"](
                 burst_local, out_local, allow_empty=allow_empty,
                 seg=self.args.seg) or 0)
+        # ``--jobs 1``：SAM 时代进程池的每个 worker 都要重载模型（≈25 s/个），
+        # 串行 + 预热缓存（LocalBoard 同进程）才是最快的形态（2026-11-20 实测）。
         opts = ["--burst", burst_remote,
                 "--camera", "wrist",
                 "--seg", self.args.seg,
                 "--zone", truth_zone_for(burst_remote),
-                "--min-frames", "5"]
+                "--min-frames", "5", "--jobs", "1", "--img-jobs", "4"]
         if allow_empty:
             opts.append("--allow-empty")
         name = os.path.basename(os.path.normpath(out_local))
@@ -2020,6 +2055,8 @@ class Round:
         print(">>> 需要人动手：确认两指整个行程内无手无遮挡、急停在手，")
         print(">>> 然后示教器先按 STOP，看到 STOPPED 后再按 PLAY。")
         print("")
+        # 模型预热藏在人做两步握手的这段时间里（BoardPort.warm；LocalBoard 同进程）
+        self.board.warm(getattr(self.args, "seg", "sam"))
         tok, rem = self.board.wait_token(self.args.auth_timeout,
                                          self.args.auth_poll,
                                          now=self.deps["now"],

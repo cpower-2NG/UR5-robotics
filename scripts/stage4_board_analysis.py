@@ -66,7 +66,23 @@ def cmd_truth(a):
         argv.append("--allow-empty")
     if a.jobs is not None:
         argv += ["--jobs", str(int(a.jobs))]
+    argv += ["--img-jobs", str(int(a.img_jobs))]
+    if float(a.img_skip_dup_mm or 0) > 0:
+        argv += ["--img-skip-dup-mm", str(float(a.img_skip_dup_mm))]
     return int(tf.main(argv) or 0)
+
+
+def warm(seg="sam"):
+    """预热：把 MobileSAM 加载进**当前进程**（一轮只付一次 ~25 s）。
+
+    ``--where board`` 的编排器与板端分析同进程（LocalBoard 直接调用本模块），
+    在授权等待前预热，计算段的真值调用就不再重载模型；跑后三机位也共用。
+    """
+    if seg != "sam":
+        return 0
+    import sam_blocks
+    sam_blocks.get_predictor()
+    return 0
 
 
 def cmd_colour(a):
@@ -131,6 +147,10 @@ def build_parser():
                    help="干净的机位是合法结果（只给跑后三机位）")
     t.add_argument("--jobs", type=int, default=None,
                    help="逐帧量测进程数（缺省 min(CPU, 帧数)）")
+    t.add_argument("--img-jobs", type=int, default=1,
+                   help="图像块心细化线程数")
+    t.add_argument("--img-skip-dup-mm", type=float, default=0.0,
+                   help="片筛选：跳过被更大同色片罩住的小碎片（毫米，0=关）")
     t.set_defaults(func=cmd_truth)
 
     c = sub.add_parser("colour", help="burst → 目标块彩色顶面质心")
