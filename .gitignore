@@ -40,3 +40,7 @@ ros2_ws/src/yolo_detector/models/*.pt
 
 # Claude Code 本地 worktree/会话产物（本目录放本地 worktree 碎屑；.claude/commands/ 收束命令要入库，别整目录忽略）
 .claude/worktrees/
+
+# Gazebo / gz-sim 在仓库根留下的进程号碎屑（gz.pid / gz2.pid / gz3.pid …）：
+# 每次起仿真都会重生成，且 PID 本身毫无长期价值 —— 2026-11-21 实测 git status 里连出三个 ??。
+*.pid
