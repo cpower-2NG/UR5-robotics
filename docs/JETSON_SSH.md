@@ -1,6 +1,6 @@
 # Jetson 板子 SSH 访问（WSL 侧）
 
-核对时间：2026-09-27。本文供 WSL 下的工具直接使用。
+核对时间：2026-09-27（**2026-11-02 复核**：私钥与别名现况更新，见「WSL 侧已就绪的状态」）。本文供 WSL 下的工具直接使用。
 
 > 2026-09-27 补充核验：`ssh jetson` **实测连通**（返回 `CONNECT_OK` / `yahboom` / `aarch64`）。
 > 同日在板端做了一次**只读**资产取回，见文末「板端已有资产」。
@@ -10,7 +10,7 @@
 在 WSL 里直接 `ssh jetson` 即可免密登录，别名已配好，等价于：
 
 ```bash
-ssh -i ~/.ssh/board_ed25519 jetson@<host-ip>
+ssh -i <identity-file> jetson@<host-ip>   # 现役私钥名以 ~/.ssh/config 为准
 ```
 
 ## 连接信息
@@ -26,8 +26,13 @@ ssh -i ~/.ssh/board_ed25519 jetson@<host-ip>
 ## WSL 侧已就绪的状态
 
 - WSL 与板子同网段直通：WSL 本机地址 `<ip>/23`，`ping <host-ip>` 约 1 ms。
-- 私钥 `~/.ssh/board_ed25519`（权限 `600`）已在 WSL 内，免密登录实测通过。
-- `~/.ssh/config` 已写入 `Host jetson` 别名；配置模板见 `docs/jetson_ssh_config.txt`。
+- 私钥与别名**以 `~/.ssh/config` 为准**。2026-11-02 复核：初版记的 `board_ed25519` 已不存在（别按旧名找）；
+  现配三个别名 `jetson` / `jetson-wifi` / `jetson-hotspot`（对应三条网络路线，热点路线端口非 22），
+  各指 `~/.ssh` 下现役钥匙，免密实测通过（当刻仅热点路线可达——板子换网是常态，用前先探）。
+- 给真人的**含真值连接卡**在 `~/.config/ur5-vision-grasp/board-ssh-handout.md`（仓外，权限 600，
+  由 `~/robotics/scratch/make_board_ssh_handout.py` 从 `~/.ssh/config` + 板上只读探测自动生成）；
+  本仓只存占位符版。
+- 配置模板见 `docs/jetson_ssh_config.txt`。
 
 ## 常用命令
 
